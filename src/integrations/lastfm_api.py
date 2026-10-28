@@ -19,19 +19,16 @@ USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 class LastFMAPIError(Exception):
     """Base exception for Last.fm API errors."""
 
-    pass
 
 
 class LastFMRateLimitError(LastFMAPIError):
     """Raised when rate limit is exceeded (error code 29)."""
 
-    pass
 
 
 class LastFMClientError(LastFMAPIError):
     """Raised for client errors (invalid user, etc.)."""
 
-    pass
 
 
 @dataclass

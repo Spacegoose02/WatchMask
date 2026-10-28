@@ -53,7 +53,7 @@ def safe_url(value: str | None) -> str:
 
 def stable_hmac(value: str, *, namespace: str, length: int | None = None) -> str:
     """Return a deterministic keyed digest suitable for cache and dedupe keys."""
-    message = f"{namespace}:{value}".encode("utf-8")
+    message = f"{namespace}:{value}".encode()
     digest = hmac.new(
         settings.SECRET_KEY.encode("utf-8"),
         message,

@@ -589,7 +589,8 @@ class GetHorizontalHistoryImageTests(TestCase):
     @patch("lists.models.CustomList._get_tmdb_backdrop")
     def test_tvdb_tv_missing_provider_external_ids_falls_back_to_portrait(self, mock_backdrop):
         """Old serialised history entries that pre-date the provider_external_ids
-        field must not crash and must fall back to the portrait poster."""
+        field must not crash and must fall back to the portrait poster.
+        """
         item = {
             "id": 10,
             "media_type": MediaTypes.TV.value,

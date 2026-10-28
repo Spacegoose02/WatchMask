@@ -14,15 +14,14 @@ from app.log_safety import exception_summary, presence_map
 from app.models import MediaTypes, Sources, Status
 from app.providers import services
 from app.services.music import prefetch_album_covers
-
-# Suppress InsecureRequestWarning (Plex local connections often use self-signed certs)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 from integrations import plex as plex_api
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 from integrations.webhooks import anime_mappings
 from integrations.webhooks.plex import PlexWebhookProcessor
+
+# Suppress InsecureRequestWarning (Plex local connections often use self-signed certs)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -1249,7 +1248,7 @@ class PlexHistoryImporter:
             return None
 
         if rating <= 10:
-            rating = rating
+            pass  # already on a 10-point scale
         elif rating <= 100:
             rating /= 10
         else:

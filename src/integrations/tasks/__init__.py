@@ -3,6 +3,10 @@ import logging
 from celery import shared_task
 from django.contrib.auth import get_user_model
 
+from integrations.tasks._cinemask import (
+    sync_all_cinemask_requests,
+    sync_cinemask_requests,
+)
 from integrations.tasks._import_helpers import (
     ERROR_TITLE,
     GOODREADS_IMPORT_TASK_NAME,
@@ -12,10 +16,6 @@ from integrations.tasks._import_helpers import (
     format_import_message,
     format_media_type_display,
     format_watchlist_sync_message,
-)
-from integrations.tasks._cinemask import (
-    sync_all_cinemask_requests,
-    sync_cinemask_requests,
 )
 from integrations.tasks._lastfm import (
     LASTFM_PARTIAL_SYNC_ERROR,

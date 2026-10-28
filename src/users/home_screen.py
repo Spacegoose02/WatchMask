@@ -1898,7 +1898,7 @@ def sort_home_entries(entries: list[HomeRowEntry], sort_by: str, direction: str)
             else (
                 None
                 if getattr(entry.item, "trakt_popularity_rank", None) is None
-                else -float(getattr(entry.item, "trakt_popularity_rank"))
+                else -float(entry.item.trakt_popularity_rank)
             ),
             direction,
         )

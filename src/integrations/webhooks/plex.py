@@ -327,7 +327,7 @@ class PlexWebhookProcessor(BaseWebhookProcessor):
 
     def _process_rating(self, payload, user):
         """Process media.rate webhook events to update user ratings.
-        
+
         Note: Plex may not send media.rate webhook events reliably.
         Ratings are primarily synced via the Plex import process which
         fetches ratings from library items.
@@ -536,7 +536,7 @@ class PlexWebhookProcessor(BaseWebhookProcessor):
 
     def _remove_rating(self, payload, user, ids, media_type):
         """Remove rating from a movie or TV instance.
-        
+
         Only removes ratings from existing instances; does not create new instances.
         """
         from app.models import Sources
@@ -644,7 +644,6 @@ class PlexWebhookProcessor(BaseWebhookProcessor):
 
     def _fetch_rating_from_plex_api(self, user, rating_key, payload):
         """Fetch user rating from Plex API as fallback if not in webhook payload."""
-
         plex_account = getattr(user, "plex_account", None)
         if not plex_account or not plex_account.plex_token:
             logger.debug("No Plex account found for rating fetch")
@@ -696,7 +695,7 @@ class PlexWebhookProcessor(BaseWebhookProcessor):
         rating_source: str | None = None,
     ) -> float | None:
         """Normalize Plex rating values onto a 0-10 scale.
-        
+
         Plex userRating values are typically on a 0-10 scale (even for 5-star UI).
         Some metadata sources may report 0-100, which we normalize down.
         """
@@ -715,7 +714,7 @@ class PlexWebhookProcessor(BaseWebhookProcessor):
 
         if rating_source in {"userRating", "user_rating", "payload_userRating"}:
             if rating <= 10:
-                rating = rating
+                pass  # already on a 10-point scale
             elif rating <= 100:
                 rating /= 10
             else:
@@ -724,7 +723,7 @@ class PlexWebhookProcessor(BaseWebhookProcessor):
         elif rating <= 5:
             rating *= 2
         elif rating <= 10:
-            rating = rating
+            pass  # already on a 10-point scale
         elif rating <= 100:
             rating /= 10
         else:

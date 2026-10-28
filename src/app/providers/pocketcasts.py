@@ -93,10 +93,10 @@ def search(query, page):
 
 def lookup_by_itunes_id(itunes_collection_id):
     """Look up podcast metadata by iTunes collection ID.
-    
+
     Args:
         itunes_collection_id: iTunes collection ID (string)
-        
+
     Returns:
         Dict with podcast metadata:
         - feed_url: RSS feed URL

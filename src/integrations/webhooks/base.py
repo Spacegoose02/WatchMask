@@ -62,7 +62,7 @@ class BaseWebhookProcessor:
 
     def _extract_season_episode_from_payload(self, payload):
         """Extract season and episode numbers from payload.
-        
+
         Override in subclasses if payload structure differs.
         Returns (season_number, episode_number) or (None, None) if not found.
         """
@@ -70,7 +70,7 @@ class BaseWebhookProcessor:
 
     def _extract_series_title(self, payload):
         """Extract TV series title from payload for title-based TMDB search.
-        
+
         Override in subclasses if payload structure differs.
         Returns series title string or None if not found.
         """
@@ -92,7 +92,7 @@ class BaseWebhookProcessor:
 
     def _process_tv(self, payload, user, ids, season_number=None, episode_number=None):
         """Process TV episode webhook.
-        
+
         Args:
             payload: Webhook payload
             user: User instance
@@ -1429,8 +1429,7 @@ class BaseWebhookProcessor:
 
     def _queue_collection_metadata_update(self, payload, user, item):
         """Queue collection metadata update task if media server info is available.
-        
+
         This is a no-op by default. Subclasses should override to implement
         collection metadata extraction for their specific media server.
         """
-        pass

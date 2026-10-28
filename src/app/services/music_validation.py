@@ -13,17 +13,17 @@ logger = logging.getLogger(__name__)
 
 def validate_music_library(user):
     """Comprehensive validation of user's music library.
-    
+
     Returns a dictionary with data quality metrics including:
     - Track counts (total, unique, linked, with runtime)
     - Artist MBID coverage
     - Album track population status
     - Missing metadata breakdown
     - Enrichment readiness metrics
-    
+
     Args:
         user: Django User instance
-        
+
     Returns:
         dict with validation metrics
     """
@@ -135,7 +135,7 @@ def validate_music_library(user):
 
 def count_user_tracks(user):
     """Count unique tracks for a user.
-    
+
     Returns:
         dict with track count metrics
     """
@@ -172,7 +172,7 @@ def count_user_tracks(user):
 
 def get_enrichment_status(user):
     """Get enrichment status for user's music library.
-    
+
     Returns information about what has been enriched and what's missing.
     """
     music_entries = Music.objects.filter(user=user).select_related(
@@ -236,7 +236,7 @@ def get_enrichment_status(user):
 
 def get_missing_linkages(user):
     """Get counts of Music entries with missing linkages.
-    
+
     Returns breakdown of what's missing.
     """
     music_entries = Music.objects.filter(user=user).select_related(
@@ -268,11 +268,11 @@ def get_missing_linkages(user):
 
 def compare_plex_track_count(user, plex_track_count=None):
     """Compare Yamtrack track counts with Plex data.
-    
+
     Args:
         user: Django User instance
         plex_track_count: Optional Plex track count for comparison
-        
+
     Returns:
         dict with comparison metrics
     """

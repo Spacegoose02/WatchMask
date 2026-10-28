@@ -157,7 +157,7 @@ class PocketCastsAccount(models.Model):
     @property
     def is_connected(self):
         """Return True when we have a valid connection.
-        
+
         A connection is valid if:
         - We have email AND password (can always re-login), OR
         - We have an access token (and it's not expired, or we have refresh token to renew it)

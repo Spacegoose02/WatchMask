@@ -1506,7 +1506,7 @@ def _sync_plex_rating(request, item, media_type):
     else:
         # Search for item in Plex library
         try:
-            resources = plex_api.list_resources(plex_account.plex_token)
+            plex_api.list_resources(plex_account.plex_token)
         except Exception as exc:
             logger.debug(
                 "Failed to list Plex resources for rating sync: %s",
@@ -1560,7 +1560,7 @@ def _sync_plex_rating(request, item, media_type):
 
                     # Check if this matches our item
                     matches = False
-                    if item.source == "tmdb" and external_ids.get("tmdb_id") == str(item.media_id) or item.source == "imdb" and external_ids.get("imdb_id") == item.media_id or item.source == "tvdb" and external_ids.get("tvdb_id") == str(item.media_id):
+                    if (item.source == "tmdb" and external_ids.get("tmdb_id") == str(item.media_id)) or (item.source == "imdb" and external_ids.get("imdb_id") == item.media_id) or (item.source == "tvdb" and external_ids.get("tvdb_id") == str(item.media_id)):
                         matches = True
 
                     if matches:

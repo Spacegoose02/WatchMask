@@ -446,7 +446,7 @@ def invalidate_statistics_days(user_id: int, day_values, reason: str | None = No
 
 def _collect_stale_reading_score_days(user, day_whitelist: set[date] | None = None) -> set[date]:
     """Return reading activity days where cached score metadata is stale."""
-    active_media_types = set(getattr(user, "get_active_media_types", lambda: [])())
+    active_media_types = set(getattr(user, "get_active_media_types", list)())
     if not active_media_types:
         active_media_types = set(MediaTypes.values)
 
@@ -523,7 +523,7 @@ def _collect_stale_reading_score_days(user, day_whitelist: set[date] | None = No
 
 def build_statistics_data(user, start_date, end_date):
     """Build statistics data for a user and date range.
-    
+
     This extracts the computation logic from the statistics() view.
     Returns a dictionary with all statistics data needed for the view.
     """
@@ -666,7 +666,7 @@ def build_statistics_data(user, start_date, end_date):
 
 def _get_empty_statistics_data():
     """Return an empty statistics data structure with all required keys.
-    
+
     Used when cache is missing and refresh is in progress to avoid
     expensive inline rebuilds that cause page load delays.
     """
@@ -981,16 +981,16 @@ def get_statistics_minutes_by_type(user, start_date, end_date, range_name=None):
 
 def get_statistics_data(user, start_date, end_date, range_name=None):
     """Return cached statistics, rebuilding if needed.
-    
+
     Always returns cached data if available (even if stale) to avoid timeouts.
     Schedules background refresh if cache is stale.
-    
+
     Args:
         user: User instance
         start_date: Start date for statistics (datetime or None)
         end_date: End date for statistics (datetime or None)
         range_name: Predefined range name (e.g., "Last 12 Months") or None
-    
+
     Returns:
         Dictionary with statistics data
     """

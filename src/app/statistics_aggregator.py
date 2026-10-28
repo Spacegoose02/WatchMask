@@ -700,7 +700,7 @@ def _aggregate_statistics_from_days(
                 activity_total = 1
             activity_counts[day] = activity_total
 
-    active_types = list(getattr(user, "get_active_media_types", lambda: [])())
+    active_types = list(getattr(user, "get_active_media_types", list)())
     if not active_types:
         active_types = list(MediaTypes.values)
 

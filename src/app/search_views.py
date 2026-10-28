@@ -31,10 +31,10 @@ logger = logging.getLogger(__name__)
 def _mark_grouped_anime_route(media_items):
     """Annotate grouped-anime rows so templates route them through the Anime UI."""
     for media in media_items or []:
-        setattr(media, "route_media_type", MediaTypes.ANIME.value)
+        media.route_media_type = MediaTypes.ANIME.value
         item = getattr(media, "item", None)
         if item is not None:
-            setattr(item, "route_media_type", MediaTypes.ANIME.value)
+            item.route_media_type = MediaTypes.ANIME.value
     return media_items
 
 

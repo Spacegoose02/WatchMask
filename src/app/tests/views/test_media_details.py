@@ -214,7 +214,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, 'id="detail-secondary-content"', html=False)
         self.assertContains(response, "fragment=secondary")
         self.assertNotContains(response, "Your Notes")
-        self.assertNotContains(response, "<h2 class=\"text-xl font-bold\">Collection</h2>", html=False)
+        self.assertNotContains(response, '<h2 class="text-xl font-bold">Collection</h2>', html=False)
         mock_run_retryable_db_operation.assert_not_called()
         mock_enrich_items.assert_not_called()
         mock_fetch_delay.assert_not_called()
@@ -297,9 +297,9 @@ class MediaDetailsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "app/components/detail_secondary_content.html")
-        self.assertContains(response, "<h2 class=\"text-xl font-bold\">Your Notes</h2>", html=False)
-        self.assertContains(response, "<h2 class=\"text-xl font-bold\">Collection</h2>", html=False)
-        self.assertContains(response, "<h2 class=\"text-xl font-bold\">Cast</h2>", html=False)
+        self.assertContains(response, '<h2 class="text-xl font-bold">Your Notes</h2>', html=False)
+        self.assertContains(response, '<h2 class="text-xl font-bold">Collection</h2>', html=False)
+        self.assertContains(response, '<h2 class="text-xl font-bold">Cast</h2>', html=False)
         self.assertNotContains(
             response,
             'class="flex flex-col md:flex-row gap-8 md:gap-10 mb-2 md:mb-8"',
@@ -527,7 +527,7 @@ class MediaDetailsViewTests(TestCase):
             else volume_metadata
         )
 
-        volume_item = Item.objects.create(
+        Item.objects.create(
             media_id="500",
             source=Sources.COMICVINE.value,
             media_type=MediaTypes.COMIC.value,
@@ -2733,7 +2733,7 @@ class MediaDetailsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Edit rating")
-        self.assertContains(response, "x-text=\"formatRating(rating)\">8<", html=False)
+        self.assertContains(response, 'x-text="formatRating(rating)">8<', html=False)
         self.assertContains(response, "x-text=\"rating ? 'Edit rating' : 'Add rating'\"", html=False)
 
     @patch("app.providers.services.get_media_metadata")
@@ -2783,7 +2783,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Edit rating")
         self.assertContains(response, "ratingScaleMax: 5", html=False)
-        self.assertContains(response, "x-text=\"formatRating(rating)\">4/5<", html=False)
+        self.assertContains(response, 'x-text="formatRating(rating)">4/5<', html=False)
         self.assertContains(response, "x-text=\"rating ? 'Edit rating' : 'Add rating'\"", html=False)
 
     @patch("app.providers.services.get_media_metadata")
@@ -5303,7 +5303,7 @@ class MediaDetailsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         content = response.content.decode()
-        self.assertIn("<h1 class=\"text-3xl font-bold\">The Sound of Music</h1>", content)
+        self.assertIn('<h1 class="text-3xl font-bold">The Sound of Music</h1>', content)
         self.assertNotIn('aria-label="Show alternative title"', content)
 
     @patch("app.providers.services.get_media_metadata")

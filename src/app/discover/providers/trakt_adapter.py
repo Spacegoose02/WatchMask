@@ -270,7 +270,7 @@ class TraktDiscoverAdapter:
         media_type: str,
         row_key: str,
         source_reason: str,
-        popularity: float | int | None,
+        popularity: float | None,
         trakt_genres: list[str] | None = None,
     ) -> CandidateItem | None:
         if not show:

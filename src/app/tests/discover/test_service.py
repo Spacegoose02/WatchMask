@@ -6406,7 +6406,7 @@ class DiscoverServiceTests(TestCase):
             _hydrate_movie_candidates_from_items,
         )
 
-        item = self._create_movie_item(
+        self._create_movie_item(
             "hydrate-known",
             "Known Movie",
             provider_keywords=["Family", "Adventure"],

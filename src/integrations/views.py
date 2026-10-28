@@ -22,7 +22,14 @@ from django.views.decorators.http import require_GET, require_POST
 import users
 from app import helpers as app_helpers
 from app.log_safety import exception_summary
-from integrations import cinemask, exports, gpodder_api, lastfm_api, pocketcasts_api, tasks
+from integrations import (
+    cinemask,
+    exports,
+    gpodder_api,
+    lastfm_api,
+    pocketcasts_api,
+    tasks,
+)
 from integrations import plex as plex_api
 from integrations.gpodder_api import GPodderAuthError, GPodderClientError
 from integrations.imports import anilist, helpers, simkl, trakt
@@ -1756,7 +1763,7 @@ def import_lastfm_history_manual(request):
 @require_POST
 def import_pocketcasts(request):
     """Queue a Pocket Casts history import for the current user.
-    
+
     Pocket Casts always uses mode="new" and runs every 2 hours automatically.
     First import is "new", subsequent recurring imports are also "new".
     """

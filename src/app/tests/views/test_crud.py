@@ -1022,7 +1022,7 @@ class EditMedia(TestCase):
             start_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
             end_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
         )
-        initial_status = Movie.objects.get(item__media_id="10494").status
+        Movie.objects.get(item__media_id="10494")
 
         response = self.client.post(
             f"{reverse('media_save')}?next=/details/tmdb/movie/10494/perfect-blue",

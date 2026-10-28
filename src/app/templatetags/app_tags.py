@@ -1352,7 +1352,7 @@ def order_by_end_date(queryset):
 @register.filter
 def format_date_range_display(start_date, end_date):
     """Format date range for display in card titles.
-    
+
     Returns a human-readable string like "Last 12 Months" or "Date Range"
     based on whether it's a predefined range or custom dates.
     """

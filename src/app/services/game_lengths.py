@@ -531,7 +531,7 @@ def _extract_igdb_external_ids(metadata: dict[str, Any] | None) -> dict[str, Any
     for key in ("steam_app_id", "itch_id", "ign_uuid", "hltb_game_id"):
         if key in external_ids:
             result[key] = external_ids[key]
-    direct_hltb_id = _extract_hltb_id(((payload.get("external_links") or {}).get("HowLongToBeat")))
+    direct_hltb_id = _extract_hltb_id((payload.get("external_links") or {}).get("HowLongToBeat"))
     if direct_hltb_id:
         result["hltb_game_id"] = direct_hltb_id
     return result

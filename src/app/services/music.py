@@ -128,17 +128,17 @@ def sync_music_item_genres_from_album(item: Item, album: Album | None) -> list[s
 
 def get_artist_hero_image(artist: Artist) -> str:
     """Get a hero image for an artist from their albums.
-    
+
     Since MusicBrainz doesn't have artist photos, we derive a hero image
     from the artist's albums - preferring albums with cover art.
-    
+
     Strategy:
     1. Find albums with images, prefer earliest release (often most iconic)
     2. If no albums have images, return the default placeholder
-    
+
     Args:
         artist: The Artist object
-        
+
     Returns:
         URL to the hero image, or settings.IMG_NONE
     """
@@ -793,10 +793,10 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
 
 def refresh_album_cover_art(album: Album) -> bool:
     """Try to fetch/refresh cover art for an album.
-    
+
     Args:
         album: The Album object to refresh
-        
+
     Returns:
         True if cover art was updated, False otherwise
     """
@@ -846,11 +846,11 @@ def refresh_album_cover_art(album: Album) -> bool:
 
 def refresh_missing_album_covers(artist: Artist, limit: int = 10) -> int:
     """Refresh cover art for albums missing images.
-    
+
     Args:
         artist: The Artist whose albums to check
         limit: Maximum number of albums to refresh (to avoid rate limiting)
-        
+
     Returns:
         Number of albums that got new cover art
     """
@@ -870,14 +870,14 @@ def refresh_missing_album_covers(artist: Artist, limit: int = 10) -> int:
 
 def sync_artist_discography(artist: Artist, force: bool = False) -> int:
     """Sync the discography for an artist from MusicBrainz.
-    
+
     This creates/updates Album records for all albums in the artist's
     discography, similar to how TV seasons are populated from TMDB.
-    
+
     Args:
         artist: The Artist object to sync
         force: If True, sync even if already synced recently
-        
+
     Returns:
         Number of albums synced
     """
@@ -1290,11 +1290,11 @@ def canonicalize_album(album: Album, user=None) -> Album:
 
 def needs_discography_sync(artist: Artist, max_age_days: int = 7) -> bool:
     """Check if an artist needs discography sync.
-    
+
     Args:
         artist: The Artist object to check
         max_age_days: Maximum age of sync before it's considered stale
-        
+
     Returns:
         True if sync is needed
     """
@@ -1376,13 +1376,13 @@ def build_discography_groups(albums: list[Album]) -> list[dict]:
 
 def ensure_album_has_release_id(album: Album) -> bool:
     """Ensure an album has a release_id, fetching it from release_group if needed.
-    
+
     If the album only has a release_group_id, this will query MusicBrainz to find
     a representative release and update the album.
-    
+
     Args:
         album: The Album object
-        
+
     Returns:
         True if the album now has a release_id (or already had one)
     """
@@ -1412,7 +1412,7 @@ def ensure_album_has_release_id(album: Album) -> bool:
 
 def album_has_musicbrainz_id(album: Album) -> bool:
     """Check if an album has any MusicBrainz identity.
-    
+
     Returns True if the album has either a release_id or release_group_id.
     """
     return bool(album.musicbrainz_release_id or album.musicbrainz_release_group_id)
@@ -1504,14 +1504,14 @@ def populate_album_tracks(album: Album) -> int:
 
 def prefetch_album_covers(artist: Artist, limit: int | None = 20) -> int:
     """Prefetch cover art for albums missing images.
-    
+
     This runs on artist page load to populate album covers that
     were not fetched during discography sync.
-    
+
     Args:
         artist: The Artist whose albums to check
         limit: Maximum number of albums to prefetch (to respect rate limits)
-        
+
     Returns:
         Number of albums that got new cover art
     """
@@ -1791,14 +1791,14 @@ def merge_artist_records(source_artist: Artist, target_artist: Artist) -> Artist
 
 def link_music_to_tracks(user, limit: int | None = None):
     """Link Music entries to Track models by matching recording IDs.
-    
+
     This cleanup function helps fix Music entries that weren't linked to Track models
     during import or enrichment.
-    
+
     Args:
         user: Django User instance
         limit: Optional limit on number of entries to process
-        
+
     Returns:
         dict with counts of linked entries
     """
@@ -1885,11 +1885,11 @@ def link_music_to_tracks(user, limit: int | None = None):
 
 def backfill_music_runtimes(user, limit: int | None = None):
     """Backfill missing runtime data for Music entries from Track durations.
-    
+
     Args:
         user: Django User instance
         limit: Optional limit on number of entries to process
-        
+
     Returns:
         dict with count of backfilled runtimes
     """
@@ -1922,11 +1922,11 @@ def backfill_music_runtimes(user, limit: int | None = None):
 
 def fix_music_album_links(user, limit: int | None = None):
     """Fix Music entries missing album links by inferring from Track or Artist.
-    
+
     Args:
         user: Django User instance
         limit: Optional limit on number of entries to process
-        
+
     Returns:
         dict with count of fixed links
     """

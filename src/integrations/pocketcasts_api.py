@@ -23,7 +23,7 @@ class PocketCastsAuthError(PocketCastsClientError):
 
 def login(email: str, password: str) -> dict[str, Any]:
     """Login to Pocket Casts with email and password.
-    
+
     Returns:
         Dict with accessToken and refreshToken
     """
@@ -107,7 +107,7 @@ def login(email: str, password: str) -> dict[str, Any]:
 
 def refresh_token(refresh_token: str) -> dict[str, Any]:
     """Refresh an access token using a refresh token.
-    
+
     Returns:
         Dict with accessToken and refreshToken
     """
@@ -150,7 +150,7 @@ def refresh_token(refresh_token: str) -> dict[str, Any]:
 
 def parse_token_expiration(access_token: str) -> datetime:
     """Parse expiration time from JWT access token.
-    
+
     Returns:
         datetime when token expires (UTC)
     """
@@ -168,10 +168,10 @@ def parse_token_expiration(access_token: str) -> datetime:
 
 def validate_token(access_token: str) -> bool:
     """Validate an access token by making a test API call.
-    
+
     Args:
         access_token: The JWT access token to validate
-        
+
     Returns:
         True if token is valid, False otherwise
     """
@@ -215,10 +215,10 @@ def validate_token(access_token: str) -> bool:
 
 def get_podcast_list(access_token: str) -> dict[str, Any]:
     """Fetch the user's podcast list with metadata.
-    
+
     Args:
         access_token: The JWT access token
-        
+
     Returns:
         Dict with 'podcasts' list containing show metadata including descriptions
     """
@@ -257,11 +257,11 @@ def get_podcast_list(access_token: str) -> dict[str, Any]:
 
 def get_podcast_image_url(podcast_uuid: str, size: int = 130) -> str:
     """Get the image URL for a podcast show.
-    
+
     Args:
         podcast_uuid: The podcast UUID
         size: Image size (130 appears to be standard, but other sizes may exist)
-        
+
     Returns:
         URL to the podcast artwork image
     """

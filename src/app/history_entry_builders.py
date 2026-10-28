@@ -132,7 +132,7 @@ def _format_boardgame_plays(plays: int) -> str:
 def _get_episode_poster(episode):
     """Prefer show/season posters over episodic stills for consistent cards."""
     season_item = getattr(episode.related_season, "item", None)
-    episode_item = getattr(episode, "item", None)
+    getattr(episode, "item", None)
     tv_item = getattr(getattr(episode.related_season, "related_tv", None), "item", None)
 
     poster = (

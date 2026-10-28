@@ -148,7 +148,7 @@ def _build_prefetch_for_range(user, day_list):
     if not day_list:
         return None
 
-    active_media_types = set(getattr(user, "get_active_media_types", lambda: [])())
+    active_media_types = set(getattr(user, "get_active_media_types", list)())
     if not active_media_types:
         active_media_types = set(MediaTypes.values)
 
@@ -431,7 +431,7 @@ def build_stats_for_day(
     if not day_start or not day_end:
         return None
 
-    active_media_types = set(getattr(user, "get_active_media_types", lambda: [])())
+    active_media_types = set(getattr(user, "get_active_media_types", list)())
     if not active_media_types:
         active_media_types = set(MediaTypes.values)
     split_tv_anime = (

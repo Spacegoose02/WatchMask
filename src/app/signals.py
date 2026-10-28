@@ -526,7 +526,7 @@ def schedule_credits_backfill_on_movie_play(sender, instance, **kwargs):  # noqa
 @receiver([post_save, post_delete], sender=Music)
 def refresh_history_cache_on_music_change(sender, instance, **kwargs):  # noqa: ARG001
     """Schedule history cache refresh when music activity changes.
-    
+
     We schedule a refresh but don't delete the cache immediately,
     so users can see the old data with a notification while refresh happens.
     """
@@ -544,7 +544,7 @@ def refresh_history_cache_on_music_change(sender, instance, **kwargs):  # noqa: 
 @receiver([post_save, post_delete], sender=Podcast)
 def refresh_history_cache_on_podcast_change(sender, instance, **kwargs):  # noqa: ARG001
     """Schedule history cache refresh when podcast activity changes.
-    
+
     We schedule a refresh but don't delete the cache immediately,
     so users can see the old data with a notification while refresh happens.
     """
@@ -675,7 +675,7 @@ def _collect_reading_history_day_keys(instance):
 @receiver([post_save, post_delete], sender=Manga)
 def refresh_statistics_cache_on_manga_change(sender, instance, **kwargs):  # noqa: ARG001
     """Schedule statistics cache refresh when manga activity changes.
-    
+
     We schedule a refresh but don't delete the cache immediately,
     so users can see the old data with a notification while refresh happens.
     """
@@ -694,7 +694,7 @@ def refresh_statistics_cache_on_manga_change(sender, instance, **kwargs):  # noq
 @receiver([post_save, post_delete], sender=Book)
 def refresh_statistics_cache_on_book_change(sender, instance, **kwargs):  # noqa: ARG001
     """Schedule statistics cache refresh when book activity changes.
-    
+
     We schedule a refresh but don't delete the cache immediately,
     so users can see the old data with a notification while refresh happens.
     """
@@ -713,7 +713,7 @@ def refresh_statistics_cache_on_book_change(sender, instance, **kwargs):  # noqa
 @receiver([post_save, post_delete], sender=Comic)
 def refresh_statistics_cache_on_comic_change(sender, instance, **kwargs):  # noqa: ARG001
     """Schedule statistics cache refresh when comic activity changes.
-    
+
     We schedule a refresh but don't delete the cache immediately,
     so users can see the old data with a notification while refresh happens.
     """
@@ -745,7 +745,7 @@ def refresh_statistics_cache_on_comic_issue_change(sender, instance, **kwargs): 
 @receiver([post_save, post_delete], sender=Game)
 def refresh_statistics_cache_on_game_change(sender, instance, **kwargs):  # noqa: ARG001
     """Schedule statistics cache refresh when game activity changes.
-    
+
     We schedule a refresh but don't delete the cache immediately,
     so users can see the old data with a notification while refresh happens.
     """
@@ -772,7 +772,7 @@ def refresh_statistics_cache_on_game_change(sender, instance, **kwargs):  # noqa
 @receiver([post_save, post_delete], sender=BoardGame)
 def refresh_statistics_cache_on_boardgame_change(sender, instance, **kwargs):  # noqa: ARG001
     """Schedule statistics cache refresh when board game activity changes.
-    
+
     We schedule a refresh but don't delete the cache immediately,
     so users can see the old data with a notification while refresh happens.
     """
@@ -805,7 +805,7 @@ def schedule_runtime_backfill_on_item_save(
     **kwargs,
 ):  # noqa: ARG001
     """Queue runtime/genre/credits backfills for newly created or missing metadata items.
-    
+
     Also invalidates time_left cache when episode runtime changes.
     """
     # Check if runtime_minutes was actually updated (not just saving the same value)

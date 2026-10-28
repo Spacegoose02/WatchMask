@@ -182,7 +182,7 @@ class FullViewWallClockTests(TestCase):
         with override_settings(DEBUG=True):
             reset_queries()
             start = time.perf_counter()
-            response = media_list(request, MediaTypes.MOVIE.value)
+            media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
             queries = connection.queries[:]
 
@@ -231,7 +231,7 @@ class CacheLookupOverheadTests(TestCase):
 
         with patch.object(cache, "get", side_effect=counting_get):
             start = time.perf_counter()
-            response = media_list(request, MediaTypes.MOVIE.value)
+            media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
 
         print("\n[PERF] Cache lookups (500 items, no DB metadata):")
@@ -263,7 +263,7 @@ class CacheLookupOverheadTests(TestCase):
 
         with patch.object(cache, "get", side_effect=counting_get):
             start = time.perf_counter()
-            response = media_list(request, MediaTypes.MOVIE.value)
+            media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
 
         print("\n[PERF] Cache lookups (500 items, WITH DB metadata):")
@@ -300,7 +300,7 @@ class CollectionFilterN1Tests(TestCase):
         with override_settings(DEBUG=True):
             reset_queries()
             start = time.perf_counter()
-            response = media_list(request, MediaTypes.MOVIE.value)
+            media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
             queries = connection.queries[:]
 
@@ -398,7 +398,7 @@ class MaterializationWasteTests(TestCase):
         with override_settings(DEBUG=True):
             reset_queries()
             start = time.perf_counter()
-            response = media_list(request, MediaTypes.MOVIE.value)
+            media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
             queries = connection.queries[:]
 

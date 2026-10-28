@@ -17,11 +17,11 @@ USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 
 def fetch_album_artwork(album_title: str, artist_name: str) -> str | None:
     """Fetch album artwork from iTunes API.
-    
+
     Args:
         album_title: Album title
         artist_name: Artist name
-        
+
     Returns:
         Image URL string or None if not found
     """
@@ -115,15 +115,15 @@ def fetch_album_artwork(album_title: str, artist_name: str) -> str | None:
 
 def fetch_artist_artwork(artist_name: str) -> str | None:
     """Fetch artist artwork from iTunes API.
-    
+
     Note: iTunes doesn't typically have direct artist photos, so this
     function searches for albums by the artist and returns artwork from
     a representative album (preferring early releases which are often
     more iconic).
-    
+
     Args:
         artist_name: Artist name
-        
+
     Returns:
         Image URL string or None if not found
     """

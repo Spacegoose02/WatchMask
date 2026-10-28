@@ -39,10 +39,10 @@ POCKETCASTS_PODCAST_API_BASE_URL = "https://podcast-api.pocketcasts.com"
 
 def _cleanup_duplicate_episodes_global():
     """Clean up duplicate podcast episodes globally (standalone function).
-    
+
     Finds duplicate episodes (same show, title, published date, different UUIDs)
     and merges them. Can be called from tasks that don't have a PocketCastsImporter instance.
-    
+
     Returns:
         dict: Statistics about the cleanup (duplicates_removed, episodes_merged, items_merged)
     """
@@ -509,7 +509,7 @@ class PocketCastsImporter:
 
     def _disconnect_account(self, reason="Refresh token failed", clear_credentials=False):
         """Mark the Pocket Casts account as disconnected.
-        
+
         Args:
             reason: Reason for disconnection (for logging)
             clear_credentials: If True, clear all tokens. If False, preserve tokens but mark as broken.
@@ -539,7 +539,7 @@ class PocketCastsImporter:
 
     def _ensure_valid_token(self):
         """Ensure we have a valid access token.
-        
+
         Prefers login with credentials over refresh token when credentials are available,
         as login is more reliable than refresh tokens which may expire or be revoked.
         """
@@ -629,10 +629,10 @@ class PocketCastsImporter:
 
     def _login_with_credentials(self):
         """Login to Pocket Casts using stored email and password credentials.
-        
+
         This method decrypts the stored credentials, calls the login API,
         and stores the resulting tokens.
-        
+
         Raises:
             MediaImportError: If credentials are missing, decryption fails, or login fails
         """
@@ -691,11 +691,11 @@ class PocketCastsImporter:
 
     def _get_history_items_in_range(self, start_time, end_time):
         """Get all history items with end_date in the specified time range.
-        
+
         Args:
             start_time: Start of time range (datetime)
             end_time: End of time range (datetime)
-            
+
         Returns:
             List of tuples: (end_date, duration_seconds, media_type, is_scrobbled)
             - end_date: When the item was completed
@@ -803,7 +803,7 @@ class PocketCastsImporter:
 
     def _build_blocked_intervals(self, existing_history_items, sync_window_start, sync_window_end, inferred_podcasts=None):
         """Build blocked intervals from scrobbled items and previously inferred podcast completions.
-        
+
         Args:
             existing_history_items: List of (end_date, duration, type, is_scrobbled)
             sync_window_start: Start of the sync window
@@ -848,7 +848,7 @@ class PocketCastsImporter:
 
     def _has_gap_of_length(self, duration_seconds, sync_window_start, sync_window_end, blocked_intervals):
         """Check if there's a gap large enough for the placement buffer.
-        
+
         Uses the same capped duration as _fit_completion_after_blocked for consistency.
         """
         # Use capped duration for gap checking (same as fitting logic)
@@ -876,11 +876,11 @@ class PocketCastsImporter:
 
     def _fit_completion_after_blocked(self, base_completion_time, duration_seconds, sync_window_start, sync_window_end, blocked_intervals):
         """Find a valid completion time that doesn't overlap with blocked intervals.
-        
+
         We're placing an END time, not reserving the full playback span. The duration_seconds
         is used to determine a "virtual start" for overlap checking, but the key is finding
         a completion time within the window that doesn't conflict with blocked intervals.
-        
+
         For non-anchored cases, duration_seconds is already capped to a small value (5 min),
         making this more flexible. For anchored cases, it's the remaining time.
         """
@@ -917,7 +917,7 @@ class PocketCastsImporter:
 
     def _fallback_completion_time(self, episode_uuid, sync_window_start, sync_window_end, blocked_intervals):
         """Place completion time in an available gap using hash-based distribution.
-        
+
         Applies boundary avoidance to prevent landing exactly on gap start/end,
         which would cause clustering on sync window boundaries.
         """
@@ -1002,10 +1002,10 @@ class PocketCastsImporter:
 
     def _get_last_in_progress_record(self, episode_uuid):
         """Get the last in-progress history record for an episode.
-        
+
         Args:
             episode_uuid: The episode UUID to search for
-            
+
         Returns:
             tuple: (history_date, progress_minutes) or (None, None) if not found
         """
@@ -1052,13 +1052,13 @@ class PocketCastsImporter:
         inferred_podcasts=None,
     ):
         """Infer completion date for a podcast by fitting it into timeline gaps.
-        
+
         For anchored cases (prior in-progress snapshot exists): uses remaining time
         to calculate when the episode likely completed.
-        
+
         For non-anchored cases (98% of completions): uses hash-based distribution
         across the window since we have no information about when listening started.
-        
+
         Args:
             inferred_podcasts: List of (end_time, buffer_seconds) for already-inferred
                 podcasts in this sync, used to prevent overlapping placements.
@@ -1668,7 +1668,7 @@ class PocketCastsImporter:
 
     def _process_episode(self, episode_data, defer_completion_date=False):
         """Process single episode: create/update show/episode, calculate delta.
-        
+
         Args:
             episode_data: Episode data from API
             defer_completion_date: If True, don't set completion_date (will be inferred later)
@@ -2028,7 +2028,7 @@ class PocketCastsImporter:
 
     def _calculate_progress_delta(self, old_played_up_to, new_played_up_to, duration, playing_status, old_status):
         """Calculate time delta between imports, determine status, and return progress.
-        
+
         Returns:
             tuple: (delta_seconds, status, progress_minutes)
         """
@@ -2097,7 +2097,7 @@ class PocketCastsImporter:
 
     def _record_history(self, podcast, delta_seconds, import_time):
         """Record play history entry for delta time.
-        
+
         Creates a historical record entry for the time listened.
         """
         if delta_seconds <= 0:
@@ -2140,11 +2140,11 @@ class PocketCastsImporter:
 
     def _sync_episodes_from_rss(self, show, rss_feed_url):
         """Sync episodes from RSS feed and merge with existing episodes.
-        
+
         Fetches all episodes from RSS feed and creates/updates PodcastEpisode
         records. This ensures we have the complete episode list, not just
         what's in Pocket Casts history.
-        
+
         Args:
             show: PodcastShow instance
             rss_feed_url: RSS feed URL to fetch from
@@ -2282,9 +2282,9 @@ class PocketCastsImporter:
 
     def _cleanup_duplicate_episodes(self):
         """Clean up duplicate podcast episodes.
-        
+
         Calls the global cleanup function and handles warnings.
-        
+
         Returns:
             dict: Statistics about the cleanup (duplicates_removed, episodes_merged, items_merged)
         """
@@ -2323,7 +2323,7 @@ class PocketCastsImporter:
             "last_modified",
             "timestamp",
         ):
-            if field in episode_data and episode_data[field]:
+            if episode_data.get(field):
                 parsed = self._parse_history_timestamp(episode_data[field])
                 if parsed is not None:
                     return parsed
@@ -2384,11 +2384,11 @@ class PocketCastsImporter:
 
     def _discover_rss_feed_url(self, show_title, author=None):
         """Discover RSS feed URL from iTunes API.
-        
+
         Args:
             show_title: Podcast show title
             author: Podcast author (optional)
-            
+
         Returns:
             RSS feed URL or None if not found
         """

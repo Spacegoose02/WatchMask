@@ -292,7 +292,7 @@ class TrackModalViewTests(TestCase):
         self.assertTrue(response.context["discover_tab_available"])
         self.assertTrue(response.context["is_hidden_from_discover"])
         self.assertContains(response, "Currently hidden in Discover.")
-        self.assertContains(response, "name=\"action\"", html=False)
+        self.assertContains(response, 'name="action"', html=False)
 
     def test_artist_track_modal_uses_shared_fill_track_shell(self):
         """Music artist trackers should render through the shared modal shell."""

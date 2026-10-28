@@ -112,9 +112,9 @@ if not SECRET_KEY:
 
         raise ImproperlyConfigured(
             "SECRET env var is not set. To fix, run:\n\n"
-            "  python -c \""
+            '  python -c "'
             "import secrets; print('SECRET=' + secrets.token_urlsafe(50))"
-            "\" >> .env\n"
+            '" >> .env\n'
         )
 
 
@@ -656,8 +656,7 @@ def _parse_repo_owner(value):
     parsed = urlparse(value)
     repo_path = parsed.path if parsed.netloc else value
     repo_path = repo_path.strip("/")
-    if repo_path.endswith(".git"):
-        repo_path = repo_path[:-4]
+    repo_path = repo_path.removesuffix(".git")
     if not repo_path:
         return None
     return repo_path.split("/", 1)[0]
@@ -672,8 +671,7 @@ def _parse_repo_slug(value):
     parsed = urlparse(value)
     repo_path = parsed.path if parsed.netloc else value
     repo_path = repo_path.strip("/")
-    if repo_path.endswith(".git"):
-        repo_path = repo_path[:-4]
+    repo_path = repo_path.removesuffix(".git")
     if "/" not in repo_path:
         return None
     owner, repo = repo_path.split("/", 1)

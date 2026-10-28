@@ -1506,7 +1506,7 @@ class ListDetailViewTests(TestCase):
         mock_update_preference.side_effect = ["date_added", None]
         mock_user_can_view.return_value = True
 
-        season_item = Item.objects.create(
+        Item.objects.create(
             media_id="1668",
             source=Sources.TMDB.value,
             media_type=MediaTypes.SEASON.value,
