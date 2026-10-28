@@ -119,4 +119,9 @@ urlpatterns = [
         views.kodi_webhook,
         name="kodi_webhook",
     ),
+    path(
+        "webhook/bingebandit/<str:token>",
+        views.bingebandit_webhook,
+        name="bingebandit_webhook",
+    ),
 ]
