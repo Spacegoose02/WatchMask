@@ -76,7 +76,7 @@ class TrackModalViewTests(TestCase):
 
         self.mock_get_media_metadata = patch(
             "app.providers.services.get_media_metadata",
-            return_value={"max_progress": 1},
+            return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
         )
         self.mock_fetch_releases = patch("app.models.Item.fetch_releases")
         self.mock_get_media_metadata.start()

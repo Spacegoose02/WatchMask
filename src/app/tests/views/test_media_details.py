@@ -3253,7 +3253,8 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "Pokemon Emergency!")
         self.assertContains(response, "Pallet Party Panic")
         self.assertContains(response, "A Scare in the Air")
-        self.assertContains(response, 'title="Track Episode"', count=4)
+        # Each episode renders a track button in both the grid and list layouts
+        self.assertContains(response, 'title="Track Episode"', count=8)
         self.assertNotContains(
             response,
             "Episode cards are not available from MyAnimeList metadata.",
@@ -5137,6 +5138,8 @@ class MediaDetailsViewTests(TestCase):
             title="Test TV Show",
             image="http://example.com/image.jpg",
         )
+        # Saving a completed show looks up its metadata to fill remaining seasons
+        mock_get_metadata.return_value = {"max_progress": None}
         related_tv = TV.objects.create(
             item=show_item,
             user=self.user,
@@ -5503,7 +5506,7 @@ class MediaDetailsViewTests(TestCase):
         )
         self.assertRegex(
             content,
-            r'class="hidden flex-wrap items-center justify-start gap-y-1 text-center text-sm font-medium text-gray-400 md:flex md:text-start">\s*<h2 class="text-sm font-medium text-gray-400">Season 1</h2>\s*<span class="mx-2 text-gray-600">•</span>\s*<span class="text-sm font-medium text-gray-400">\s*Progress: 2/8\s*</span>\s*<span class="mx-2 text-gray-600">•</span>\s*<span class="text-sm font-medium text-gray-400">\s*2026-03-01 - 2026-03-12\s*</span>',
+            r'class="hidden flex-wrap items-center justify-start gap-y-1 text-center text-sm font-medium text-gray-400 md:flex md:text-start">\s*<h2 class="text-sm font-medium text-gray-400">Season 1</h2>\s*<span class="mx-2 text-gray-600">•</span>\s*<span id="season-progress-desktop-1" class="text-sm font-medium text-gray-400">\s*Progress: 2/8\s*</span>\s*<span class="mx-2 text-gray-600">•</span>\s*<span class="text-sm font-medium text-gray-400">\s*2026-03-01 - 2026-03-12\s*</span>',
         )
         self.assertNotIn("Your History", content)
 
@@ -5852,6 +5855,7 @@ class MediaDetailsViewTests(TestCase):
         mock_build_specials,
     ):
         """Saving TV tracking statuses should not remove cast/crew from reopened details."""
+        # Cast and crew render in the deferred secondary section
         tmdb.cache.clear()
         self.client.login(**self.credentials)
         append_requests = []
@@ -5970,7 +5974,7 @@ class MediaDetailsViewTests(TestCase):
                     },
                 )
 
-                untracked_response = self.client.get(detail_url)
+                untracked_response = self.client.get(detail_url, {"fragment": "secondary"})
 
                 self.assertEqual(untracked_response.status_code, 200)
                 self.assertContains(untracked_response, "John Actor")
@@ -5999,8 +6003,8 @@ class MediaDetailsViewTests(TestCase):
                     ).exists(),
                 )
 
-                tracked_response = self.client.get(detail_url)
-                reopened_response = self.client.get(detail_url)
+                tracked_response = self.client.get(detail_url, {"fragment": "secondary"})
+                reopened_response = self.client.get(detail_url, {"fragment": "secondary"})
 
                 self.assertEqual(tracked_response.status_code, 200)
                 self.assertContains(tracked_response, "John Actor")
@@ -7567,7 +7571,7 @@ class AnimeNextEpisodeRedirectTests(TestCase):
             },
         )
 
-    @patch("app.media_details_views._build_flat_anime_episode_preview")
+    @patch("app.views._build_flat_anime_episode_preview")
     @patch("app.views.services.get_media_metadata")
     def test_redirects_to_mapped_next_episode(self, mock_metadata, mock_preview):
         mock_metadata.return_value = {"title": "Witch Hat Atelier", "details": {}}
@@ -7599,7 +7603,7 @@ class AnimeNextEpisodeRedirectTests(TestCase):
             fetch_redirect_response=False,
         )
 
-    @patch("app.media_details_views._build_flat_anime_episode_preview")
+    @patch("app.views._build_flat_anime_episode_preview")
     @patch("app.views.services.get_media_metadata")
     def test_falls_back_to_detail_page_without_mapping(self, mock_metadata, mock_preview):
         mock_metadata.return_value = {"title": "Witch Hat Atelier", "details": {}}

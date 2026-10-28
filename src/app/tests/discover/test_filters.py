@@ -42,7 +42,7 @@ class DiscoverFilterTests(TestCase):
             title="Tracked Movie",
             image="http://example.com/image.jpg",
         )
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=self.item,
                 user=self.user,

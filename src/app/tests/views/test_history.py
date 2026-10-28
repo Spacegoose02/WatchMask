@@ -40,11 +40,11 @@ def _start_model_metadata_patches(test_case):
     """Prevent history view tests from making provider calls during model saves."""
     mock_item_media_metadata = patch(
         "app.models.item.providers.services.get_media_metadata",
-        return_value={"max_progress": 1},
+        return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
     )
     mock_media_media_metadata = patch(
         "app.models.media.providers.services.get_media_metadata",
-        return_value={"max_progress": 1},
+        return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
     )
     mock_fetch_releases = patch("app.models.Item.fetch_releases")
     mock_item_media_metadata.start()

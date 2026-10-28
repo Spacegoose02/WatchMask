@@ -203,7 +203,8 @@ class TV(Media):
             self.item.media_id,
             self.item.source,
         )
-        max_progress = tv_metadata["max_progress"]
+        # Nothing to fan out when the provider payload has no episode count
+        max_progress = tv_metadata.get("max_progress")
 
         if not max_progress or self.progress > max_progress:
             return
@@ -214,7 +215,7 @@ class TV(Media):
 
         season_numbers = [
             season["season_number"]
-            for season in tv_metadata["related"]["seasons"]
+            for season in (tv_metadata.get("related") or {}).get("seasons", [])
             if season["season_number"] != 0
         ]
         tv_with_seasons_metadata = providers.services.get_media_metadata(
@@ -916,7 +917,7 @@ class Season(Media):
         now = timezone.now().replace(second=0, microsecond=0)
 
         # Create Episode objects for the remaining episodes
-        for episode in reversed(season_metadata["episodes"]):
+        for episode in reversed(season_metadata.get("episodes", [])):
             if episode["episode_number"] <= latest_watched_ep_num:
                 break
 

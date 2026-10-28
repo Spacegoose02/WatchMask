@@ -246,7 +246,7 @@ class StatisticsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.context["tvdb_enabled"])
-        self.assertContains(response, "Anime Genre (via TVDB)")
+        self.assertContains(response, "Choose how TV shows tagged as Anime via TVDB appear.")
 
     @patch("app.statistics_views.tvdb.enabled", return_value=False)
     def test_statistics_view_hides_anime_genre_preference_without_tvdb(self, _mock_tvdb_enabled):
@@ -258,7 +258,7 @@ class StatisticsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.context["tvdb_enabled"])
-        self.assertNotContains(response, "Anime Genre (via TVDB)")
+        self.assertNotContains(response, "Choose how TV shows tagged as Anime via TVDB appear.")
 
     def test_statistics_view_uses_canonical_music_detail_links(self):
         """Music statistics cards should link through shared artist/album details routes."""
@@ -885,7 +885,8 @@ class StatisticsViewTests(TestCase):
         self.assertRegex(
             response_body,
             re.compile(
-                r"Average Rating.*?4(?:\.0+)?\s*<span[^>]*>/\s*5</span>",
+                # The average itself is rendered client-side from the context
+                r"Average Rating.*?<span[^>]*>/\s*5</span>",
                 re.DOTALL,
             ),
         )
@@ -2667,7 +2668,7 @@ class StatisticsViewTests(TestCase):
     @patch("app.tasks.enqueue_credits_backfill_items")
     def test_statistics_view_queues_credit_backfill_for_missing_tmdb_item(self, mock_enqueue, mock_get_metadata):
         """Statistics should queue credit backfill for played TMDB items missing credits."""
-        mock_get_metadata.return_value = {"max_progress": 1}
+        mock_get_metadata.return_value = {"max_progress": 1, "related": {"seasons": []}, "episodes": []}
         watched_at = timezone.now()
         item = Item.objects.create(
             media_id="42",
@@ -2704,7 +2705,7 @@ class StatisticsViewTests(TestCase):
         mock_get_metadata,
     ):
         """Day refresh should schedule missing credits without duplicate enqueue in top-talent aggregate."""
-        mock_get_metadata.return_value = {"max_progress": 1}
+        mock_get_metadata.return_value = {"max_progress": 1, "related": {"seasons": []}, "episodes": []}
         watched_at = timezone.now()
         item = Item.objects.create(
             media_id="9042",
@@ -2820,7 +2821,12 @@ class StatisticsViewTests(TestCase):
             allow_inline=True,
         )
 
-    def test_get_user_media_splits_tvdb_tagged_tv_into_anime_bucket(self):
+    # Saving completed TVDB shows fans out through provider metadata
+    @patch(
+        "app.providers.services.get_media_metadata",
+        return_value={"max_progress": None, "related": {"seasons": []}, "episodes": []},
+    )
+    def test_get_user_media_splits_tvdb_tagged_tv_into_anime_bucket(self, _mock_get_media_metadata):
         """TV items tagged as Anime via TVDB should move from TV stats into Anime when enabled."""
         self.user.anime_enabled = False
         self.user.stats_split_tv_anime = True
@@ -2877,7 +2883,12 @@ class StatisticsViewTests(TestCase):
         self.assertFalse(user_media["tv"].exists())
         self.assertTrue(user_media["anime"].filter(pk=tv.pk).exists())
 
-    def test_refresh_statistics_cache_splits_tvdb_tagged_tv_into_anime_bucket(self):
+    # Saving completed TVDB shows fans out through provider metadata
+    @patch(
+        "app.providers.services.get_media_metadata",
+        return_value={"max_progress": None, "related": {"seasons": []}, "episodes": []},
+    )
+    def test_refresh_statistics_cache_splits_tvdb_tagged_tv_into_anime_bucket(self, _mock_get_media_metadata):
         """Predefined-range cache refresh should classify TVDB-tagged anime under Anime."""
         cache.clear()
         self.user.anime_enabled = False

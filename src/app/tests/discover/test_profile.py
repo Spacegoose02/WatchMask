@@ -64,7 +64,7 @@ class DiscoverProfileTests(TestCase):
             genres=["Romance"],
         )
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=recent_item,
                 user=self.user,
@@ -135,7 +135,7 @@ class DiscoverProfileTests(TestCase):
             genres=["Western"],
         )
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=recent_item,
                 user=self.user,
@@ -274,7 +274,7 @@ class DiscoverProfileTests(TestCase):
         )
         ItemStudioCredit.objects.create(item=item, studio=studio)
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=item,
                 user=self.user,
@@ -342,7 +342,7 @@ class DiscoverProfileTests(TestCase):
         )
         ItemStudioCredit.objects.create(item=item, studio=studio)
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=item,
                 user=self.user,
@@ -416,7 +416,7 @@ class DiscoverProfileTests(TestCase):
         )
         ItemStudioCredit.objects.create(item=item, studio=studio)
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             TV.objects.create(
                 item=item,
                 user=self.user,
@@ -488,7 +488,7 @@ class DiscoverProfileTests(TestCase):
         )
         ItemStudioCredit.objects.create(item=item, studio=studio)
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Anime.objects.create(
                 item=item,
                 user=self.user,
@@ -532,7 +532,7 @@ class DiscoverProfileTests(TestCase):
             image="http://example.com/cached-profile.jpg",
             genres=["Comedy"],
         )
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             movie = Movie.objects.create(
                 item=item,
                 user=self.user,
@@ -561,7 +561,7 @@ class DiscoverProfileTests(TestCase):
 
     def test_get_or_compute_taste_profile_returns_cached_world_rating_profile(self):
         now = timezone.now()
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             for index, (user_score, provider_rating) in enumerate(
                 [(9, 8.9), (8, 8.2), (7, 7.5), (6, 6.8), (5, 6.1)],
                 start=1,
@@ -612,7 +612,7 @@ class DiscoverProfileTests(TestCase):
 
     def test_get_or_compute_taste_profile_recomputes_missing_world_rating_profile_backfill(self):
         now = timezone.now()
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             for index, (user_score, provider_rating) in enumerate(
                 [(9, 8.9), (8, 8.2), (7, 7.5), (6, 6.8), (5, 6.1)],
                 start=1,
@@ -698,7 +698,7 @@ class DiscoverProfileTests(TestCase):
             image="http://example.com/feedback-snapshot.jpg",
             genres=["Mystery"],
         )
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=item,
                 user=self.user,
@@ -746,7 +746,7 @@ class DiscoverProfileTests(TestCase):
         )
         with patch(
             "app.models.providers.services.get_media_metadata",
-            return_value={"max_progress": 1},
+            return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
         ):
             Movie.objects.create(
                 item=item,
@@ -808,7 +808,7 @@ class DiscoverProfileTests(TestCase):
             )
             with patch(
                 "app.models.providers.services.get_media_metadata",
-                return_value={"max_progress": 1},
+                return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
             ):
                 movie = Movie.objects.create(
                     item=item,
@@ -836,7 +836,7 @@ class DiscoverProfileTests(TestCase):
         )
         with patch(
             "app.models.providers.services.get_media_metadata",
-            return_value={"max_progress": 10},
+            return_value={"max_progress": 10, "related": {"seasons": []}, "episodes": []},
         ):
             TV.objects.create(
                 item=tv_item,

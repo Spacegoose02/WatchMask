@@ -836,7 +836,7 @@ class MetadataBackfillTaskTests(TestCase):
 
         with patch(
             "app.models.providers.services.get_media_metadata",
-            return_value={"max_progress": 1},
+            return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
         ):
             Movie.objects.create(
                 item=item,

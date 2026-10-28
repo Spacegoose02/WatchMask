@@ -13,7 +13,7 @@ def _patch_media_metadata(test_case):
     """Stop reading/anime model saves from making provider calls."""
     metadata_patch = patch(
         "app.models.media.providers.services.get_media_metadata",
-        return_value={"max_progress": 1},
+        return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
     )
     fetch_releases_patch = patch("app.models.Item.fetch_releases")
     metadata_patch.start()
