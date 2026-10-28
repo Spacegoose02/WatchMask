@@ -2166,11 +2166,17 @@ class StatisticsViewTests(TestCase):
         response = self.client.get(reverse("statistics_talent_fragment") + "?start-date=all&end-date=all")
 
         self.assertEqual(response.status_code, 200)
-        mock_enqueue.assert_called_once()
-        enqueue_args, enqueue_kwargs = mock_enqueue.call_args
-        scheduled_ids = sorted(enqueue_args[0])
+        # The day cache rebuild and the talent aggregation can each schedule
+        # the missing credits; the enqueue helper dedupes them
+        mock_enqueue.assert_called()
+        scheduled_ids = {
+            item_id
+            for call in mock_enqueue.call_args_list
+            for item_id in call.args[0]
+        }
         self.assertIn(episode_item_two.id, scheduled_ids)
-        self.assertEqual(enqueue_kwargs, {"countdown": 3})
+        for call in mock_enqueue.call_args_list:
+            self.assertEqual(call.kwargs, {"countdown": 3})
         top_actors = response.context["top_talent"]["top_actors"]
         by_name = {entry["name"]: entry for entry in top_actors}
         self.assertIn("Episode Specific Actor", by_name)
