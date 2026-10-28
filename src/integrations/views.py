@@ -2140,3 +2140,46 @@ def kodi_webhook(request, token):
 
     tasks.process_webhook.delay("kodi", payload, user.id)
     return HttpResponse(status=200)
+
+
+@login_not_required
+@csrf_exempt
+@require_POST
+def bingebandit_webhook(request, token):
+    """Handle BingeBandit webhook notifications for media playback."""
+    try:
+        user = users.models.User.objects.get(token=token)
+    except ObjectDoesNotExist:
+        logger.warning(
+            "Could not process BingeBandit webhook: Invalid token: %s",
+            token,
+        )
+        return HttpResponse(status=401)
+
+    data = request.body
+    if not data:
+        logger.warning("Missing payload in BingeBandit webhook request")
+        return HttpResponse("Missing payload", status=400)
+
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON payload in BingeBandit webhook request")
+        return HttpResponse("Invalid JSON", status=400)
+    if not isinstance(payload, dict):
+        return HttpResponse("Invalid payload", status=400)
+
+    # One BingeBandit server sends every member's plays to each webhook, so
+    # ?users=alice,bob on the URL limits tracking to those BingeBandit users.
+    allowed_users = {
+        name.strip().lower()
+        for name in request.GET.get("users", "").split(",")
+        if name.strip()
+    }
+    event_user = str((payload.get("data") or {}).get("user") or "").strip().lower()
+    if allowed_users and event_user not in allowed_users:
+        logger.debug("Ignoring BingeBandit webhook for an unlisted user")
+        return HttpResponse(status=200)
+
+    tasks.process_webhook.delay("bingebandit", payload, user.id)
+    return HttpResponse(status=200)

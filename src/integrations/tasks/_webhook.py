@@ -16,6 +16,7 @@ WEBHOOK_PROCESSORS = {
     "jellyseerr": "integrations.webhooks.jellyseerr.JellyseerrWebhookProcessor",
     "kodi": "integrations.webhooks.kodi.KodiWebhookProcessor",
     "cinemask": "integrations.webhooks.cinemask.CinemaskWebhookProcessor",
+    "bingebandit": "integrations.webhooks.bingebandit.BingeBanditWebhookProcessor",
 }
 
 

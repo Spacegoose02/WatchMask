@@ -94,6 +94,13 @@
           Kodi
         </button>
         <button type="button"
+                @click="activeIntegration = 'bingebandit'"
+                :aria-pressed="activeIntegration === 'bingebandit'"
+                class="px-3 py-1.5 text-xs rounded-md border transition-colors cursor-pointer"
+                :class="activeIntegration === 'bingebandit' ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-[#2a2f35] text-gray-300 border-gray-600 hover:border-indigo-500 hover:text-white'">
+          BingeBandit
+        </button>
+        <button type="button"
                 @click="activeIntegration = 'jellyseerr'"
                 :aria-pressed="activeIntegration === 'jellyseerr'"
                 class="px-3 py-1.5 text-xs rounded-md border transition-colors cursor-pointer"
@@ -532,6 +539,44 @@
           <li>Leave the username and password fields blank.</li>
           <li>Enable the following events: <strong>Start</strong>, <strong>Stopped</strong>, and <strong>Finished</strong>.</li>
           <li>An item is marked watched when playback reaches 80% or Kodi reports a <em>Finished</em> event.</li>
+        </ol>
+      </div>
+    </div>
+
+    {# BingeBandit #}
+    <div class="bg-[#39404b] p-5 rounded-lg mb-6"
+         x-show="activeIntegration === 'all' || activeIntegration === 'bingebandit'"
+         x-transition.opacity.duration.150ms>
+      <div class="flex items-center mb-3">
+        {% include "app/icons/server.svg" with classes="w-5 h-5 text-indigo-400 mr-2" %}
+        <h3 class="text-base font-medium">BingeBandit Integration</h3>
+      </div>
+      <p class="text-gray-400 mb-4 text-sm">Connect BingeBandit to automatically track your watching progress and show what's playing now.</p>
+      <div class="bg-[#262a2f] p-4 rounded-md">
+        <h4 class="text-sm font-medium mb-3">Setup Instructions</h4>
+        <ol class="list-decimal list-inside space-y-2 text-sm text-gray-300">
+          <li>In BingeBandit, go to <strong>Settings &gt; Webhooks</strong> and add a webhook.</li>
+          <li>
+            Set the URL to:
+            {# djlint:off #}
+            <div class="inline-flex items-center gap-2 w-full">
+              <input readonly
+                     id="bingebandit-webhook-url"
+                     class="w-full bg-[#262a2f] rounded-md text-gray-400 text-sm border-0 focus:ring-0 outline-none font-mono px-2 py-1"
+                     type="text"
+                     value="{% url 'bingebandit_webhook' request.user.token as bingebandit_webhook_path %}{% absolute_app_url bingebandit_webhook_path %}">
+              <span class="flex items-center cursor-pointer group"
+                    title="Copy"
+                    data-copy-target="#bingebandit-webhook-url">
+                {% include "app/icons/copy.svg" with classes="w-5 h-5 text-gray-400 group-hover:text-indigo-400 transition-colors" %}
+              </span>
+            </div>
+            {# djlint:on #}
+          </li>
+          <li>Leave the format on the default (JSON), not <em>Plex-style</em>.</li>
+          <li>Enable the events <strong>playback.start</strong> and <strong>playback.finished</strong> for tracking, and <strong>player.play</strong>, <strong>player.pause</strong>, <strong>player.resume</strong> and <strong>player.stop</strong> for the Now Playing card.</li>
+          <li>BingeBandit sends every user's plays to the webhook. To track only your own, add <code>?users=yourname</code> to the URL (separate several names with commas).</li>
+          <li>Items are marked in progress after 30 seconds of play and watched when BingeBandit marks them watched.</li>
         </ol>
       </div>
     </div>
