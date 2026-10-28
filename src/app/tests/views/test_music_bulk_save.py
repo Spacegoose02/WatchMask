@@ -121,7 +121,8 @@ class MusicBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        self.assertEqual(response["HX-Redirect"], return_url)
+        # Bulk saves run in the background; the modal closes instead of redirecting
+        self.assertIn("closeModal", response["HX-Trigger"])
         self.assertTrue(ArtistTracker.objects.filter(user=self.user, artist=artist).exists())
         self.assertTrue(AlbumTracker.objects.filter(user=self.user, album=album).exists())
 
@@ -201,7 +202,8 @@ class MusicBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        self.assertEqual(response["HX-Redirect"], return_url)
+        # Bulk saves run in the background; the modal closes instead of redirecting
+        self.assertIn("closeModal", response["HX-Trigger"])
         self.assertTrue(ArtistTracker.objects.filter(user=self.user, artist=artist).exists())
         self.assertTrue(AlbumTracker.objects.filter(user=self.user, album=first_album).exists())
         self.assertTrue(AlbumTracker.objects.filter(user=self.user, album=second_album).exists())
@@ -282,7 +284,8 @@ class MusicBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        self.assertEqual(response["HX-Redirect"], return_url)
+        # Bulk saves run in the background; the modal closes instead of redirecting
+        self.assertIn("closeModal", response["HX-Trigger"])
 
         plays = list(
             Music.objects.filter(user=self.user, album__artist=artist)

@@ -139,10 +139,8 @@ class EpisodeBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        self.assertEqual(
-            response["HX-Redirect"],
-            "/details/pocketcasts/podcast/show-uuid-1/podcast-show",
-        )
+        # Bulk saves run in the background; the modal closes instead of redirecting
+        self.assertIn("closeModal", response["HX-Trigger"])
         self.assertTrue(
             PodcastShowTracker.objects.filter(user=self.user, show=show).exists(),
         )
@@ -222,7 +220,8 @@ class EpisodeBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        self.assertEqual(response["HX-Redirect"], self.return_url)
+        # Bulk saves run in the background; the modal closes instead of redirecting
+        self.assertIn("closeModal", response["HX-Trigger"])
         self.assertTrue(
             TV.objects.filter(user=self.user, item__media_id="1396").exists(),
         )
@@ -844,9 +843,8 @@ class EpisodeBulkSaveViewTests(TestCase):
             },
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Start date is required.")
-        self.assertContains(response, "End date is required.")
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("Start and end dates are required.", response["HX-Trigger"])
         self.assertEqual(
             Episode.objects.filter(related_season__user=self.user).count(),
             0,
@@ -977,11 +975,8 @@ class EpisodeBulkSaveViewTests(TestCase):
             },
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(
-            response,
-            "One or more selected episodes are missing air dates.",
-        )
+        # The range is validated by the background task, which creates nothing
+        self.assertEqual(response.status_code, 204)
         self.assertEqual(
             Episode.objects.filter(related_season__user=self.user).count(),
             0,
@@ -1079,7 +1074,8 @@ class EpisodeBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        self.assertIn("/details/tvdb/anime/9350138/", response["HX-Redirect"])
+        # Bulk saves run in the background; the modal closes instead of redirecting
+        self.assertIn("closeModal", response["HX-Trigger"])
         self.assertTrue(
             TV.objects.filter(
                 user=self.user,

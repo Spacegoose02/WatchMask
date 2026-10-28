@@ -34,8 +34,6 @@ def bulk_episode_plays_task(
     library_media_type: str | None = None,
 ):
     """Apply a bulk episode play range in the background after the modal has closed."""
-    from datetime import date  # noqa: PLC0415
-
     from app.models import PodcastShow  # noqa: PLC0415
     from app.services import bulk_episode_tracking, metadata_resolution  # noqa: PLC0415
 
@@ -127,8 +125,18 @@ def bulk_episode_plays_task(
         if first_ep["order"] <= ep["order"] <= last_ep["order"]
     ]
 
-    start_date = date.fromisoformat(start_date_str.split("T")[0]) if start_date_str else None
-    end_date = date.fromisoformat(end_date_str.split("T")[0]) if end_date_str else None
+    # Keep the time of day the user picked; date-only values lose it
+    start_date = bulk_episode_tracking.coerce_episode_datetime(start_date_str)
+    end_date = bulk_episode_tracking.coerce_episode_datetime(end_date_str)
+
+    if distribution_mode == "air_date" and any(
+        not ep.get("air_date") for ep in selected_episodes
+    ):
+        logger.warning(
+            "bulk_episode_plays_task: selected episodes missing air dates media_id=%s",
+            media_id,
+        )
+        return
 
     result = bulk_episode_tracking.apply_bulk_episode_plays(
         user,
@@ -163,10 +171,8 @@ def bulk_music_plays_task(
     end_date_str: str | None,
 ):
     """Apply a bulk music play range in the background after the modal has closed."""
-    from datetime import date  # noqa: PLC0415
-
     from app.models import Album, Artist  # noqa: PLC0415
-    from app.services import bulk_music_tracking  # noqa: PLC0415
+    from app.services import bulk_episode_tracking, bulk_music_tracking  # noqa: PLC0415
 
     logger.info(
         "bulk_music_plays_task_start task_id=%s user_id=%d context_kind=%s context_id=%d",
@@ -224,8 +230,9 @@ def bulk_music_plays_task(
         if first_ep["order"] <= ep["order"] <= last_ep["order"]
     ]
 
-    start_date = date.fromisoformat(start_date_str.split("T")[0]) if start_date_str else None
-    end_date = date.fromisoformat(end_date_str.split("T")[0]) if end_date_str else None
+    # Keep the time of day the user picked; date-only values lose it
+    start_date = bulk_episode_tracking.coerce_episode_datetime(start_date_str)
+    end_date = bulk_episode_tracking.coerce_episode_datetime(end_date_str)
 
     result = bulk_music_tracking.apply_bulk_music_plays(
         user,

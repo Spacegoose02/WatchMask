@@ -359,7 +359,10 @@ def apply_bulk_music_plays(
     end_date=None,
 ):
     """Persist a bulk music play range against artist or album tracking."""
-    if distribution_mode == "air_date":
+    # Without every release date there is nothing to bias toward, so spread evenly
+    if distribution_mode == "air_date" and all(
+        episode.get("air_date") for episode in selected_episodes
+    ):
         timestamps = distribute_target_timestamps(
             [episode["air_date"] for episode in selected_episodes],
             start_date,
