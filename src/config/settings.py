@@ -1153,6 +1153,11 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 60 * 60 * 2,  # every 2 hours
         "options": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     },
+    "sync_cinemask_requests": {
+        "task": "Sync Cinemask requests for all users",
+        "schedule": 60 * 30,  # every 30 minutes
+        "options": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
+    },
     "refresh_discover_profiles": {
         "task": "Refresh Discover Profiles",
         "schedule": crontab(hour=4, minute=0),  # every day at 4 AM

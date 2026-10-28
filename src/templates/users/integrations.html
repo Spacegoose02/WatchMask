@@ -100,6 +100,13 @@
                 :class="activeIntegration === 'jellyseerr' ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-[#2a2f35] text-gray-300 border-gray-600 hover:border-indigo-500 hover:text-white'">
           Jellyseerr
         </button>
+        <button type="button"
+                @click="activeIntegration = 'cinemask'"
+                :aria-pressed="activeIntegration === 'cinemask'"
+                class="px-3 py-1.5 text-xs rounded-md border transition-colors cursor-pointer"
+                :class="activeIntegration === 'cinemask' ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-[#2a2f35] text-gray-300 border-gray-600 hover:border-indigo-500 hover:text-white'">
+          Cinemask
+        </button>
       </div>
     </div>
 
@@ -747,6 +754,129 @@
             </div>
           </li>
           <li>Select the notification types you want (commonly request/approval events).</li>
+        </ol>
+      </div>
+    </div>
+
+    {# Cinemask #}
+    <div class="bg-[#39404b] p-5 rounded-lg mb-6"
+         x-show="activeIntegration === 'all' || activeIntegration === 'cinemask'"
+         x-transition.opacity.duration.150ms>
+      <div class="flex items-center mb-3">
+        {% include "app/icons/server.svg" with classes="w-5 h-5 text-indigo-400 mr-2" %}
+        <h3 class="text-base font-medium">Cinemask Integration</h3>
+      </div>
+      <p class="text-gray-400 mb-4 text-sm">
+        Request movies and shows on Cinemask from their Yamtrack pages, follow each request's status, and add requests to your list automatically.
+      </p>
+
+      {% if cinemask_account %}
+        <div class="bg-[#262a2f] p-4 rounded-md mb-4">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="text-sm text-gray-300">
+              Connected to <span class="font-mono">{{ cinemask_account.base_url }}</span>
+              <div class="text-gray-400 mt-1">
+                {% if cinemask_account.last_error_message %}
+                  <span class="text-red-400">{{ cinemask_account.last_error_message }}</span>
+                {% elif cinemask_account.last_sync_at %}
+                  Requests synced {{ cinemask_account.last_sync_at|timesince }} ago.
+                {% else %}
+                  Waiting for the first sync.
+                {% endif %}
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <form method="post" action="{% url 'cinemask_sync' %}">
+                {% csrf_token %}
+                <button type="submit" class="px-3 py-2 text-sm rounded-md bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer">Sync now</button>
+              </form>
+              <form method="post" action="{% url 'cinemask_disconnect' %}">
+                {% csrf_token %}
+                <button type="submit" class="px-3 py-2 text-sm rounded-md bg-[#39404b] hover:bg-red-700 text-white cursor-pointer">Disconnect</button>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-[#262a2f] p-4 rounded-md mb-4">
+          <h4 class="text-sm font-medium mb-3">Cinemask Settings</h4>
+          <form method="post" action="{% url 'cinemask_settings' %}" class="space-y-3">
+            {% csrf_token %}
+            <label class="flex items-center gap-2 text-sm text-gray-200">
+              <input type="checkbox" name="add_to_tracking" class="rounded" {% if cinemask_account.add_to_tracking %}checked{% endif %}>
+              Add requested movies and shows to Yamtrack as Planning
+            </label>
+            <div>
+              <label for="cinemask_allowed_usernames" class="block text-gray-200 text-sm font-medium mb-1">
+                Other Cinemask requesters to add (comma-separated)
+              </label>
+              <p class="text-gray-400 text-xs mb-2">
+                Your own requests are always added. The webhook covers the whole Cinemask server, so leave this blank to add everyone's requests, or list the people whose requests you want.
+              </p>
+              <input type="text"
+                     id="cinemask_allowed_usernames"
+                     name="allowed_usernames"
+                     class="w-full bg-[#39404b] rounded-md text-gray-200 text-sm border-0 focus:ring-2 focus:ring-indigo-500 p-2"
+                     placeholder="kid, partner"
+                     value="{{ cinemask_account.allowed_usernames }}">
+            </div>
+            <button type="submit"
+                    class="inline-flex items-center px-4 py-2 text-sm rounded-md bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer">
+              {% include "app/icons/save.svg" with classes="w-4 h-4 mr-2" %}
+              Save Changes
+            </button>
+          </form>
+        </div>
+      {% else %}
+        <div class="bg-[#262a2f] p-4 rounded-md mb-4">
+          <h4 class="text-sm font-medium mb-3">Connect</h4>
+          <form method="post" action="{% url 'cinemask_connect' %}" class="space-y-3">
+            {% csrf_token %}
+            <input type="url"
+                   name="base_url"
+                   required
+                   class="w-full bg-[#39404b] rounded-md text-gray-200 text-sm border-0 focus:ring-2 focus:ring-indigo-500 p-2"
+                   placeholder="https://cinemask.example.com">
+            <input type="password"
+                   name="api_key"
+                   required
+                   autocomplete="off"
+                   class="w-full bg-[#39404b] rounded-md text-gray-200 text-sm border-0 focus:ring-2 focus:ring-indigo-500 p-2"
+                   placeholder="cmk_...">
+            <p class="text-gray-400 text-xs">
+              In Cinemask, open <strong>Account &gt; API keys</strong> and create a <strong>full-access</strong> key (read-only keys can't send requests). Requests are made as that Cinemask user.
+            </p>
+            <button type="submit"
+                    class="px-4 py-2 text-sm rounded-md bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer">
+              Connect Cinemask
+            </button>
+          </form>
+        </div>
+      {% endif %}
+
+      <div class="bg-[#262a2f] p-4 rounded-md">
+        <h4 class="text-sm font-medium mb-3">Webhook (optional, for instant updates)</h4>
+        <ol class="list-decimal list-inside space-y-2 text-sm text-gray-300">
+          <li>In Cinemask, open <strong>Settings &gt; API and webhooks</strong> and tick <strong>Send webhook events</strong>.</li>
+          <li>
+            Set the URL to:
+            {# djlint:off #}
+            <div class="mt-2 inline-flex items-center gap-2 w-[calc(100%-30px)]">
+              <input readonly
+                     id="cinemask-webhook-url"
+                     class="w-full bg-[#262a2f] rounded-md text-gray-400 text-sm border-0 focus:ring-0 outline-none font-mono"
+                     type="text"
+                     value="{% url 'cinemask_webhook' request.user.token as cinemask_webhook_path %}{% absolute_app_url cinemask_webhook_path %}">
+              <span class="flex items-center cursor-pointer group"
+                    title="Copy"
+                    data-copy-target="#cinemask-webhook-url">
+                {% include "app/icons/copy.svg" with classes="w-5 h-5 text-gray-400 group-hover:text-indigo-400 transition-colors" %}
+              </span>
+            </div>
+            {# djlint:on #}
+          </li>
+          <li>Choose the <strong>request.created</strong> and <strong>request.available</strong> events and press <strong>Save and send a test</strong>.</li>
+          <li>Without the webhook, Yamtrack still checks your requests every 30 minutes.</li>
         </ol>
       </div>
     </div>

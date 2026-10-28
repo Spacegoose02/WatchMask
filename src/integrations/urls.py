@@ -55,6 +55,16 @@ urlpatterns = [
     path("import/imdb", views.import_imdb, name="import_imdb"),
     path("import/goodreads", views.import_goodreads, name="import_goodreads"),
     path("import/hardcover", views.import_hardcover, name="import_hardcover"),
+    path("cinemask/connect", views.cinemask_connect, name="cinemask_connect"),
+    path("cinemask/disconnect", views.cinemask_disconnect, name="cinemask_disconnect"),
+    path("cinemask/settings", views.cinemask_settings, name="cinemask_settings"),
+    path("cinemask/sync", views.cinemask_sync, name="cinemask_sync"),
+    path("cinemask/request", views.cinemask_request, name="cinemask_request"),
+    path(
+        "cinemask/request-button",
+        views.cinemask_request_button,
+        name="cinemask_request_button",
+    ),
     path("import/audiobookshelf/connect", views.audiobookshelf_connect, name="audiobookshelf_connect"),
     path("import/audiobookshelf/disconnect", views.audiobookshelf_disconnect, name="audiobookshelf_disconnect"),
     path("import/audiobookshelf", views.import_audiobookshelf, name="import_audiobookshelf"),
@@ -98,6 +108,11 @@ urlpatterns = [
         "webhook/jellyseerr/<str:token>",
         views.jellyseerr_webhook,
         name="jellyseerr_webhook",
+    ),
+    path(
+        "webhook/cinemask/<str:token>",
+        views.cinemask_webhook,
+        name="cinemask_webhook",
     ),
     path(
         "webhook/kodi/<str:token>",

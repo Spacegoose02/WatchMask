@@ -961,6 +961,7 @@ def integrations(request):
             "plex_webhook_needs_update": plex_webhook_needs_update,
             "plex_library_options_json": json.dumps(plex_library_options),
             "selected_plex_webhook_libraries_json": json.dumps(selected_plex_webhook_libraries),
+            "cinemask_account": getattr(user, "cinemask_account", None),
         },
     )
 
