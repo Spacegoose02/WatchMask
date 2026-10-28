@@ -5190,7 +5190,7 @@ class MediaDetailsViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.context["trakt_score"]["rating"], "7.8")
+        self.assertEqual(response.context["trakt_score"]["rating"], 7.8)
         self.assertEqual(response.context["trakt_score"]["rating_count"], 1849)
         mock_refresh_trakt_popularity.assert_called_once()
         self.assertTrue(
