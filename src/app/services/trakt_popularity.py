@@ -172,7 +172,7 @@ def lookup_item_summary(
 
 
 def compute_popularity_score(
-    rating: float | int | None,
+    rating: float | None,
     votes: int | None,
     *,
     prior_mean: float = TRAKT_POPULARITY_PRIOR_MEAN,

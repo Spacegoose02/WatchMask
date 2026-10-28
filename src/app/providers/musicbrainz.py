@@ -98,11 +98,11 @@ def _infer_genre_parents(genre_name: str) -> list[str]:
 
 def get_wikipedia_data(title):
     """Fetch Wikipedia data for a given title (bio extract and image).
-    
+
     Uses Wikipedia's REST API to get a summary/extract and image.
     The title can be an artist name or a specific Wikipedia article title
     (e.g., "Queen_(band)" which is more accurate than just "Queen").
-    
+
     Returns a dict with 'extract' and 'image' keys, or None values if not found.
     """
     if not title:
@@ -157,7 +157,7 @@ def get_wikipedia_data(title):
 
 def get_wikipedia_extract(artist_name):
     """Fetch the Wikipedia extract for an artist (legacy wrapper).
-    
+
     Returns just the extract string for backwards compatibility.
     """
     data = get_wikipedia_data(artist_name)
@@ -211,7 +211,7 @@ def _mb_request(endpoint, params=None):
 
 def _try_fetch_cover_from_url(url):
     """Helper to fetch cover from a specific Cover Art Archive URL.
-    
+
     Returns the best quality image URL or None.
     """
     try:
@@ -255,14 +255,14 @@ def _try_fetch_cover_from_url(url):
 
 def get_cover_art(release_id=None, release_group_id=None):
     """Fetch cover art from Cover Art Archive.
-    
+
     This is the centralized function for all cover art fetching.
     Tries release first, then release-group as fallback.
-    
+
     Args:
         release_id: MusicBrainz release ID (specific album edition)
         release_group_id: MusicBrainz release group ID (canonical album)
-    
+
     Returns:
         Image URL or IMG_NONE placeholder
     """
@@ -307,7 +307,7 @@ def _cover_art_async_url(release_id):
 
 def search(query, page=1, skip_cover_art=False):
     """Search for music recordings on MusicBrainz.
-    
+
     Args:
         query: Search query string
         page: Page number for pagination
@@ -755,7 +755,7 @@ def search_artists(query, page=1):
 
 def search_releases(query, page=1, skip_cover_art=False):
     """Search for releases (albums) on MusicBrainz.
-    
+
     Args:
         query: Search query string
         page: Page number for pagination
@@ -993,14 +993,14 @@ def get_artist(artist_id):
 
 def get_artist_discography(artist_id, skip_cover_art=False):
     """Get the full discography for an artist from MusicBrainz.
-    
+
     This fetches release-groups (which represent unique album releases)
     and finds a representative release for each to get cover art.
-    
+
     Args:
         artist_id: MusicBrainz artist ID
         skip_cover_art: If True, skip fetching cover art (faster initial load)
-    
+
     Returns a normalized list of albums with:
     - title, release_group_id, release_id, release_date, image, release_type
     """
@@ -1097,13 +1097,13 @@ def get_artist_discography(artist_id, skip_cover_art=False):
 
 def get_release_for_group(release_group_id):
     """Get a representative release for a release group.
-    
+
     This is useful when we only have a release_group_id and need to find
     a specific release to fetch tracks from.
-    
+
     Args:
         release_group_id: The MusicBrainz release group ID
-        
+
     Returns:
         A release ID string, or None if not found
     """
@@ -1154,7 +1154,7 @@ def get_release_for_group(release_group_id):
 
 def get_release(release_id, skip_cover_art: bool = False):
     """Get detailed metadata for a release (album).
-    
+
     Args:
         release_id: MusicBrainz release UUID
         skip_cover_art: If True, do not fetch cover art (use placeholder)
@@ -1260,7 +1260,7 @@ def get_release(release_id, skip_cover_art: bool = False):
 
 def search_combined(query, page=1):
     """Combined search returning artists, albums, and tracks.
-    
+
     First page returns artists/albums while image files load client-side.
     """
     cache_key = f"musicbrainz_combined_search_{query.lower()}_p{page}"

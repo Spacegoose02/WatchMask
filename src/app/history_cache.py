@@ -846,7 +846,7 @@ def _build_game_entries(
 
 def build_history_days(user, filters=None, date_filters=None, logging_style_override=None):
     """Build the list of grouped history entries for a user.
-    
+
     Args:
         user: User instance
         filters: Optional dict of filter parameters:

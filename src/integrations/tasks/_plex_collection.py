@@ -666,18 +666,18 @@ def _find_plex_rating_key_for_item(
 
 
 def _aggregate_tv_show_collection_metadata(
-    token: str, 
-    uri: str, 
-    show_rating_key: str, 
+    token: str,
+    uri: str,
+    show_rating_key: str,
     show_metadata: dict | None = None,
     fetch_episode_details: bool = True
 ) -> tuple[dict, list]:
     """Aggregate collection metadata from all episodes of a TV show.
-    
+
     Similar to how we aggregate music track metadata at the album level,
     this function fetches episodes and aggregates their collection metadata
     at the show level.
-    
+
     Args:
         token: Plex authentication token
         uri: Plex server URI
@@ -685,7 +685,7 @@ def _aggregate_tv_show_collection_metadata(
         show_metadata: Optional already-fetched show metadata to avoid duplicate API call
         fetch_episode_details: If False, skip fetching detailed metadata for each episode
                               (only fetch episode lists for episode entry creation)
-        
+
     Returns:
         Tuple of (aggregated_metadata_dict, episode_list) where:
         - aggregated_metadata_dict: Dictionary with aggregated collection metadata (most common values)
@@ -1014,7 +1014,6 @@ def update_collection_metadata_from_plex(library, user_id):
                         break
 
     # Process each section incrementally: process cached items first, then scan in batches
-    import time
     start_time = time.time()
 
     for section in sections:
@@ -1301,7 +1300,7 @@ def update_collection_metadata_from_plex(library, user_id):
 
                 # Log progress after each batch
                 elapsed = time.time() - section_start_time
-                items_remaining = len(items_to_find) - len(items_found_set)
+                len(items_to_find) - len(items_found_set)
                 match_rate = (batch_matched / batch_processed * 100) if batch_processed > 0 else 0
 
                 # Estimate time remaining

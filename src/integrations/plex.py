@@ -352,7 +352,7 @@ def fetch_section_all_items(
     max_retries: int = 3,
 ) -> tuple[list[dict[str, Any]], int]:
     """Fetch all items from a Plex library section.
-    
+
     Args:
         token: Plex authentication token
         uri: Plex server URI
@@ -360,7 +360,7 @@ def fetch_section_all_items(
         start: Starting offset for pagination
         size: Number of items to fetch per page
         max_retries: Maximum number of retry attempts for network errors
-        
+
     Returns:
         Tuple of (items list, total count)
     """
@@ -431,7 +431,7 @@ def fetch_section_all_items(
 
 def fetch_metadata(token: str, uri: str, rating_key: str, timeout: int = 20) -> dict[str, Any] | None:
     """Fetch rich metadata for a history item.
-    
+
     Args:
         token: Plex authentication token
         uri: Plex server URI
@@ -643,10 +643,10 @@ def _coerce_int(value: Any, default: int) -> int:
 
 def extract_external_ids_from_guids(guids: list[dict[str, Any] | str]) -> dict[str, str]:
     """Extract external IDs (TMDB, IMDB, TVDB) from Plex GUIDs.
-    
+
     Args:
         guids: List of GUID dictionaries or strings from Plex metadata
-        
+
     Returns:
         Dictionary with keys: 'tmdb_id', 'imdb_id', 'tvdb_id', 'plex_guid' (if found)
     """

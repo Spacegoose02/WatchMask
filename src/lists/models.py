@@ -236,7 +236,7 @@ class CustomList(models.Model):
     @property
     def image(self):
         """Return the image of the first item in the list.
-        
+
         For TMDB movies and TV shows, prefer horizontal backdrop image
         over the 2:3 poster for better display in list cards.
         For IGDB games, prefer widescreen screenshots or artworks over cover art.
@@ -288,11 +288,10 @@ class CustomList(models.Model):
                         backdrop_url,
                     )
                     return backdrop_url
-                else:
-                    logger.debug(
-                        "No IGDB backdrop found, falling back to cover art for game %s",
-                        first_item.media_id,
-                    )
+                logger.debug(
+                    "No IGDB backdrop found, falling back to cover art for game %s",
+                    first_item.media_id,
+                )
             except Exception as exc:
                 import logging
                 logger = logging.getLogger(__name__)
@@ -302,14 +301,13 @@ class CustomList(models.Model):
                     exc_info=True,
                 )
                 # If anything fails, fall back to regular cover
-                pass
 
         # Fall back to regular poster image
         return first_item.image
 
     def _get_tmdb_backdrop(self, media_type, media_id):
         """Get backdrop image URL from TMDB for movies and TV shows.
-        
+
         Uses caching to avoid repeated API calls for the same item.
         """
         cache_key = f"tmdb_backdrop_{media_type}_{media_id}"
@@ -348,10 +346,10 @@ class CustomList(models.Model):
 
     def _get_igdb_backdrop(self, media_id):
         """Get widescreen backdrop image URL from IGDB for games.
-        
+
         Prefers artworks (promotional images, typically widescreen) over screenshots.
         Uses caching to avoid repeated API calls for the same item.
-        
+
         First tries to extract from the raw API response used by igdb.game(),
         then falls back to a lightweight API call if needed.
         """
@@ -474,7 +472,7 @@ class CustomList(models.Model):
                     else:
                         screenshot_ids = screenshots_raw
 
-                logger.debug("IGDB artwork data for game %s: raw_count=%s, artwork_ids=%s, artwork_image_ids=%s", 
+                logger.debug("IGDB artwork data for game %s: raw_count=%s, artwork_ids=%s, artwork_image_ids=%s",
                            media_id, len(artworks_raw), artwork_ids, artwork_image_ids)
                 logger.debug("IGDB screenshot IDs for game %s: count=%s, data=%s", media_id, len(screenshot_ids), screenshot_ids)
 
@@ -528,7 +526,7 @@ class CustomList(models.Model):
                                         media_id,
                                         error_json,
                                     )
-                                except:
+                                except Exception:
                                     logger.warning(
                                         "IGDB artworks API error for game %s batch: %s",
                                         media_id,
@@ -625,8 +623,7 @@ class CustomList(models.Model):
                             )
                             cache.set(cache_key, backdrop_url, 60 * 60 * 24 * 7)
                             return backdrop_url
-                        else:
-                            logger.debug("Artwork image_id=%s failed aspect ratio check for game %s", artwork_id, media_id)
+                        logger.debug("Artwork image_id=%s failed aspect ratio check for game %s", artwork_id, media_id)
 
                 if key_arts or other_artworks:
                     logger.debug("No suitable artworks found (after aspect ratio filtering) for game %s. Key Arts tried: %s, Other artworks tried: %s", media_id, len(key_arts), len(other_artworks))
@@ -656,8 +653,7 @@ class CustomList(models.Model):
                         # Cache for 7 days
                         cache.set(cache_key, backdrop_url, 60 * 60 * 24 * 7)
                         return backdrop_url
-                    else:
-                        logger.debug("First screenshot in list has no image_id for game %s", media_id)
+                    logger.debug("First screenshot in list has no image_id for game %s", media_id)
                 else:
                     logger.debug("No screenshots found for game %s", media_id)
 
@@ -683,10 +679,10 @@ class CustomList(models.Model):
 
     def _check_igdb_image_aspect_ratio(self, image_id, media_id, image_type_label):
         """Check if an IGDB image has a suitable aspect ratio for list covers.
-        
+
         Prefers 16:9 or closer to 3:2 (aspect ratio between 1.5 and 1.777).
         Skips images wider than 16:9 (aspect ratio > 1.777).
-        
+
         Returns the backdrop URL if suitable, None otherwise.
         """
         import logging

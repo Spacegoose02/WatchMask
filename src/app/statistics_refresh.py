@@ -155,10 +155,10 @@ def invalidate_all_statistics_days(user_id: int, reason: str | None = None) -> i
 
 def invalidate_statistics_cache(user_id: int, range_name: str = None):
     """Remove cached statistics for a user.
-    
+
     If a refresh is in progress, keep the old cache so users can see it
     while the refresh completes. Otherwise, delete the cache.
-    
+
     Args:
         user_id: User ID
         range_name: Specific range to invalidate, or None to invalidate all ranges
@@ -300,7 +300,7 @@ def _get_activity_bounds(user):
 
 
 def _get_sparse_activity_days(user):
-    active_media_types = set(getattr(user, "get_active_media_types", lambda: [])())
+    active_media_types = set(getattr(user, "get_active_media_types", list)())
     if not active_media_types:
         active_media_types = set(MediaTypes.values)
 
@@ -594,7 +594,7 @@ def schedule_statistics_refresh(
     priority: int | None = None,
 ):
     """Queue a background refresh for a user's statistics cache.
-    
+
     Args:
         user_id: User ID
         range_name: Predefined range name

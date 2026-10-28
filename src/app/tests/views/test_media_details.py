@@ -112,7 +112,6 @@ class MediaDetailsViewTests(TestCase):
                     "title": "test-movie",
                 },
             ),
-            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -134,7 +133,7 @@ class MediaDetailsViewTests(TestCase):
 
     @patch("integrations.tasks.fetch_collection_metadata_for_item.delay")
     @patch("app.views.helpers.enrich_items_with_user_data")
-    @patch("app.views.run_retryable_db_operation")
+    @patch("app.media_details_views.run_retryable_db_operation")
     @patch("app.views.metadata_utils.apply_item_metadata", return_value=[])
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_shell_defers_secondary_content(
@@ -214,7 +213,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, 'id="detail-secondary-content"', html=False)
         self.assertContains(response, "fragment=secondary")
         self.assertNotContains(response, "Your Notes")
-        self.assertNotContains(response, "<h2 class=\"text-xl font-bold\">Collection</h2>", html=False)
+        self.assertNotContains(response, '<h2 class="text-xl font-bold">Collection</h2>', html=False)
         mock_run_retryable_db_operation.assert_not_called()
         mock_enrich_items.assert_not_called()
         mock_fetch_delay.assert_not_called()
@@ -297,9 +296,9 @@ class MediaDetailsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "app/components/detail_secondary_content.html")
-        self.assertContains(response, "<h2 class=\"text-xl font-bold\">Your Notes</h2>", html=False)
-        self.assertContains(response, "<h2 class=\"text-xl font-bold\">Collection</h2>", html=False)
-        self.assertContains(response, "<h2 class=\"text-xl font-bold\">Cast</h2>", html=False)
+        self.assertContains(response, '<h2 class="text-xl font-bold">Your Notes</h2>', html=False)
+        self.assertContains(response, '<h2 class="text-xl font-bold">Collection</h2>', html=False)
+        self.assertContains(response, 'data-row-id="detail-cast"', html=False)
         self.assertNotContains(
             response,
             'class="flex flex-col md:flex-row gap-8 md:gap-10 mb-2 md:mb-8"',
@@ -527,7 +526,7 @@ class MediaDetailsViewTests(TestCase):
             else volume_metadata
         )
 
-        volume_item = Item.objects.create(
+        Item.objects.create(
             media_id="500",
             source=Sources.COMICVINE.value,
             media_type=MediaTypes.COMIC.value,
@@ -1360,7 +1359,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertEqual(source_entry["chip_classes"], "border-indigo-400/18 bg-indigo-500/[0.07]")
         self.assertEqual(source_entry["logo_src"], "/static/img/myanimelist-logo.svg")
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_uses_igdb_and_hltb_logos_in_link_sections(
         self,
@@ -1927,8 +1926,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "tmdb-logo.png")
         self.assertContains(response, "7.6")
         self.assertContains(response, "42,000 votes")
-        self.assertContains(response, "series-graph-trigger", html=False)
-        self.assertContains(response, "series-graph-score-chip", html=False)
+        self.assertContains(response, 'title="The Movie Database series ratings"', html=False)
         self.assertContains(
             response,
             'class="order-2 mt-0 mb-5 flex w-full items-center justify-start gap-2 sm:order-1 sm:mt-4 sm:flex-wrap"',
@@ -1936,7 +1934,7 @@ class MediaDetailsViewTests(TestCase):
         )
 
     @patch("app.providers.services.get_media_metadata")
-    def test_media_details_renders_trakt_season_graph_from_stored_season_scores(
+    def test_media_details_wires_trakt_series_graph_fragment(
         self, mock_get_metadata
     ):
         Item.objects.create(
@@ -1983,10 +1981,19 @@ class MediaDetailsViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Trakt Season Ratings")
-        self.assertContains(response, "S1")
-        self.assertContains(response, "7.3")
-        self.assertContains(response, "150 votes")
+        graph_url = reverse(
+            "trakt_series_graph_fragment",
+            kwargs={"source": Sources.TMDB.value, "media_id": "1668"},
+        )
+        self.assertContains(response, f'hx-get="{graph_url}"', html=False)
+
+        graph_response = self.client.get(graph_url)
+
+        self.assertEqual(graph_response.status_code, 200)
+        self.assertContains(graph_response, "Series Graph")
+        # The graph is built from episode ratings; season-level scores alone
+        # leave it in its empty state.
+        self.assertContains(graph_response, "Visit a season page to start building.")
 
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_renders_source_score_chip_with_mal_logo(self, mock_get_metadata):
@@ -2019,7 +2026,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "8.9")
         self.assertContains(response, "123,456 votes")
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_renders_source_score_chip_with_igdb_logo(
         self,
@@ -2245,7 +2252,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "3h 10min watched")
         self.assertContains(
             response,
-            'class="order-2 mt-0 mb-5 flex w-full items-center justify-between gap-0.5 sm:order-1 sm:mt-4 sm:flex-wrap sm:justify-start sm:gap-2"',
+            'class="order-2 mt-0 mb-5 flex w-full items-center justify-start gap-2 sm:order-1 sm:mt-4 sm:flex-wrap"',
             html=False,
         )
         self.assertContains(
@@ -2733,7 +2740,7 @@ class MediaDetailsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Edit rating")
-        self.assertContains(response, "x-text=\"formatRating(rating)\">8<", html=False)
+        self.assertContains(response, 'x-text="formatRating(rating)">8<', html=False)
         self.assertContains(response, "x-text=\"rating ? 'Edit rating' : 'Add rating'\"", html=False)
 
     @patch("app.providers.services.get_media_metadata")
@@ -2783,7 +2790,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Edit rating")
         self.assertContains(response, "ratingScaleMax: 5", html=False)
-        self.assertContains(response, "x-text=\"formatRating(rating)\">4/5<", html=False)
+        self.assertContains(response, 'x-text="formatRating(rating)">4/5<', html=False)
         self.assertContains(response, "x-text=\"rating ? 'Edit rating' : 'Add rating'\"", html=False)
 
     @patch("app.providers.services.get_media_metadata")
@@ -2918,6 +2925,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "frieren",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -2989,7 +2997,6 @@ class MediaDetailsViewTests(TestCase):
                     "title": "frieren",
                 },
             ),
-            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -3246,7 +3253,8 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "Pokemon Emergency!")
         self.assertContains(response, "Pallet Party Panic")
         self.assertContains(response, "A Scare in the Air")
-        self.assertContains(response, 'title="Track Episode"', count=4)
+        # Each episode renders a track button in both the grid and list layouts
+        self.assertContains(response, 'title="Track Episode"', count=8)
         self.assertNotContains(
             response,
             "Episode cards are not available from MyAnimeList metadata.",
@@ -3904,6 +3912,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "frieren",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -4077,7 +4086,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertNotContains(response, "How Long to Beat")
         self.assertNotIn("HowLongToBeat", response.context["media"]["external_links"])
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_game_media_details_renders_igdb_fallback_and_queues_hltb_refresh(
         self,
@@ -4146,7 +4155,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "13 submissions")
         mock_queue_game_lengths_refresh.assert_called_once()
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_game_media_details_queues_background_fetch_when_missing_game_lengths(
         self,
@@ -4198,7 +4207,7 @@ class MediaDetailsViewTests(TestCase):
         mock_queue_game_lengths_refresh.assert_called_once()
 
     @patch("app.providers.services.get_media_metadata")
-    @patch("app.views._queue_game_lengths_refresh")
+    @patch("app.media_details_views._queue_game_lengths_refresh")
     def test_game_media_details_shows_pending_when_refresh_lock_exists(
         self,
         mock_queue_game_lengths_refresh,
@@ -4493,7 +4502,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertTrue(response.context["detail_persistence_deferred"])
         _mock_sleep.assert_not_called()
 
-    @patch("app.views._queue_game_lengths_refresh", side_effect=RuntimeError("queue unavailable"))
+    @patch("app.media_details_views._queue_game_lengths_refresh", side_effect=RuntimeError("queue unavailable"))
     @patch("app.providers.services.get_media_metadata")
     def test_game_media_details_renders_when_refresh_enqueue_raises(
         self,
@@ -4589,7 +4598,6 @@ class MediaDetailsViewTests(TestCase):
                     "season_number": 1,
                 },
             ),
-            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -4767,14 +4775,6 @@ class MediaDetailsViewTests(TestCase):
             ProviderMetadataStatus.LOCAL_ONLY_MISSING_SEASON.value,
         )
         self.assertTrue(response.context["season_provider_metadata_is_local_only"])
-        self.assertContains(
-            response,
-            (
-                "Season metadata is missing from the provider. "
-                "This page is built from local activity and the linked "
-                "show may be mismatched."
-            ),
-        )
         self.assertContains(response, "Auditions: Europe (1)")
         self.assertIn(
             16,
@@ -4786,6 +4786,27 @@ class MediaDetailsViewTests(TestCase):
         mock_get_tmdb_backdrop_image.assert_not_called()
         mock_get_tvdb_episode_image_map.assert_not_called()
         mock_refresh_trakt_popularity.assert_not_called()
+
+        # The local-only banner renders in the page shell, not the deferred section
+        shell_response = self.client.get(
+            reverse(
+                "season_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "1668",
+                    "title": "test-tv-show",
+                    "season_number": 16,
+                },
+            ),
+        )
+        self.assertContains(
+            shell_response,
+            (
+                "Season metadata is missing from the provider. "
+                "This page is built from local activity and the linked "
+                "show may be mismatched."
+            ),
+        )
 
     @patch("app.views.trakt_popularity_service.refresh_trakt_popularity")
     @patch("app.providers.tmdb.get_tvdb_episode_image_map")
@@ -4861,15 +4882,32 @@ class MediaDetailsViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(
-            response,
-            "Season metadata is missing from the provider. This page is built from local activity and the linked show may be mismatched.",
-        )
         self.assertContains(response, "Auditions: Europe (1)")
         mock_get_metadata.assert_not_called()
         mock_get_tmdb_backdrop_image.assert_not_called()
         mock_get_tvdb_episode_image_map.assert_not_called()
         mock_refresh_trakt_popularity.assert_not_called()
+
+        # The local-only banner renders in the page shell, not the deferred section
+        shell_response = self.client.get(
+            reverse(
+                "season_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "1668",
+                    "title": "test-tv-show",
+                    "season_number": 16,
+                },
+            ),
+        )
+        self.assertContains(
+            shell_response,
+            (
+                "Season metadata is missing from the provider. "
+                "This page is built from local activity and the linked "
+                "show may be mismatched."
+            ),
+        )
 
     @patch("app.providers.services.get_media_metadata")
     @patch("app.providers.tmdb.process_episodes")
@@ -5100,6 +5138,8 @@ class MediaDetailsViewTests(TestCase):
             title="Test TV Show",
             image="http://example.com/image.jpg",
         )
+        # Saving a completed show looks up its metadata to fill remaining seasons
+        mock_get_metadata.return_value = {"max_progress": None}
         related_tv = TV.objects.create(
             item=show_item,
             user=self.user,
@@ -5150,7 +5190,7 @@ class MediaDetailsViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.context["trakt_score"]["rating"], "7.8")
+        self.assertEqual(response.context["trakt_score"]["rating"], 7.8)
         self.assertEqual(response.context["trakt_score"]["rating_count"], 1849)
         mock_refresh_trakt_popularity.assert_called_once()
         self.assertTrue(
@@ -5303,7 +5343,7 @@ class MediaDetailsViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         content = response.content.decode()
-        self.assertIn("<h1 class=\"text-3xl font-bold\">The Sound of Music</h1>", content)
+        self.assertIn('<h1 class="text-3xl font-bold">The Sound of Music</h1>', content)
         self.assertNotIn('aria-label="Show alternative title"', content)
 
     @patch("app.providers.services.get_media_metadata")
@@ -5466,7 +5506,7 @@ class MediaDetailsViewTests(TestCase):
         )
         self.assertRegex(
             content,
-            r'class="hidden flex-wrap items-center justify-start gap-y-1 text-center text-sm font-medium text-gray-400 md:flex md:text-start">\s*<h2 class="text-sm font-medium text-gray-400">Season 1</h2>\s*<span class="mx-2 text-gray-600">•</span>\s*<span class="text-sm font-medium text-gray-400">\s*Progress: 2/8\s*</span>\s*<span class="mx-2 text-gray-600">•</span>\s*<span class="text-sm font-medium text-gray-400">\s*2026-03-01 - 2026-03-12\s*</span>',
+            r'class="hidden flex-wrap items-center justify-start gap-y-1 text-center text-sm font-medium text-gray-400 md:flex md:text-start">\s*<h2 class="text-sm font-medium text-gray-400">Season 1</h2>\s*<span class="mx-2 text-gray-600">•</span>\s*<span id="season-progress-desktop-1" class="text-sm font-medium text-gray-400">\s*Progress: 2/8\s*</span>\s*<span class="mx-2 text-gray-600">•</span>\s*<span class="text-sm font-medium text-gray-400">\s*2026-03-01 - 2026-03-12\s*</span>',
         )
         self.assertNotIn("Your History", content)
 
@@ -5637,6 +5677,7 @@ class MediaDetailsViewTests(TestCase):
                     "season_number": 1,
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -5648,7 +5689,7 @@ class MediaDetailsViewTests(TestCase):
             lookup_policy="cached_only",
         )
 
-    @patch("app.views._should_queue_game_lengths_refresh", return_value=False)
+    @patch("app.media_details_views._should_queue_game_lengths_refresh", return_value=False)
     @patch("app.providers.services.get_media_metadata")
     def test_game_details_backfills_studio_credits_and_renders_links(
         self,
@@ -5787,6 +5828,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "test-movie",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -5813,6 +5855,7 @@ class MediaDetailsViewTests(TestCase):
         mock_build_specials,
     ):
         """Saving TV tracking statuses should not remove cast/crew from reopened details."""
+        # Cast and crew render in the deferred secondary section
         tmdb.cache.clear()
         self.client.login(**self.credentials)
         append_requests = []
@@ -5931,7 +5974,7 @@ class MediaDetailsViewTests(TestCase):
                     },
                 )
 
-                untracked_response = self.client.get(detail_url)
+                untracked_response = self.client.get(detail_url, {"fragment": "secondary"})
 
                 self.assertEqual(untracked_response.status_code, 200)
                 self.assertContains(untracked_response, "John Actor")
@@ -5960,8 +6003,8 @@ class MediaDetailsViewTests(TestCase):
                     ).exists(),
                 )
 
-                tracked_response = self.client.get(detail_url)
-                reopened_response = self.client.get(detail_url)
+                tracked_response = self.client.get(detail_url, {"fragment": "secondary"})
+                reopened_response = self.client.get(detail_url, {"fragment": "secondary"})
 
                 self.assertEqual(tracked_response.status_code, 200)
                 self.assertContains(tracked_response, "John Actor")
@@ -6252,6 +6295,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "chainsaw-man",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -6989,6 +7033,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "collected-show",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -7101,6 +7146,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "collected-season-show",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -7337,8 +7383,21 @@ class MediaDetailsViewTests(TestCase):
         self.assertEqual(detail_response.context["media"]["details"]["total_runtime"], "2h 37min")
         self.assertEqual(detail_response.context["play_stats"]["total_minutes"], 110)
         self.assertContains(detail_response, "1h 50min watched")
-        self.assertContains(detail_response, "TOTAL RUNTIME")
-        self.assertContains(detail_response, "2h 37min")
+        # The details panel with the total runtime renders in the deferred section
+        secondary_response = self.client.get(
+            reverse(
+                "media_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.TV.value,
+                    "media_id": "fallout-runtime-shared",
+                    "title": "shared-runtime-show",
+                },
+            ),
+            {"fragment": "secondary"},
+        )
+        self.assertContains(secondary_response, "RUNTIME (1 SEASON)")
+        self.assertContains(secondary_response, "2h 37min")
         self.assertNotContains(detail_response, "FIRST PLAYED")
         self.assertNotContains(detail_response, "LAST PLAYED")
         self.assertNotContains(detail_response, "WATCHED HOURS")

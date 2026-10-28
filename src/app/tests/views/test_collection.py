@@ -122,7 +122,7 @@ class CollectionAddViewTest(TestCase):
         )
 
         # Try to add again with different data
-        response = self.client.post(
+        self.client.post(
             reverse("collection_add"),
             {
                 "item_id": self.item.id,
@@ -296,7 +296,7 @@ class CollectionUpdateViewTest(TestCase):
     def test_collection_update_existing_entry(self):
         """Test POST updates existing CollectionEntry."""
         self.client.login(**self.credentials)
-        response = self.client.post(
+        self.client.post(
             reverse("collection_update", kwargs={"entry_id": self.entry.id}),
             {
                 "item": self.item.id,
@@ -376,7 +376,7 @@ class CollectionRemoveViewTest(TestCase):
     def test_collection_remove_deletes_entry(self):
         """Test POST deletes CollectionEntry."""
         self.client.login(**self.credentials)
-        response = self.client.post(
+        self.client.post(
             reverse("collection_remove", kwargs={"entry_id": self.entry.id}),
         )
 

@@ -17,7 +17,7 @@ from django.http import HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse
-from django.utils import formats, timezone
+from django.utils import timezone
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from app import cache_utils, helpers, history_cache
@@ -49,6 +49,7 @@ from app.models import (
 )
 from app.release_years import prefill_display_release_years
 from app.search_views import _mark_grouped_anime_route
+from app.stats_music import _country_name_from_code
 from app.templatetags import app_tags
 from app.tv_sort import _sort_tv_media_by_time_left
 from users.models import (
@@ -310,8 +311,6 @@ def build_filter_data_from_items(
     collection-enriched format/platform data; omit them (or pass None) for
     contexts that don't have collection data (e.g. person detail pages).
     """
-    from app.models import Sources
-
     genres_set = set()
     implied_genres_set = set()
     years_set = set()
@@ -495,7 +494,7 @@ def media_list(request, media_type):
         else route_media_type
     )
 
-    if sort_filter == "time_left" and effective_media_type != MediaTypes.TV.value or sort_filter == "runtime" and effective_media_type not in runtime_media_types or sort_filter == "time_to_beat" and effective_media_type != MediaTypes.GAME.value or sort_filter == "plays" and effective_media_type not in plays_media_types or sort_filter == "time_watched" and effective_media_type not in runtime_media_types:
+    if (sort_filter == "time_left" and effective_media_type != MediaTypes.TV.value) or (sort_filter == "runtime" and effective_media_type not in runtime_media_types) or (sort_filter == "time_to_beat" and effective_media_type != MediaTypes.GAME.value) or (sort_filter == "plays" and effective_media_type not in plays_media_types) or (sort_filter == "time_watched" and effective_media_type not in runtime_media_types):
         sort_filter = "title"  # Default fallback
         # Update the user's preference to the fallback
         request.user.update_preference(f"{route_media_type}_sort", "title")
@@ -511,7 +510,7 @@ def media_list(request, media_type):
         request.user.update_preference(f"{route_media_type}_sort", "title")
         # Reset direction to the default for the fallback sort
         direction_param = None
-    elif sort_filter == "critic_rating" and effective_media_type not in critic_rating_media_types or sort_filter == "popularity" and effective_media_type not in popularity_media_types:
+    elif (sort_filter == "critic_rating" and effective_media_type not in critic_rating_media_types) or (sort_filter == "popularity" and effective_media_type not in popularity_media_types):
         sort_filter = "title"
         request.user.update_preference(f"{route_media_type}_sort", "title")
         direction_param = None
@@ -707,7 +706,7 @@ def media_list(request, media_type):
             if not has_collection and media_type in tv_anime_types:
                 has_collection = show_has_episode_collection(media)
 
-            if filter_value == "collected" and has_collection or filter_value == "not_collected" and not has_collection:
+            if (filter_value == "collected" and has_collection) or (filter_value == "not_collected" and not has_collection):
                 filtered_items.append(media)
 
         return filtered_items
@@ -2190,7 +2189,7 @@ def media_list(request, media_type):
                     label = value.upper() if len(value) <= 3 else value
                     try:
                         if len(value) <= 3:
-                            country_name = stats._country_name_from_code(value.upper())
+                            country_name = _country_name_from_code(value.upper())
                             if country_name:
                                 label = country_name
                     except Exception:  # pragma: no cover - defensive
@@ -2251,9 +2250,6 @@ def media_list(request, media_type):
             for tracker in artist_page.object_list:
                 artist_id = tracker.artist.id
                 old_image = tracker.artist.image
-                # Get the latest image from DB (may be None if not in map or if DB value is None)
-                # Use get() with a sentinel to distinguish "not in map" from "None in DB"
-                new_image = artist_images_map.get(artist_id, object())  # object() as sentinel
 
                 # Always update the in-memory object with the latest image from DB
                 # This ensures we have the most up-to-date data, even if it's None
@@ -2497,30 +2493,30 @@ def update_table_columns(request, media_type):
     hidden = [value for value in parsed_hidden if isinstance(value, str)] if isinstance(parsed_hidden, list) else []
 
     current_sort = request.POST.get("sort") or getattr(request.user, f"{media_type}_sort", MediaSortChoices.SCORE)
-    if current_sort == "time_left" and media_type != MediaTypes.TV.value or current_sort == "runtime" and media_type not in {
+    if (current_sort == "time_left" and media_type != MediaTypes.TV.value) or (current_sort == "runtime" and media_type not in {
         MediaTypes.MOVIE.value,
         MediaTypes.TV.value,
         MediaTypes.ANIME.value,
-    } or current_sort == "time_to_beat" and media_type != MediaTypes.GAME.value or current_sort == "plays" and media_type not in {
+    }) or (current_sort == "time_to_beat" and media_type != MediaTypes.GAME.value) or (current_sort == "plays" and media_type not in {
         MediaTypes.MOVIE.value,
         MediaTypes.TV.value,
         MediaTypes.ANIME.value,
-    } or current_sort == "time_watched" and media_type not in {
+    }) or (current_sort == "time_watched" and media_type not in {
         MediaTypes.MOVIE.value,
         MediaTypes.TV.value,
         MediaTypes.ANIME.value,
-    } or current_sort == "next_episode_air_date" and media_type not in {
+    }) or (current_sort == "next_episode_air_date" and media_type not in {
         MediaTypes.TV.value,
         MediaTypes.SEASON.value,
         MediaTypes.ANIME.value,
-    } or current_sort == "critic_rating" and media_type in {
+    }) or (current_sort == "critic_rating" and media_type in {
         MediaTypes.MUSIC.value,
         MediaTypes.PODCAST.value,
-    } or current_sort == "popularity" and media_type not in {
+    }) or (current_sort == "popularity" and media_type not in {
         MediaTypes.MOVIE.value,
         MediaTypes.TV.value,
         MediaTypes.ANIME.value,
-    }:
+    }):
         current_sort = "title"
 
     if settings.DEBUG:

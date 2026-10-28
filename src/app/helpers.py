@@ -427,15 +427,15 @@ def is_item_collected(user, item):
 
 def get_album_collection_metadata(user, album):
     """Get aggregated collection metadata for an album from all its tracks.
-    
+
     For music albums, we aggregate collection metadata from all tracks that have
     collection entries. Returns the most common values (or first non-empty value)
     for fields that should be consistent across tracks (like audio_codec, audio_channels).
-    
+
     Args:
         user: Django user object
         album: Album object
-        
+
     Returns:
         Dictionary with collection metadata:
         - audio_codec: Most common audio codec across collected tracks
@@ -547,11 +547,11 @@ def get_collection_stats(user):
 
 def get_artist_collection_stats(user, artist):
     """Get collection statistics for an artist.
-    
+
     Args:
         user: Django user object
         artist: Artist object
-        
+
     Returns:
         Dictionary with collection statistics:
         - collected_albums: Number of distinct albums with at least one collected track
@@ -616,12 +616,12 @@ def get_artist_collection_stats(user, artist):
 
 def get_tv_show_collection_stats(user, tv_item, metadata_episode_count=None):
     """Get collection statistics for a TV show.
-    
+
     Args:
         user: Django user object
         tv_item: Item object with media_type='tv' or 'anime'
         metadata_episode_count: Optional episode count from metadata (e.g., TMDB) to match Details pane
-        
+
     Returns:
         Dictionary with collection statistics:
         - collected_seasons: Number of distinct seasons with at least one collected episode
@@ -742,11 +742,11 @@ def get_tv_show_collection_stats(user, tv_item, metadata_episode_count=None):
 
 def get_season_collection_stats(user, season_item):
     """Get collection statistics for a specific season.
-    
+
     Args:
         user: Django user object
         season_item: Item object with media_type='season'
-        
+
     Returns:
         Dictionary with collection statistics:
         - collected_episodes: Number of collected episodes in this season
@@ -822,15 +822,15 @@ def get_season_collection_stats(user, season_item):
 
 def get_season_collection_metadata(user, season_item):
     """Get aggregated collection metadata for a season from all its episodes.
-    
+
     Similar to get_album_collection_metadata, this aggregates collection metadata
     from all episodes in the season that have collection entries. Returns the most
     common values for fields that should be consistent across episodes.
-    
+
     Args:
         user: Django user object
         season_item: Item object with media_type='season'
-        
+
     Returns:
         Dictionary with collection metadata (or None if no episodes are collected):
         - resolution: Most common resolution across collected episodes

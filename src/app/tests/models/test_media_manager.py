@@ -262,7 +262,7 @@ class MediaManagerTests(TestCase):
 
         self.assertTrue(hasattr(prefetched_queryset, "_prefetch_related_lookups"))
         prefetch_lookups = prefetched_queryset._prefetch_related_lookups
-        self.assertEqual(len(prefetch_lookups), 2)
+        self.assertEqual(len(prefetch_lookups), 3)  # seasons, season events, season episodes
 
         queryset = Season.objects.filter(user=self.user.id)
         prefetched_queryset = manager._apply_prefetch_related(
@@ -485,8 +485,8 @@ class MediaManagerTests(TestCase):
             sort_filter="score",
         )
 
-        self.assertEqual(media_list.first(), self.anime)
-        self.assertEqual(media_list.last(), anime2)
+        self.assertEqual(media_list[0], self.anime)
+        self.assertEqual(media_list[-1], anime2)
 
     def test_get_media_types_to_process(self):
         """Test the _get_media_types_to_process method."""
@@ -676,6 +676,10 @@ class MediaManagerTests(TestCase):
         manager.annotate_max_progress(movie_list, MediaTypes.MOVIE.value)
         self.assertEqual(movie_list[0].max_progress, 1)
 
+        # Manual items take max_progress from custom metadata, so use a provider
+        # source to exercise the event-based path
+        self.anime_item.source = Sources.MAL.value
+        self.anime_item.save(update_fields=["source"])
         anime_list = list(
             Anime.objects.filter(user=self.user.id).select_related("item"),
         )

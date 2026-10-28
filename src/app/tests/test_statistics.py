@@ -794,7 +794,7 @@ class StatisticsTests(TestCase):
         self.assertEqual(statistics.get_level(10), 4)
         self.assertEqual(statistics.get_level(20), 4)
 
-    @patch("app.statistics.get_filtered_historical_data")
+    @patch("app.stats_activity.get_filtered_historical_data")
     def test_get_activity_data(self, mock_get_filtered_data):
         """Test the get_activity_data function."""
         start_date = datetime.datetime(2025, 1, 1, 0, 0, tzinfo=datetime.UTC)
@@ -841,8 +841,8 @@ class StatisticsTests(TestCase):
         months = result["months"]
         self.assertIsInstance(months, list)
 
-    @patch("app.statistics.BasicMedia.objects.get_historical_models")
-    @patch("app.statistics.apps.get_model")
+    @patch("app.stats_activity.BasicMedia.objects.get_historical_models")
+    @patch("app.stats_activity.apps.get_model")
     def test_get_filtered_historical_data(self, mock_get_model, mock_get_hist_models):
         """Test the get_filtered_historical_data function."""
         start = datetime.datetime(2025, 1, 1, tzinfo=datetime.UTC)
@@ -1338,7 +1338,10 @@ class ConsumptionStatisticsTests(TestCase):
 
     def test_consumption_stats_aggregation(self):
         """TV/movie consumption helpers should return expected totals and chart data."""
-        with patch("app.statistics._get_media_metadata_for_statistics") as metadata_mock:
+        with (
+            patch("app.stats_time._get_media_metadata_for_statistics") as metadata_mock,
+            patch("app.stats_video._get_media_metadata_for_statistics", new=metadata_mock),
+        ):
             metadata_mock.return_value = {"runtime": "2h"}
             user_media, _ = statistics.get_user_media(
                 self.user,
@@ -1406,7 +1409,10 @@ class ConsumptionStatisticsTests(TestCase):
 
     def test_statistics_view_includes_consumption_context(self):
         """Statistics view should include the consumption breakdown data."""
-        with patch("app.statistics._get_media_metadata_for_statistics") as metadata_mock:
+        with (
+            patch("app.stats_time._get_media_metadata_for_statistics") as metadata_mock,
+            patch("app.stats_video._get_media_metadata_for_statistics", new=metadata_mock),
+        ):
             metadata_mock.return_value = {"runtime": "2h"}
             response = self.client.get(reverse("statistics"))
         self.assertEqual(response.status_code, 200)
@@ -1423,7 +1429,10 @@ class ConsumptionStatisticsTests(TestCase):
         self.user.season_enabled = False
         self.user.save(update_fields=["season_enabled"])
 
-        with patch("app.statistics._get_media_metadata_for_statistics") as metadata_mock:
+        with (
+            patch("app.stats_time._get_media_metadata_for_statistics") as metadata_mock,
+            patch("app.stats_video._get_media_metadata_for_statistics", new=metadata_mock),
+        ):
             metadata_mock.return_value = {"runtime": "2h"}
             response = self.client.get(reverse("statistics"))
 

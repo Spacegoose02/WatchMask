@@ -1478,7 +1478,8 @@ class TestPlexMultiServerImport(TestCase):
 
 class TestOverwriteMetadataFailureSafety(TestCase):
     """Regression tests for issue #252: overwrite import must not permanently delete media
-    when TMDB metadata is unavailable (404) or when the import aborts mid-run."""
+    when TMDB metadata is unavailable (404) or when the import aborts mid-run.
+    """
 
     def setUp(self):
         User = get_user_model()
@@ -1516,7 +1517,7 @@ class TestOverwriteMetadataFailureSafety(TestCase):
             media_type=MediaTypes.TV.value,
             title="For All Mankind",
         )
-        tv = TV.objects.create(user=self.user, item=item, status=Status.IN_PROGRESS.value)
+        TV.objects.create(user=self.user, item=item, status=Status.IN_PROGRESS.value)
 
         episode_history_entry = {
             "type": "episode",
@@ -1556,14 +1557,15 @@ class TestOverwriteMetadataFailureSafety(TestCase):
 
     def test_tv_show_preserved_when_tmdb_raises_during_metadata_warm(self):
         """If TMDB raises a non-404 error during metadata warm-up, the import must abort
-        before deleting any existing records."""
+        before deleting any existing records.
+        """
         item = Item.objects.create(
             media_id="8888",
             source=Sources.TMDB.value,
             media_type=MediaTypes.TV.value,
             title="For All Mankind",
         )
-        tv = TV.objects.create(user=self.user, item=item, status=Status.IN_PROGRESS.value)
+        TV.objects.create(user=self.user, item=item, status=Status.IN_PROGRESS.value)
 
         episode_history_entry = {
             "type": "episode",
@@ -1589,9 +1591,9 @@ class TestOverwriteMetadataFailureSafety(TestCase):
             patch("integrations.imports.plex.services.get_media_metadata", side_effect=metadata_side_effect),
             patch("integrations.imports.plex.services.search", return_value={"results": []}),
         ]
-        started = [p.start() for p in patches]
+        [p.start() for p in patches]
         try:
-            with self.assertRaises(Exception):
+            with self.assertRaises(Exception):  # noqa: B017
                 plex.importer("m::1", self.user, "overwrite")
         finally:
             for p in patches:

@@ -2,7 +2,7 @@ import hashlib
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 from django.apps import apps
 from django.conf import settings
@@ -467,7 +467,7 @@ def media_details(
             episodes = PodcastEpisode.objects.filter(show=show).annotate(
                 published_or_old=Coalesce(
                     "published",
-                    Value(datetime(1970, 1, 1, tzinfo=dt_timezone.utc),
+                    Value(datetime(1970, 1, 1, tzinfo=UTC),
                           output_field=DateTimeField()),
                 ),
             ).order_by("-published_or_old", "-episode_number")

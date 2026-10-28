@@ -214,7 +214,7 @@ class SteamImporter:
                 item.image = igdb_game["image"]
                 self.to_update_meta.append(item)
                 # In "new" mode, skip existing games
-            else: 
+            else:
                 item, _ = app.models.Item.objects.get_or_create(
                     media_id=media_id,
                     source=Sources.IGDB.value,

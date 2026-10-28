@@ -589,7 +589,8 @@ class GetHorizontalHistoryImageTests(TestCase):
     @patch("lists.models.CustomList._get_tmdb_backdrop")
     def test_tvdb_tv_missing_provider_external_ids_falls_back_to_portrait(self, mock_backdrop):
         """Old serialised history entries that pre-date the provider_external_ids
-        field must not crash and must fall back to the portrait poster."""
+        field must not crash and must fall back to the portrait poster.
+        """
         item = {
             "id": 10,
             "media_type": MediaTypes.TV.value,
@@ -641,36 +642,42 @@ class NormalizeHistoryHighlightImagesTests(TestCase):
         highlights = {
             "first_play": _highlight_entry(_tv_item_dict(), image=PORTRAIT_POSTER),
             "last_play": _highlight_entry(_movie_item_dict(), image=PORTRAIT_POSTER),
-            "today_in_history": _highlight_entry(_episode_item_dict(), image=PORTRAIT_POSTER),
-            "today_in_user_history": _highlight_entry(_anime_item_dict(), image=PORTRAIT_POSTER),
+            "today_card": {
+                "entry": _highlight_entry(_episode_item_dict(), image=PORTRAIT_POSTER),
+            },
             "today_month": 5,
             "today_day": 20,
         }
 
         statistics_cache._normalize_history_highlight_images(highlights)
 
-        for key in ("first_play", "last_play", "today_in_history", "today_in_user_history"):
+        entries = {
+            "first_play": highlights["first_play"],
+            "last_play": highlights["last_play"],
+            "today_card": highlights["today_card"]["entry"],
+        }
+        for key, entry in entries.items():
             self.assertEqual(
-                highlights[key]["image"],
+                entry["image"],
                 BACKDROP_URL,
                 msg=f"{key} still has portrait poster after normalization",
             )
 
     @patch("lists.models.CustomList._get_tmdb_backdrop", return_value=BACKDROP_URL)
-    def test_all_four_highlight_slots_normalized(self, mock_backdrop):
-        """All four named keys are processed independently."""
-        entries = {
+    def test_all_highlight_slots_normalized(self, mock_backdrop):
+        """First play, last play and the today card are processed independently."""
+        highlights = {
             "first_play": _highlight_entry(_tv_item_dict(media_id="1396")),
             "last_play": _highlight_entry(_movie_item_dict(media_id="1865")),
-            "today_in_history": _highlight_entry(_episode_item_dict(media_id="1399")),
-            "today_in_user_history": _highlight_entry(_anime_item_dict(media_id="94954")),
+            "today_card": {"entry": _highlight_entry(_anime_item_dict(media_id="94954"))},
+            "today_month": 5,
+            "today_day": 20,
         }
-        highlights = {**entries, "today_month": 5, "today_day": 20}
 
         statistics_cache._normalize_history_highlight_images(highlights)
 
         # TMDB should have been consulted for each distinct item
-        self.assertEqual(mock_backdrop.call_count, 4)
+        self.assertEqual(mock_backdrop.call_count, 3)
 
     @patch("lists.models.CustomList._get_tmdb_backdrop", return_value=BACKDROP_URL)
     def test_none_entries_are_skipped_without_error(self, mock_backdrop):
@@ -678,8 +685,7 @@ class NormalizeHistoryHighlightImagesTests(TestCase):
         highlights = {
             "first_play": _highlight_entry(_tv_item_dict()),
             "last_play": None,
-            "today_in_history": None,
-            "today_in_user_history": None,
+            "today_card": None,
         }
 
         statistics_cache._normalize_history_highlight_images(highlights)  # must not raise

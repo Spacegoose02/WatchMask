@@ -486,10 +486,10 @@ def _get_or_create_artist(metadata: ResolvedMusicMetadata) -> tuple[Artist, bool
     if metadata.artist_image:
         updates["image"] = metadata.artist_image
 
-    for field, value in updates.items():
-        current = getattr(artist, field)
+    for field_name, value in updates.items():
+        current = getattr(artist, field_name)
         if not current and value:
-            setattr(artist, field, value)
+            setattr(artist, field_name, value)
 
     artist.name = name
     artist.save()
@@ -551,10 +551,10 @@ def _get_or_create_album(metadata: ResolvedMusicMetadata, artist: Artist) -> tup
         updates["image"] = metadata.album_image
 
     changed_fields = []
-    for field, value in updates.items():
-        if value and getattr(album, field) != value:
-            setattr(album, field, value)
-            changed_fields.append(field)
+    for field_name, value in updates.items():
+        if value and getattr(album, field_name) != value:
+            setattr(album, field_name, value)
+            changed_fields.append(field_name)
 
     if changed_fields:
         album.save(update_fields=changed_fields)
@@ -626,10 +626,10 @@ def _get_or_create_track(metadata: ResolvedMusicMetadata, album: Album) -> Track
     }
 
     changed_fields = []
-    for field, value in updates.items():
-        if value is not None and getattr(track, field) != value:
-            setattr(track, field, value)
-            changed_fields.append(field)
+    for field_name, value in updates.items():
+        if value is not None and getattr(track, field_name) != value:
+            setattr(track, field_name, value)
+            changed_fields.append(field_name)
 
     if changed_fields:
         track.save(update_fields=changed_fields)
@@ -919,7 +919,7 @@ def _update_music_entry(
     played_at,
 ) -> Music:
     """Create or update the per-user Music row.
-    
+
     Each track has its own Music record (via unique item), so deduplication
     only applies to the same track played multiple times. Different tracks
     will always get separate Music records and be fully logged, even if
@@ -1301,8 +1301,8 @@ def _enrich_missing_artist_metadata(
             updates["musicbrainz_release_group_id"] = release_group_id
         if updates:
             try:
-                for field, value in updates.items():
-                    setattr(target_album, field, value)
+                for field_name, value in updates.items():
+                    setattr(target_album, field_name, value)
                 target_album.save(update_fields=list(updates.keys()))
             except IntegrityError:
                 logger.debug(
@@ -1368,10 +1368,10 @@ def _sync_artist_metadata(artist: Artist, musicbrainz_id: str, force: bool = Fal
         updates["genres"] = data["genres"]
 
     changed_fields = []
-    for field, value in updates.items():
-        if value and getattr(artist, field) != value:
-            setattr(artist, field, value)
-            changed_fields.append(field)
+    for field_name, value in updates.items():
+        if value and getattr(artist, field_name) != value:
+            setattr(artist, field_name, value)
+            changed_fields.append(field_name)
 
     if changed_fields:
         artist.save(update_fields=changed_fields)

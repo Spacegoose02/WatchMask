@@ -51,7 +51,10 @@ class TV(Media):
         completed_on_create = is_create and self.status == Status.COMPLETED.value
         if (not is_create and self.tracker.has_changed("status")) or completed_on_create:
             if self.status == Status.COMPLETED.value:
-                self._completed()
+                if completed_on_create:
+                    self._completed_on_create()
+                else:
+                    self._completed()
 
             elif self.status == Status.DROPPED.value:
                 self._mark_in_progress_seasons_as_dropped()
@@ -196,6 +199,22 @@ class TV(Media):
 
         return dates
 
+    def _completed_on_create(self):
+        """Fan out completion for a new show without failing the save.
+
+        Imports and webhooks create completed shows in bulk, including ones a
+        provider no longer knows about, so a provider error must not lose the
+        record that was just saved.
+        """
+        try:
+            self._completed()
+        except providers.services.ProviderAPIError as error:
+            logger.warning(
+                "Skipped completion fan-out for new %s: %s",
+                self.item,
+                error,
+            )
+
     def _completed(self):
         """Create remaining seasons and episodes for a TV show."""
         tv_metadata = providers.services.get_media_metadata(
@@ -203,7 +222,8 @@ class TV(Media):
             self.item.media_id,
             self.item.source,
         )
-        max_progress = tv_metadata["max_progress"]
+        # Nothing to fan out when the provider payload has no episode count
+        max_progress = tv_metadata.get("max_progress")
 
         if not max_progress or self.progress > max_progress:
             return
@@ -214,7 +234,7 @@ class TV(Media):
 
         season_numbers = [
             season["season_number"]
-            for season in tv_metadata["related"]["seasons"]
+            for season in (tv_metadata.get("related") or {}).get("seasons", [])
             if season["season_number"] != 0
         ]
         tv_with_seasons_metadata = providers.services.get_media_metadata(
@@ -443,6 +463,25 @@ class Season(Media):
         """Return the title of the media and season number."""
         return f"{self.item.title} S{self.item.season_number}"
 
+    def _completed(self):
+        """Create the remaining episode watches and move the show along."""
+        season_metadata = providers.services.get_media_metadata(
+            MediaTypes.SEASON.value,
+            self.item.media_id,
+            self.item.source,
+            [self.item.season_number],
+        )
+        episodes_to_create = self.get_remaining_eps(season_metadata)
+        if episodes_to_create:
+            bulk_create_with_history(
+                episodes_to_create,
+                Episode,
+            )
+
+        self.related_tv._handle_completed_season(
+            self.item.season_number,
+        )
+
     @tracker  # postpone field reset until after the save
     def save(self, *args, **kwargs):
         """Save the media instance."""
@@ -458,22 +497,18 @@ class Season(Media):
         completed_on_create = is_create and self.status == Status.COMPLETED.value
         if (not is_create and self.tracker.has_changed("status")) or completed_on_create:
             if self.status == Status.COMPLETED.value:
-                season_metadata = providers.services.get_media_metadata(
-                    MediaTypes.SEASON.value,
-                    self.item.media_id,
-                    self.item.source,
-                    [self.item.season_number],
-                )
-                episodes_to_create = self.get_remaining_eps(season_metadata)
-                if episodes_to_create:
-                    bulk_create_with_history(
-                        episodes_to_create,
-                        Episode,
-                    )
-
-                self.related_tv._handle_completed_season(
-                    self.item.season_number,
-                )
+                if completed_on_create:
+                    # Same reasoning as TV._completed_on_create
+                    try:
+                        self._completed()
+                    except providers.services.ProviderAPIError as error:
+                        logger.warning(
+                            "Skipped completion fan-out for new %s: %s",
+                            self.item,
+                            error,
+                        )
+                else:
+                    self._completed()
 
             elif (
                 self.status == Status.DROPPED.value
@@ -916,7 +951,7 @@ class Season(Media):
         now = timezone.now().replace(second=0, microsecond=0)
 
         # Create Episode objects for the remaining episodes
-        for episode in reversed(season_metadata["episodes"]):
+        for episode in reversed(season_metadata.get("episodes", [])):
             if episode["episode_number"] <= latest_watched_ep_num:
                 break
 

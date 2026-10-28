@@ -6,6 +6,7 @@ import math
 import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from django.utils import timezone
 
@@ -48,6 +49,9 @@ from app.discover.service_helpers import (
     _model_has_field,
 )
 from app.models import MediaTypes, Status
+
+if TYPE_CHECKING:
+    from app.models import Item
 
 MOVIE_COMFORT_PROFILE_LAYER_WEIGHTS = {
     "phase": 0.60,

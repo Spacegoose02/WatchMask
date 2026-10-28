@@ -793,7 +793,6 @@ def track_modal(
             from app.models import Podcast
 
             show = episode.show
-            instance_id = request.GET.get("instance_id")
 
             # Get all Podcast entries for this episode to aggregate history
             # Each Podcast entry has its own history, so we need to combine them

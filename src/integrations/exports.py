@@ -278,8 +278,7 @@ def write_backup(user, media_types=None, include_lists=True):
     filepath = backup_dir / filename
 
     with open(filepath, "w", newline="", encoding="utf-8") as f:
-        for row_data in generate_rows(user, media_types=media_types, include_lists=include_lists):
-            f.write(row_data)
+        f.writelines(generate_rows(user, media_types=media_types, include_lists=include_lists))
 
     logger.info("Backup written to %s for user %s", filepath, user.username)
     return str(filepath)

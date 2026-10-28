@@ -353,12 +353,16 @@ class TVSpecialActivityTests(TestCase):
             image="http://example.com/season1.jpg",
             season_number=1,
         )
+        # Mark it completed directly: saving as completed would fetch the real
+        # season and create the episode items this setup builds by hand
         season_one = Season.objects.create(
             item=season_one_item,
             user=self.user,
             related_tv=self.tv,
-            status=Status.COMPLETED.value,
+            status=Status.IN_PROGRESS.value,
         )
+        Season.objects.filter(pk=season_one.pk).update(status=Status.COMPLETED.value)
+        season_one.refresh_from_db()
         regular_episode = Episode(
             item=Item.objects.create(
                 media_id="114410",
@@ -385,8 +389,9 @@ class TVSpecialActivityTests(TestCase):
             item=special_item,
             user=self.user,
             related_tv=self.tv,
-            status=Status.COMPLETED.value,
+            status=Status.IN_PROGRESS.value,
         )
+        Season.objects.filter(pk=specials.pk).update(status=Status.COMPLETED.value)
         special_episode = Episode(
             item=Item.objects.create(
                 media_id="114410",

@@ -976,6 +976,7 @@ class ListDetailViewTests(TestCase):
                 "title",
                 "media_type",
                 "score",
+                "critic_rating",
                 "progress",
                 "status",
                 "release_date",
@@ -1046,6 +1047,7 @@ class ListDetailViewTests(TestCase):
                     "media_type",
                     "status",
                     "score",
+                    "critic_rating",
                     "runtime",
                     "time_watched",
                     "popularity",
@@ -1506,7 +1508,7 @@ class ListDetailViewTests(TestCase):
         mock_update_preference.side_effect = ["date_added", None]
         mock_user_can_view.return_value = True
 
-        season_item = Item.objects.create(
+        Item.objects.create(
             media_id="1668",
             source=Sources.TMDB.value,
             media_type=MediaTypes.SEASON.value,

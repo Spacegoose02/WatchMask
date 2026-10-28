@@ -648,7 +648,7 @@ class CreateMedia(TestCase):
             2,
         )
 
-    @patch("app.views.ensure_item_metadata")
+    @patch("app.save_views.ensure_item_metadata")
     def test_create_game_htmx_returns_activity_subtitle_update(self, ensure_item_metadata_mock):
         """HTMX game saves should refresh the shared activity subtitle in place."""
         item = Item.objects.create(
@@ -930,6 +930,8 @@ class CreateMedia(TestCase):
                 return tv_with_seasons_metadata
             if media_type == MediaTypes.TV.value:
                 return tv_metadata
+            if media_type == MediaTypes.SEASON.value:
+                return tv_with_seasons_metadata["season/1"]
             error_message = f"Unexpected metadata request: {media_type}"
             raise AssertionError(error_message)
 
@@ -1022,7 +1024,7 @@ class EditMedia(TestCase):
             start_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
             end_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
         )
-        initial_status = Movie.objects.get(item__media_id="10494").status
+        Movie.objects.get(item__media_id="10494")
 
         response = self.client.post(
             f"{reverse('media_save')}?next=/details/tmdb/movie/10494/perfect-blue",
@@ -1176,7 +1178,7 @@ class EditMedia(TestCase):
         game.refresh_from_db()
         self.assertIsNone(game.start_date)
 
-    @patch("app.views.ensure_item_metadata")
+    @patch("app.save_views.ensure_item_metadata")
     def test_create_movie_htmx_inserts_score_chip_slot(self, ensure_item_metadata_mock):
         """HTMX tracker creation should insert the score chip into the page."""
         item = Item.objects.create(

@@ -1,4 +1,9 @@
+import os
+
 from fakeredis import FakeConnection
+
+# Tests must not depend on a real SECRET (CI forks have no repo secrets).
+os.environ.setdefault("SECRET", "test-secret-key-not-for-production")
 
 from .settings import *  # noqa: F403
 

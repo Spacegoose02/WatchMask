@@ -438,7 +438,7 @@ class MusicScrobbleServiceTests(TestCase):
     ):
         """Skip cover fetch when album already has art."""
         artist = Artist.objects.create(name="Has Art")
-        album = Album.objects.create(
+        Album.objects.create(
             title="With Art",
             artist=artist,
             image="http://img/already.jpg",
@@ -588,7 +588,7 @@ class MusicScrobbleServiceTests(TestCase):
         """If a null track-number duplicate exists, it should be removed when matched."""
         artist = Artist.objects.create(name="Walter Beasley")
         album = Album.objects.create(title="Tonight We Love", artist=artist)
-        extra = album.tracklist.create(title="Let's Stay Together", track_number=None)
+        album.tracklist.create(title="Let's Stay Together", track_number=None)
         canonical = album.tracklist.create(title="Let's Stay Together", track_number=2)
 
         event = MusicPlaybackEvent(

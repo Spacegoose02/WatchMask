@@ -151,9 +151,9 @@ class TVTimeLeftSortTests(TestCase):
         self.assertEqual(sorted_excluded.episodes_left_display, 9)
         self.assertEqual(sorted_excluded.time_left_display, "4h 30m")
 
-        # The sort view changes only the time-left ordering/display math.
-        self.assertEqual(sorted_excluded.episodes_left, 14)
-        self.assertEqual(sorted_excluded.time_left, 420)
+        # Dropped seasons are left out of the show's own progress math too
+        self.assertEqual(sorted_excluded.episodes_left, 9)
+        self.assertEqual(sorted_excluded.time_left, 270)
 
     def test_time_left_sort_does_not_crash_with_untracked_entry(self):
         """Untracked MediaListEntry (media=None) must not crash the TV time-left sort.

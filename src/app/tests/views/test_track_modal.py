@@ -76,7 +76,7 @@ class TrackModalViewTests(TestCase):
 
         self.mock_get_media_metadata = patch(
             "app.providers.services.get_media_metadata",
-            return_value={"max_progress": 1},
+            return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
         )
         self.mock_fetch_releases = patch("app.models.Item.fetch_releases")
         self.mock_get_media_metadata.start()
@@ -263,10 +263,9 @@ class TrackModalViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         content = response.content.decode()
-        self.assertIn('@click="', content)
-        self.assertIn("if (modalState && modalState.createTrackOpen)", content)
-        self.assertIn("if (modalState && modalState.editTrackOpen)", content)
-        self.assertIn("if (modalState && modalState.trackOpen)", content)
+        # closeTrackModal finds whichever x-show state (trackOpen, editTrackOpen,
+        # createTrackOpen) wraps the modal, so one handler covers every wrapper
+        self.assertIn('@click="closeTrackModal($el)"', content)
         self.assertNotContains(response, 'onclick="closeTrackModal(this)"', html=False)
 
     def test_track_modal_view_uses_stored_discover_hidden_state(self):
@@ -292,7 +291,7 @@ class TrackModalViewTests(TestCase):
         self.assertTrue(response.context["discover_tab_available"])
         self.assertTrue(response.context["is_hidden_from_discover"])
         self.assertContains(response, "Currently hidden in Discover.")
-        self.assertContains(response, "name=\"action\"", html=False)
+        self.assertContains(response, 'name="action"', html=False)
 
     def test_artist_track_modal_uses_shared_fill_track_shell(self):
         """Music artist trackers should render through the shared modal shell."""

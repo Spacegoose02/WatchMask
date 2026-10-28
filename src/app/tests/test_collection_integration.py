@@ -37,7 +37,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/movie.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_entry_tv(self):
@@ -50,7 +50,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/tv.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_entry_anime(self):
@@ -63,7 +63,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/anime.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_entry_manga(self):
@@ -76,7 +76,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/manga.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_entry_game(self):
@@ -89,7 +89,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/game.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_entry_book(self):
@@ -102,7 +102,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/book.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_entry_comic(self):
@@ -115,7 +115,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/comic.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_entry_music(self):
@@ -128,7 +128,7 @@ class CollectionIntegrationTest(TestCase):
             image="http://example.com/music.jpg",
         )
 
-        entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
 
     def test_collection_independent_of_media_tracking(self):
@@ -142,12 +142,12 @@ class CollectionIntegrationTest(TestCase):
         )
 
         # Create collection entry without Media tracking
-        collection_entry = CollectionEntry.objects.create(user=self.user, item=item)
+        CollectionEntry.objects.create(user=self.user, item=item)
         self.assertTrue(CollectionEntry.objects.filter(user=self.user, item=item).exists())
         self.assertFalse(Movie.objects.filter(user=self.user, item=item).exists())
 
         # Create Media tracking without collection entry
-        movie = Movie.objects.create(
+        Movie.objects.create(
             user=self.user,
             item=item,
             status=Status.IN_PROGRESS.value,

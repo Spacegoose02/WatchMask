@@ -94,7 +94,7 @@ class CollectionWebhookTest(TestCase):
         # Mock Plex account
         from integrations.models import PlexAccount
 
-        plex_account = PlexAccount.objects.create(
+        PlexAccount.objects.create(
             user=self.user,
             plex_token="test_token",
             plex_username="test",

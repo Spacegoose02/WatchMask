@@ -137,6 +137,7 @@ class NewSeasonStatusUpdateTests(TestCase):
         mock_clear_time_left_cache,
     ):
         """New-season detection should reopen the TV show without auto-starting the season."""
+        # Only seasons with upcoming episodes reopen a completed show
         season_metadata = {
             "season/2": {
                 "image": "http://example.com/season2.jpg",
@@ -144,12 +145,12 @@ class NewSeasonStatusUpdateTests(TestCase):
                 "episodes": [
                     {
                         "episode_number": 1,
-                        "air_date": "2024-01-15",
+                        "air_date": "2099-01-15",
                         "still_path": "/ep1.jpg",
                     },
                     {
                         "episode_number": 2,
-                        "air_date": "2024-01-22",
+                        "air_date": "2099-01-22",
                         "still_path": "/ep2.jpg",
                     },
                 ],

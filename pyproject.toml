@@ -5,7 +5,42 @@ force-exclude = true
 
 [tool.ruff.lint]
 select = ["ALL"]
-ignore = ["ANN", "PT", "PD", "D100", "D104", "RUF012", "PLR0913", "SLF001", "COM812"]
+ignore = [
+    "ANN", "PT", "PD", "D100", "D104", "RUF012", "PLR0913", "SLF001", "COM812",
+    # This fork's code was written without enforcing these rules, so CI ignores
+    # them for now. Remove entries as the code is cleaned up.
+    # Line length and docstrings
+    "E501", "W505", "D101", "D102", "D103", "D105", "D106", "D107", "D205",
+    "D301", "D401",
+    # Complexity and structure
+    "C901", "PLR0911", "PLR0912", "PLR0915", "PLR2004", "PLC0415", "PLC0206",
+    "PLR1714", "PLW0108", "PLW0603", "PLW2901",
+    # Exceptions and logging
+    "BLE001", "B904", "EM101", "EM102", "G004", "G201", "S110", "S112",
+    "TRY002", "TRY003", "TRY004", "TRY201", "TRY300", "TRY301", "TRY400",
+    "TRY401",
+    # Arguments, naming and builtins
+    "A001", "A004", "ARG001", "ARG002", "ARG005", "FBT001", "FBT002", "FBT003",
+    "N803", "N806",
+    # Dates and paths
+    "DTZ001", "DTZ007", "DTZ011", "PTH100", "PTH103", "PTH118", "PTH119",
+    "PTH120", "PTH123",
+    # Security heuristics
+    "S105", "S106", "S301", "S311", "S314", "S324", "S603", "S607", "S608",
+    "S610",
+    # Django models
+    "DJ001", "DJ008", "DJ012",
+    # Style and simplification
+    "B007", "B905", "C401", "C408", "ERA001", "FIX002", "FURB110", "FURB162",
+    "FURB171", "ICN001", "INP001", "PERF102", "PERF401", "RET504", "RUF001",
+    "RUF002", "RUF003", "RUF005", "RUF007", "RUF013", "RUF034", "RUF046",
+    "RUF059", "SIM101", "SIM102", "SIM103", "SIM105", "SIM108", "SIM117",
+    "SIM118", "T201", "TC001", "TC002", "TC003", "TD002", "TD003", "UP022",
+    # Many modules re-export names that other modules and test patch targets use
+    "F401",
+    # Keep existing noqa comments for the rules above until they are re-enabled
+    "RUF100",
+]
 
 [tool.ruff.lint.pycodestyle]
 max-doc-length = 88

@@ -667,7 +667,6 @@ def season_details(
             except ItemModel.DoesNotExist:
                 # Show item doesn't exist yet, skip background fetch
                 logger.debug("Season page: Show item not found for media_id=%s, source=%s", media_id, source)
-                pass
             except Exception as exc:
                 logger.error("Error checking show collection entry in season_details: %s", exception_summary(exc), exc_info=True)
 

@@ -2115,7 +2115,7 @@ class DiscoverServiceTests(TestCase):
         comfort_item = build_item("tv-comfort-1", "Comfort Mystery Show")
         recent_item = build_item("tv-recent-1", "Recent Mystery Show")
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             TV.objects.create(
                 user=self.user,
                 item=planning_item,
@@ -2316,7 +2316,7 @@ class DiscoverServiceTests(TestCase):
         comfort_item = build_item("anime-comfort-1", "Comfort Rewatch Anime")
         recent_item = build_item("anime-recent-1", "Recent Comfort Anime")
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 10}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 10, "related": {"seasons": []}, "episodes": []}):
             Anime.objects.create(
                 user=self.user,
                 item=planning_item,
@@ -3797,7 +3797,7 @@ class DiscoverServiceTests(TestCase):
             provider_rating=7.8,
         )
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 10}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 10, "related": {"seasons": []}, "episodes": []}):
             Anime.objects.create(
                 user=self.user,
                 item=open_item,
@@ -4220,7 +4220,7 @@ class DiscoverServiceTests(TestCase):
             genres=["Comedy"],
         )
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=rated_item,
                 user=self.user,
@@ -4275,7 +4275,7 @@ class DiscoverServiceTests(TestCase):
             genres=["Animation"],
         )
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=eligible_item,
                 user=self.user,
@@ -4306,7 +4306,7 @@ class DiscoverServiceTests(TestCase):
 
     def test_comfort_candidates_biases_phase_evidence_with_limited_backfill(self):
         phase_media_ids = {"5001", "5002"}
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             for media_id in sorted(phase_media_ids):
                 item = Item.objects.create(
                     media_id=media_id,
@@ -4409,7 +4409,7 @@ class DiscoverServiceTests(TestCase):
         )
         ItemStudioCredit.objects.create(item=item, studio=studio)
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             entry = Movie.objects.create(
                 item=item,
                 user=self.user,
@@ -4483,7 +4483,7 @@ class DiscoverServiceTests(TestCase):
         )
         ItemStudioCredit.objects.create(item=item, studio=studio)
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             entry = Anime.objects.create(
                 item=item,
                 user=self.user,
@@ -5321,7 +5321,7 @@ class DiscoverServiceTests(TestCase):
             studios=["Walt Disney Animation Studios"],
         )
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             Movie.objects.create(
                 item=zootopia_item,
                 user=self.user,
@@ -5474,7 +5474,7 @@ class DiscoverServiceTests(TestCase):
             studios=["Disney"],
         )
 
-        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1}):
+        with patch("app.models.providers.services.get_media_metadata", return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []}):
             for days_ago in (35, 50, 70):
                 Movie.objects.create(
                     item=bursty_item,
@@ -5668,7 +5668,7 @@ class DiscoverServiceTests(TestCase):
     def _create_movie_watches(self, item, days_ago_list, score=9):
         with patch(
             "app.models.providers.services.get_media_metadata",
-            return_value={"max_progress": 1},
+            return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
         ):
             for days_ago in days_ago_list:
                 Movie.objects.create(
@@ -6406,7 +6406,7 @@ class DiscoverServiceTests(TestCase):
             _hydrate_movie_candidates_from_items,
         )
 
-        item = self._create_movie_item(
+        self._create_movie_item(
             "hydrate-known",
             "Known Movie",
             provider_keywords=["Family", "Adventure"],

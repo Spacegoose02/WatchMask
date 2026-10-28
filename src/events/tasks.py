@@ -157,7 +157,7 @@ def send_daily_digest_notifications():
 @shared_task(name="Refresh podcast episodes")
 def refresh_podcast_episodes():
     """Refresh episode lists from RSS feeds for all podcast shows.
-    
+
     Fetches latest episodes from RSS feeds and updates the database.
     This ensures we have the complete episode list, including new episodes
     that haven't been listened to yet.
