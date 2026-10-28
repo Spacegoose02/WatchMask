@@ -556,6 +556,15 @@
               </div>
             </div>
 
+            {% if request.user.cinemask_account and media.source == Sources.TMDB.value %}
+              {% if media_type == MediaTypes.MOVIE.value or media_type == MediaTypes.TV.value %}
+                <div class="flex-1 sm:flex-none"
+                     hx-get="{% url 'cinemask_request_button' %}?media_type={{ media_type }}&tmdb_id={{ media.media_id|urlencode }}"
+                     hx-trigger="load"
+                     hx-swap="outerHTML"></div>
+              {% endif %}
+            {% endif %}
+
             <a class="inline-flex h-11 w-full flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#2a2f35] text-gray-100 shadow-sm transition-colors duration-200 hover:bg-[#343a40] cursor-pointer sm:size-11 sm:w-11 sm:flex-none"
                title="View your activity history"
                href="{% url 'history' %}?{% if media_type == MediaTypes.SEASON.value %}media_type={{ MediaTypes.TV.value }}&media_id={{ media.media_id|urlencode }}&source={{ media.source|urlencode }}&season_number={{ media.season_number }}{% elif media_type == MediaTypes.TV.value %}media_type={{ MediaTypes.TV.value }}&media_id={{ media.media_id|urlencode }}&source={{ media.source|urlencode }}{% elif media_type == MediaTypes.PODCAST.value and podcast_show %}media_type={{ MediaTypes.PODCAST.value }}&podcast_show={{ podcast_show.id }}{% else %}media_type={{ media_type }}&media_id={{ media.media_id|urlencode }}&source={{ media.source|urlencode }}{% endif %}{% if media_type == MediaTypes.GAME.value or media_type == MediaTypes.BOARDGAME.value %}&logging_style=sessions{% endif %}">

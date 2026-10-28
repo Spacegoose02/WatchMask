@@ -13,6 +13,10 @@ from integrations.tasks._import_helpers import (
     format_media_type_display,
     format_watchlist_sync_message,
 )
+from integrations.tasks._cinemask import (
+    sync_all_cinemask_requests,
+    sync_cinemask_requests,
+)
 from integrations.tasks._lastfm import (
     LASTFM_PARTIAL_SYNC_ERROR,
     _enqueue_lastfm_music_enrichment,
