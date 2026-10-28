@@ -2171,12 +2171,12 @@ class StatisticsViewTests(TestCase):
         mock_enqueue.assert_called()
         scheduled_ids = {
             item_id
-            for call in mock_enqueue.call_args_list
-            for item_id in call.args[0]
+            for enqueue_call in mock_enqueue.call_args_list
+            for item_id in enqueue_call.args[0]
         }
         self.assertIn(episode_item_two.id, scheduled_ids)
-        for call in mock_enqueue.call_args_list:
-            self.assertEqual(call.kwargs, {"countdown": 3})
+        for enqueue_call in mock_enqueue.call_args_list:
+            self.assertEqual(enqueue_call.kwargs, {"countdown": 3})
         top_actors = response.context["top_talent"]["top_actors"]
         by_name = {entry["name"]: entry for entry in top_actors}
         self.assertIn("Episode Specific Actor", by_name)
