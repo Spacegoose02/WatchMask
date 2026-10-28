@@ -77,6 +77,12 @@ class BingeBanditWebhookViewTests(TestCase):
         response = self.client.post(self.url, data="", content_type="application/json")
         self.assertEqual(response.status_code, 400)
 
+    def test_plex_style_format(self):
+        payload = json.dumps({"event": "media.play", "Metadata": {}})
+        response = self.client.post(self.url, data={"payload": payload})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"BingeBandit JSON", response.content)
+
     def test_invalid_json(self):
         response = self.client.post(
             self.url, data="not-json", content_type="application/json",
