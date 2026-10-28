@@ -104,7 +104,9 @@ class IntegrationTest(StaticLiveServerTestCase):
         self.page.locator("button").filter(has_text="Add to tracker").click()
         expect(self.page.locator("#track-tv-1396")).to_contain_text("Score")
         self.page.get_by_label("Status").select_option("Completed")
-        self.page.get_by_role("button", name="Add", exact=True).click()
+        # Completing fans out to every season, so let the save finish first
+        with self.page.expect_response("**/media_save*", timeout=60000):
+            self.page.get_by_role("button", name="Add", exact=True).click()
         self._open_media_list("TV Shows", "tv", "table")
         expect(self.page.locator("tbody")).to_contain_text("Breaking Bad")
         expect(self.page.locator("tbody")).to_contain_text("Completed")
@@ -123,7 +125,8 @@ class IntegrationTest(StaticLiveServerTestCase):
         expect(self.page.get_by_role("main")).to_contain_text("Breaking Bad")
         self.page.get_by_role("button", name="Add to tracker").click()
         expect(self.page.locator("#track-season-1396-1")).to_contain_text("Score")
-        self.page.get_by_role("button", name="Add", exact=True).click()
+        with self.page.expect_response("**/media_save*", timeout=60000):
+            self.page.get_by_role("button", name="Add", exact=True).click()
         self._open_media_list("TV Seasons", "season", "table")
         expect(self.page.locator("tbody")).to_contain_text("Completed")
         expect(self.page.locator("tbody")).to_contain_text("7")
