@@ -158,9 +158,11 @@ class BingeBanditWebhookProcessingTests(TestCase):
         self.assertEqual(response.status_code, 200)
         mock_movie.assert_not_called()
 
+    # Live playback state looks up show artwork too; keep it out of the count
+    @patch("app.live_playback.apply_playback_event")
     @patch("integrations.webhooks.base.BaseWebhookProcessor._handle_tv_episode")
     @patch("app.providers.tmdb.tv_with_seasons")
-    def test_episode_uses_show_tmdb_id(self, mock_tv, mock_handle_episode):
+    def test_episode_uses_show_tmdb_id(self, mock_tv, mock_handle_episode, _mock_live):
         mock_tv.return_value = {
             "media_id": "1668",
             "title": "Friends",

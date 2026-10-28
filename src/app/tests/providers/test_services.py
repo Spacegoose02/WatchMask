@@ -2,7 +2,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import requests
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from app.models import Item, MediaTypes, Sources
 from app.providers import (
@@ -632,6 +632,7 @@ class ServicesTests(TestCase):
 
         mock_search.assert_called_once_with(MediaTypes.ANIME.value, "test", 1)
 
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
     @patch("app.providers.tvdb.search")
     def test_search_anime_tvdb(self, mock_search):
         """Test the search function for anime via TVDB."""

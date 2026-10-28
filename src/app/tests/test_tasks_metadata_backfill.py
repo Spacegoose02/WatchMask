@@ -143,11 +143,15 @@ class MetadataBackfillTaskTests(TestCase):
             image="https://example.com/ted.jpg",
             metadata_fetched_at=old_fetched_at,
         )
+        # Saving as completed would fan out through the mocked provider, so
+        # mark it completed directly
         tv = TV.objects.create(
             item=tv_item,
             user=user,
-            status=Status.COMPLETED.value,
+            status=Status.IN_PROGRESS.value,
         )
+        TV.objects.filter(pk=tv.pk).update(status=Status.COMPLETED.value)
+        tv.refresh_from_db()
 
         season1_item = Item.objects.create(
             media_id="201834",
@@ -163,8 +167,10 @@ class MetadataBackfillTaskTests(TestCase):
             item=season1_item,
             related_tv=tv,
             user=user,
-            status=Status.COMPLETED.value,
+            status=Status.IN_PROGRESS.value,
         )
+        Season.objects.filter(pk=season1.pk).update(status=Status.COMPLETED.value)
+        season1.refresh_from_db()
         season2_item = Item.objects.create(
             media_id="201834",
             source=Sources.TMDB.value,
@@ -254,7 +260,9 @@ class MetadataBackfillTaskTests(TestCase):
         result = tasks.backfill_item_metadata_task(batch_size=1)
 
         tv.refresh_from_db()
-        self.assertEqual(tv.status, Status.IN_PROGRESS.value)
+        # Season 2 has already aired, and only seasons with upcoming episodes
+        # reopen a completed show
+        self.assertEqual(tv.status, Status.COMPLETED.value)
         season2 = tv.seasons.get(item__season_number=2)
         self.assertEqual(season2.status, Status.PLANNING.value)
         self.assertEqual(
@@ -311,11 +319,15 @@ class MetadataBackfillTaskTests(TestCase):
             metadata_fetched_at=old_fetched_at,
             release_datetime=first_air_date,
         )
+        # Saving as completed would fan out through the mocked provider, so
+        # mark it completed directly
         tv = TV.objects.create(
             item=tv_item,
             user=user,
-            status=Status.COMPLETED.value,
+            status=Status.IN_PROGRESS.value,
         )
+        TV.objects.filter(pk=tv.pk).update(status=Status.COMPLETED.value)
+        tv.refresh_from_db()
 
         season1_item = Item.objects.create(
             media_id="201835",
@@ -331,8 +343,10 @@ class MetadataBackfillTaskTests(TestCase):
             item=season1_item,
             related_tv=tv,
             user=user,
-            status=Status.COMPLETED.value,
+            status=Status.IN_PROGRESS.value,
         )
+        Season.objects.filter(pk=season1.pk).update(status=Status.COMPLETED.value)
+        season1.refresh_from_db()
         season2_item = Item.objects.create(
             media_id="201835",
             source=Sources.TMDB.value,
@@ -423,7 +437,9 @@ class MetadataBackfillTaskTests(TestCase):
         result = tasks.backfill_item_metadata_task(batch_size=1)
 
         tv.refresh_from_db()
-        self.assertEqual(tv.status, Status.IN_PROGRESS.value)
+        # Season 2 has already aired, and only seasons with upcoming episodes
+        # reopen a completed show
+        self.assertEqual(tv.status, Status.COMPLETED.value)
         season2 = tv.seasons.get(item__season_number=2)
         self.assertEqual(season2.status, Status.PLANNING.value)
         self.assertEqual(

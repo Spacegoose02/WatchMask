@@ -928,12 +928,17 @@ class NextEpisodeUrlTests(TestCase):
             image="http://example.com/tv-s1.jpg",
             season_number=1,
         )
-        Season.objects.create(
-            item=season_item,
-            user=self.user,
-            related_tv=tv,
-            status=Status.COMPLETED.value,
-        )
+        # Completing the season fans out through the provider; keep it offline
+        with patch(
+            "app.providers.services.get_media_metadata",
+            return_value={"max_progress": None, "related": {"seasons": []}, "episodes": []},
+        ):
+            Season.objects.create(
+                item=season_item,
+                user=self.user,
+                related_tv=tv,
+                status=Status.COMPLETED.value,
+            )
         return tv_item, tv
 
     def test_tv_show_falls_back_to_untracked_season_events(self):

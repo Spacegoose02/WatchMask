@@ -1678,7 +1678,8 @@ class Metadata(TestCase):
         """Test the metadata method for books from Hardcover."""
         response = hardcover.book("377193")
         self.assertEqual(response["title"], "The Great Gatsby")
-        self.assertEqual(response["details"]["author"], "F. Scott Fitzgerald")
+        # Live Hardcover data; later editions list extra contributors
+        self.assertTrue(response["details"]["author"].startswith("F. Scott Fitzgerald"))
         self.assertIn("Fiction", response["genres"])
         self.assertIn("Young Adult", response["genres"])
         self.assertIn("Classics", response["genres"])
