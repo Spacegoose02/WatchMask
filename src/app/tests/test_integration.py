@@ -81,6 +81,18 @@ class IntegrationTest(StaticLiveServerTestCase):
         self.page.get_by_role("button", name="Add watch").click()
         expect(self.page.get_by_role("main")).to_contain_text(f"Ended: {today}")
 
+    def _open_media_list(self, link_name, media_type, layout):
+        """Open a library list and wait for each navigation to land.
+
+        Clicking the next link before the previous page has loaded can be
+        swallowed, leaving the test on the wrong list.
+        """
+        self.page.get_by_role("link", name=link_name).click()
+        self.page.wait_for_url(f"**/medialist/{media_type}**")
+        layout_name = "Table View" if layout == "table" else "Grid View"
+        self.page.get_by_role("link", name=layout_name).click()
+        self.page.wait_for_url(f"**/medialist/{media_type}?*layout={layout}*")
+
     def test_tv_completed(self):
         """Test the completed status of a TV show."""
         self.page.locator("#global-search").click()
@@ -93,8 +105,7 @@ class IntegrationTest(StaticLiveServerTestCase):
         expect(self.page.locator("#track-tv-1396")).to_contain_text("Score")
         self.page.get_by_label("Status").select_option("Completed")
         self.page.get_by_role("button", name="Add", exact=True).click()
-        self.page.get_by_role("link", name="TV Shows").click()
-        self.page.get_by_role("link", name="Table View").click()
+        self._open_media_list("TV Shows", "tv", "table")
         expect(self.page.locator("tbody")).to_contain_text("Breaking Bad")
         expect(self.page.locator("tbody")).to_contain_text("Completed")
 
@@ -113,8 +124,7 @@ class IntegrationTest(StaticLiveServerTestCase):
         self.page.get_by_role("button", name="Add to tracker").click()
         expect(self.page.locator("#track-season-1396-1")).to_contain_text("Score")
         self.page.get_by_role("button", name="Add", exact=True).click()
-        self.page.get_by_role("link", name="TV Seasons").click()
-        self.page.get_by_role("link", name="Table View").click()
+        self._open_media_list("TV Seasons", "season", "table")
         expect(self.page.locator("tbody")).to_contain_text("Completed")
         expect(self.page.locator("tbody")).to_contain_text("7")
 
@@ -170,11 +180,9 @@ class IntegrationTest(StaticLiveServerTestCase):
         )
 
         # Check visibility
-        self.page.get_by_role("link", name="TV Shows").click()
-        self.page.get_by_role("link", name="Grid View").click()
+        self._open_media_list("TV Shows", "tv", "grid")
         expect(self.page.get_by_role("main")).to_contain_text("Friends")
-        self.page.get_by_role("link", name="TV Seasons").click()
-        self.page.get_by_role("link", name="Grid View").click()
+        self._open_media_list("TV Seasons", "season", "grid")
         expect(self.page.get_by_role("main")).to_contain_text("Season 1")
         self.page.get_by_role("link", name="TV Shows").click()
         self.page.get_by_title("Friends").click()
