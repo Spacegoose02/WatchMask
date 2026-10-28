@@ -112,7 +112,6 @@ class MediaDetailsViewTests(TestCase):
                     "title": "test-movie",
                 },
             ),
-            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -2918,6 +2917,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "frieren",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -2989,7 +2989,6 @@ class MediaDetailsViewTests(TestCase):
                     "title": "frieren",
                 },
             ),
-            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -3904,6 +3903,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "frieren",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -4589,7 +4589,6 @@ class MediaDetailsViewTests(TestCase):
                     "season_number": 1,
                 },
             ),
-            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -5637,6 +5636,7 @@ class MediaDetailsViewTests(TestCase):
                     "season_number": 1,
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -5787,6 +5787,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "test-movie",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -6252,6 +6253,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "chainsaw-man",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -6989,6 +6991,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "collected-show",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -7101,6 +7104,7 @@ class MediaDetailsViewTests(TestCase):
                     "title": "collected-season-show",
                 },
             ),
+            {"fragment": "secondary"},
         )
 
         self.assertEqual(response.status_code, 200)

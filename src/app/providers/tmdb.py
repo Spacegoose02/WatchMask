@@ -1610,9 +1610,8 @@ def get_companies_full(companies):
 
 def get_score(score):
     """Return the score for the media with one decimal place."""
-    # when unknown score, value from response is 0.0
-
-    return round(score, 1)
+    # when unknown score, value from response is 0.0 or missing entirely
+    return round(score or 0.0, 1)
 
 
 def get_related(related_medias, media_type, parent_response=None, tv_media_id=None):
