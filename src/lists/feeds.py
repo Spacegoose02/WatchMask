@@ -108,7 +108,7 @@ class PublicListFeed(Feed):
 
     def title(self, obj):
         """Return the feed title."""
-        return f"{obj.name} - Yamtrack"
+        return f"{obj.name} - Watchmask"
 
     def link(self, obj):
         """Return the list detail URL."""

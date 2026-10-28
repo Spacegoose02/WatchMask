@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 PODCAST_INDEX_API_BASE = "https://api.podcastindex.org/api/1.0"
 ITUNES_API_BASE = "https://itunes.apple.com/search"
-USER_AGENT = "Yamtrack/1.0 (https://github.com/FuzzyGrim/Yamtrack)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 
 
 def fetch_podcast_artwork(

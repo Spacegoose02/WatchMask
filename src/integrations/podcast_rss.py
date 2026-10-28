@@ -17,7 +17,7 @@ from app.log_safety import exception_summary, safe_url
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "Yamtrack/1.0 (https://github.com/FuzzyGrim/Yamtrack)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 
 
 def fetch_show_metadata_from_rss(rss_feed_url: str) -> dict:

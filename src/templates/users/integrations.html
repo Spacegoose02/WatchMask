@@ -3,7 +3,7 @@
 {% load app_tags %}
 
 {% block title %}
-  Integrations - Yamtrack
+  Integrations - Watchmask
 {% endblock title %}
 
 {% block settings_content %}
@@ -139,7 +139,7 @@
           <li>
             Configure the webhook with the following settings:
             <ul class="list-disc list-inside ml-6 mt-2 space-y-1 text-gray-400">
-              <li>Name: <strong>Yamtrack</strong></li>
+              <li>Name: <strong>Watchmask</strong></li>
               <li>Notification Type: <strong>Playback Start</strong> and <strong>Playback Stop</strong></li>
               <li>User Filter: your Jellyfin user</li>
             </ul>
@@ -589,7 +589,7 @@
         {% include "app/icons/server.svg" with classes="w-5 h-5 text-indigo-400 mr-2" %}
         <h3 class="text-base font-medium">Jellyseerr Integration</h3>
       </div>
-      <p class="text-gray-400 mb-4 text-sm">Use a Jellyseerr webhook to automatically add requested/approved media into Yamtrack.</p>
+      <p class="text-gray-400 mb-4 text-sm">Use a Jellyseerr webhook to automatically add requested/approved media into Watchmask.</p>
 
       <div class="bg-[#262a2f] p-4 rounded-md mb-4">
         <h4 class="text-sm font-medium mb-3">Jellyseerr Settings</h4>
@@ -601,7 +601,7 @@
               Auto-add requested media
             </label>
             <p class="text-gray-400 text-sm mb-2">
-              Controls whether Jellyseerr webhooks are allowed to add items to your Yamtrack list.
+              Controls whether Jellyseerr webhooks are allowed to add items to your Watchmask list.
             </p>
 
             <div class="relative"
@@ -692,7 +692,7 @@
 
           <div>
             <label for="jellyseerr_default_added_status" class="block text-gray-200 text-sm font-medium mb-1">
-              Default Yamtrack status for added items
+              Default Watchmask status for added items
             </label>
             <div class="relative" x-data="{ open: false, selectedValue: '{{ request.user.jellyseerr_default_added_status|default:"Planning" }}', selectedLabel: '{{ request.user.jellyseerr_default_added_status|default:"Planning" }}' }">
               <button type="button"
@@ -792,7 +792,7 @@
 }
 {% endverbatim %}</textarea>
               <p class="text-gray-400 text-sm mt-3">
-                Important: Jellyseerr's default payload will not work with Yamtrack. You must use the template above.
+                Important: Jellyseerr's default payload will not work with Watchmask. You must use the template above.
                 If you see logs like <code class="px-1 rounded bg-black/30">unsupported media_type='{media_type}'</code>,
                 Jellyseerr is sending the literal template (it was pasted/escaped incorrectly).
               </p>

@@ -7,15 +7,15 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="keywords" content="Yamtrack, Media Tracker">
-    <meta name="description" content="Search and track media on Yamtrack.">
+    <meta name="keywords" content="Watchmask, Media Tracker">
+    <meta name="description" content="Search and track media on Watchmask.">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="mobile-web-app-title" content="Yamtrack">
+    <meta name="mobile-web-app-title" content="Watchmask">
 
     <title>
       {% block title %}
-        Yamtrack
+        Watchmask
       {% endblock title %}
     </title>
 
@@ -54,7 +54,10 @@
         <header class="bg-[#1a1d20] border-b border-[#2c3136] shadow-md">
           <div class="container mx-auto px-4">
             <div class="h-16 flex items-center justify-between">
-              <h1 class="text-2xl font-semibold text-gray-100">Yamtrack</h1>
+              <h1 class="flex items-center gap-2 text-2xl font-semibold text-gray-100">
+              <img src="{% static "img/watchmask-logo.png" %}" alt="" class="w-9 h-9" width="36" height="36">
+              <span>Watchmask</span>
+            </h1>
               {% if REGISTRATION %}
                 <a href="{% url 'account_login' %}"
                    class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md transition-colors text-sm">
@@ -74,7 +77,7 @@
         <footer class="border-t border-[#2c3136] bg-[#1a1d20]">
           <div class="container mx-auto px-4 py-6 space-y-2">
             <p class="text-sm text-gray-400">
-              Yamtrack is a self-hosted media tracker for books, games, movies, music, podcasts, tv shows, and more.
+              Watchmask is a self-hosted media tracker for books, games, movies, music, podcasts, tv shows, and more.
             </p>
             <p class="text-sm text-gray-400">
               This fork is maintained by
