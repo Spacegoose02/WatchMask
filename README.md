@@ -4,9 +4,9 @@
 
 Watchmask is a self-hosted Trakt replacement built on Yamtrack, with unified History, Time Left / Progress, richer stats, smarter lists, deeper integrations, and the daily-driver polish former Trakt users usually miss.
 
-> **Naming note:** Watchmask is the new name for this fork. Deployment identifiers such as the `/yamtrack` container paths, `YAMTRACK_*` environment variables, database names, and the Docker image name are unchanged, so existing installs keep working without edits.
+> **Naming note:** Watchmask is the new name for this fork. Deployment identifiers such as the `/yamtrack` container paths, `YAMTRACK_*` environment variables, and database names are unchanged, so existing data keeps working. The Docker image is now published as `ghcr.io/spacegoose02/watchmask`; to switch an existing install, change the `image:` line and keep your volumes and environment as they are.
 
-[Demo](https://yamtrack.dannyvfilms.com) | [Docker Image](https://github.com/dannyvfilms/Yamtrack/pkgs/container/yamtrack) | [Releases](https://github.com/dannyvfilms/Yamtrack/releases)
+[Demo](https://yamtrack.dannyvfilms.com) | [Docker Image](https://github.com/Spacegoose02/Yamtrack/pkgs/container/watchmask) | [Releases](https://github.com/Spacegoose02/Yamtrack/releases) | [Changelog](CHANGELOG.md)
 
 Credentials for Demo:
 - Username: `demo`
@@ -127,7 +127,7 @@ This single stack runs the app and Redis together — paste it into a Portainer 
 ```yaml
 services:
   yamtrack:
-    image: ghcr.io/dannyvfilms/yamtrack:latest
+    image: ghcr.io/spacegoose02/watchmask:latest
     container_name: yamtrack
     restart: unless-stopped
     depends_on:
@@ -184,7 +184,7 @@ Then visit `http://localhost:8000` and log in with the account you created.
 ```yaml
 services:
   yamtrack:
-    image: ghcr.io/dannyvfilms/yamtrack:latest
+    image: ghcr.io/spacegoose02/watchmask:latest
     container_name: yamtrack
     restart: unless-stopped
     depends_on:
@@ -264,7 +264,7 @@ docker run -d \
   -e WEB_CONCURRENCY=2 \
   -v yamtrack-db:/yamtrack/db \
   -p 8000:8000 \
-  ghcr.io/dannyvfilms/yamtrack:latest
+  ghcr.io/spacegoose02/watchmask:latest
 ```
 
 Leave `REGISTRATION=True` for your first run so you can create an account, then set it back to `False` (`docker rm -f yamtrack` and re-run with the updated value, or use `docker update`/recreate) once you're the only user who needs one.
@@ -390,7 +390,7 @@ environment:
 
 ### Docker Image Tags
 
-The Docker image is available at `ghcr.io/dannyvfilms/yamtrack` with these tags:
+The Docker image is available at `ghcr.io/spacegoose02/watchmask` with these tags:
 
 - `:latest` - the latest commit on this fork's `latest` branch
 - `:release` - builds published from GitHub release tags
