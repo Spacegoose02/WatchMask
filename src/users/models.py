@@ -1727,7 +1727,7 @@ class User(AbstractUser):
 
         import pyotp
 
-        issuer = "Yamtrack"
+        issuer = "Watchmask"
         return pyotp.TOTP(self.authenticator_secret).provisioning_uri(
             name=self.username,
             issuer_name=issuer,

@@ -1,6 +1,10 @@
-# Yamtrack
+<p align="center"><img src="src/static/img/watchmask-logo.png" alt="Watchmask logo" width="160"></p>
 
-A self-hosted Trakt replacement built on Yamtrack, with unified History, Time Left / Progress, richer stats, smarter lists, deeper integrations, and the daily-driver polish former Trakt users usually miss.
+# Watchmask
+
+Watchmask is a self-hosted Trakt replacement built on Yamtrack, with unified History, Time Left / Progress, richer stats, smarter lists, deeper integrations, and the daily-driver polish former Trakt users usually miss.
+
+> **Naming note:** Watchmask is the new name for this fork. Deployment identifiers such as the `/yamtrack` container paths, `YAMTRACK_*` environment variables, database names, and the Docker image name are unchanged, so existing installs keep working without edits.
 
 [Demo](https://yamtrack.dannyvfilms.com) | [Docker Image](https://github.com/dannyvfilms/Yamtrack/pkgs/container/yamtrack) | [Releases](https://github.com/dannyvfilms/Yamtrack/releases)
 
@@ -112,8 +116,8 @@ The easiest way to get started is with Docker Compose. This works well with Port
 
 Important:
 
-- Yamtrack uses PostgreSQL only when `DB_HOST` is set.
-- If `DB_HOST` is not set, Yamtrack uses SQLite at `/yamtrack/db/db.sqlite3`.
+- Watchmask uses PostgreSQL only when `DB_HOST` is set.
+- If `DB_HOST` is not set, Watchmask uses SQLite at `/yamtrack/db/db.sqlite3`.
 - `DATABASE_URL` is not currently supported.
 
 **For SQLite (simple setup):**
@@ -221,7 +225,7 @@ volumes:
   redis_data:
 ```
 
-For PostgreSQL, use `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `DB_PORT`. Do not replace these with `DATABASE_URL`; Yamtrack falls back to SQLite if `DB_HOST` is missing.
+For PostgreSQL, use `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `DB_PORT`. Do not replace these with `DATABASE_URL`; Watchmask falls back to SQLite if `DB_HOST` is missing.
 
 ### Docker Run
 
@@ -284,7 +288,7 @@ Portainer users should prefer **Stacks** over **Containers -> Add container**. S
 
 - Always set `SECRET` and `REDIS_URL`.
 - For SQLite, mount persistent storage to `/yamtrack/db`.
-- For PostgreSQL, set `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `DB_PORT` on the Yamtrack container.
+- For PostgreSQL, set `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `DB_PORT` on the Watchmask container.
 - For PostgreSQL, also persist `/var/lib/postgresql/data` on the Postgres container.
 - Publish port `8000` from the container to a host port.
 - Leave `Command` and `Entrypoint` empty unless you know you need to override them.
@@ -319,7 +323,7 @@ For a complete list, see the [Environment Variables documentation](wiki/6.-Admin
 - SQLite stores the app database at `/yamtrack/db/db.sqlite3`; persist `/yamtrack/db`.
 - PostgreSQL stores its database files at `/var/lib/postgresql/data`; persist that path on the Postgres container.
 - Redis stores sessions and background-task state; resetting Redis can log users out, but it should not delete accounts if the database is persisted.
-- Do not assume `DATABASE_URL` enables PostgreSQL. Yamtrack uses Postgres only when `DB_HOST` is set.
+- Do not assume `DATABASE_URL` enables PostgreSQL. Watchmask uses Postgres only when `DB_HOST` is set.
 
 Example `.env` file:
 
@@ -348,11 +352,11 @@ If you import from a private Trakt profile, configure OAuth first:
 1. Create an app in [Trakt API Apps](https://trakt.tv/oauth/applications).
 2. Add this Redirect URI in the Trakt app:
    - `https://your_domain.com/import/trakt/private`
-3. Set these environment variables in Yamtrack:
+3. Set these environment variables in Watchmask:
    - `TRAKT_API` = your Trakt client ID
    - `TRAKT_API_SECRET` = your Trakt client secret
 
-If you run Yamtrack behind a reverse proxy, set `URLS=https://your_domain.com` so Yamtrack generates the correct external callback URL.
+If you run Watchmask behind a reverse proxy, set `URLS=https://your_domain.com` so Watchmask generates the correct external callback URL.
 
 
 ### Troubleshooting: I Updated and My Login Is Gone
@@ -375,7 +379,7 @@ environment:
 
 Multiple origins can be specified with commas, for example `https://yamtrack.mydomain.com,https://yamtrack-alt.mydomain.com`.
 
-If Yamtrack does not generate the correct callback URLs for authenticating with Anilist and other imports, add this to your environment variables:
+If Watchmask does not generate the correct callback URLs for authenticating with Anilist and other imports, add this to your environment variables:
 
 ```yaml
 environment:
@@ -400,7 +404,7 @@ If you want to contribute or customize the app locally:
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/dannyvfilms/Yamtrack.git
+   git clone https://github.com/Spacegoose02/Yamtrack.git
    cd Yamtrack
    ```
 
@@ -463,8 +467,8 @@ The fork also provisions a built-in demo account after migrations:
 ## Support the Project
 
 - Star the repository if you want to help more people discover the fork.
-- Open an [issue](https://github.com/dannyvfilms/Yamtrack/issues) for bugs or missing migration workflows you run into.
-- Use [GitHub issues](https://github.com/dannyvfilms/Yamtrack/issues) for feature requests and fork-specific improvement ideas.
+- Open an [issue](https://github.com/Spacegoose02/Yamtrack/issues) for bugs or missing migration workflows you run into.
+- Use [GitHub issues](https://github.com/Spacegoose02/Yamtrack/issues) for feature requests and fork-specific improvement ideas.
 - Open a pull request if you want to contribute code, docs, or polish.
 
 ## License

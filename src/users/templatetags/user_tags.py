@@ -38,7 +38,7 @@ SOURCES_CONFIG = {
         "logo": static("img/simkl-logo.png"),
     },
     "yamtrack": {
-        "name": "YamTrack",
+        "name": "Watchmask / Yamtrack",
         "logo": static("favicon/apple-touch-icon.png"),
     },
     "hltb": {

@@ -1809,7 +1809,7 @@ def import_template_csv(request):
     """View for downloading a sample CSV demonstrating the import format."""
     content = exports.generate_sample_template()
     response = HttpResponse(content, content_type="text/csv")
-    response["Content-Disposition"] = 'attachment; filename="yamtrack_import_template.csv"'
+    response["Content-Disposition"] = 'attachment; filename="watchmask_import_template.csv"'
     return response
 
 
@@ -1833,7 +1833,7 @@ def export_csv(request):
             request.user, media_types=media_types, include_lists=include_lists,
         ),
         content_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="yamtrack_{now}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="watchmask_{now}.csv"'},
     )
     logger.info("User %s started CSV export", request.user.username)
     return response
