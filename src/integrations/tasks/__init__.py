@@ -4,6 +4,10 @@ from celery import shared_task
 from django.contrib.auth import get_user_model
 
 _EXPORT_MODULES = {
+    **dict.fromkeys(
+        ("sync_all_cinemask_requests", "sync_cinemask_requests"),
+        "integrations.tasks._cinemask",
+    ),
     "export_tmdb_ratings": "integrations.tasks._ratings",
     "export_wetrakr_library": "integrations.tasks._wetrakr_export",
     **dict.fromkeys(
@@ -244,6 +248,8 @@ __all__ = [
     "format_media_type_display",
     "format_watchlist_sync_message",
     "import_anilist",
+    "sync_all_cinemask_requests",
+    "sync_cinemask_requests",
     "import_audiobookshelf",
     "import_audiobookshelf_recurring",
     "import_clz",

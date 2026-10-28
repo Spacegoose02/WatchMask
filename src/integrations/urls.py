@@ -141,6 +141,16 @@ urlpatterns = [
     path("import/imdb", views.import_imdb, name="import_imdb"),
     path("import/goodreads", views.import_goodreads, name="import_goodreads"),
     path("import/hardcover", views.import_hardcover, name="import_hardcover"),
+    path("cinemask/connect", views.cinemask_connect, name="cinemask_connect"),
+    path("cinemask/disconnect", views.cinemask_disconnect, name="cinemask_disconnect"),
+    path("cinemask/settings", views.cinemask_settings, name="cinemask_settings"),
+    path("cinemask/sync", views.cinemask_sync, name="cinemask_sync"),
+    path("cinemask/request", views.cinemask_request, name="cinemask_request"),
+    path(
+        "cinemask/request-button",
+        views.cinemask_request_button,
+        name="cinemask_request_button",
+    ),
     path("import/storygraph", views.import_storygraph, name="import_storygraph"),
     path(
         "import/youtube-takeout",
@@ -394,6 +404,11 @@ urlpatterns = [
         "webhook/seerr/global/",
         views.seerr_global_webhook,
         name="seerr_global_webhook",
+    ),
+    path(
+        "webhook/cinemask/<str:token>",
+        views.cinemask_webhook,
+        name="cinemask_webhook",
     ),
     path(
         "webhook/kodi/<str:token>",

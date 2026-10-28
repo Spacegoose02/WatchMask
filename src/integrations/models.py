@@ -2808,3 +2808,88 @@ class KodiAccount(models.Model):
     def is_connected(self):
         """Return whether the connection is usable."""
         return bool(self.base_url and not self.connection_broken)
+
+
+class CinemaskAccount(models.Model):
+    """Store Cinemask connection settings for a user."""
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="cinemask_account",
+    )
+    base_url = models.URLField(help_text="Cinemask server URL")
+    api_key = models.TextField(help_text="Encrypted Cinemask API key")
+    add_to_tracking = models.BooleanField(
+        default=True,
+        help_text="Add requested movies and shows to Watchmask as Planning",
+    )
+    allowed_usernames = models.TextField(
+        blank=True,
+        default="",
+        help_text="Comma-separated Cinemask requesters whose webhook requests are added",
+    )
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    connection_broken = models.BooleanField(default=False)
+    last_error_message = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model options."""
+
+        verbose_name = "Cinemask account"
+        verbose_name_plural = "Cinemask accounts"
+
+    def __str__(self):
+        """Readable representation."""
+        return f"CinemaskAccount({self.user.username})"
+
+
+class CinemaskRequestStatus(models.TextChoices):
+    """Request states reported by Cinemask."""
+
+    PENDING = "pending", "Requested"
+    APPROVED = "approved", "Approved"
+    DECLINED = "declined", "Declined"
+    AVAILABLE = "available", "Available"
+
+
+class CinemaskRequest(models.Model):
+    """Last-known state of a Cinemask request made by a user."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="cinemask_requests",
+    )
+    request_id = models.PositiveIntegerField()
+    media_type = models.CharField(max_length=10)
+    tmdb_id = models.CharField(max_length=32)
+    title = models.CharField(max_length=255, blank=True, default="")
+    status = models.CharField(
+        max_length=20,
+        choices=CinemaskRequestStatus.choices,
+        default=CinemaskRequestStatus.PENDING,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model options."""
+
+        verbose_name = "Cinemask request"
+        verbose_name_plural = "Cinemask requests"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "request_id"],
+                name="integrations_cinemaskrequest_unique_user_request",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "media_type", "tmdb_id"]),
+        ]
+
+    def __str__(self):
+        """Readable representation."""
+        return f"CinemaskRequest({self.user.username}, {self.request_id})"

@@ -57,6 +57,7 @@ from app.services import metadata_resolution
 from app.templatetags.app_tags import media_url
 from integrations import (
     arr_library,
+    cinemask,
     exports,
     gpodder_api,
     koito_api,
@@ -124,6 +125,8 @@ from integrations.match_corrections import (
 )
 from integrations.models import (
     AudiobookshelfAccount,
+    CinemaskAccount,
+    CinemaskRequest,
     CollectionSourceState,
     ExternalReference,
     ExternalReferenceReviewStatus,
@@ -3797,6 +3800,137 @@ def plex_cover(request, token):
     return response
 
 
+@require_POST
+def cinemask_connect(request):
+    """Connect Cinemask using its URL and a full-access API key."""
+    base_url = request.POST.get("base_url", "").strip()
+    api_key = request.POST.get("api_key", "").strip()
+
+    if not base_url or not api_key:
+        messages.error(request, "Cinemask URL and API key are required.")
+        return redirect("integrations")
+
+    try:
+        cinemask.CinemaskClient(base_url, api_key).list_requests()
+    except cinemask.CinemaskError as exc:
+        messages.error(request, f"Failed to connect to Cinemask: {exc}")
+        return redirect("integrations")
+
+    CinemaskAccount.objects.update_or_create(
+        user=request.user,
+        defaults={
+            "base_url": base_url,
+            "api_key": helpers.encrypt(api_key),
+            "connection_broken": False,
+            "last_error_message": "",
+        },
+    )
+    tasks.sync_cinemask_requests.delay(user_id=request.user.id)
+    messages.success(request, "Connected Cinemask. Syncing your requests.")
+    return redirect("integrations")
+
+
+@require_POST
+def cinemask_disconnect(request):
+    """Disconnect Cinemask and forget synced requests."""
+    CinemaskAccount.objects.filter(user=request.user).delete()
+    CinemaskRequest.objects.filter(user=request.user).delete()
+    messages.info(request, "Disconnected Cinemask.")
+    return redirect("integrations")
+
+
+@require_POST
+def cinemask_settings(request):
+    """Update Cinemask tracking options."""
+    account = getattr(request.user, "cinemask_account", None)
+    if not account:
+        messages.error(request, "Connect Cinemask first.")
+        return redirect("integrations")
+
+    account.add_to_tracking = request.POST.get("add_to_tracking") == "on"
+    account.allowed_usernames = ",".join(
+        name.strip()
+        for name in request.POST.get("allowed_usernames", "").split(",")
+        if name.strip()
+    )
+    account.save(update_fields=["add_to_tracking", "allowed_usernames"])
+    messages.success(request, "Cinemask settings saved.")
+    return redirect("integrations")
+
+
+@require_POST
+def cinemask_sync(request):
+    """Queue a refresh of the user's Cinemask requests."""
+    if not getattr(request.user, "cinemask_account", None):
+        messages.error(request, "Connect Cinemask first.")
+        return redirect("integrations")
+    tasks.sync_cinemask_requests.delay(user_id=request.user.id)
+    messages.info(request, "Cinemask sync queued.")
+    return redirect("integrations")
+
+
+def _cinemask_button(request, media_type, tmdb_id, error=None):
+    cinemask_request = (
+        CinemaskRequest.objects.filter(
+            user=request.user,
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+        )
+        .order_by("-request_id")
+        .first()
+    )
+    return render(
+        request,
+        "integrations/cinemask_request_button.html",
+        {
+            "media_type": media_type,
+            "tmdb_id": tmdb_id,
+            "cinemask_request": cinemask_request,
+            "error": error,
+        },
+    )
+
+
+def _cinemask_target(params):
+    media_type = params.get("media_type", "")
+    tmdb_id = params.get("tmdb_id", "")
+    if media_type not in cinemask.KIND_BY_MEDIA_TYPE or not tmdb_id.isdigit():
+        return None
+    return media_type, tmdb_id
+
+
+@require_GET
+def cinemask_request_button(request):
+    """Render the request button or request status for a detail page."""
+    target = _cinemask_target(request.GET)
+    if not target or not getattr(request.user, "cinemask_account", None):
+        return HttpResponse("")
+    return _cinemask_button(request, *target)
+
+
+@require_POST
+def cinemask_request(request):
+    """Send a request for a movie or show to Cinemask."""
+    target = _cinemask_target(request.POST)
+    account = getattr(request.user, "cinemask_account", None)
+    if not target or not account:
+        return HttpResponse(status=400)
+    media_type, tmdb_id = target
+
+    try:
+        row = cinemask.CinemaskClient.for_account(account).create_request(
+            media_type,
+            tmdb_id,
+        )
+    except cinemask.CinemaskError as exc:
+        return _cinemask_button(request, media_type, tmdb_id, error=str(exc))
+
+    cinemask.save_request(request.user, row)
+    if account.add_to_tracking:
+        cinemask.add_to_tracking(request.user, media_type, tmdb_id)
+    return _cinemask_button(request, media_type, tmdb_id)
+
+
 STORYTELLER_RECURRING_TASK_NAME = "Import from Storyteller (Recurring)"
 STORYTELLER_PENDING_SESSION_KEY = "storyteller_pending_auth"
 
@@ -5839,6 +5973,29 @@ def emby_webhook(request, token):
         **_webhook_request_fields(payload, "emby", user.id),
     ):
         return HttpResponse(status=503)
+    return HttpResponse(status=200)
+
+
+@login_not_required
+@csrf_exempt
+@require_POST
+def cinemask_webhook(request, token):
+    """Handle Cinemask webhook events for requests."""
+    try:
+        user = users.models.User.objects.get(token=token)
+    except ObjectDoesNotExist:
+        logger.warning("Could not process Cinemask webhook: Invalid token")
+        return HttpResponse(status=401)
+
+    try:
+        payload = json.loads(request.body)
+    except ValueError:
+        logger.warning("Invalid JSON payload in Cinemask webhook request")
+        return HttpResponse("Invalid JSON", status=400)
+    if not isinstance(payload, dict):
+        return HttpResponse("Invalid payload", status=400)
+
+    tasks.process_webhook.delay("cinemask", payload, user.id)
     return HttpResponse(status=200)
 
 

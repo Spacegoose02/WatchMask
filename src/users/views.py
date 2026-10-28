@@ -1959,6 +1959,7 @@ def integrations(request):
                 selected_plex_webhook_libraries
             ),
             "plex_webhook_shares": plex_webhook_shares,
+            "cinemask_account": getattr(user, "cinemask_account", None),
             "received_plex_webhook_shares": received_plex_webhook_shares,
             "match_review_references": match_review_references,
             "match_saved_references": match_saved_references,

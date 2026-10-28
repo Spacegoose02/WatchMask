@@ -26,6 +26,7 @@ WEBHOOK_PROCESSORS = {
     "seerr": "integrations.webhooks.seerr.SeerrWebhookProcessor",
     "kodi": "integrations.webhooks.kodi.KodiWebhookProcessor",
     "stremio": "integrations.webhooks.stremio.StremioWebhookProcessor",
+    "cinemask": "integrations.webhooks.cinemask.CinemaskWebhookProcessor",
 }
 
 # Queue wait is logged as a millisecond value plus one fixed bucket label, so

@@ -1,0 +1,32 @@
+<div id="cinemask-request" class="flex-1 sm:flex-none">
+  {% if cinemask_request %}
+    <span class="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-[#2a2f35] px-4 text-sm text-gray-100 shadow-sm sm:w-auto"
+          title="Cinemask request status">
+      {% if cinemask_request.status == "available" %}
+        {% include "app/icons/circle-check.svg" with classes="w-4 h-4 text-emerald-400" %}
+      {% elif cinemask_request.status == "declined" %}
+        {% include "app/icons/circle-x.svg" with classes="w-4 h-4 text-red-400" %}
+      {% else %}
+        {% include "app/icons/clock.svg" with classes="w-4 h-4 text-indigo-400" %}
+      {% endif %}
+      {{ cinemask_request.get_status_display }}
+    </span>
+  {% else %}
+    <form hx-post="{% url 'cinemask_request' %}"
+          hx-target="#cinemask-request"
+          hx-swap="outerHTML"
+          x-data="{ loading: false }"
+          @submit="loading = true">
+      {% csrf_token %}
+      <input type="hidden" name="media_type" value="{{ media_type }}">
+      <input type="hidden" name="tmdb_id" value="{{ tmdb_id }}">
+      <button type="submit"
+              title="{% if error %}{{ error }}{% else %}Request on Cinemask{% endif %}"
+              class="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border px-4 text-sm text-gray-100 shadow-sm transition-colors duration-200 cursor-pointer disabled:opacity-75 sm:w-auto {% if error %}border-red-500/60 bg-red-900/30 hover:bg-red-900/50{% else %}border-white/10 bg-[#2a2f35] hover:bg-[#343a40]{% endif %}"
+              :disabled="loading">
+        {% include "app/icons/download.svg" with classes="w-4 h-4" %}
+        {% if error %}Retry request{% else %}Request{% endif %}
+      </button>
+    </form>
+  {% endif %}
+</div>

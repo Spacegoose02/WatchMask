@@ -1646,6 +1646,7 @@ else:
     CELERY_IMPORTS = (
         "app.tasks_game_groups",
         "integrations.tasks._change_log",
+        "integrations.tasks._cinemask",
         "integrations.tasks._jellyfin_pull",
         "integrations.tasks._koito",
         "integrations.tasks._lastfm",
@@ -2180,6 +2181,11 @@ CELERY_BEAT_SCHEDULE = {
     "warm_history_day_cache_coverage": {
         "task": "Warm History Day Cache Coverage",
         "schedule": by_tier(60 * 60 * 12, 60 * 60 * 6, 60 * 60 * 2),
+    },
+    "sync_cinemask_requests": {
+        "task": "Sync Cinemask requests for all users",
+        "schedule": 60 * 30,  # every 30 minutes
+        "options": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     },
     "refresh_discover_profiles": {
         "task": "Refresh Discover Profiles",
