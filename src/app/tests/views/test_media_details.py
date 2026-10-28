@@ -298,7 +298,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertTemplateUsed(response, "app/components/detail_secondary_content.html")
         self.assertContains(response, '<h2 class="text-xl font-bold">Your Notes</h2>', html=False)
         self.assertContains(response, '<h2 class="text-xl font-bold">Collection</h2>', html=False)
-        self.assertContains(response, '<h2 class="text-xl font-bold">Cast</h2>', html=False)
+        self.assertContains(response, 'data-row-id="detail-cast"', html=False)
         self.assertNotContains(
             response,
             'class="flex flex-col md:flex-row gap-8 md:gap-10 mb-2 md:mb-8"',
@@ -1926,8 +1926,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "tmdb-logo.png")
         self.assertContains(response, "7.6")
         self.assertContains(response, "42,000 votes")
-        self.assertContains(response, "series-graph-trigger", html=False)
-        self.assertContains(response, "series-graph-score-chip", html=False)
+        self.assertContains(response, 'title="The Movie Database series ratings"', html=False)
         self.assertContains(
             response,
             'class="order-2 mt-0 mb-5 flex w-full items-center justify-start gap-2 sm:order-1 sm:mt-4 sm:flex-wrap"',
@@ -1935,7 +1934,7 @@ class MediaDetailsViewTests(TestCase):
         )
 
     @patch("app.providers.services.get_media_metadata")
-    def test_media_details_renders_trakt_season_graph_from_stored_season_scores(
+    def test_media_details_wires_trakt_series_graph_fragment(
         self, mock_get_metadata
     ):
         Item.objects.create(
@@ -1982,10 +1981,19 @@ class MediaDetailsViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Trakt Season Ratings")
-        self.assertContains(response, "S1")
-        self.assertContains(response, "7.3")
-        self.assertContains(response, "150 votes")
+        graph_url = reverse(
+            "trakt_series_graph_fragment",
+            kwargs={"source": Sources.TMDB.value, "media_id": "1668"},
+        )
+        self.assertContains(response, f'hx-get="{graph_url}"', html=False)
+
+        graph_response = self.client.get(graph_url)
+
+        self.assertEqual(graph_response.status_code, 200)
+        self.assertContains(graph_response, "Series Graph")
+        # The graph is built from episode ratings; season-level scores alone
+        # leave it in its empty state.
+        self.assertContains(graph_response, "Visit a season page to start building.")
 
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_renders_source_score_chip_with_mal_logo(self, mock_get_metadata):
@@ -2244,7 +2252,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "3h 10min watched")
         self.assertContains(
             response,
-            'class="order-2 mt-0 mb-5 flex w-full items-center justify-between gap-0.5 sm:order-1 sm:mt-4 sm:flex-wrap sm:justify-start sm:gap-2"',
+            'class="order-2 mt-0 mb-5 flex w-full items-center justify-start gap-2 sm:order-1 sm:mt-4 sm:flex-wrap"',
             html=False,
         )
         self.assertContains(
@@ -4766,14 +4774,6 @@ class MediaDetailsViewTests(TestCase):
             ProviderMetadataStatus.LOCAL_ONLY_MISSING_SEASON.value,
         )
         self.assertTrue(response.context["season_provider_metadata_is_local_only"])
-        self.assertContains(
-            response,
-            (
-                "Season metadata is missing from the provider. "
-                "This page is built from local activity and the linked "
-                "show may be mismatched."
-            ),
-        )
         self.assertContains(response, "Auditions: Europe (1)")
         self.assertIn(
             16,
@@ -4785,6 +4785,27 @@ class MediaDetailsViewTests(TestCase):
         mock_get_tmdb_backdrop_image.assert_not_called()
         mock_get_tvdb_episode_image_map.assert_not_called()
         mock_refresh_trakt_popularity.assert_not_called()
+
+        # The local-only banner renders in the page shell, not the deferred section
+        shell_response = self.client.get(
+            reverse(
+                "season_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "1668",
+                    "title": "test-tv-show",
+                    "season_number": 16,
+                },
+            ),
+        )
+        self.assertContains(
+            shell_response,
+            (
+                "Season metadata is missing from the provider. "
+                "This page is built from local activity and the linked "
+                "show may be mismatched."
+            ),
+        )
 
     @patch("app.views.trakt_popularity_service.refresh_trakt_popularity")
     @patch("app.providers.tmdb.get_tvdb_episode_image_map")
@@ -4860,15 +4881,32 @@ class MediaDetailsViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(
-            response,
-            "Season metadata is missing from the provider. This page is built from local activity and the linked show may be mismatched.",
-        )
         self.assertContains(response, "Auditions: Europe (1)")
         mock_get_metadata.assert_not_called()
         mock_get_tmdb_backdrop_image.assert_not_called()
         mock_get_tvdb_episode_image_map.assert_not_called()
         mock_refresh_trakt_popularity.assert_not_called()
+
+        # The local-only banner renders in the page shell, not the deferred section
+        shell_response = self.client.get(
+            reverse(
+                "season_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "1668",
+                    "title": "test-tv-show",
+                    "season_number": 16,
+                },
+            ),
+        )
+        self.assertContains(
+            shell_response,
+            (
+                "Season metadata is missing from the provider. "
+                "This page is built from local activity and the linked "
+                "show may be mismatched."
+            ),
+        )
 
     @patch("app.providers.services.get_media_metadata")
     @patch("app.providers.tmdb.process_episodes")
@@ -7341,8 +7379,21 @@ class MediaDetailsViewTests(TestCase):
         self.assertEqual(detail_response.context["media"]["details"]["total_runtime"], "2h 37min")
         self.assertEqual(detail_response.context["play_stats"]["total_minutes"], 110)
         self.assertContains(detail_response, "1h 50min watched")
-        self.assertContains(detail_response, "TOTAL RUNTIME")
-        self.assertContains(detail_response, "2h 37min")
+        # The details panel with the total runtime renders in the deferred section
+        secondary_response = self.client.get(
+            reverse(
+                "media_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.TV.value,
+                    "media_id": "fallout-runtime-shared",
+                    "title": "shared-runtime-show",
+                },
+            ),
+            {"fragment": "secondary"},
+        )
+        self.assertContains(secondary_response, "RUNTIME (1 SEASON)")
+        self.assertContains(secondary_response, "2h 37min")
         self.assertNotContains(detail_response, "FIRST PLAYED")
         self.assertNotContains(detail_response, "LAST PLAYED")
         self.assertNotContains(detail_response, "WATCHED HOURS")
