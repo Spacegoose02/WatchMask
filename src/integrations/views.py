@@ -2156,6 +2156,15 @@ def bingebandit_webhook(request, token):
         )
         return HttpResponse(status=401)
 
+    # BingeBandit's "Plex-style" format posts a multipart form, which this
+    # endpoint can't read. Say so, since BingeBandit shows the reply.
+    if request.content_type == "multipart/form-data":
+        logger.warning("BingeBandit webhook sent in Plex-style format")
+        return HttpResponse(
+            "Plex-style format: set this webhook's Format to BingeBandit JSON",
+            status=400,
+        )
+
     data = request.body
     if not data:
         logger.warning("Missing payload in BingeBandit webhook request")
