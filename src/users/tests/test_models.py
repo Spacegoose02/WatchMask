@@ -282,9 +282,12 @@ class UserGetImportTasksTests(TestCase):
             month_of_year="*",
         )
 
+    @patch("users.models.AsyncResult")
     @patch("users.helpers.process_task_result")
-    def test_get_import_tasks_results(self, mock_process_task_result):
+    def test_get_import_tasks_results(self, mock_process_task_result, mock_async_result):
         """Test get_import_tasks returns correct task results."""
+        # Failed rows without a traceback ask the result backend for one
+        mock_async_result.return_value.traceback = None
         # Create mock processed task
         mock_task = MagicMock()
         mock_task.summary = "Imported 10 items"
@@ -671,6 +674,8 @@ class UserGetImportTasksTests(TestCase):
         backend_result = MagicMock()
         backend_result.status = "SUCCESS"
         backend_result.result = "Imported 3 movies."
+        backend_result.traceback = None
+        backend_result.date_done = None
         mock_async_result.return_value = backend_result
 
         task_result = TaskResult.objects.create(

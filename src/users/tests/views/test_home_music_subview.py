@@ -1,6 +1,7 @@
 """Smoke tests for music subview Home rows (albums/artists/tracks)."""
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TestCase
 
 from app.models import MediaTypes, Status
@@ -15,6 +16,8 @@ from users.models import (
 
 class MusicSubviewHomeTests(TestCase):
     def setUp(self):
+        # Row sections are cached by user and row id, which repeat across tests
+        cache.clear()
         self.user = get_user_model().objects.create_user(
             username="musicfan", password="pw",
         )

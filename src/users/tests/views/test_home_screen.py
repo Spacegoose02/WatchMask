@@ -329,8 +329,10 @@ class HomeScreenViewTests(TestCase):
             [entry.item.title for entry in groups[0]["rows"][0]["items"]],
             ["Home Active Season 1"],
         )
+        # The row hides it by derived status; the stored status is left alone
+        # because seasons marked In progress are never auto-promoted
         stale_season.refresh_from_db()
-        self.assertEqual(stale_season.status, Status.COMPLETED.value)
+        self.assertEqual(stale_season.status, Status.IN_PROGRESS.value)
 
     def test_library_row_status_all_includes_collected_untracked_items(self):
         self._set_enabled_media_types(MediaTypes.MOVIE.value)
