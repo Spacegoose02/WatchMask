@@ -43,7 +43,8 @@ class HomeScreenViewTests(TestCase):
         enabled_set = set(enabled_media_types)
         update_fields = []
         for media_type in MediaTypes.values:
-            if media_type == MediaTypes.EPISODE.value:
+            # Episodes and comic issues have no toggle of their own
+            if media_type in (MediaTypes.EPISODE.value, MediaTypes.COMIC_ISSUE.value):
                 continue
             field_name = f"{media_type}_enabled"
             setattr(self.user, field_name, media_type in enabled_set)
@@ -59,7 +60,11 @@ class HomeScreenViewTests(TestCase):
         self.assertTemplateUsed(response, "users/home_screen.html")
 
         sections = json.loads(response.context["home_screen_sections_json"])
-        self.assertEqual([section["media_type"] for section in sections], ["tv", "movie"])
+        # Season rows are always configurable on Home, whatever the sidebar settings
+        self.assertEqual(
+            [section["media_type"] for section in sections],
+            ["tv", "movie", "season"],
+        )
         self.assertContains(response, "Home Screen")
         self.assertContains(response, "sections: JSON.parse(")
         self.assertContains(response, "directionChoices: JSON.parse(")

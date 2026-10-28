@@ -134,7 +134,7 @@ class MediaDetailsViewTests(TestCase):
 
     @patch("integrations.tasks.fetch_collection_metadata_for_item.delay")
     @patch("app.views.helpers.enrich_items_with_user_data")
-    @patch("app.views.run_retryable_db_operation")
+    @patch("app.media_details_views.run_retryable_db_operation")
     @patch("app.views.metadata_utils.apply_item_metadata", return_value=[])
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_shell_defers_secondary_content(
@@ -1360,7 +1360,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertEqual(source_entry["chip_classes"], "border-indigo-400/18 bg-indigo-500/[0.07]")
         self.assertEqual(source_entry["logo_src"], "/static/img/myanimelist-logo.svg")
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_uses_igdb_and_hltb_logos_in_link_sections(
         self,
@@ -2019,7 +2019,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "8.9")
         self.assertContains(response, "123,456 votes")
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_media_details_renders_source_score_chip_with_igdb_logo(
         self,
@@ -4077,7 +4077,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertNotContains(response, "How Long to Beat")
         self.assertNotIn("HowLongToBeat", response.context["media"]["external_links"])
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_game_media_details_renders_igdb_fallback_and_queues_hltb_refresh(
         self,
@@ -4146,7 +4146,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertContains(response, "13 submissions")
         mock_queue_game_lengths_refresh.assert_called_once()
 
-    @patch("app.views._queue_game_lengths_refresh", return_value=True)
+    @patch("app.media_details_views._queue_game_lengths_refresh", return_value=True)
     @patch("app.providers.services.get_media_metadata")
     def test_game_media_details_queues_background_fetch_when_missing_game_lengths(
         self,
@@ -4198,7 +4198,7 @@ class MediaDetailsViewTests(TestCase):
         mock_queue_game_lengths_refresh.assert_called_once()
 
     @patch("app.providers.services.get_media_metadata")
-    @patch("app.views._queue_game_lengths_refresh")
+    @patch("app.media_details_views._queue_game_lengths_refresh")
     def test_game_media_details_shows_pending_when_refresh_lock_exists(
         self,
         mock_queue_game_lengths_refresh,
@@ -4493,7 +4493,7 @@ class MediaDetailsViewTests(TestCase):
         self.assertTrue(response.context["detail_persistence_deferred"])
         _mock_sleep.assert_not_called()
 
-    @patch("app.views._queue_game_lengths_refresh", side_effect=RuntimeError("queue unavailable"))
+    @patch("app.media_details_views._queue_game_lengths_refresh", side_effect=RuntimeError("queue unavailable"))
     @patch("app.providers.services.get_media_metadata")
     def test_game_media_details_renders_when_refresh_enqueue_raises(
         self,
@@ -5648,7 +5648,7 @@ class MediaDetailsViewTests(TestCase):
             lookup_policy="cached_only",
         )
 
-    @patch("app.views._should_queue_game_lengths_refresh", return_value=False)
+    @patch("app.media_details_views._should_queue_game_lengths_refresh", return_value=False)
     @patch("app.providers.services.get_media_metadata")
     def test_game_details_backfills_studio_credits_and_renders_links(
         self,
@@ -7512,7 +7512,7 @@ class AnimeNextEpisodeRedirectTests(TestCase):
             },
         )
 
-    @patch("app.views._build_flat_anime_episode_preview")
+    @patch("app.media_details_views._build_flat_anime_episode_preview")
     @patch("app.views.services.get_media_metadata")
     def test_redirects_to_mapped_next_episode(self, mock_metadata, mock_preview):
         mock_metadata.return_value = {"title": "Witch Hat Atelier", "details": {}}
@@ -7544,7 +7544,7 @@ class AnimeNextEpisodeRedirectTests(TestCase):
             fetch_redirect_response=False,
         )
 
-    @patch("app.views._build_flat_anime_episode_preview")
+    @patch("app.media_details_views._build_flat_anime_episode_preview")
     @patch("app.views.services.get_media_metadata")
     def test_falls_back_to_detail_page_without_mapping(self, mock_metadata, mock_preview):
         mock_metadata.return_value = {"title": "Witch Hat Atelier", "details": {}}

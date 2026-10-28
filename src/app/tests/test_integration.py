@@ -284,7 +284,7 @@ class IntegrationTest(StaticLiveServerTestCase):
         expect(self.page.locator("[data-track-modal-root]:visible")).to_have_count(0)
 
     @patch("app.models.Item.fetch_releases")
-    @patch("app.views._should_queue_game_lengths_refresh", return_value=False)
+    @patch("app.media_details_views._should_queue_game_lengths_refresh", return_value=False)
     @patch("app.providers.services.get_media_metadata")
     def test_game_progress_live_updates_start_date(
         self,
