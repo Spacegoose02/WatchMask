@@ -4,6 +4,37 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
+## v26.10.29
+
+### New
+
+- **BingeBandit import card**: connect a BingeBandit server from the Import
+  page with an API key, pick a library, and import finished movie and episode
+  plays from its history export. Imports can be scheduled like Plex's. The
+  usernames saved on the card also filter the webhook, alongside `?users=`.
+- The BingeBandit webhook now says what's wrong when it receives the
+  Plex-style format, instead of a bare 400: set the webhook's Format to
+  BingeBandit JSON.
+
+### Fixes
+
+- Completing a show or season no longer crashes when the provider payload is
+  missing seasons, episodes or progress, and a provider error (an ID TMDB no
+  longer knows, or an outage) during an import or webhook keeps the saved
+  record instead of failing.
+- The TV details page no longer crashes on TMDB responses without a score.
+- Bulk play dates keep the chosen time of day, air-date bulk saves skip
+  episodes without an air date, and music plays spread evenly when release
+  dates are missing.
+- The music origin filter shows country names again.
+- Lint now passes in CI, and many outdated tests were brought up to date with
+  the current code.
+
+### Upgrade notes
+
+- Runs one new database migration (`integrations.0017_bingebanditaccount`) on
+  start.
+
 ## v26.10.28 — First Watchmask release
 
 ### Rebrand
