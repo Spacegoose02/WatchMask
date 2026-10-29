@@ -12,6 +12,7 @@ from app.mixins import disable_fetch_releases
 from integrations.imports import (
     anilist,
     audiobookshelf,
+    bingebandit,
     goodreads,
     gpodder,
     hardcover,
@@ -213,6 +214,12 @@ def import_hardcover(file, user_id, mode):
 def import_plex(library, user_id, mode, username=None):  # noqa: ARG001
     """Celery task for importing media data from Plex."""
     return import_media(plex.importer, library, user_id, mode)
+
+
+@shared_task(name="Import from BingeBandit")
+def import_bingebandit(library, user_id, mode, username=None):  # noqa: ARG001
+    """Celery task for importing watch history from BingeBandit."""
+    return import_media(bingebandit.importer, library, user_id, mode)
 
 
 @shared_task(name="Import from Radarr")

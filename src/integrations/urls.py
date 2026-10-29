@@ -24,6 +24,14 @@ urlpatterns = [
         name="plex_disable_watchlist",
     ),
     path("import/plex", views.import_plex, name="import_plex"),
+    path("import/bingebandit/connect", views.bingebandit_connect, name="bingebandit_connect"),
+    path(
+        "import/bingebandit/disconnect",
+        views.bingebandit_disconnect,
+        name="bingebandit_disconnect",
+    ),
+    path("import/bingebandit/status", views.bingebandit_status, name="bingebandit_status"),
+    path("import/bingebandit", views.import_bingebandit, name="import_bingebandit"),
     path("import/simkl-oauth", views.simkl_oauth, name="simkl_oauth"),
     path(
         "import/simkl_private",

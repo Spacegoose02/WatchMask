@@ -162,6 +162,7 @@ def _get_import_data_user(user):
     return user._meta.model.objects.select_related(
         "plex_account",
         "audiobookshelf_account",
+        "bingebandit_account",
         "pocketcasts_account",
         "lastfm_account",
         "radarr_account",
@@ -1028,6 +1029,7 @@ def import_data(request):
         "plex_sections": plex_sections,
         "plex_sections_json": json.dumps(plex_sections),
         "audiobookshelf_account": audiobookshelf_account,
+        "bingebandit_account": getattr(user, "bingebandit_account", None),
         "storyteller_account": storyteller_account,
         "storyteller_pending": storyteller_pending,
         "pocketcasts_account": pocketcasts_account,

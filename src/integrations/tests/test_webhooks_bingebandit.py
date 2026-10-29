@@ -6,6 +6,7 @@ from django.test import Client, TestCase
 from django.urls import reverse
 
 from app.models import MediaTypes, Movie, Status
+from integrations.models import BingeBanditAccount
 
 MOVIE_DATA = {
     "user": "alice",
@@ -110,6 +111,22 @@ class BingeBanditWebhookViewTests(TestCase):
         url = f"{self.url}?users=bob,%20ALICE"
         response = self._post(_event("playback.start", MOVIE_DATA), url)
         self.assertEqual(response.status_code, 200)
+        mock_delay.assert_called_once()
+
+    @patch("integrations.tasks.process_webhook.delay")
+    def test_saved_usernames_filter_events(self, mock_delay):
+        account = BingeBanditAccount.objects.create(
+            user=self.user,
+            base_url="http://bb.local",
+            api_key="x",
+            webhook_usernames="bob",
+        )
+        self._post(_event("playback.start", MOVIE_DATA))
+        mock_delay.assert_not_called()
+
+        account.webhook_usernames = "bob, Alice"
+        account.save()
+        self._post(_event("playback.start", MOVIE_DATA))
         mock_delay.assert_called_once()
 
 

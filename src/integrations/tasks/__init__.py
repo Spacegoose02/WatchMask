@@ -32,6 +32,7 @@ from integrations.tasks._media_imports import (
     import_anilist,
     import_audiobookshelf,
     import_audiobookshelf_recurring,
+    import_bingebandit,
     import_goodreads,
     import_goodreads_dotted,
     import_goodreads_legacy,
