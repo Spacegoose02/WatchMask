@@ -542,6 +542,50 @@ class StorytellerAccount(models.Model):
         return bool(self.server_url and self.auth_token) and not self.connection_broken
 
 
+class BingeBanditAccount(models.Model):
+    """Store a user's BingeBandit server and API key."""
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="bingebandit_account",
+    )
+    base_url = models.URLField(help_text="BingeBandit server URL")
+    api_key = models.TextField(help_text="Encrypted BingeBandit API key")
+    username = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="BingeBandit username the API key belongs to",
+    )
+    webhook_usernames = models.TextField(
+        blank=True,
+        default="",
+        help_text="Comma-separated BingeBandit usernames whose webhook events are tracked",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model options."""
+
+        verbose_name = "BingeBandit account"
+        verbose_name_plural = "BingeBandit accounts"
+
+    def __str__(self):
+        """Readable representation."""
+        return f"BingeBanditAccount({self.username})"
+
+    @property
+    def webhook_username_set(self):
+        """Lower-cased usernames to accept webhook events from."""
+        return {
+            name.strip().lower()
+            for name in self.webhook_usernames.split(",")
+            if name.strip()
+        }
+
+
 class TraktAccount(models.Model):
     """Store Trakt API client credentials for a user."""
 

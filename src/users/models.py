@@ -1458,6 +1458,7 @@ class User(AbstractUser):
                 "integrations.tasks.import_goodreads",
             ],
             "plex": ["Import from Plex", "Sync Plex Watchlist"],
+            "bingebandit": ["Import from BingeBandit"],
             "radarr": ["Import from Radarr", "Import from Radarr (Recurring)"],
             "sonarr": ["Import from Sonarr", "Import from Sonarr (Recurring)"],
             "audiobookshelf": ["Import from Audiobookshelf", "Import from Audiobookshelf (Recurring)"],

@@ -61,6 +61,10 @@ SOURCES_CONFIG = {
         "name": "Plex",
         "logo": static("img/plex-logo.svg"),
     },
+    "bingebandit": {
+        "name": "BingeBandit",
+        "logo": static("img/bingebandit-logo.png"),
+    },
     "audiobookshelf": {
         "name": "Audiobookshelf",
         "logo": static("img/audiobookshelf-logo.svg"),

@@ -575,7 +575,7 @@
           </li>
           <li>Leave the format on the default (JSON), not <em>Plex-style</em>.</li>
           <li>Enable the events <strong>playback.start</strong> and <strong>playback.finished</strong> for tracking, and <strong>player.play</strong>, <strong>player.pause</strong>, <strong>player.resume</strong> and <strong>player.stop</strong> for the Now Playing card.</li>
-          <li>BingeBandit sends every user's plays to the webhook. To track only your own, add <code>?users=yourname</code> to the URL (separate several names with commas).</li>
+          <li>BingeBandit sends every user's plays to the webhook. To track only your own, connect BingeBandit on the <a href="{% url 'import_data' %}" class="text-indigo-400 hover:text-indigo-300 underline">Import page</a> and list your username(s) there, or add <code>?users=yourname</code> to the URL (separate several names with commas).</li>
           <li>Items are marked in progress after 30 seconds of play and watched when BingeBandit marks them watched.</li>
         </ol>
       </div>

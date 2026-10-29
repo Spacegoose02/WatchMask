@@ -443,6 +443,117 @@
         </div>
 
 
+        {# BingeBandit #}
+        <div class="bg-[#39404b] p-4 rounded-lg space-y-3"
+             x-show="sourceSupports(['screen'])"
+             x-transition.opacity.duration.150ms
+             {% if bingebandit_account %}
+             x-data="{
+               bbState: 'checking',
+               bbLibraries: [],
+               bbError: '',
+               async init() {
+                 try {
+                   const response = await fetch('{% url "bingebandit_status" %}', {headers: {'Accept': 'application/json'}});
+                   const data = await response.json();
+                   this.bbState = data.state || 'error';
+                   this.bbLibraries = data.libraries || [];
+                   this.bbError = data.error || '';
+                 } catch (error) {
+                   this.bbState = 'error';
+                   this.bbError = error.message || 'Could not reach BingeBandit.';
+                 }
+               },
+               bbBadgeClasses() {
+                 if (this.bbState === 'connected') return 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30';
+                 if (this.bbState === 'error') return 'bg-amber-500/10 text-amber-200 border-amber-400/30';
+                 return 'bg-gray-500/20 text-gray-300 border-gray-600/50';
+               },
+               bbBadgeLabel() {
+                 return {connected: 'Connected', error: 'Error'}[this.bbState] || 'Checking...';
+               }
+             }"
+             {% endif %}>
+          <div class="flex items-center justify-between">
+            <div class="flex items-center">{% source_display "bingebandit" %}</div>
+            {% if bingebandit_account %}
+              <div class="flex items-center gap-2">
+                <span class="px-2 py-1 text-xs rounded border"
+                      :class="bbBadgeClasses()"
+                      x-text="bbBadgeLabel()"></span>
+                <form method="post" action="{% url 'bingebandit_disconnect' %}">
+                  {% csrf_token %}
+                  <button type="submit"
+                          class="px-2 py-1 text-xs rounded bg-slate-500/10 text-slate-200 border border-slate-400/30 hover:bg-slate-500/20 transition-colors cursor-pointer">
+                    Disconnect
+                  </button>
+                </form>
+              </div>
+            {% else %}
+              <span class="px-2 py-1 text-xs rounded bg-gray-500/20 text-gray-300 border border-gray-600/50">Disconnected</span>
+            {% endif %}
+          </div>
+          {% if bingebandit_account %}
+            <p class="text-sm text-gray-400">
+              Import BingeBandit watch history. Comma-separate username(s) to filter events sent to your webhook.
+            </p>
+            <div x-cloak
+                 x-show="bbError"
+                 class="text-xs text-amber-200 bg-amber-500/10 border border-amber-400/30 rounded p-2"
+                 x-text="bbError"></div>
+
+            <form method="post" action="{% url 'import_bingebandit' %}" class="space-y-3">
+              {% csrf_token %}
+              <input type="hidden" name="frequency" x-model="importFrequency">
+              <input type="hidden" name="time" x-model="importTime">
+              <input type="hidden" name="mode" x-model="importMode">
+
+              <div>
+                <label class="block text-sm text-gray-300 mb-2">Library</label>
+                <div class="relative">
+                  <select name="library"
+                          class="w-full py-2 px-3 bg-[#2a2f35] rounded-md text-white text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50 appearance-none">
+                    <option value="all">All libraries</option>
+                    <template x-for="library in bbLibraries" :key="library.id">
+                      <option :value="library.id" x-text="library.name"></option>
+                    </template>
+                  </select>
+                  {% include "app/icons/chevron-down.svg" with classes="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" %}
+                </div>
+              </div>
+
+              <div class="flex w-full">
+                <input name="bingebandit_usernames"
+                       value="{{ bingebandit_account.webhook_usernames }}"
+                       placeholder="username 1, username 2"
+                       class="relative w-full py-2 px-3 bg-[#2a2f35] rounded-l-md text-white text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                       type="text">
+                <button type="submit"
+                        class="px-4 py-2 rounded-r-md transition-colors text-sm border cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed bg-indigo-600 text-white border-indigo-600 hover:bg-indigo-700"
+                        style="min-width: 10rem; white-space: nowrap; flex-shrink: 0;"
+                        :disabled="standardImportsDisabled() || bbState === 'error'">
+                  Import
+                </button>
+              </div>
+            </form>
+          {% else %}
+            <p class="text-sm text-gray-400">Import watch history from your BingeBandit server.</p>
+            <form method="post" action="{% url 'bingebandit_connect' %}" class="space-y-3">
+              {% csrf_token %}
+              <input type="url" name="base_url" required
+                     class="w-full py-2 px-3 bg-[#2a2f35] rounded-md text-white text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                     placeholder="Server URL, e.g. http://192.168.1.10:8484">
+              <input type="password" name="api_key" required
+                     class="w-full py-2 px-3 bg-[#2a2f35] rounded-md text-white text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                     placeholder="API key (Account → API keys in BingeBandit)">
+              <button type="submit"
+                      class="w-full px-4 py-2 text-sm rounded-md transition-colors cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700">
+                Connect BingeBandit
+              </button>
+            </form>
+          {% endif %}
+        </div>
+
         {# Radarr #}
         <div class="bg-[#39404b] p-4 rounded-lg space-y-3"
              x-show="sourceSupports(['screen'])"

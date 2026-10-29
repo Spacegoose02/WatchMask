@@ -22,6 +22,7 @@ from django.views.decorators.http import require_GET, require_POST
 import users
 from app import helpers as app_helpers
 from app.log_safety import exception_summary
+from integrations import bingebandit as bingebandit_api
 from integrations import (
     cinemask,
     exports,
@@ -50,6 +51,7 @@ from integrations.lastfm_api import (
 )
 from integrations.models import (
     AudiobookshelfAccount,
+    BingeBanditAccount,
     CinemaskAccount,
     CinemaskRequest,
     GPodderAccount,
@@ -74,6 +76,7 @@ ARR_SYNC_INTERVAL_HOURS = 2
 RADARR_RECURRING_TASK_NAME = "Import from Radarr (Recurring)"
 SONARR_RECURRING_TASK_NAME = "Import from Sonarr (Recurring)"
 GPODDER_RECURRING_TASK_NAME = "Import from GPodder (Recurring)"
+BINGEBANDIT_IMPORT_TASK_NAME = "Import from BingeBandit"
 
 
 def _read_uploaded_file(file):
@@ -601,6 +604,120 @@ def plex_disable_watchlist(request):
         plex_account.save(update_fields=["watchlist_sync_enabled"])
 
     messages.info(request, "Disabled Plex watchlist sync.")
+    return redirect("import_data")
+
+
+def _clean_usernames(raw_usernames):
+    """De-duplicate a comma-separated username list, keeping the first spelling."""
+    seen = set()
+    names = [name.strip() for name in raw_usernames.split(",") if name.strip()]
+    return ", ".join(
+        name for name in names if not (name.lower() in seen or seen.add(name.lower()))
+    )
+
+
+def _bingebandit_client(account):
+    return bingebandit_api.BingeBanditClient(
+        account.base_url,
+        helpers.decrypt(account.api_key),
+    )
+
+
+@require_POST
+def bingebandit_connect(request):
+    """Connect a BingeBandit server with an API key."""
+    base_url = request.POST.get("base_url", "").strip()
+    api_key = request.POST.get("api_key", "").strip()
+    if not base_url or not api_key:
+        messages.error(request, "BingeBandit server URL and API key are required.")
+        return redirect("import_data")
+
+    try:
+        me = bingebandit_api.BingeBanditClient(base_url, api_key).get_me()
+    except bingebandit_api.BingeBanditError as exc:
+        messages.error(request, str(exc))
+        return redirect("import_data")
+
+    username = str(me.get("username") or "")
+    account, created = BingeBanditAccount.objects.update_or_create(
+        user=request.user,
+        defaults={
+            "base_url": base_url.rstrip("/"),
+            "api_key": helpers.encrypt(api_key),
+            "username": username,
+        },
+    )
+    # Start the webhook filter on the connected user so other members'
+    # plays on the same server aren't tracked.
+    if created and username:
+        account.webhook_usernames = username
+        account.save(update_fields=["webhook_usernames"])
+
+    messages.success(request, f"Connected BingeBandit as {username or 'your account'}.")
+    return redirect("import_data")
+
+
+@require_POST
+def bingebandit_disconnect(request):
+    """Disconnect BingeBandit and remove its scheduled imports."""
+    from django_celery_beat.models import PeriodicTask
+
+    PeriodicTask.objects.filter(
+        _periodic_task_filter_for_user(request.user.id),
+        task=BINGEBANDIT_IMPORT_TASK_NAME,
+    ).delete()
+    BingeBanditAccount.objects.filter(user=request.user).delete()
+    messages.info(request, "Disconnected BingeBandit.")
+    return redirect("import_data")
+
+
+@require_GET
+def bingebandit_status(request):
+    """Check the stored BingeBandit key and list its libraries."""
+    account = getattr(request.user, "bingebandit_account", None)
+    if not account:
+        return JsonResponse({"state": "disconnected", "libraries": [], "error": ""})
+    try:
+        libraries = _bingebandit_client(account).get_libraries()
+    except bingebandit_api.BingeBanditError as exc:
+        return JsonResponse({"state": "error", "libraries": [], "error": str(exc)})
+    return JsonResponse({"state": "connected", "libraries": libraries, "error": ""})
+
+
+@require_POST
+def import_bingebandit(request):
+    """Save the webhook username filter and queue a BingeBandit history import."""
+    account = getattr(request.user, "bingebandit_account", None)
+    if not account:
+        messages.error(request, "Connect BingeBandit before importing.")
+        return redirect("import_data")
+
+    usernames = _clean_usernames(request.POST.get("bingebandit_usernames", ""))
+    if usernames != account.webhook_usernames:
+        account.webhook_usernames = usernames
+        account.save(update_fields=["webhook_usernames"])
+
+    library = request.POST.get("library") or "all"
+    mode = request.POST.get("mode", "new")
+    frequency = request.POST.get("frequency", "once")
+    if mode not in ("new", "overwrite"):
+        messages.error(request, "BingeBandit only supports the new and overwrite import modes.")
+        return redirect("import_data")
+
+    if frequency != "once":
+        helpers.create_import_schedule(
+            username=account.username or request.user.username,
+            request=request,
+            mode=mode,
+            frequency=frequency,
+            import_time=request.POST.get("time", "00:00"),
+            source="BingeBandit",
+            extra_kwargs={"library": library},
+        )
+        return redirect("import_data")
+
+    tasks.import_bingebandit.delay(library=library, user_id=request.user.id, mode=mode)
+    messages.info(request, "The task to import watch history from BingeBandit has been queued.")
     return redirect("import_data")
 
 
@@ -2187,11 +2304,15 @@ def bingebandit_webhook(request, token):
 
     # One BingeBandit server sends every member's plays to each webhook, so
     # ?users=alice,bob on the URL limits tracking to those BingeBandit users.
+    # The usernames saved on the Import page's BingeBandit card do the same.
     allowed_users = {
         name.strip().lower()
         for name in request.GET.get("users", "").split(",")
         if name.strip()
     }
+    account = BingeBanditAccount.objects.filter(user=user).first()
+    if account:
+        allowed_users |= account.webhook_username_set
     event_user = str((payload.get("data") or {}).get("user") or "").strip().lower()
     if allowed_users and event_user not in allowed_users:
         logger.debug("Ignoring BingeBandit webhook for an unlisted user")
