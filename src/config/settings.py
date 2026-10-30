@@ -276,7 +276,14 @@ USING_SQLITE_DATABASE = not bool(DB_HOST)
 if DB_HOST:
     DB_POOL_ENABLED = config("DB_POOL_ENABLED", default=True, cast=bool)
     DB_POOL_MIN = config("DB_POOL_MIN", default=1, cast=int)
-    DB_POOL_MAX = config("DB_POOL_MAX", default=2, cast=int)
+    # Each gunicorn worker serves GUNICORN_THREADS requests at once, so give it
+    # at least one connection per thread (plus one spare) or requests queue for
+    # a free connection.
+    DB_POOL_MAX = config(
+        "DB_POOL_MAX",
+        default=int(os.environ.get("GUNICORN_THREADS", "4")) + 1,
+        cast=int,
+    )
     DB_POOL_TIMEOUT = config("DB_POOL_TIMEOUT", default=30, cast=int)
     db_options = {}
     if DB_POOL_ENABLED:

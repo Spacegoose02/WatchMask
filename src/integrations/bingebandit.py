@@ -27,13 +27,13 @@ class BingeBanditClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, timeout=30):
         try:
             response = requests.get(
                 f"{self.base_url}/api{path}",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 params=params,
-                timeout=30,
+                timeout=timeout,
             )
         except requests.RequestException as exc:
             msg = f"Could not reach BingeBandit: {exc}"
@@ -50,11 +50,11 @@ class BingeBanditClient:
         """Return the user the API key belongs to."""
         return self._get("/me").json()
 
-    def get_libraries(self):
+    def get_libraries(self, timeout=30):
         """Return the libraries the user can see as [{id, name, kind}]."""
         return [
             {"id": lib["id"], "name": lib.get("name", ""), "kind": lib.get("kind", "")}
-            for lib in self._get("/libraries").json()
+            for lib in self._get("/libraries", timeout=timeout).json()
         ]
 
     def get_library_tmdb_ids(self, library_id):

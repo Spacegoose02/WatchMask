@@ -26,14 +26,14 @@ self.addEventListener("fetch", (event) => {
   const isSameOrigin = url.origin === self.location.origin;
   const isHtmxRequest = request.headers.get("HX-Request") === "true";
 
-  // Keep app routes and HTMX requests on network to avoid stale dynamic HTML.
+  // Leave app routes and HTMX requests to the browser so they skip the worker
+  // entirely and never return stale dynamic HTML.
   if (
     request.method !== "GET" ||
     !isSameOrigin ||
     isHtmxRequest ||
     !url.pathname.startsWith("/static/")
   ) {
-    event.respondWith(fetch(request));
     return;
   }
 

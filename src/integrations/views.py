@@ -678,7 +678,9 @@ def bingebandit_status(request):
     if not account:
         return JsonResponse({"state": "disconnected", "libraries": [], "error": ""})
     try:
-        libraries = _bingebandit_client(account).get_libraries()
+        # Rendered live on the Import page, so fail fast instead of holding a
+        # web thread for the full default timeout when BingeBandit is down.
+        libraries = _bingebandit_client(account).get_libraries(timeout=5)
     except bingebandit_api.BingeBanditError as exc:
         return JsonResponse({"state": "error", "libraries": [], "error": str(exc)})
     return JsonResponse({"state": "connected", "libraries": libraries, "error": ""})

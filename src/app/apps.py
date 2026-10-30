@@ -9,6 +9,9 @@ from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
+# Give the web UI time to settle after a restart before heavy IMDB work starts.
+IMDB_PROFILE_BACKFILL_STARTUP_DELAY_SECONDS = 600
+
 
 def _is_celery_worker_process() -> bool:
     """Return whether the current process is a Celery worker or beat.
@@ -81,7 +84,10 @@ class AppConfig(AppConfig):
             self._schedule_history_day_coverage_warmup()
 
         if not settings.TESTING and not is_celery_worker and not is_runserver_parent:
-            self._schedule_imdb_game_person_profile_backfill()
+            # The IMDB refresh streams several large dataset dumps, so run it at
+            # most once a day rather than on every container restart.
+            if self._add_startup_cache_key("imdb_profile_backfill_startup_scheduled"):
+                self._schedule_imdb_game_person_profile_backfill()
             self._schedule_genre_backfill_reconcile()
             self._schedule_trakt_popularity_reconcile()
             self._schedule_igdb_rating_backfill_reconcile()
@@ -169,7 +175,7 @@ class AppConfig(AppConfig):
             # dedicated profile-backfill task so older shared workers on the
             # same broker can still execute the repair path.
             tasks_imdb.refresh_imdb_game_credits_from_datasets.apply_async(
-                countdown=0,
+                countdown=IMDB_PROFILE_BACKFILL_STARTUP_DELAY_SECONDS,
                 priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
             )
             logger.info(
