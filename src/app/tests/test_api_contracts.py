@@ -717,6 +717,20 @@ class OpenAPIArtifactTests(SimpleTestCase):
                 "validateListenBrainzToken",
                 {"200", "401"},
             ),
+            *(
+                (
+                    f"/apis/listenbrainz/1/stats/user/{{username}}/{entity}/",
+                    "get",
+                    operation_id,
+                    {"200", "400", "401", "404"},
+                )
+                for entity, operation_id in (
+                    ("artists", "getListenBrainzUserArtists"),
+                    ("release-groups", "getListenBrainzUserReleaseGroups"),
+                    ("recordings", "getListenBrainzUserRecordings"),
+                    ("genre-activity", "getListenBrainzUserGenreActivity"),
+                )
+            ),
         ):
             operation = paths[path][method]
             self.assertEqual(operation["operationId"], operation_id)
