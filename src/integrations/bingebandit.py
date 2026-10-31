@@ -34,6 +34,7 @@ MEDIA_TYPE_BY_KIND = {
 
 LIBRARY_CACHE_KEY = "bingebandit_library:{user_id}"
 LIBRARY_CACHE_SECONDS = 60 * 60 * 24
+LIBRARY_NAMES_CACHE_KEY = "bingebandit_library_names:{user_id}"
 
 CONTINUE_WATCHING_LIMIT = 14
 
@@ -193,7 +194,12 @@ def sync_library(account):
             ),
             batch_size=1000,
         )
-    cache.delete(LIBRARY_CACHE_KEY.format(user_id=account.user_id))
+    cache.delete_many(
+        [
+            LIBRARY_CACHE_KEY.format(user_id=account.user_id),
+            LIBRARY_NAMES_CACHE_KEY.format(user_id=account.user_id),
+        ],
+    )
 
     if account.sync_collection:
         sync_collection(account.user, set(item_ids))
@@ -320,14 +326,25 @@ def push_watched(user, media_type, tmdb_id):
 
 
 def library_names(user, media_type):
-    """Return the BingeBandit library names holding titles of a media type."""
-    return list(
-        BingeBanditLibraryItem.objects.filter(user=user, media_type=media_type)
-        .exclude(library_name="")
-        .values_list("library_name", flat=True)
-        .distinct()
-        .order_by("library_name"),
-    )
+    """Return the BingeBandit library names holding titles of a media type.
+
+    Cached until the next library sync: the Movies and TV lists ask on every
+    page load.
+    """
+    key = LIBRARY_NAMES_CACHE_KEY.format(user_id=user.id)
+    names = cache.get(key)
+    if names is None:
+        names = {}
+        for kind, name in (
+            BingeBanditLibraryItem.objects.filter(user=user)
+            .exclude(library_name="")
+            .values_list("media_type", "library_name")
+            .distinct()
+        ):
+            names.setdefault(kind, set()).add(name)
+        names = {kind: sorted(values) for kind, values in names.items()}
+        cache.set(key, names, LIBRARY_CACHE_SECONDS)
+    return list(names.get(media_type, []))
 
 
 def library_tmdb_ids(user, media_type, library_name):

@@ -68,13 +68,16 @@ TV_LIST_TIME_LEFT_SORT_MAX_QUERIES = (
     26  # pinned after Fix 4 bulk runtime load (was ~400+ per-season queries)
 )
 TV_LIST_NEXT_EPISODE_SORT_MAX_QUERIES = (
-    33  # +2 fixed Item prefetches after compact Episode window selection;
+    34  # +1 for the BingeBandit library chips (cached until the next library
+    # sync, so only a cold cache pays it). +2 fixed Item prefetches after compact Episode window selection;
     # keeps wide Item columns out of the history-sized window intermediates.
     # The untracked-season events of every show on the page are read in
     # one query; it was one per show plus one per event's item (49 for these
     # ten shows, 92 for sixty)
 )
-MOVIE_LIST_DEFAULT_SORT_MAX_QUERIES = 14
+MOVIE_LIST_DEFAULT_SORT_MAX_QUERIES = (
+    15  # +1 for the BingeBandit library chips, cached until the next library sync
+)
 ANIME_LIST_DEFAULT_SORT_MAX_QUERIES = (
     22  # +2 over the pre-credential-registry pin: resolving the MAL/TMDB
     # credentials reads the instance credential table and the viewer's personal

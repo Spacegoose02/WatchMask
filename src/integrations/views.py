@@ -844,7 +844,12 @@ def bingebandit_disconnect(request):
     BingeBanditLibraryItem.objects.filter(user=request.user).delete()
     BingeBanditResumePoint.objects.filter(user=request.user).delete()
     bingebandit_api.sync_collection(request.user, set())
-    cache.delete(bingebandit_api.LIBRARY_CACHE_KEY.format(user_id=request.user.id))
+    cache.delete_many(
+        [
+            bingebandit_api.LIBRARY_CACHE_KEY.format(user_id=request.user.id),
+            bingebandit_api.LIBRARY_NAMES_CACHE_KEY.format(user_id=request.user.id),
+        ],
+    )
     messages.info(request, "Disconnected BingeBandit.")
     return redirect("import_data")
 

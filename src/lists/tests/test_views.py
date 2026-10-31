@@ -2051,7 +2051,8 @@ class ListDetailViewTests(TestCase):
         # Keys the page only offers when its filter_data carries options for
         # them, so their absence here is the gating working, not a dropped
         # field. `provider` needs a watch region; this fixture has none.
-        conditionally_offered = {"provider"}
+        # `library` needs a synced BingeBandit library.
+        conditionally_offered = {"provider", "library"}
         # Stored on the list and kept by every save; never edited in the form.
         not_editable = {"semantics_version"}
         missing = [
