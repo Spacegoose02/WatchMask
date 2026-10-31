@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING
 
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
@@ -16,7 +19,6 @@ from app.discover.feature_metadata import (
     normalize_studio,
 )
 from app.discover.profile import MODEL_BY_MEDIA_TYPE
-from app.discover.schemas import CandidateItem
 from app.models import (
     CreditRoleType,
     Episode,
@@ -27,7 +29,11 @@ from app.models import (
     Status,
 )
 
+if TYPE_CHECKING:
+    from app.discover.schemas import CandidateItem
+
 MAX_ITEMS_PER_ROW = 12
+MAX_LEAD_CAST_MEMBERS = 3
 
 BEHAVIOR_FIRST_MEDIA_TYPES = {
     MediaTypes.MOVIE.value,
@@ -40,7 +46,14 @@ WORLD_QUALITY_MEDIA_TYPES = {
 }
 
 HOLIDAY_STRONG_TERMS = {"christmas", "xmas", "noel", "grinch", "krampus", "nutcracker"}
-HOLIDAY_SOFT_TERMS = {"holiday", "holidays", "new year", "new years", "jack frost", "santa claus"}
+HOLIDAY_SOFT_TERMS = {
+    "holiday",
+    "holidays",
+    "new year",
+    "new years",
+    "jack frost",
+    "santa claus",
+}
 
 COMFORT_DIVERSITY_DECAY = 0.92
 COMFORT_PHASE_LANE_QUOTA = 4
@@ -66,7 +79,9 @@ def _item_tag_map(user, item_ids: list[int]) -> dict[int, list[str]]:
     if not item_ids:
         return mapping
 
-    for item_tag in ItemTag.objects.filter(item_id__in=item_ids, tag__user=user).select_related("tag"):
+    for item_tag in ItemTag.objects.filter(
+        item_id__in=item_ids, tag__user=user
+    ).select_related("tag"):
         tag_name = (item_tag.tag.name or "").strip()
         if tag_name:
             mapping[item_tag.item_id].append(tag_name)
@@ -74,7 +89,49 @@ def _item_tag_map(user, item_ids: list[int]) -> dict[int, list[str]]:
     return mapping
 
 
-def _item_credit_feature_maps(item_ids: list[int]) -> tuple[dict[int, list[str]], dict[int, list[str]], dict[int, list[str]]]:
+# One Discover rebuild reads the credits of the same library items for several
+# rows; inside this scope each item's credits are read once.
+_credit_maps_scope: ContextVar[dict | None] = ContextVar(
+    "discover_credit_maps_scope", default=None
+)
+
+
+@contextmanager
+def credit_maps_scope():
+    """Share per-item credit feature maps between the calls of one rebuild."""
+    token = _credit_maps_scope.set({})
+    try:
+        yield
+    finally:
+        _credit_maps_scope.reset(token)
+
+
+def _item_credit_feature_maps(
+    item_ids: list[int],
+) -> tuple[dict[int, list[str]], dict[int, list[str]], dict[int, list[str]]]:
+    scope = _credit_maps_scope.get()
+    if scope is None:
+        return _read_item_credit_feature_maps(item_ids)
+    missing = [item_id for item_id in item_ids if item_id not in scope]
+    if missing:
+        maps = _read_item_credit_feature_maps(missing)
+        for item_id in missing:
+            scope[item_id] = tuple(m.get(item_id) for m in maps)
+    people_map: dict[int, list[str]] = defaultdict(list)
+    directors_map: dict[int, list[str]] = defaultdict(list)
+    lead_cast_map: dict[int, list[str]] = defaultdict(list)
+    for item_id in item_ids:
+        for target, values in zip(
+            (people_map, directors_map, lead_cast_map), scope[item_id], strict=True
+        ):
+            if values:
+                target[item_id] = list(values)
+    return people_map, directors_map, lead_cast_map
+
+
+def _read_item_credit_feature_maps(
+    item_ids: list[int],
+) -> tuple[dict[int, list[str]], dict[int, list[str]], dict[int, list[str]]]:
     people_map: dict[int, list[str]] = defaultdict(list)
     directors_map: dict[int, list[str]] = defaultdict(list)
     lead_cast_map: dict[int, list[str]] = defaultdict(list)
@@ -85,7 +142,7 @@ def _item_credit_feature_maps(item_ids: list[int]) -> tuple[dict[int, list[str]]
     directors_seen: dict[int, set[str]] = defaultdict(set)
     lead_cast_seen: dict[int, set[str]] = defaultdict(set)
     lead_cast_counts: dict[int, int] = defaultdict(int)
-    credits = (
+    credit_entries = (
         ItemPersonCredit.objects.filter(item_id__in=item_ids)
         .order_by("item_id", "role_type", "sort_order", "person__name")
         .values_list(
@@ -96,20 +153,42 @@ def _item_credit_feature_maps(item_ids: list[int]) -> tuple[dict[int, list[str]]
             "person__name",
         )
     )
-    for item_id, role_type, role, department, person_name_raw in credits:
-        person_name = normalize_person_name(person_name_raw or "")
+    # Stream the rows, and share one string per name: a library holds hundreds
+    # of thousands of credits but far fewer distinct people.
+    shared_names: dict[str, str] = {}
+    # Names and role triples repeat across hundreds of thousands of credits;
+    # normalize each distinct value once.
+    normalized_names: dict[str, str] = {}
+    director_roles: dict[tuple, bool] = {}
+    for (
+        item_id,
+        role_type,
+        role,
+        department,
+        person_name_raw,
+    ) in credit_entries.iterator(chunk_size=5000):
+        person_name = normalized_names.get(person_name_raw)
+        if person_name is None:
+            person_name = normalize_person_name(person_name_raw or "")
+            person_name = shared_names.setdefault(person_name, person_name)
+            normalized_names[person_name_raw] = person_name
         if not person_name:
             continue
         if person_name not in people_seen[item_id]:
             people_seen[item_id].add(person_name)
             people_map[item_id].append(person_name)
-        if is_director_credit(role_type, role, department):
-            if person_name not in directors_seen[item_id]:
-                directors_seen[item_id].add(person_name)
-                directors_map[item_id].append(person_name)
+        role_key = (role_type, role, department)
+        is_director = director_roles.get(role_key)
+        if is_director is None:
+            is_director = director_roles[role_key] = is_director_credit(
+                role_type, role, department
+            )
+        if is_director and person_name not in directors_seen[item_id]:
+            directors_seen[item_id].add(person_name)
+            directors_map[item_id].append(person_name)
         if (
             role_type == CreditRoleType.CAST.value
-            and lead_cast_counts[item_id] < 3
+            and lead_cast_counts[item_id] < MAX_LEAD_CAST_MEMBERS
             and person_name not in lead_cast_seen[item_id]
         ):
             lead_cast_seen[item_id].add(person_name)
@@ -124,12 +203,12 @@ def _item_studio_map(item_ids: list[int]) -> dict[int, list[str]]:
         return mapping
 
     seen: dict[int, set[str]] = defaultdict(set)
-    credits = (
+    credit_entries = (
         ItemStudioCredit.objects.filter(item_id__in=item_ids)
         .order_by("item_id", "sort_order", "studio__name")
         .values_list("item_id", "studio__name")
     )
-    for item_id, studio_name_raw in credits:
+    for item_id, studio_name_raw in credit_entries:
         studio_name = normalize_studio(studio_name_raw or "")
         if not studio_name or studio_name in seen[item_id]:
             continue
@@ -263,7 +342,9 @@ def _clamp_unit(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
-def _calibrate_display_score(raw_score: float, *, offset: float, weight: float) -> float:
+def _calibrate_display_score(
+    raw_score: float, *, offset: float, weight: float
+) -> float:
     return _clamp_unit(offset + (raw_score * weight))
 
 
@@ -305,7 +386,9 @@ def _holiday_seasonal_strength(candidate: CandidateItem) -> float:
     return strength
 
 
-def _holiday_seasonal_adjustment(candidate: CandidateItem, *, holiday_window_active: bool) -> tuple[float, float]:
+def _holiday_seasonal_adjustment(
+    candidate: CandidateItem, *, holiday_window_active: bool
+) -> tuple[float, float]:
     holiday_strength = _holiday_seasonal_strength(candidate)
     if holiday_strength <= 0.0:
         return 0.0, 0.0

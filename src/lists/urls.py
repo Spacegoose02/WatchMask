@@ -6,7 +6,9 @@ from lists import (
     views_add_reorder,
     views_list_actions,
     views_list_browse,
+    views_mdblist,
     views_recommendations,
+    views_tiers,
     views_trakt,
 )
 
@@ -39,11 +41,28 @@ urlpatterns = [
         name="list_smart_rules_update",
     ),
     path("list/create", views_list_actions.create, name="list_create"),
+    path("list/share-view", views_list_actions.share_view, name="list_share_view"),
     path("list/edit", views_list_actions.edit, name="list_edit"),
+    path(
+        "list/<int:list_id>/edit-form",
+        views_list_actions.edit_form,
+        name="list_edit_form",
+    ),
     path("list/delete", views_list_actions.delete, name="list_delete"),
+    path("list/import-csv", views_list_actions.import_list_csv, name="list_import_csv"),
+    path(
+        "list/bulk-add",
+        views_list_actions.bulk_list_add,
+        name="bulk_list_add",
+    ),
     path("list/<slug:list_reference>", views.list_detail, name="list_detail"),
     path("list/<slug:list_reference>/rss", feeds.list_rss_feed, name="list_rss"),
     path("list/<slug:list_reference>/json", feeds.list_json, name="list_json"),
+    path(
+        "list/<slug:list_reference>/export",
+        views.list_export_csv,
+        name="list_export_csv",
+    ),
     path(
         "list/<int:list_id>/cover-image",
         views_list_browse.list_cover_image,
@@ -58,6 +77,31 @@ urlpatterns = [
         "list/<int:list_id>/reorder-all",
         views_add_reorder.reorder_list_items_all,
         name="list_reorder_all",
+    ),
+    path(
+        "list/<int:list_id>/tiers/move",
+        views_tiers.move_tier_item,
+        name="list_tier_move",
+    ),
+    path(
+        "list/<int:list_id>/tiers/save",
+        views_tiers.save_tiers,
+        name="list_tier_save",
+    ),
+    path(
+        "list/<int:list_id>/tiers/fill",
+        views_tiers.fill_from_ratings,
+        name="list_tier_fill",
+    ),
+    path(
+        "list/<int:list_id>/tiers/fill/undo",
+        views_tiers.undo_fill,
+        name="list_tier_fill_undo",
+    ),
+    path(
+        "list/<int:list_id>/tiers/export.png",
+        views_tiers.export_tiers,
+        name="list_tier_export",
     ),
     path(
         "list/<int:list_id>/add",
@@ -85,7 +129,39 @@ urlpatterns = [
         views_trakt.trakt_lists_callback,
         name="trakt_lists_callback",
     ),
-    path("list_item_toggle", views_list_actions.list_item_toggle, name="list_item_toggle"),
+    path(
+        "lists/import/trakt/device",
+        views_trakt.trakt_lists_device_verify,
+        name="trakt_lists_device_verify",
+    ),
+    path(
+        "lists/import/trakt/device/poll",
+        views_trakt.trakt_lists_device_poll,
+        name="trakt_lists_device_poll",
+    ),
+    path(
+        "lists/import/mdblist/connect",
+        views_mdblist.mdblist_connect,
+        name="mdblist_connect",
+    ),
+    path(
+        "lists/import/mdblist/disconnect",
+        views_mdblist.mdblist_disconnect,
+        name="mdblist_disconnect",
+    ),
+    path(
+        "lists/import/mdblist/sync",
+        views_mdblist.mdblist_sync_now,
+        name="mdblist_sync_now",
+    ),
+    path(
+        "lists/import/mdblist/url",
+        views_mdblist.mdblist_import_url,
+        name="mdblist_import_url",
+    ),
+    path(
+        "list_item_toggle", views_list_actions.list_item_toggle, name="list_item_toggle"
+    ),
     # Recommendation URLs
     path(
         "list/<int:list_id>/recommend",

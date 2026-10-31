@@ -1,13 +1,14 @@
+import re
 from datetime import UTC, datetime
 
+from django.conf import settings
 from django.db import models
 from django.db.models import (
     Case,
+    Exists,
     IntegerField,
-    Min,
     OuterRef,
     Q,
-    Subquery,
     UniqueConstraint,
     Value,
     When,
@@ -15,7 +16,9 @@ from django.db.models import (
 from django.utils import timezone
 
 from app import config
-from app.models import TV, Item, MediaTypes, Season, Status
+from app.models import TV, Item, MediaTypes, Season, Sources, Status
+from app.services.item_merge import dedupe_cross_provider_items
+from integrations.anime_mapping import resolve_provider_series_id
 
 # Statuses that represent inactive tracking
 # will be ignored when creating events
@@ -23,6 +26,30 @@ INACTIVE_TRACKING_STATUSES = [
     Status.PAUSED.value,
     Status.DROPPED.value,
 ]
+
+
+_SEASON_PART_SUFFIX_RE = re.compile(r"(?i)\b(season|part|cour)\b.*$")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_anime_title(title: str) -> str:
+    """Strip season/part suffixes and punctuation for an exact-match fallback."""
+    stripped = _SEASON_PART_SUFFIX_RE.sub("", title)
+    return _NON_ALNUM_RE.sub("", stripped.lower())
+
+
+class ReleaseTypes(models.TextChoices):
+    """Extra release dates a movie can have next to its main (theatrical) date.
+
+    The main release is stored with a blank release type.
+    """
+
+    DIGITAL = "digital", "Digital"
+    PHYSICAL = "physical", "Physical"
+
+
+# Any release date before this year is a placeholder, not a real release.
+MIN_VALID_RELEASE_DATETIME = datetime(1900, 1, 1, tzinfo=UTC)
 
 
 class SentinelDatetime:
@@ -35,6 +62,71 @@ class SentinelDatetime:
     MINUTE = 59
     SECOND = 59
     MICROSECOND = 999999
+
+
+def _unknown_time_q(field_name):
+    """Match a datetime carrying the date-only sentinel time.
+
+    DateTimeField extracts its parts in the active timezone, so the sentinel's
+    11:59:59 UTC hour is not stable: it becomes 12:59 or 13:59 in Europe.
+    Minute and second survive a timezone shift, and provider air times sit on
+    minute boundaries, so matching :59:59 identifies the sentinel portably.
+    """
+    return Q(
+        **{
+            f"{field_name}__minute": SentinelDatetime.MINUTE,
+            f"{field_name}__second": SentinelDatetime.SECOND,
+        },
+    )
+
+
+def released_q(field_name, now=None):
+    """Return a Q matching datetimes whose release moment has passed.
+
+    A provider that knows only the release date stores the sentinel time. That
+    value is an all-day date, not an instant: it counts as released once the
+    date has ended in the active timezone. Comparing it directly with ``now``
+    made an episode released at the sentinel's midday time on its listed date,
+    which is the day before it airs for users east of UTC (#1588).
+
+    The lower bound keeps year-1 unknown-date sentinels out of the query before
+    its timezone-aware lookups run. SQLite's datetime extract/cast functions
+    underflow datetime.MINYEAR when converting year 1 into a zone west of UTC,
+    which surfaced as ``DataError: string or blob too big`` (#1717).
+    """
+    now = now or timezone.now()
+    return (
+        Q(**{f"{field_name}__gte": MIN_VALID_RELEASE_DATETIME})
+        & Q(**{f"{field_name}__lte": now})
+        & ~(
+            _unknown_time_q(field_name)
+            & Q(**{f"{field_name}__date__gte": timezone.localdate(now)})
+        )
+    )
+
+
+def is_released_datetime(value, now=None):
+    """Return whether a stored release datetime has passed."""
+    if value is None:
+        return False
+    now = now or timezone.now()
+    if (
+        value.minute == SentinelDatetime.MINUTE
+        and value.second == SentinelDatetime.SECOND
+    ):
+        return timezone.localtime(value).date() < timezone.localdate(now)
+    return value <= now
+
+
+# Columns dedupe_cross_provider_items reads; every other Item column is skipped.
+_DEDUPE_ITEM_FIELDS = (
+    "id",
+    "media_id",
+    "media_type",
+    "season_number",
+    "source",
+    "provider_external_ids",
+)
 
 
 class EventManager(models.Manager):
@@ -66,18 +158,222 @@ class EventManager(models.Manager):
                 **{f"item__{media_type}__status__in": INACTIVE_TRACKING_STATUSES},
             )
 
-        tv_query = self._build_tv_query(user, enabled_types)
+        tv_enabled = (
+            MediaTypes.TV.value in enabled_types
+            or MediaTypes.SEASON.value in enabled_types
+        )
+        active_tv_items = self._active_tv_items(user) if tv_enabled else []
+        tv_query = self._build_tv_query(user, enabled_types, active_tv_items)
         combined_query = (user_query & active_status_query) | tv_query
 
+        # Digital and physical dates are per country: only the user's own count.
         queryset = self.filter(
+            Q(release_type="") | Q(region=user.watch_provider_region),
             combined_query,
             datetime__gte=start_datetime,
             datetime__lte=end_datetime,
         ).select_related("item")
 
+        hidden_item_ids = self.hidden_duplicate_item_ids(
+            user,
+            enabled_types,
+            active_tv_items,
+        )
+        if hidden_item_ids:
+            queryset = queryset.exclude(item_id__in=hidden_item_ids)
+
         return self.sort_with_sentinel_last(queryset)
 
-    def _build_tv_query(self, user, enabled_types):
+    def hidden_duplicate_item_ids(self, user, enabled_types, active_tv_items=None):
+        """Return `Item` ids to exclude because a preferred duplicate exists.
+
+        Combines the TMDB/TVDB cross-provider dedup (#639) with the
+        Anime/TV cross-bucket dedup (#968), so both the calendar and
+        release notifications hide the same duplicates.
+        """
+        return self._cross_provider_hidden_season_item_ids(
+            user,
+            enabled_types,
+            active_tv_items,
+        ) | self._cross_bucket_hidden_anime_item_ids(
+            user,
+            enabled_types,
+        )
+
+    def _active_tv_items(self, user):
+        """Return the user's actively-tracked TV `Item`s with only the dedupe fields.
+
+        The calendar needs this list twice (which shows to include, which
+        duplicates to hide). Loading every column, including the large JSON
+        ones, for thousands of shows was most of the page's time.
+        """
+        return list(
+            Item.objects.filter(
+                tv__user=user,
+                media_type=MediaTypes.TV.value,
+            )
+            .exclude(tv__status__in=INACTIVE_TRACKING_STATUSES)
+            .only(*_DEDUPE_ITEM_FIELDS),
+        )
+
+    def _active_tv_show_media_ids(self, user, active_tv_items=None):
+        """Return media_ids of the user's actively-tracked TV shows, deduped across providers."""
+        items = (
+            self._active_tv_items(user) if active_tv_items is None else active_tv_items
+        )
+        if not items:
+            return []
+
+        preferred_source = getattr(
+            user,
+            "tv_metadata_source_default",
+            Sources.TMDB.value,
+        )
+        deduped = dedupe_cross_provider_items(items, preferred_source)
+        return [item.media_id for item in deduped]
+
+    def _cross_provider_hidden_season_item_ids(
+        self,
+        user,
+        enabled_types,
+        active_tv_items=None,
+    ):
+        """Return Season `Item` ids to hide because a preferred counterpart exists.
+
+        A user can legitimately track the same show under both a TMDB and a
+        TVDB identity (the #620 dual-identity model); each identity gets its
+        own independent Season `Item`s and `Event`s. Without this, the
+        calendar shows the same real episode twice - once per identity
+        (#639). Uses the same verified cached cross-provider mapping already
+        used for Home rows; Season rows fall back to their matching TMDB TV
+        item's mapping when the child row has no `tvdb_id` of its own.
+        """
+        if not (
+            MediaTypes.TV.value in enabled_types
+            or MediaTypes.SEASON.value in enabled_types
+        ):
+            return set()
+
+        all_active_tv_items = (
+            self._active_tv_items(user) if active_tv_items is None else active_tv_items
+        )
+        if not all_active_tv_items:
+            return set()
+
+        preferred_source = getattr(
+            user,
+            "tv_metadata_source_default",
+            Sources.TMDB.value,
+        )
+        kept_tv_media_ids = {
+            item.media_id
+            for item in dedupe_cross_provider_items(
+                all_active_tv_items,
+                preferred_source,
+            )
+        }
+
+        # Seasons of TV shows discarded by the parent-level dedup above are
+        # duplicates too, even when their own season numbers don't line up
+        # with the kept show's (e.g. TMDB absolute S1 vs TVDB split S4) and
+        # so wouldn't be caught by the per-show dedupe below (#1202).
+        discarded_tv_media_ids = {
+            item.media_id
+            for item in all_active_tv_items
+            if item.media_id not in kept_tv_media_ids
+        }
+        hidden_ids = set(
+            Item.objects.filter(
+                media_type=MediaTypes.SEASON.value,
+                media_id__in=discarded_tv_media_ids,
+            ).values_list("id", flat=True),
+        )
+
+        season_items = list(
+            Item.objects.filter(
+                media_type=MediaTypes.SEASON.value,
+                media_id__in=kept_tv_media_ids,
+            ).only(*_DEDUPE_ITEM_FIELDS),
+        )
+        if season_items:
+            deduped = dedupe_cross_provider_items(season_items, preferred_source)
+            if len(deduped) < len(season_items):
+                kept_ids = {item.id for item in deduped}
+                hidden_ids.update(
+                    item.id for item in season_items if item.id not in kept_ids
+                )
+
+        return hidden_ids
+
+    def _cross_bucket_hidden_anime_item_ids(self, user, enabled_types):
+        """Return Anime `Item` ids to hide because a tracked TV counterpart exists.
+
+        A user can track the same real show both in the Anime bucket (MAL)
+        and the TV bucket (TMDB/TVDB) - each gets its own independent `Item`
+        and `Event`s, so without this the calendar and release notifications
+        fire twice for the same episode (#968). Uses the pinned Kometa
+        Anime-IDs mapping (`integrations.anime_mapping`) to resolve a MAL id
+        to its verified TMDB/TVDB series id. Newly announced anime aren't in
+        that static snapshot yet (#1000), so as a guarded fallback - only
+        when the verified lookup misses, and only against the user's own
+        actively-tracked shows, never the global DB - an anime item whose
+        normalized title exactly matches a tracked TV show's is also hidden.
+        The TV bucket is always kept since it carries season/episode
+        structure; the Anime bucket duplicate is hidden.
+        """
+        if MediaTypes.ANIME.value not in enabled_types:
+            return set()
+        if not (
+            MediaTypes.TV.value in enabled_types
+            or MediaTypes.SEASON.value in enabled_types
+        ):
+            return set()
+
+        active_anime_items = list(
+            Item.objects.filter(
+                media_type=MediaTypes.ANIME.value,
+                source=Sources.MAL.value,
+                anime__user=user,
+            )
+            .exclude(anime__status__in=INACTIVE_TRACKING_STATUSES)
+            .only(*_DEDUPE_ITEM_FIELDS, "title"),
+        )
+        if not active_anime_items:
+            return set()
+
+        active_tv_rows = list(
+            TV.objects.filter(
+                user=user,
+                item__media_type=MediaTypes.TV.value,
+            )
+            .exclude(status__in=INACTIVE_TRACKING_STATUSES)
+            .values_list("item__source", "item__media_id", "item__title"),
+        )
+        if not active_tv_rows:
+            return set()
+
+        active_tv_shows = {(source, media_id) for source, media_id, _ in active_tv_rows}
+        active_tv_title_slugs = {
+            slug
+            for _, _, title in active_tv_rows
+            if (slug := _normalize_anime_title(title))
+        }
+
+        hidden_ids = set()
+        for anime_item in active_anime_items:
+            tmdb_id = resolve_provider_series_id(anime_item.media_id, "tmdb")
+            tvdb_id = resolve_provider_series_id(anime_item.media_id, "tvdb")
+            has_verified_match = (
+                tmdb_id and (Sources.TMDB.value, tmdb_id) in active_tv_shows
+            ) or (tvdb_id and (Sources.TVDB.value, tvdb_id) in active_tv_shows)
+            title_slug = _normalize_anime_title(anime_item.title)
+            has_title_fallback_match = title_slug and title_slug in active_tv_title_slugs
+            if has_verified_match or has_title_fallback_match:
+                hidden_ids.add(anime_item.id)
+
+        return hidden_ids
+
+    def _build_tv_query(self, user, enabled_types, active_tv_items=None):
         """Build query for TV shows based on TV status and season statuses."""
         if not (
             MediaTypes.TV.value in enabled_types
@@ -86,60 +382,30 @@ class EventManager(models.Manager):
             return Q()
 
         # Get active TV shows
-        active_tv_shows = (
-            TV.objects.filter(
-                user=user,
-                item__media_type=MediaTypes.TV.value,
-            )
-            .exclude(
-                status__in=INACTIVE_TRACKING_STATUSES,
-            )
-            .values_list("item__media_id", flat=True)
-        )
+        active_tv_shows = self._active_tv_show_media_ids(user, active_tv_items)
 
         if not active_tv_shows:
             return Q()
 
-        # Subquery to find the first season with inactive status for each TV show
-        first_dropped_seasons = (
+        # A dropped/paused season hides itself and every later season of the
+        # same show. Checking "does an inactive season at or before this
+        # season's number exist" via a correlated Exists avoids compiling one
+        # OR clause per active show with a dropped season.
+        dropped_season_exists = Exists(
             Season.objects.filter(
                 user=user,
-                item__media_id=OuterRef("media_id"),
+                item__media_id=OuterRef("item__media_id"),
                 status__in=INACTIVE_TRACKING_STATUSES,
-            )
-            .values("item__media_id")
-            .annotate(min_season=Min("item__season_number"))
-            .values("min_season")
+                item__season_number__lte=OuterRef("item__season_number"),
+            ),
         )
-
-        # Get all media_ids and their first dropped season numbers
-        dropped_seasons = (
-            Item.objects.filter(
-                media_id__in=active_tv_shows,
-                media_type=MediaTypes.SEASON.value,
-            )
-            .annotate(
-                first_dropped_season=Subquery(first_dropped_seasons),
-            )
-            .filter(first_dropped_season__isnull=False)
-            .values_list("media_id", "first_dropped_season")
-        )
-
-        # Build exclusion query
-        exclude_query = Q()
-        for media_id, first_dropped_season in dropped_seasons:
-            exclude_query |= Q(
-                item__media_type=MediaTypes.SEASON.value,
-                item__media_id=media_id,
-                item__season_number__gte=first_dropped_season,
-            )
 
         return (
             Q(
                 item__media_type=MediaTypes.SEASON.value,
                 item__media_id__in=active_tv_shows,
             )
-            & ~exclude_query
+            & ~Q(dropped_season_exists)
         )
 
     def sort_with_sentinel_last(self, queryset):
@@ -178,27 +444,53 @@ class Event(models.Model):
     item = models.ForeignKey(Item, on_delete=models.CASCADE)
     content_number = models.IntegerField(null=True)
     datetime = models.DateTimeField()
+    # Blank for the item's main release date. Digital and physical dates differ
+    # per country, so those events also carry the region they apply to and only
+    # show for users whose watch provider region matches.
+    release_type = models.CharField(
+        max_length=10,
+        choices=ReleaseTypes,
+        blank=True,
+        default="",
+    )
+    region = models.CharField(max_length=5, blank=True, default="")
     notification_sent = models.BooleanField(default=False)
+    # notification_sent is global, so it cannot say who was actually reached.
+    # Users whose real-time alert failed are recorded here so the daily digest
+    # can still list the event for them.
+    alert_failed_users = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        related_name="+",
+    )
     objects = EventManager()
 
     class Meta:
         """Meta class for Event model."""
 
         ordering = ["-datetime"]
+        # The calendar filters one month out of every event ever stored.
+        # Without this index SQLite scans the whole table (SCAN events_event).
+        indexes = [
+            models.Index(fields=["datetime"], name="events_event_datetime_idx"),
+        ]
         constraints = [
             UniqueConstraint(
                 fields=["item", "content_number"],
                 name="unique_item_content_number",
             ),
             UniqueConstraint(
-                fields=["item"],
+                fields=["item", "release_type", "region"],
                 condition=Q(content_number__isnull=True),
-                name="unique_item_null_content_number",
+                name="unique_item_release_null_content_number",
             ),
         ]
 
     def __str__(self):
         """Return event title."""
+        if self.release_type:
+            return f"{self.item} ({self.get_release_type_display()} release)"
+
         if self.content_number:
             return (
                 f"{self.item.__str__()} "

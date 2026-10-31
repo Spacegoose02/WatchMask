@@ -1,4 +1,4 @@
-"""Yamtrack base URL Configuration.
+"""Floppy base URL Configuration.
 
 The `urlpatterns` list routes URLs to views. For more information please see:
     https://docs.djangoproject.com/en/stable/topics/http/urls/
@@ -13,18 +13,87 @@ from allauth.urls import build_provider_urlpatterns
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.decorators import login_not_required
+from django.contrib.staticfiles.views import serve
 from django.http import JsonResponse
 from django.urls import include, path, re_path
-from django.views.static import serve
+from django.utils import translation
+from django.utils.cache import add_never_cache_headers, patch_cache_control
+from django.views.i18n import JavaScriptCatalog
 from health_check.views import MainView
+
+from api.contract_views import (
+    api_docs,
+    asyncapi_contract,
+    jsonld_context,
+    openapi_contract,
+)
+from api.schema import LiveSchemaView
+from app.media_list_entry_grouping_views import (
+    media_list as media_list_with_entry_grouping,
+)
+from app.media_list_entry_grouping_views import (
+    update_entry_grouping,
+)
+from users.views import CustomSignupView, CustomSocialSignupView
 
 handler400 = "app.error_views.bad_request"
 handler403 = "app.error_views.permission_denied"
 handler404 = "app.error_views.page_not_found"
 handler500 = "app.error_views.server_error"
 
+_javascript_catalog_view = JavaScriptCatalog.as_view()
+
+
+def javascript_catalog(request):
+    """Serve the translation catalog, browser-cached only when versioned.
+
+    Pages link it with a release and language token (javascript_catalog_url),
+    so that URL can be kept for a year: a new release or a language switch
+    changes the URL. A bare URL names neither, so it is never cached.
+    """
+    # The catalog must be built in the language the URL names, not the one the
+    # request's cookie or header resolves to; otherwise a shared cache could
+    # store one language under another's URL for a year.
+    try:
+        language = translation.get_supported_language_variant(
+            request.GET.get("l") or ""
+        )
+    except LookupError:
+        language = None
+    if request.GET.get("v") and language:
+        with translation.override(language):
+            response = _javascript_catalog_view(request)
+        patch_cache_control(response, public=True, max_age=31536000, immutable=True)
+    else:
+        response = _javascript_catalog_view(request)
+        add_never_cache_headers(response)
+    return response
+
+
 urlpatterns = [
+    path(
+        "jsi18n/",
+        login_not_required(javascript_catalog),
+        name="javascript-catalog",
+    ),
+    path("api/v1/", include("api.urls")),
+    # ListenBrainz-compatible ingest lives at the root path clients expect.
+    path("apis/listenbrainz/1/", include("api.listenbrainz_urls")),
+    path("api/schema/", LiveSchemaView.as_view(), name="schema"),
+    path("api/openapi.yaml", openapi_contract, name="openapi-contract"),
+    path("api/context.jsonld", jsonld_context, name="jsonld-context"),
+    path("api/asyncapi.json", asyncapi_contract, name="asyncapi-contract"),
+    path("api/docs/", api_docs, name="swagger-ui"),
+    path(
+        "medialist/<str:media_type>/entry-grouping/",
+        update_entry_grouping,
+        name="medialist_entry_grouping",
+    ),
+    # Keep the established named route in app.urls. This earlier route handles
+    # requests for the same URL and applies the request-scoped display policy.
+    path("medialist/<str:media_type>", media_list_with_entry_grouping),
     path("", include("app.urls")),
+    path("", include("integrations.oauth_urls")),
     path("", include("integrations.urls")),
     path("", include("users.urls")),
     path("", include("lists.urls")),
@@ -51,7 +120,7 @@ account_patterns = [
     # login, logout, signup, account_inactive
     path("login/", allauth_account_views.login, name="account_login"),
     path("logout/", allauth_account_views.logout, name="account_logout"),
-    path("signup/", allauth_account_views.signup, name="account_signup"),
+    path("signup/", CustomSignupView.as_view(), name="account_signup"),
     path(
         "account_inactive/",
         allauth_account_views.account_inactive,
@@ -74,7 +143,7 @@ account_patterns = [
                 ),
                 path(
                     "signup/",
-                    allauth_social_account_views.signup,
+                    CustomSocialSignupView.as_view(),
                     name="socialaccount_signup",
                 ),
                 path(
@@ -99,13 +168,14 @@ if settings.ENABLE_DEBUG_TOOLBAR:
     urlpatterns.append(path("__debug__/", include("debug_toolbar.urls")))
 
 # Serve static files for local Django commands like runserver even when
-# DEBUG is disabled in the user's .env.
+# DEBUG is disabled in the user's .env. The finders cover installed apps'
+# static (django_select2, admin), not just the project's own directory.
 if not settings.IS_PROD:
     static_url_pattern = re.escape(settings.STATIC_URL.lstrip("/"))
     urlpatterns.append(
         re_path(
             rf"^{static_url_pattern}(?P<path>.*)$",
             login_not_required(serve),
-            {"document_root": str(settings.STATICFILES_DIRS[0])},
+            {"insecure": True},
         ),
     )

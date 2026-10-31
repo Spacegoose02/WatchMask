@@ -1,5 +1,6 @@
 from django.urls import reverse
 from django.utils.http import urlencode
+from django.utils.translation import gettext_noop
 
 from app.models import MediaTypes, Sources, Status
 
@@ -68,7 +69,7 @@ MEDIA_TYPE_CONFIG = {
         "sources": [Sources.TMDB, Sources.TVDB],
         "default_source": Sources.TMDB,
         "unicode_icon": "📺",
-        "verb": ("watch", "watched"),
+        "verb": (gettext_noop("watch"), gettext_noop("watched")),
         "text_color": COLORS["emerald"]["text"],
         "stats_color": COLORS["emerald"]["hex"],
         "collection_auto_fetch": True,
@@ -80,7 +81,7 @@ MEDIA_TYPE_CONFIG = {
         "sources": [Sources.TMDB, Sources.TVDB],
         "default_source": Sources.TMDB,
         "unicode_icon": "📺",
-        "verb": ("watch", "watched"),
+        "verb": (gettext_noop("watch"), gettext_noop("watched")),
         "text_color": COLORS["purple"]["text"],
         "stats_color": COLORS["purple"]["hex"],
         "svg_icon": """
@@ -88,13 +89,13 @@ MEDIA_TYPE_CONFIG = {
             1.83l8.58 3.91 a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/>
             <path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/>
             <path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>""",
-        "unit": ("E", "Episode"),
+        "unit": ("E", gettext_noop("Episode")),
     },
     MediaTypes.EPISODE.value: {
         "sources": [Sources.TMDB, Sources.TVDB],
         "default_source": Sources.TMDB,
         "unicode_icon": "📺",
-        "verb": ("watch", "watched"),
+        "verb": (gettext_noop("watch"), gettext_noop("watched")),
         "text_color": COLORS["indigo"]["text"],
         "stats_color": COLORS["indigo"]["hex"],
         "svg_icon": """<polygon points="6 3 20 12 6 21 6 3"/>""",
@@ -103,7 +104,7 @@ MEDIA_TYPE_CONFIG = {
         "sources": [Sources.TMDB],
         "default_source": Sources.TMDB,
         "unicode_icon": "🎬",
-        "verb": ("watch", "watched"),
+        "verb": (gettext_noop("watch"), gettext_noop("watched")),
         "text_color": COLORS["orange"]["text"],
         "stats_color": COLORS["orange"]["hex"],
         "collection_auto_fetch": True,
@@ -122,21 +123,21 @@ MEDIA_TYPE_CONFIG = {
         "sources": [Sources.MAL, Sources.TMDB, Sources.TVDB],
         "default_source": Sources.MAL,
         "unicode_icon": "🎭",
-        "verb": ("watch", "watched"),
+        "verb": (gettext_noop("watch"), gettext_noop("watched")),
         "text_color": COLORS["blue"]["text"],
         "stats_color": COLORS["blue"]["hex"],
         "collection_auto_fetch": True,
         "svg_icon": """
             <circle cx="12" cy="12" r="10"/>
             <polygon points="10 8 16 12 10 16 10 8"/>""",
-        "unit": ("E", "Episode"),
+        "unit": ("E", gettext_noop("Episode")),
         "date_key": "end_date",
     },
     MediaTypes.MANGA.value: {
-        "sources": [Sources.MAL, Sources.MANGAUPDATES],
+        "sources": [Sources.MAL, Sources.MANGAUPDATES, Sources.MANGABAKA],
         "default_source": Sources.MAL,
         "unicode_icon": "📚",
-        "verb": ("read", "read"),
+        "verb": (gettext_noop("read"), gettext_noop("read")),
         "text_color": COLORS["red"]["text"],
         "stats_color": COLORS["red"]["hex"],
         "svg_icon": """
@@ -147,13 +148,13 @@ MEDIA_TYPE_CONFIG = {
             <path d="M16 13H8"/>
             <path d="M16 17H8"/>""",
         "date_key": "end_date",
-        "unit": ("#", "Chapter"),
+        "unit": ("#", gettext_noop("Chapter")),
     },
     MediaTypes.GAME.value: {
         "sources": [Sources.IGDB],
         "default_source": Sources.IGDB,
         "unicode_icon": "🎮",
-        "verb": ("play", "played"),
+        "verb": (gettext_noop("play"), gettext_noop("played")),
         "text_color": COLORS["yellow"]["text"],
         "stats_color": COLORS["yellow"]["hex"],
         "svg_icon": """
@@ -171,23 +172,23 @@ MEDIA_TYPE_CONFIG = {
         "date_key": "release_date",
     },
     MediaTypes.BOOK.value: {
-        "sources": [Sources.HARDCOVER, Sources.OPENLIBRARY],
+        "sources": [Sources.HARDCOVER, Sources.OPENLIBRARY, Sources.GOOGLEBOOKS],
         "default_source": Sources.HARDCOVER,
         "unicode_icon": "📖",
-        "verb": ("read", "read"),
+        "verb": (gettext_noop("read"), gettext_noop("read")),
         "text_color": COLORS["fuchsia"]["text"],
         "stats_color": COLORS["fuchsia"]["hex"],
         "svg_icon": """
             <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5
             2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/>""",
         "date_key": "publish_date",
-        "unit": ("P", "Page"),
+        "unit": ("P", gettext_noop("Page")),
     },
     MediaTypes.COMIC.value: {
-        "sources": [Sources.COMICVINE],
+        "sources": [Sources.COMICVINE, Sources.GCD],
         "default_source": Sources.COMICVINE,
         "unicode_icon": "📕",
-        "verb": ("read", "read"),
+        "verb": (gettext_noop("read"), gettext_noop("read")),
         "text_color": COLORS["cyan"]["text"],
         "stats_color": COLORS["cyan"]["hex"],
         "svg_icon": """
@@ -195,13 +196,13 @@ MEDIA_TYPE_CONFIG = {
             <path d="M7 3v18"/>
             <path d="M20.4 18.9c.2.5-.1 1.1-.6 1.3l-1.9.7c-.5.2-1.1-.1-1.3-.6L11.1
             5.1c-.2-.5.1-1.1.6-1.3l1.9-.7c.5-.2 1.1.1 1.3.6Z"/>""",
-        "unit": ("#", "Issue"),
+        "unit": ("#", gettext_noop("Issue")),
     },
     MediaTypes.COMIC_ISSUE.value: {
-        "sources": [Sources.COMICVINE],
+        "sources": [Sources.COMICVINE, Sources.GCD],
         "default_source": Sources.COMICVINE,
         "unicode_icon": "📄",
-        "verb": ("read", "read"),
+        "verb": (gettext_noop("read"), gettext_noop("read")),
         "text_color": COLORS["cyan"]["text"],
         "stats_color": COLORS["cyan"]["hex"],
         "svg_icon": """
@@ -209,14 +210,14 @@ MEDIA_TYPE_CONFIG = {
             <path d="M7 3v18"/>
             <path d="M20.4 18.9c.2.5-.1 1.1-.6 1.3l-1.9.7c-.5.2-1.1-.1-1.3-.6L11.1
             5.1c-.2-.5.1-1.1.6-1.3l1.9-.7c.5-.2 1.1.1 1.3.6Z"/>""",
-        "unit": ("#", "Read"),
+        "unit": ("#", gettext_noop("Read")),
         "date_key": "store_date",
     },
     MediaTypes.BOARDGAME.value: {
         "sources": [Sources.BGG],
         "default_source": Sources.BGG,
         "unicode_icon": "🎲",
-        "verb": ("play", "played"),
+        "verb": (gettext_noop("play"), gettext_noop("played")),
         "text_color": COLORS["lime"]["text"],
         "stats_color": COLORS["lime"]["hex"],
         "svg_icon": """
@@ -225,28 +226,28 @@ MEDIA_TYPE_CONFIG = {
             <path d="M16 8h-2"/>
             <circle cx="16" cy="16" r="2"/>
             <path d="M8 16v-2"/>""",
-        "unit": ("#", "Play"),
+        "unit": ("#", gettext_noop("Play")),
         "date_key": "year",
     },
     MediaTypes.MUSIC.value: {
         "sources": [Sources.MUSICBRAINZ],
         "default_source": Sources.MUSICBRAINZ,
         "unicode_icon": "🎵",
-        "verb": ("listen", "listened"),
+        "verb": (gettext_noop("listen"), gettext_noop("listened")),
         "text_color": "text-rose-400",
         "stats_color": "#fb7185",
         "svg_icon": """
             <path d="M9 18V5l12-2v13"/>
             <circle cx="6" cy="18" r="3"/>
             <circle cx="18" cy="16" r="3"/>""",
-        "unit": ("#", "Play"),
+        "unit": ("#", gettext_noop("Play")),
         "date_key": "release_date",
     },
     MediaTypes.PODCAST.value: {
-        "sources": [Sources.POCKETCASTS, Sources.GPODDER],
+        "sources": [Sources.POCKETCASTS, Sources.GPODDER, Sources.AUDIOBOOKSHELF],
         "default_source": Sources.POCKETCASTS,
         "unicode_icon": "🎙️",
-        "verb": ("listen", "listened"),
+        "verb": (gettext_noop("listen"), gettext_noop("listened")),
         "text_color": COLORS["purple"]["text"],
         "stats_color": COLORS["purple"]["hex"],
         "svg_icon": """
@@ -254,7 +255,20 @@ MEDIA_TYPE_CONFIG = {
             <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
             <line x1="12" x2="12" y1="19" y2="23"/>
             <line x1="8" x2="16" y1="23" y2="23"/>""",
-        "unit": ("m", "Minute"),
+        "unit": ("m", gettext_noop("Minute")),
+        "date_key": "published",
+    },
+    MediaTypes.VIDEO.value: {
+        "sources": [Sources.YOUTUBE],
+        "default_source": Sources.YOUTUBE,
+        "unicode_icon": "▶️",
+        "verb": (gettext_noop("watch"), gettext_noop("watched")),
+        "text_color": COLORS["red"]["text"],
+        "stats_color": COLORS["red"]["hex"],
+        "svg_icon": """
+            <rect width="20" height="14" x="2" y="5" rx="3"/>
+            <path d="m10 9 5 3-5 3Z"/>""",
+        "unit": ("s", gettext_noop("Second")),
         "date_key": "published",
     },
 }
@@ -270,11 +284,26 @@ COLLECTION_FIELD_CONFIG = {
             "audio_codec",
             "audio_channels",
             "bitrate",
+            "purchase_price",
+            "purchase_location",
             "collected_at",
         ],
-        "labels": {"media_type": "Format", "is_3d": "3D", "collected_at": "Collected At"},
+        "labels": {
+            "media_type": "Format",
+            "is_3d": "3D",
+            "purchase_price": "Purchase Price",
+            "purchase_location": "Location",
+            "collected_at": "Collected At",
+        },
         "choices": {
-            "media_type": ["4K Blu-ray", "Blu-ray", "DVD", "Digital", "Streaming", "VHS"],
+            "media_type": [
+                "4K Blu-ray",
+                "Blu-ray",
+                "DVD",
+                "Digital",
+                "Streaming",
+                "VHS",
+            ],
             "resolution": ["480p", "720p", "1080p", "4K", "8K"],
             "hdr": ["HDR10", "HDR10+", "Dolby Vision", "HLG"],
             "audio_codec": [
@@ -294,8 +323,21 @@ COLLECTION_FIELD_CONFIG = {
         },
     },
     "music": {
-        "fields": ["media_type", "audio_codec", "audio_channels", "bitrate", "collected_at"],
-        "labels": {"media_type": "Format", "collected_at": "Collected At"},
+        "fields": [
+            "media_type",
+            "audio_codec",
+            "audio_channels",
+            "bitrate",
+            "purchase_price",
+            "purchase_location",
+            "collected_at",
+        ],
+        "labels": {
+            "media_type": "Format",
+            "purchase_price": "Purchase Price",
+            "purchase_location": "Location",
+            "collected_at": "Collected At",
+        },
         "choices": {
             "media_type": ["Vinyl", "CD", "Digital", "Cassette", "SACD", "Streaming"],
             "audio_codec": ["FLAC", "MP3", "AAC", "ALAC", "WAV", "OGG", "Opus"],
@@ -304,23 +346,38 @@ COLLECTION_FIELD_CONFIG = {
         },
     },
     "books": {
-        "fields": ["media_type", "collected_at"],
-        "labels": {"media_type": "Format", "collected_at": "Collected At"},
+        "fields": ["media_type", "purchase_price", "purchase_location", "collected_at"],
+        "labels": {
+            "media_type": "Format",
+            "purchase_price": "Purchase Price",
+            "purchase_location": "Location",
+            "collected_at": "Collected At",
+        },
         "choices": {
-            "media_type": ["Hardcover", "Paperback", "Trade Paperback", "Digital", "Audiobook"],
+            "media_type": [
+                "Hardcover",
+                "Paperback",
+                "Trade Paperback",
+                "Digital",
+                "Audiobook",
+            ],
         },
     },
     "games": {
         "fields": [
-            "media_type",
             "resolution",
+            "media_type",
             "hdr",
+            "purchase_price",
+            "purchase_location",
             "collected_at",
         ],
         "labels": {
             "media_type": "Format",
             "resolution": "Platform",
             "hdr": "Edition",
+            "purchase_price": "Purchase Price",
+            "purchase_location": "Location",
             "collected_at": "Collected At",
         },
         "choices": {
@@ -353,8 +410,13 @@ COLLECTION_FIELD_CONFIG = {
         },
     },
     "boardgames": {
-        "fields": ["media_type", "collected_at"],
-        "labels": {"media_type": "Format", "collected_at": "Collected At"},
+        "fields": ["media_type", "purchase_price", "purchase_location", "collected_at"],
+        "labels": {
+            "media_type": "Format",
+            "purchase_price": "Purchase Price",
+            "purchase_location": "Location",
+            "collected_at": "Collected At",
+        },
         "choices": {
             "media_type": ["Physical", "Print & Play", "Digital"],
         },
@@ -371,6 +433,7 @@ COLLECTION_FIELD_BY_TYPE = {
     MediaTypes.BOOK.value: COLLECTION_FIELD_CONFIG["books"],
     MediaTypes.MANGA.value: COLLECTION_FIELD_CONFIG["books"],
     MediaTypes.COMIC.value: COLLECTION_FIELD_CONFIG["books"],
+    MediaTypes.COMIC_ISSUE.value: COLLECTION_FIELD_CONFIG["books"],
     MediaTypes.GAME.value: COLLECTION_FIELD_CONFIG["games"],
     MediaTypes.BOARDGAME.value: COLLECTION_FIELD_CONFIG["boardgames"],
 }

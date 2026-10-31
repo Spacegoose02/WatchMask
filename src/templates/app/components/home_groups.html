@@ -1,14 +1,14 @@
 {% comment %}
-  Shared home group loop — used by the home shell (first group) and by
-  home_rest_fragment (remaining groups).
+  Shared home group loop — the home shell renders the first group here;
+  later groups use home_deferred_groups.html so each row can load on its own.
   Context: home_groups, user
 {% endcomment %}
 {% for group in home_groups %}
   <section class="space-y-4">
     {% if user.home_show_media_type_headers %}
-      <div class="flex items-center gap-2 border-b border-[#39404b] pb-3">
-        <span class="text-indigo-400">{{ group.icon_svg|safe }}</span>
-        <h2 class="text-3xl font-semibold text-gray-100">{{ group.label }}</h2>
+      <div class="flex items-center gap-2 border-b border-[var(--color-surface-strong)] pb-3">
+        <span class="text-[var(--color-link)]">{{ group.icon_svg|safe }}</span>
+        <h2 class="text-3xl font-semibold text-[var(--color-text)]">{{ group.label }}</h2>
       </div>
     {% endif %}
     <div class="space-y-3">

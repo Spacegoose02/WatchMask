@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 
 from django.apps import apps
 from django.core.cache import cache
-from django.db.models import Prefetch
+from django.db.models import Prefetch, Q
 
 from app import config
 from app.models import CreditRoleType, ItemPersonCredit, MediaTypes, Status
@@ -38,8 +38,38 @@ def _reading_entry_in_range(entry, start_date, end_date):
     return filter_start <= activity_date <= filter_end
 
 
+def _reading_entry_range_filter(start_date, end_date):
+    """Narrow a reading queryset to rows ``_reading_entry_in_range`` may keep.
+
+    The predicate compares stored calendar dates while these boundaries are
+    instants, so one day of slack is added: the SQL filter must only remove
+    rows the predicate would certainly reject, never one it would keep.
+    Returns None for an unbounded range, which the predicate treats as all.
+    """
+    if not (start_date and end_date):
+        return None
+    start = start_date - datetime.timedelta(days=1)
+    end = end_date + datetime.timedelta(days=1)
+    return (
+        Q(
+            start_date__isnull=False,
+            end_date__isnull=False,
+            start_date__lte=end,
+            end_date__gte=start,
+        )
+        | Q(start_date__isnull=True, end_date__gte=start, end_date__lte=end)
+        | Q(end_date__isnull=True, start_date__gte=start, start_date__lte=end)
+        | Q(
+            start_date__isnull=True,
+            end_date__isnull=True,
+            created_at__gte=start,
+            created_at__lte=end,
+        )
+    )
+
+
 def _format_reading_unit(value, unit_name):
-    numeric = int(round(value or 0))
+    numeric = round(value or 0)
     unit_lower = (unit_name or "Unit").lower()
     if numeric == 1:
         return f"{numeric} {unit_lower}"
@@ -118,7 +148,9 @@ def _fetch_reading_items_with_authors(item_ids):
     )
     return {
         item.id: item
-        for item in Item.objects.filter(id__in=item_ids).prefetch_related(author_credit_prefetch)
+        for item in Item.objects.filter(id__in=item_ids).prefetch_related(
+            author_credit_prefetch
+        )
     }
 
 
@@ -164,15 +196,15 @@ def _extract_item_authors(item):
     if not fallback_names:
         fallback_names = _extract_cached_item_authors(item)
 
-    for name in fallback_names:
-        authors.append(
-            {
-                "name": name,
-                "image": "",
-                "source": "",
-                "person_id": "",
-            },
-        )
+    authors.extend(
+        {
+            "name": name,
+            "image": "",
+            "source": "",
+            "person_id": "",
+        }
+        for name in fallback_names
+    )
     return authors
 
 
@@ -284,10 +316,18 @@ def _build_weighted_media_charts(weighted_datetimes, color, dataset_label):
     hour_values = [hour_totals.get(hour, 0) for hour in range(24)]
 
     return {
-        "by_year": _build_single_series_chart(year_labels, year_values, color, dataset_label),
-        "by_month": _build_single_series_chart(month_labels, month_values, color, dataset_label),
-        "by_weekday": _build_single_series_chart(weekday_labels, weekday_values, color, dataset_label),
-        "by_time_of_day": _build_single_series_chart(hour_labels, hour_values, color, dataset_label),
+        "by_year": _build_single_series_chart(
+            year_labels, year_values, color, dataset_label
+        ),
+        "by_month": _build_single_series_chart(
+            month_labels, month_values, color, dataset_label
+        ),
+        "by_weekday": _build_single_series_chart(
+            weekday_labels, weekday_values, color, dataset_label
+        ),
+        "by_time_of_day": _build_single_series_chart(
+            hour_labels, hour_values, color, dataset_label
+        ),
     }
 
 
@@ -307,6 +347,9 @@ def get_reading_consumption_stats(user_media, start_date, end_date, media_type):
     if queryset is None:
         queryset = []
     elif hasattr(queryset, "select_related"):
+        range_filter = _reading_entry_range_filter(start_date, end_date)
+        if range_filter is not None:
+            queryset = queryset.filter(range_filter)
         queryset = queryset.select_related("item")
 
     unit_name = config.get_unit(media_type, short=False) or "Unit"
@@ -397,7 +440,9 @@ def get_reading_consumption_stats(user_media, start_date, end_date, media_type):
             entries,
             key=lambda entry: _get_activity_datetime(entry) or entry.created_at,
         )
-        latest_activity = _get_activity_datetime(latest_entry) or latest_entry.created_at
+        latest_activity = (
+            _get_activity_datetime(latest_entry) or latest_entry.created_at
+        )
         localized_activity = _localize_datetime(latest_activity)
 
         if total_item_units > 0:
@@ -416,7 +461,9 @@ def get_reading_consumption_stats(user_media, start_date, end_date, media_type):
                     "media": latest_entry,
                     "units": total_item_units,
                     "entry_count": len(entries),
-                    "formatted_units": _format_reading_unit(total_item_units, unit_name),
+                    "formatted_units": _format_reading_unit(
+                        total_item_units, unit_name
+                    ),
                 }
             )
 
@@ -427,18 +474,22 @@ def get_reading_consumption_stats(user_media, start_date, end_date, media_type):
                 genre_stats[key]["title_ids"].add(item_id)
 
         completed_candidates = [
-            entry
-            for entry in entries
-            if entry.status == Status.COMPLETED.value
+            entry for entry in entries if entry.status == Status.COMPLETED.value
         ]
         if completed_candidates:
             latest_completed = max(
                 completed_candidates,
                 key=lambda entry: _get_activity_datetime(entry) or entry.created_at,
             )
-            completed_dt = _get_activity_datetime(latest_completed) or latest_completed.created_at
+            completed_dt = (
+                _get_activity_datetime(latest_completed) or latest_completed.created_at
+            )
             completed_datetimes.append(_localize_datetime(completed_dt))
-            completed_length = latest_completed.progress or getattr(latest_completed.item, "number_of_pages", 0) or 0
+            completed_length = (
+                latest_completed.progress
+                or getattr(latest_completed.item, "number_of_pages", 0)
+                or 0
+            )
             if completed_length > 0:
                 completed_lengths.append(completed_length)
 
@@ -456,30 +507,39 @@ def get_reading_consumption_stats(user_media, start_date, end_date, media_type):
         if score_value is not None:
             scored_items.append(float(score_value))
 
-    top_items = sorted(top_items, key=lambda item: item["units"], reverse=True)[:STATISTICS_TOP_N]
+    top_items = sorted(top_items, key=lambda item: item["units"], reverse=True)[
+        :STATISTICS_TOP_N
+    ]
 
-    top_genres = []
-    for payload in sorted(
-        genre_stats.values(),
-        key=lambda item: (item["units"], len(item["title_ids"])),
-        reverse=True,
-    )[:STATISTICS_TOP_N]:
-        top_genres.append(
-            {
-                "name": payload["name"],
-                "units": payload["units"],
-                "titles": len(payload["title_ids"]),
-                "formatted_units": _format_reading_unit(payload["units"], unit_name),
-            }
-        )
-    top_authors = _build_reading_top_authors(author_item_units, unit_name, limit=STATISTICS_TOP_N)
+    top_genres = [
+        {
+            "name": payload["name"],
+            "units": payload["units"],
+            "titles": len(payload["title_ids"]),
+            "formatted_units": _format_reading_unit(payload["units"], unit_name),
+        }
+        for payload in sorted(
+            genre_stats.values(),
+            key=lambda item: (item["units"], len(item["title_ids"])),
+            reverse=True,
+        )[:STATISTICS_TOP_N]
+    ]
+    top_authors = _build_reading_top_authors(
+        author_item_units, unit_name, limit=STATISTICS_TOP_N
+    )
 
     avg_length = round(sum(item_lengths) / len(item_lengths), 1) if item_lengths else 0
-    avg_rating = round(sum(scored_items) / len(scored_items), 2) if scored_items else None
+    avg_rating = (
+        round(sum(scored_items) / len(scored_items), 2) if scored_items else None
+    )
 
     charts = _build_weighted_media_charts(weighted_datetimes, color, chart_label)
-    completion_charts = _build_media_charts(completed_datetimes, color, completion_label)
-    completed_length_chart = _build_completed_length_distribution_chart(completed_lengths, unit_name, color)
+    completion_charts = _build_media_charts(
+        completed_datetimes, color, completion_label
+    )
+    completed_length_chart = _build_completed_length_distribution_chart(
+        completed_lengths, unit_name, color
+    )
     release_chart = _build_release_year_chart(release_datetimes, color, release_label)
 
     units_breakdown = _compute_metric_breakdown(

@@ -1,14 +1,156 @@
 """Tests for cache-backed live playback state and request-path purity."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from unittest import skipUnless
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django.test import TestCase
-from django.urls import reverse
+from django.db import close_old_connections, connection
+from django.test import TestCase, TransactionTestCase, override_settings
+from django.urls import reverse, set_script_prefix
 
 from app import live_playback
-from app.models import MediaTypes, Sources
+from app.models import Item, MediaTypes, PlaybackProgress, Sources
+
+
+class ScrobbleProgressFloorTests(TestCase):
+    """A scrobbled title is treated as being near its end."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="scrobblefloor",
+            password="pw",
+        )
+
+    def tearDown(self):
+        live_playback.clear_user_playback_state(self.user.id)
+        cache.clear()
+        super().tearDown()
+
+    @patch("app.live_playback._attach_resolved_image")
+    def _scrobble(self, _mock_image, *, offset, duration=5340):
+        live_playback.apply_playback_event(
+            user_id=self.user.id,
+            event_type="media.scrobble",
+            playback_media_type=MediaTypes.MOVIE.value,
+            media_id="701",
+            source=Sources.TMDB.value,
+            rating_key="rk-1",
+            title="A Movie",
+            view_offset_seconds=offset,
+            duration_seconds=duration,
+        )
+        return live_playback.get_user_playback_state(self.user.id)
+
+    @patch("app.live_playback._attach_resolved_image")
+    def test_offsetless_scrobble_falls_back_to_the_threshold(self, _mock_image):
+        """Plex sends the scrobble without one; the cached one can be stale."""
+        self._scrobble(offset=1871)  # last position before a seek to the end
+        state = self._scrobble(offset=None)
+
+        self.assertEqual(state["view_offset_seconds"], 4806)
+
+    def test_reported_offset_is_always_kept(self):
+        """A server scrobbling below the threshold still knows best."""
+        state = self._scrobble(offset=1871)
+
+        self.assertEqual(state["view_offset_seconds"], 1871)
+
+    @patch("app.live_playback._attach_resolved_image")
+    def test_card_expires_shortly_after_an_offsetless_scrobble(self, _mock_image):
+        """The card must not linger for the rest of the runtime."""
+        self._scrobble(offset=1871)
+        state = self._scrobble(offset=None)
+
+        remaining = state["scrobble_expires_at_ts"] - state["updated_at_ts"]
+        self.assertLessEqual(remaining, 5340 * 0.1 + 30)
+
+    def test_missing_duration_keeps_the_fallback_expiry(self):
+        """Without a duration there is nothing to take a share of."""
+        state = self._scrobble(offset=1871, duration=None)
+
+        remaining = state["scrobble_expires_at_ts"] - state["updated_at_ts"]
+        self.assertEqual(remaining, live_playback.PLAYBACK_SCROBBLE_FALLBACK_SECONDS)
+
+    @patch("app.live_playback._attach_resolved_image")
+    def test_seeking_back_after_a_scrobble_is_not_floored(self, _mock_image):
+        """Skipping back into the credits must not jump the card forward."""
+        self._scrobble(offset=5300)
+
+        live_playback.apply_playback_event(
+            user_id=self.user.id,
+            event_type="media.resume",
+            playback_media_type=MediaTypes.MOVIE.value,
+            media_id="701",
+            source=Sources.TMDB.value,
+            rating_key="rk-1",
+            title="A Movie",
+            view_offset_seconds=600,
+            duration_seconds=5340,
+        )
+
+        state = live_playback.get_user_playback_state(self.user.id)
+        self.assertEqual(state["view_offset_seconds"], 600)
+
+
+class OffsetlessPauseTests(TestCase):
+    """A pause must keep the position playing had already established."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="offsetlesspause",
+            password="pw",
+        )
+
+    def tearDown(self):
+        live_playback.clear_user_playback_state(self.user.id)
+        cache.clear()
+        super().tearDown()
+
+    @patch("app.live_playback._attach_resolved_image")
+    def _event(self, _mock_image, *, event_type, offset):
+        live_playback.apply_playback_event(
+            user_id=self.user.id,
+            event_type=event_type,
+            playback_media_type=MediaTypes.MOVIE.value,
+            media_id="701",
+            source=Sources.TMDB.value,
+            rating_key="rk-1",
+            title="A Movie",
+            view_offset_seconds=offset,
+            duration_seconds=5340,
+        )
+
+    def test_offsetless_pause_keeps_the_extrapolated_position(self):
+        """Not every client reports a view offset, and a pause writes state.
+
+        Storing the raw offset there discarded what playing had established: a
+        session that began at zero and ran two minutes was stored as zero the
+        moment it was paused, and every reader showed 0:00 for something two
+        minutes in.
+        """
+        self._event(event_type="media.play", offset=0)
+
+        # Two minutes of playback, then a pause the client reports no offset for.
+        state = live_playback.get_user_playback_state(self.user.id)
+        state["updated_at_ts"] = state["updated_at_ts"] - 120
+        live_playback.set_user_playback_state(self.user.id, state)
+
+        self._event(event_type="media.pause", offset=None)
+        paused = live_playback.get_user_playback_state(self.user.id)
+
+        self.assertEqual(paused["status"], live_playback.PLAYBACK_STATUS_PAUSED)
+        self.assertGreaterEqual(paused["view_offset_seconds"], 118)
+
+    def test_a_reported_offset_still_wins(self):
+        """The estimate only stands in when the event says nothing."""
+        self._event(event_type="media.play", offset=0)
+        self._event(event_type="media.pause", offset=42)
+
+        state = live_playback.get_user_playback_state(self.user.id)
+        self.assertEqual(state["view_offset_seconds"], 42)
 
 
 class ApplyPlaybackEventImageTests(TestCase):
@@ -17,7 +159,7 @@ class ApplyPlaybackEventImageTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(
             username="playbackimg",
-            password="pw",  # noqa: S106
+            password="pw",
         )
 
     def tearDown(self):
@@ -78,6 +220,20 @@ class ApplyPlaybackEventImageTests(TestCase):
         self.assertIsNotNone(state)
         self.assertNotIn("image", state)
 
+    @patch("app.live_playback._resolve_landscape_image")
+    def test_caller_supplied_image_skips_resolution(self, mock_resolve):
+        """A MAL cour card carries artwork the episode resolver cannot look up."""
+        self._apply_play(
+            source=Sources.MAL.value,
+            media_id="849",
+            image="https://example.com/haruhi.jpg",
+        )
+
+        state = live_playback.get_user_playback_state(self.user.id)
+        self.assertEqual(state["image"], "https://example.com/haruhi.jpg")
+        self.assertEqual(state["image_source"], "primary")
+        mock_resolve.assert_not_called()
+
 
 class FetchEpisodeStillCacheTests(TestCase):
     """Episode still lookups are cached, including failures."""
@@ -118,7 +274,7 @@ class RequestPathPurityTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(
             username="purity",
-            password="pw",  # noqa: S106
+            password="pw",
         )
         self.client.force_login(self.user)
 
@@ -201,13 +357,170 @@ class RequestPathPurityTests(TestCase):
         mock_fill.assert_called_once_with(self.user.id)
 
 
+class MalCourCardTests(TestCase):
+    """A MAL-sourced episode card renders as a flat anime cour."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="malcard")
+        self.user.anime_enabled = True
+        self.user.save()
+
+    def tearDown(self):
+        live_playback.clear_user_playback_state(self.user.id)
+        cache.clear()
+        super().tearDown()
+
+    def _seed(self):
+        now_ts = live_playback._now_ts()
+        live_playback.set_user_playback_state(
+            self.user.id,
+            {
+                "event_type": "media.play",
+                "media_type": MediaTypes.EPISODE.value,
+                "media_id": "849",
+                "source": Sources.MAL.value,
+                "series_title": "Suzumiya Haruhi no Yuutsu",
+                "season_number": None,
+                "episode_number": 3,
+                "image": "https://example.com/haruhi.jpg",
+                "image_source": "primary",
+                "view_offset_seconds": 60,
+                "duration_seconds": 1400,
+                "started_at_ts": now_ts,
+                "status": live_playback.PLAYBACK_STATUS_PLAYING,
+                "updated_at_ts": now_ts,
+                "expires_at_ts": now_ts + 3600,
+                "pause_expires_at_ts": None,
+                "scrobble_expires_at_ts": None,
+            },
+        )
+
+    def test_card_links_to_the_anime_details_page(self):
+        self._seed()
+        card = live_playback.build_home_playback_card(self.user)
+        self.assertIn(f"/{Sources.MAL.value}/{MediaTypes.ANIME.value}/849/", card["details_url"])
+        self.assertEqual(card["image"], "https://example.com/haruhi.jpg")
+        self.assertEqual(card["episode_code"], "E03")
+
+
+class LiveDetailsUrlTests(TestCase):
+    """The card's hand-built links are exactly what ``reverse()`` produces.
+
+    They are built without ``reverse()`` so a Celery worker can render the
+    card; this holds each branch to the real route in ``app/urls.py``.
+    """
+
+    CASES = (
+        ({"media_id": None}, None, "home", {}),
+        (
+            {
+                "media_id": "603",
+                "media_type": MediaTypes.MOVIE.value,
+                "title": "The Matrix",
+            },
+            None,
+            "media_details",
+            {
+                "media_type": MediaTypes.MOVIE.value,
+                "media_id": "603",
+                "title": "the-matrix",
+            },
+        ),
+        (
+            {"media_id": "603", "media_type": None, "title": "The Matrix"},
+            None,
+            "media_details",
+            {
+                "media_type": MediaTypes.MOVIE.value,
+                "media_id": "603",
+                "title": "the-matrix",
+            },
+        ),
+        (
+            {
+                "media_id": "849",
+                "media_type": MediaTypes.EPISODE.value,
+                "series_title": "Haruhi",
+            },
+            MediaTypes.ANIME.value,
+            "media_details",
+            {
+                "media_type": MediaTypes.ANIME.value,
+                "media_id": "849",
+                "title": "haruhi",
+            },
+        ),
+        (
+            {
+                "media_id": "1668",
+                "media_type": MediaTypes.EPISODE.value,
+                "series_title": "Friends",
+                "season_number": 3,
+            },
+            None,
+            "season_details",
+            {"media_id": "1668", "title": "friends", "season_number": 3},
+        ),
+        (
+            {
+                "media_id": "1668",
+                "media_type": MediaTypes.EPISODE.value,
+                "series_title": "Friends",
+            },
+            None,
+            "media_details",
+            {"media_type": MediaTypes.TV.value, "media_id": "1668", "title": "friends"},
+        ),
+        # `<path:media_id>` keeps slashes and quotes the rest; so must we.
+        (
+            {
+                "media_id": "a b/ç",
+                "media_type": MediaTypes.MOVIE.value,
+                "title": "Odd Id",
+            },
+            None,
+            "media_details",
+            {
+                "media_type": MediaTypes.MOVIE.value,
+                "media_id": "a b/ç",
+                "title": "odd-id",
+            },
+        ),
+    )
+
+    def _assert_matches_reverse(self):
+        for overrides, library_media_type, name, route_kwargs in self.CASES:
+            state = {"source": Sources.TMDB.value, **overrides}
+            kwargs = (
+                {"source": Sources.TMDB.value, **route_kwargs} if route_kwargs else None
+            )
+            with self.subTest(name=name, state=state):
+                self.assertEqual(
+                    live_playback._build_details_url(state, library_media_type),
+                    reverse(name, kwargs=kwargs),
+                )
+
+    def test_links_match_reverse(self):
+        self._assert_matches_reverse()
+
+    @override_settings(FORCE_SCRIPT_NAME="/floppy")
+    def test_request_script_prefix_is_not_applied_twice(self):
+        """In a request under BASE_URL the prefix is already set; keep it once."""
+        set_script_prefix("/floppy/")
+        self.addCleanup(set_script_prefix, "/")
+        self._assert_matches_reverse()
+        self.assertTrue(
+            live_playback._build_details_url({"media_id": None}).startswith("/floppy/"),
+        )
+
+
 class ResolveStateImageTaskTests(TestCase):
     """The background fill-in task resolves and persists the image."""
 
     def setUp(self):
         self.user = get_user_model().objects.create_user(
             username="filltask",
-            password="pw",  # noqa: S106
+            password="pw",
         )
 
     def tearDown(self):
@@ -255,3 +568,361 @@ class ResolveStateImageTaskTests(TestCase):
         live_playback.resolve_state_image(self.user.id)
 
         mock_resolve.assert_not_called()
+
+
+class PlaybackProgressAtomicTests(TestCase):
+    """Webhook progress writes preserve fields that an event omits."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="progress-atomic")
+        self.item = Item.objects.create(
+            media_id="701",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+            image="https://example.com/matrix.jpg",
+        )
+
+    def test_completion_only_preserves_position_and_known_duration(self):
+        PlaybackProgress.objects.create(
+            user=self.user,
+            item=self.item,
+            position_seconds=1200,
+            duration_seconds=3600,
+        )
+
+        live_playback.store_playback_progress(
+            self.user.id,
+            item=self.item,
+            event_type="media.scrobble",
+            playback_media_type=MediaTypes.MOVIE.value,
+            view_offset_seconds=None,
+            duration_seconds=8160,
+        )
+
+        progress = PlaybackProgress.objects.get(user=self.user, item=self.item)
+        self.assertEqual(progress.position_seconds, 1200)
+        self.assertEqual(progress.duration_seconds, 3600)
+        self.assertTrue(progress.completed)
+
+    def test_completion_only_fills_missing_duration(self):
+        PlaybackProgress.objects.create(
+            user=self.user,
+            item=self.item,
+            position_seconds=1200,
+        )
+
+        live_playback.store_playback_progress(
+            self.user.id,
+            item=self.item,
+            event_type="media.scrobble",
+            playback_media_type=MediaTypes.MOVIE.value,
+            view_offset_seconds=None,
+            duration_seconds=8160,
+        )
+
+        progress = PlaybackProgress.objects.get(user=self.user, item=self.item)
+        self.assertEqual(progress.position_seconds, 1200)
+        self.assertEqual(progress.duration_seconds, 8160)
+        self.assertTrue(progress.completed)
+
+    def test_provider_incomplete_stop_overrides_completion_tail(self):
+        PlaybackProgress.objects.create(
+            user=self.user,
+            item=self.item,
+            position_seconds=8000,
+            duration_seconds=8160,
+            completed=True,
+        )
+
+        live_playback.store_playback_progress(
+            self.user.id,
+            item=self.item,
+            event_type="media.stop",
+            playback_media_type=MediaTypes.MOVIE.value,
+            view_offset_seconds=8160,
+            duration_seconds=8160,
+            provider_completed=False,
+        )
+
+        self.assertFalse(
+            PlaybackProgress.objects.get(user=self.user, item=self.item).completed,
+        )
+
+
+@skipUnless(connection.vendor == "postgresql", "requires PostgreSQL row-lock semantics")
+class PlaybackProgressConcurrencyTests(TransactionTestCase):
+    """Concurrent webhook writes resolve to a serialized final state."""
+
+    reset_sequences = True
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="progress-race")
+        self.item = Item.objects.create(
+            media_id="701",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+            image="https://example.com/matrix.jpg",
+        )
+
+    def _run_concurrently(self, *events):
+        barrier = Barrier(len(events))
+
+        def run(event):
+            close_old_connections()
+            try:
+                barrier.wait(timeout=5)
+                live_playback.store_playback_progress(
+                    self.user.id,
+                    item=self.item,
+                    event_type=event[0],
+                    playback_media_type=MediaTypes.MOVIE.value,
+                    view_offset_seconds=event[1],
+                    duration_seconds=8160,
+                    provider_completed=event[2],
+                )
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=len(events)) as executor:
+            return list(executor.map(run, events))
+
+    def test_scrobble_and_pause_do_not_restore_a_stale_position(self):
+        PlaybackProgress.objects.create(
+            user=self.user,
+            item=self.item,
+            position_seconds=6000,
+            duration_seconds=8160,
+        )
+
+        self._run_concurrently(
+            ("media.scrobble", None, None),
+            ("media.pause", 120, None),
+        )
+
+        progress = PlaybackProgress.objects.get(user=self.user, item=self.item)
+        self.assertEqual(progress.position_seconds, 120)
+
+    def test_scrobble_and_trailing_stop_keep_completion(self):
+        PlaybackProgress.objects.create(
+            user=self.user,
+            item=self.item,
+            position_seconds=6000,
+            duration_seconds=8160,
+        )
+
+        self._run_concurrently(
+            ("media.scrobble", None, None),
+            ("media.stop", 8160, None),
+        )
+
+        progress = PlaybackProgress.objects.get(user=self.user, item=self.item)
+        self.assertEqual(progress.position_seconds, 8160)
+        self.assertTrue(progress.completed)
+
+
+class SessionCardTests(TestCase):
+    """A manual Check-in of a game, book or video shows an elapsed-time card."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="sessioncard")
+
+    def tearDown(self):
+        live_playback.clear_user_playback_state(self.user.id)
+        cache.clear()
+        super().tearDown()
+
+    def _start(self, media_type):
+        item = Item.objects.create(
+            media_id="9",
+            source=Sources.MANUAL.value,
+            media_type=media_type,
+            title="Checked In",
+            image="https://example.com/cover.jpg",
+            runtime_minutes=120,
+        )
+        with patch("app.live_playback._attach_resolved_image"):
+            live_playback.apply_playback_event(
+                user_id=self.user.id,
+                event_type="media.play",
+                playback_media_type=media_type,
+                media_id="9",
+                source=Sources.MANUAL.value,
+                title=item.title,
+                image=item.image,
+                view_offset_seconds=0,
+                checkin_token="token",
+                ends_at_ts=live_playback._now_ts() + 4 * 3600,
+            )
+
+    def test_every_session_type_gets_a_card_without_a_made_up_duration(self):
+        for media_type in live_playback.SESSION_MEDIA_TYPES:
+            with self.subTest(media_type=media_type):
+                self._start(media_type)
+
+                card = live_playback.build_home_playback_card(self.user)
+
+                self.assertEqual(card["title"], "Checked In")
+                self.assertIn(f"/{media_type}/9/", card["details_url"])
+                # A runtime on the item must not turn a read into a 2-hour film.
+                self.assertEqual(card["duration_seconds"], 0)
+                self.assertEqual(card["progress_percent"], 0)
+                live_playback.clear_user_playback_state(self.user.id)
+
+    def test_the_now_playing_api_reports_the_type(self):
+        from api.fork_views_playback import build_now_playing_payload
+
+        self._start(MediaTypes.BOOK.value)
+
+        payload = build_now_playing_payload(self.user)
+
+        self.assertEqual(payload["media_type"], MediaTypes.BOOK.value)
+        self.assertEqual(payload["title"], "Checked In")
+
+
+class UnknownRuntimeCardTests(TestCase):
+    """The unknown-runtime marker on an item must never become a duration."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="unknownruntime")
+
+    def tearDown(self):
+        live_playback.clear_user_playback_state(self.user.id)
+        cache.clear()
+        super().tearDown()
+
+    def _play(self, *, runtime_minutes, duration_seconds=None, offset=479):
+        Item.objects.create(
+            media_id="5",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Episode",
+            image="https://example.com/still.jpg",
+            season_number=1,
+            episode_number=5,
+            runtime_minutes=runtime_minutes,
+        )
+        with patch("app.live_playback._attach_resolved_image"):
+            live_playback.apply_playback_event(
+                user_id=self.user.id,
+                event_type="media.play",
+                playback_media_type=MediaTypes.EPISODE.value,
+                media_id="5",
+                source=Sources.TMDB.value,
+                season_number=1,
+                episode_number=5,
+                title="Show",
+                view_offset_seconds=offset,
+                duration_seconds=duration_seconds,
+            )
+        return live_playback.build_home_playback_card(self.user)
+
+    def test_aired_but_unknown_runtime_hides_the_total(self):
+        card = self._play(runtime_minutes=999998)
+
+        self.assertEqual(card["duration_seconds"], 0)
+        self.assertEqual(card["progress_percent"], 0)
+        self.assertNotIn("16666", card["progress_display"])
+        self.assertNotIn("/", card["progress_display"])
+
+    def test_failed_lookup_runtime_hides_the_total(self):
+        card = self._play(runtime_minutes=999999)
+
+        self.assertEqual(card["duration_seconds"], 0)
+        self.assertNotIn("/", card["progress_display"])
+
+    def test_a_real_runtime_still_gives_the_total(self):
+        card = self._play(runtime_minutes=45)
+
+        self.assertEqual(card["duration_seconds"], 45 * 60)
+        self.assertIn("/ 45:00", card["progress_display"])
+
+    def test_the_server_reported_duration_wins_over_the_marker(self):
+        card = self._play(runtime_minutes=999998, duration_seconds=2400)
+
+        self.assertEqual(card["duration_seconds"], 2400)
+        self.assertIn("/ 40:00", card["progress_display"])
+
+    def test_a_card_cached_with_the_marker_is_repaired_on_read(self):
+        """Cards written before the fix still hold 999998 minutes in seconds."""
+        card = self._play(runtime_minutes=45, duration_seconds=999998 * 60)
+
+        self.assertEqual(card["duration_seconds"], 45 * 60)
+        self.assertNotIn("16666", card["progress_display"])
+
+    def test_the_now_playing_api_reports_no_duration_for_the_marker(self):
+        from api.fork_views_playback import build_now_playing_payload
+
+        self._play(runtime_minutes=999998)
+
+        payload = build_now_playing_payload(self.user)
+
+        self.assertFalse(payload["duration_seconds"])
+
+    def _runtime(self):
+        return Item.objects.get(media_id="5").runtime_minutes
+
+    def test_the_server_reported_duration_fills_an_unknown_runtime(self):
+        for marker in (999998, 999999):
+            with self.subTest(marker=marker):
+                Item.objects.all().delete()
+                self._play(runtime_minutes=marker, duration_seconds=2700)
+
+                self.assertEqual(self._runtime(), 45)
+
+    def test_a_known_runtime_is_not_overwritten_by_the_server(self):
+        self._play(runtime_minutes=42, duration_seconds=2700)
+
+        self.assertEqual(self._runtime(), 42)
+
+    def test_no_server_duration_leaves_the_marker_for_a_later_try(self):
+        self._play(runtime_minutes=999998)
+
+        self.assertEqual(self._runtime(), 999998)
+
+    def test_a_sub_minute_server_duration_is_not_a_runtime(self):
+        self._play(runtime_minutes=999998, duration_seconds=30)
+
+        self.assertEqual(self._runtime(), 999998)
+
+    def test_a_later_play_fills_the_runtime_once_the_server_reports_it(self):
+        self._play(runtime_minutes=999998)
+        with patch("app.live_playback._attach_resolved_image"):
+            live_playback.apply_playback_event(
+                user_id=self.user.id,
+                event_type="media.pause",
+                playback_media_type=MediaTypes.EPISODE.value,
+                media_id="5",
+                source=Sources.TMDB.value,
+                season_number=1,
+                episode_number=5,
+                title="Show",
+                view_offset_seconds=500,
+                duration_seconds=3000,
+            )
+
+        self.assertEqual(self._runtime(), 50)
+
+    def test_a_movie_runtime_is_filled_the_same_way(self):
+        Item.objects.create(
+            media_id="88",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Movie",
+            image="https://example.com/m.jpg",
+            runtime_minutes=999999,
+        )
+        with patch("app.live_playback._attach_resolved_image"):
+            live_playback.apply_playback_event(
+                user_id=self.user.id,
+                event_type="media.play",
+                playback_media_type=MediaTypes.MOVIE.value,
+                media_id="88",
+                source=Sources.TMDB.value,
+                title="Movie",
+                view_offset_seconds=0,
+                duration_seconds=6000,
+            )
+
+        self.assertEqual(Item.objects.get(media_id="88").runtime_minutes, 100)

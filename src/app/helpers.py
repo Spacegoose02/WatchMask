@@ -1,4 +1,6 @@
+import ipaddress
 import re
+from datetime import date, datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 from django.apps import apps
@@ -7,10 +9,41 @@ from django.contrib import messages
 from django.db.models import Q
 from django.http import HttpResponseRedirect
 from django.shortcuts import redirect
+from django.utils.dateparse import parse_date, parse_datetime
 from django.utils.encoding import iri_to_uri
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.utils.timezone import is_naive, make_aware
 
-from app.models import BasicMedia, CollectionEntry, MediaTypes, Status
+from app.models import (
+    TV,
+    Anime,
+    BasicMedia,
+    BoardGame,
+    Book,
+    CollectionEntry,
+    Comic,
+    ComicIssue,
+    Game,
+    Manga,
+    MediaTypes,
+    Movie,
+    Music,
+    Status,
+)
+
+MODEL_MAP = {
+    MediaTypes.TV.value: TV,
+    MediaTypes.MOVIE.value: Movie,
+    MediaTypes.ANIME.value: Anime,
+    MediaTypes.MANGA.value: Manga,
+    MediaTypes.GAME.value: Game,
+    MediaTypes.BOOK.value: Book,
+    MediaTypes.COMIC.value: Comic,
+    MediaTypes.BOARDGAME.value: BoardGame,
+    # Fork media types that support manual-source items
+    MediaTypes.MUSIC.value: Music,
+    MediaTypes.COMIC_ISSUE.value: ComicIssue,
+}
 
 _DEFAULT_IMAGE_SENTINEL = object()
 _ENCODED_NAVIGATION_SEPARATOR_PATTERNS = (
@@ -19,6 +52,14 @@ _ENCODED_NAVIGATION_SEPARATOR_PATTERNS = (
     (re.compile(r"%3D", re.IGNORECASE), "="),
     (re.compile(r"%23", re.IGNORECASE), "#"),
 )
+
+
+def get_page_number(request):
+    """Return the ``page`` query parameter as an int, or 1 when it is not numeric."""
+    try:
+        return int(request.GET.get("page", 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 def is_htmx_fragment(request):
@@ -41,6 +82,18 @@ def minutes_to_hhmm(total_minutes):
     if hours == 0:
         return f"{minutes}min"
     return f"{hours}h {minutes:02d}min"
+
+
+def seconds_to_hm(total_seconds):
+    """Convert a duration in seconds to "1h 9m", or to "46m" under an hour.
+
+    Returns "" for a missing or zero duration.
+    """
+    if not total_seconds:
+        return ""
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
 def has_real_image(image):
@@ -78,16 +131,24 @@ def get_tmdb_backdrop_image(media_type, media_id):
         return None
 
     try:
-        from lists.models import CustomList
-    except Exception:
-        return None
+        from app.backdrops import get_tmdb_backdrop
 
-    try:
-        backdrop = CustomList()._get_tmdb_backdrop(media_type, media_id)
+        backdrop = get_tmdb_backdrop(media_type, media_id)
     except Exception:
         return None
 
     return backdrop if has_real_image(backdrop) else None
+
+
+def safe_return_url(request, destination, fallback="/"):
+    """Keep user-supplied navigation on this host and preserve HTTPS."""
+    if url_has_allowed_host_and_scheme(
+        destination,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
+        return destination
+    return fallback
 
 
 def redirect_back(request):
@@ -96,7 +157,6 @@ def redirect_back(request):
         request.GET.get("next") or request.POST.get("next"),
     )
     if url_has_allowed_host_and_scheme(next_url, None):
-
         # Parse the URL
         parsed_url = urlparse(next_url)
 
@@ -234,7 +294,24 @@ def refresh_item_image_if_missing(item, new_image):
     item.save(update_fields=["image"])
 
 
-def enrich_items_with_user_data(request, items, section_name=None, user=None, library_media_type=None):
+_PROVIDER_ID_KEYS = {"tmdb": "tmdb_id", "imdb": "imdb_id", "tvdb": "tvdb_id"}
+
+
+def build_provider_ids(item):
+    """Map an Item's resolved external ids to the API's `ids` vocabulary."""
+    if item is None:
+        return {}
+    stored = getattr(item, "provider_external_ids", None) or {}
+    return {
+        key: str(stored[field])
+        for key, field in _PROVIDER_ID_KEYS.items()
+        if stored.get(field)
+    }
+
+
+def enrich_items_with_user_data(
+    request, items, section_name=None, user=None, library_media_type=None
+):
     """Enrich a list of items with user tracking data.
 
     Args:
@@ -294,7 +371,9 @@ def enrich_items_with_user_data(request, items, section_name=None, user=None, li
     # This allows multiple plays of the same episode to be tracked separately in the DB
     # but we show the most recent one in the UI
     if media_type == MediaTypes.PODCAST.value:
-        media_queryset = media_queryset.order_by("item__media_id", "item__source", "-created_at")
+        media_queryset = media_queryset.order_by(
+            "item__media_id", "item__source", "-created_at"
+        )
 
     # Create a lookup dictionary for fast matching
     # For podcasts with multiple entries, keep only the most recent one (first after ordering)
@@ -344,6 +423,23 @@ def enrich_items_with_user_data(request, items, section_name=None, user=None, li
     return enriched_items
 
 
+def default_status_for_new_entry(*, has_in_progress_entry=False):
+    """Return the status to pre-select when tracking media the user has no entry for.
+
+    The model default is Completed, which only suits play-based writes. A new
+    entry made by hand starts as Planning (#1305), unless the user already has
+    an in-progress entry for the same media.
+    """
+    from app.models import Status
+
+    if has_in_progress_entry:
+        return Status.IN_PROGRESS.value
+    return Status.PLANNING.value
+
+
+MIN_VALID_RELEASE_YEAR = 1900
+
+
 def extract_release_datetime(metadata):
     """Extract release datetime from metadata dict."""
     from datetime import datetime
@@ -362,7 +458,10 @@ def extract_release_datetime(metadata):
         year = metadata.get("details", {}).get("year") or metadata.get("year")
         if year:
             try:
-                return datetime(int(year), 1, 1, tzinfo=ZoneInfo("UTC"))
+                parsed_year = int(year)
+                if parsed_year < MIN_VALID_RELEASE_YEAR:
+                    return None
+                return datetime(parsed_year, 1, 1, tzinfo=ZoneInfo("UTC"))
             except (ValueError, TypeError):
                 return None
         return None
@@ -380,7 +479,9 @@ def extract_release_datetime(metadata):
     }
     for fmt, length in format_lengths.items():
         try:
-            dt = datetime.strptime(date_str[:length], fmt)
+            dt = datetime.strptime(date_str[:length], fmt)  # noqa: DTZ007  # date-only value; no timezone applies
+            if dt.year < MIN_VALID_RELEASE_YEAR:
+                continue
             return dt.replace(tzinfo=ZoneInfo("UTC"))
         except (ValueError, TypeError):
             continue
@@ -488,17 +589,27 @@ def get_album_collection_metadata(user, album):
         if entry.audio_codec:
             audio_codecs[entry.audio_codec] = audio_codecs.get(entry.audio_codec, 0) + 1
         if entry.audio_channels:
-            audio_channels_list[entry.audio_channels] = audio_channels_list.get(entry.audio_channels, 0) + 1
+            audio_channels_list[entry.audio_channels] = (
+                audio_channels_list.get(entry.audio_channels, 0) + 1
+            )
         if entry.bitrate:
             bitrates[entry.bitrate] = bitrates.get(entry.bitrate, 0) + 1
         if entry.media_type:
             media_types[entry.media_type] = media_types.get(entry.media_type, 0) + 1
 
     # Get most common value (or first if tie)
-    audio_codec = max(audio_codecs.items(), key=lambda x: x[1])[0] if audio_codecs else None
-    audio_channels = max(audio_channels_list.items(), key=lambda x: x[1])[0] if audio_channels_list else None
+    audio_codec = (
+        max(audio_codecs.items(), key=lambda x: x[1])[0] if audio_codecs else None
+    )
+    audio_channels = (
+        max(audio_channels_list.items(), key=lambda x: x[1])[0]
+        if audio_channels_list
+        else None
+    )
     bitrate = max(bitrates.items(), key=lambda x: x[1])[0] if bitrates else None
-    media_type = max(media_types.items(), key=lambda x: x[1])[0] if media_types else None
+    media_type = (
+        max(media_types.items(), key=lambda x: x[1])[0] if media_types else None
+    )
 
     return {
         "has_collection": True,
@@ -653,6 +764,13 @@ def get_tv_show_collection_stats(user, tv_item, metadata_episode_count=None):
     )
 
     # Use metadata episode count if provided (matches Details pane), otherwise count from Items
+    # Guard against providers handing back an episode list instead of a count:
+    # a non-numeric value would be rendered verbatim by the Collection panel.
+    if isinstance(metadata_episode_count, bool) or not isinstance(
+        metadata_episode_count,
+        int,
+    ):
+        metadata_episode_count = None
     if metadata_episode_count is not None:
         total_episodes = metadata_episode_count
     else:
@@ -663,20 +781,28 @@ def get_tv_show_collection_stats(user, tv_item, metadata_episode_count=None):
     episode_item_ids = [item.id for item in all_episode_items]
 
     # Get collection entries for seasons
-    season_collection_item_ids = list(
-        CollectionEntry.objects.filter(
-            user=user,
-            item_id__in=season_item_ids,
-        ).values_list("item_id", flat=True)
-    ) if season_item_ids else []
+    season_collection_item_ids = (
+        list(
+            CollectionEntry.objects.filter(
+                user=user,
+                item_id__in=season_item_ids,
+            ).values_list("item_id", flat=True)
+        )
+        if season_item_ids
+        else []
+    )
 
     # Get collection entries for episodes
-    episode_collection_item_ids = list(
-        CollectionEntry.objects.filter(
-            user=user,
-            item_id__in=episode_item_ids,
-        ).values_list("item_id", flat=True)
-    ) if episode_item_ids else []
+    episode_collection_item_ids = (
+        list(
+            CollectionEntry.objects.filter(
+                user=user,
+                item_id__in=episode_item_ids,
+            ).values_list("item_id", flat=True)
+        )
+        if episode_item_ids
+        else []
+    )
 
     # Match season_details fallback behavior: a show-level collection entry represents
     # the entire show only when no granular season/episode collection rows exist.
@@ -740,6 +866,30 @@ def get_tv_show_collection_stats(user, tv_item, metadata_episode_count=None):
     }
 
 
+def _resolve_show_item_for_season(season_item):
+    """Find the parent show's TV Item for a season, tolerating bucket duplicates.
+
+    A show can legitimately have more than one TV-media-type Item (e.g. one in
+    the 'tv' bucket, one in a 'season' bucket) once the fork's unique
+    constraint scopes on library_media_type — see issue #1015. Prefer the row
+    sharing the season's own bucket, then fall back to any other match rather
+    than raising MultipleObjectsReturned.
+    """
+    from app.models import Item, MediaTypes
+
+    tv_items = Item.objects.filter(
+        media_id=season_item.media_id,
+        source=season_item.source,
+        media_type=MediaTypes.TV.value,
+    )
+    return (
+        tv_items.filter(library_media_type=season_item.library_media_type).first()
+        or tv_items.exclude(library_media_type=season_item.library_media_type)
+        .order_by("id")
+        .first()
+    )
+
+
 def get_season_collection_stats(user, season_item):
     """Get collection statistics for a specific season.
 
@@ -776,7 +926,8 @@ def get_season_collection_stats(user, season_item):
         item_id__in=episode_item_ids,
     )
 
-    collected_count = episode_collection_entries.count()
+    # Count episodes, not copies: a Blu-ray and a digital copy are one episode.
+    collected_count = episode_collection_entries.values("item_id").distinct().count()
 
     # If no episode-level entries exist, fall back to broader collection rows.
     # A manual season-level entry represents the whole season in the current UI.
@@ -798,12 +949,8 @@ def get_season_collection_stats(user, season_item):
     # If no episode or season-level entries exist anywhere for the show,
     # a show-level collection entry can still represent the whole season.
     if collected_count == 0:
-        try:
-            tv_item = Item.objects.get(
-                media_id=season_item.media_id,
-                source=season_item.source,
-                media_type=MediaTypes.TV.value,
-            )
+        tv_item = _resolve_show_item_for_season(season_item)
+        if tv_item is not None:
             show_collection_entry = CollectionEntry.objects.filter(
                 user=user,
                 item=tv_item,
@@ -811,13 +958,161 @@ def get_season_collection_stats(user, season_item):
 
             if show_collection_entry and not show_has_granular_collection:
                 collected_count = total_episodes
-        except Item.DoesNotExist:
-            pass
 
     return {
         "collected_episodes": collected_count,
         "total_episodes": total_episodes,
     }
+
+
+def get_collection_completeness_map(user, show_items):
+    """Get TV/anime collection completeness for multiple shows in a batch.
+
+    Mirrors the fallback logic of get_tv_show_collection_stats and
+    get_season_collection_stats (show-level entry counts as fully collected
+    when no season/episode rows exist; a season-level entry counts as fully
+    collected when it has no episode rows), but computes it for many shows
+    using a fixed number of queries instead of looping per show/season, so
+    it is safe to call once per page of collection rows.
+
+    Args:
+        user: Django user object
+        show_items: iterable of Item objects with media_type in (tv, anime)
+
+    Returns:
+        Dict keyed by show Item id and by season Item id (for seasons with
+        at least one episode), each mapping to:
+        {"collected": int, "total": int, "is_partial": bool}
+        A row is "is_partial" only when 0 < collected < total.
+    """
+    from app.models import Item, MediaTypes
+
+    show_items = list(show_items)
+    if not show_items:
+        return {}
+
+    show_keys = {(item.media_id, item.source) for item in show_items}
+    media_ids = {media_id for media_id, _source in show_keys}
+    sources = {source for _media_id, source in show_keys}
+
+    all_season_items = [
+        item
+        for item in Item.objects.filter(
+            media_id__in=media_ids,
+            source__in=sources,
+            media_type=MediaTypes.SEASON.value,
+        ).exclude(season_number=0)
+        if (item.media_id, item.source) in show_keys
+    ]
+    all_episode_items = [
+        item
+        for item in Item.objects.filter(
+            media_id__in=media_ids,
+            source__in=sources,
+            media_type=MediaTypes.EPISODE.value,
+        ).exclude(season_number=0)
+        if (item.media_id, item.source) in show_keys
+    ]
+
+    def collected_item_ids(item_ids):
+        if not item_ids:
+            return set()
+        item_ids = list(item_ids)
+        chunk_size = 500
+        collected = set()
+        for offset in range(0, len(item_ids), chunk_size):
+            collected.update(
+                CollectionEntry.objects.filter(
+                    user=user,
+                    item_id__in=item_ids[offset : offset + chunk_size],
+                ).values_list("item_id", flat=True)
+            )
+        return collected
+
+    collected_season_ids = collected_item_ids([item.id for item in all_season_items])
+    collected_episode_ids = collected_item_ids([item.id for item in all_episode_items])
+    collected_show_ids = collected_item_ids([item.id for item in show_items])
+
+    seasons_by_show = {}
+    for item in all_season_items:
+        seasons_by_show.setdefault((item.media_id, item.source), []).append(item)
+    episodes_by_show = {}
+    for item in all_episode_items:
+        episodes_by_show.setdefault((item.media_id, item.source), []).append(item)
+
+    result = {}
+    for show_item in show_items:
+        key = (show_item.media_id, show_item.source)
+        season_items_for_show = seasons_by_show.get(key, [])
+        episode_items_for_show = episodes_by_show.get(key, [])
+        total_episodes = len(episode_items_for_show)
+
+        episode_ids_by_season_number = {}
+        for item in episode_items_for_show:
+            if item.season_number is not None:
+                episode_ids_by_season_number.setdefault(
+                    item.season_number,
+                    set(),
+                ).add(item.id)
+
+        show_seasons_collected = {
+            item.id for item in season_items_for_show if item.id in collected_season_ids
+        }
+        show_episodes_collected = {
+            item.id
+            for item in episode_items_for_show
+            if item.id in collected_episode_ids
+        }
+        show_has_granular_collection = bool(
+            show_seasons_collected or show_episodes_collected,
+        )
+
+        if not show_has_granular_collection:
+            collected_episodes_count = (
+                total_episodes if show_item.id in collected_show_ids else 0
+            )
+        else:
+            collected_episode_id_set = set(show_episodes_collected)
+            for season_item in season_items_for_show:
+                if season_item.id in show_seasons_collected:
+                    collected_episode_id_set.update(
+                        episode_ids_by_season_number.get(
+                            season_item.season_number,
+                            set(),
+                        ),
+                    )
+            collected_episodes_count = len(collected_episode_id_set)
+
+        result[show_item.id] = {
+            "collected": collected_episodes_count,
+            "total": total_episodes,
+            "is_partial": 0 < collected_episodes_count < total_episodes,
+        }
+
+        for season_item in season_items_for_show:
+            season_episode_ids = episode_ids_by_season_number.get(
+                season_item.season_number,
+                set(),
+            )
+            season_total = len(season_episode_ids)
+            if season_total == 0:
+                continue
+            season_collected = len(season_episode_ids & show_episodes_collected)
+            if season_collected == 0 and season_item.id in show_seasons_collected:
+                season_collected = season_total
+            if (
+                season_collected == 0
+                and not show_has_granular_collection
+                and show_item.id in collected_show_ids
+            ):
+                season_collected = season_total
+            result[season_item.id] = {
+                "collected": season_collected,
+                "total": season_total,
+                "is_partial": 0 < season_collected < season_total,
+            }
+
+    return result
 
 
 def get_season_collection_metadata(user, season_item):
@@ -891,12 +1186,8 @@ def get_season_collection_metadata(user, season_item):
             item__source=season_item.source,
             item__media_type__in=[MediaTypes.SEASON.value, MediaTypes.EPISODE.value],
         ).exists()
-        try:
-            tv_item = Item.objects.get(
-                media_id=season_item.media_id,
-                source=season_item.source,
-                media_type=MediaTypes.TV.value,
-            )
+        tv_item = _resolve_show_item_for_season(season_item)
+        if tv_item is not None:
             show_collection_entry = CollectionEntry.objects.filter(
                 user=user,
                 item=tv_item,
@@ -914,8 +1205,6 @@ def get_season_collection_metadata(user, season_item):
                     "is_3d": show_collection_entry.is_3d,
                     "collected_at": show_collection_entry.collected_at,
                 }
-        except Item.DoesNotExist:
-            pass
 
         return None
 
@@ -995,3 +1284,96 @@ def build_absolute_app_url(request, path):
         return None
 
     return request.build_absolute_uri(path)
+
+
+def supports_oauth_redirect(callback_url):
+    """Whether an OAuth provider will accept this callback URL.
+
+    Trakt (and a growing number of providers) reject redirect URIs that are not
+    HTTPS unless the host is loopback, so an instance served over plain HTTP on
+    a LAN address cannot use the browser-redirect flow at all (#681).
+    """
+    if not callback_url:
+        return False
+
+    parsed = urlparse(callback_url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def parse_completion_datetime(value):
+    """Return an aware datetime for a user-supplied completion date.
+
+    Accepts a datetime, a date, an ISO datetime string, or an ISO date string,
+    and raises ``ValueError`` for anything else. A date without a time is read
+    as midnight, and a naive value is made aware in the active timezone.
+
+    The web forms and the REST API both take a completion date from the user
+    and must agree on what a given string means. Keeping one reader here is
+    what stops them drifting: the API used to reject an unparsable date while
+    the web form quietly discarded it and recorded something else.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        parsed = parse_datetime(value)
+        if parsed is None:
+            parsed_date = parse_date(value)
+            if parsed_date is None:
+                msg = "Invalid date format"
+                raise ValueError(msg)
+            parsed = datetime.combine(parsed_date, datetime.min.time())
+
+    if is_naive(parsed):
+        parsed = make_aware(parsed)
+
+    return parsed
+
+
+def split_pass_history(tracked_plays, season):
+    """Return (plays in the season's current rewatch pass, every play).
+
+    Outside a pass the two are the same, so callers can key display off the
+    first and lifetime counts off the second without special-casing.
+    """
+    if season is None:
+        return tracked_plays, tracked_plays
+    return [
+        play for play in tracked_plays if season.play_counts_for_pass(play)
+    ], tracked_plays
+
+
+def entry_activity_key(entry):
+    """Sort key that puts the most recently active tracked entry last."""
+    dates = [d for d in (entry.end_date, entry.start_date) if d]
+    primary_date = max(dates) if dates else entry.created_at
+    return (
+        primary_date,
+        entry.start_date or entry.created_at,
+        entry.created_at,
+    )
+
+
+def progress_activity(media):
+    """Return when an entry last progressed, for the Last Watched fallback.
+
+    A completed entry without a watch date has none: its progress time only
+    records when it was logged, so it must not rank as just watched.
+    """
+    if getattr(media, "status", None) == Status.COMPLETED.value:
+        return None
+    return getattr(media, "progressed_at", None)

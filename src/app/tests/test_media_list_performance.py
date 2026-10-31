@@ -20,6 +20,7 @@ from django.db import connection, reset_queries
 from django.test import RequestFactory, TestCase, tag
 from django.test.utils import override_settings
 
+from app.media_list_filters import media_list_entries_for_items
 from app.models import (
     BasicMedia,
     Item,
@@ -31,8 +32,16 @@ from app.models import (
 )
 from users.models import MediaStatusChoices
 
+
 # Suppress noisy debug logging during tests
-logging.disable(logging.DEBUG)
+def setUpModule():
+    """Silence log noise for this module only."""
+    logging.disable(logging.DEBUG)
+
+
+def tearDownModule():
+    """Restore logging so other modules' assertLogs still see records."""
+    logging.disable(logging.NOTSET)
 
 
 def _bulk_create_movie_items_and_entries(
@@ -171,7 +180,9 @@ class FullViewWallClockTests(TestCase):
             pk__in=Item.objects.filter(
                 media_id__startswith="perf_",
                 media_type=MediaTypes.MOVIE.value,
-            ).order_by("id").values_list("id", flat=True)[:500],
+            )
+            .order_by("id")
+            .values_list("id", flat=True)[:500],
         ).update(genres=["Comedy"])
 
         from app.views import media_list
@@ -182,7 +193,7 @@ class FullViewWallClockTests(TestCase):
         with override_settings(DEBUG=True):
             reset_queries()
             start = time.perf_counter()
-            media_list(request, MediaTypes.MOVIE.value)
+            response = media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
             queries = connection.queries[:]
 
@@ -213,9 +224,7 @@ class CacheLookupOverheadTests(TestCase):
 
     def test_cache_lookups_without_db_fields(self):
         """Items without DB-level metadata should not spam cache.get for facets."""
-        _bulk_create_movie_items_and_entries(
-            self.user, 500, populate_languages=False
-        )
+        _bulk_create_movie_items_and_entries(self.user, 500, populate_languages=False)
 
         from app.views import media_list
 
@@ -231,7 +240,7 @@ class CacheLookupOverheadTests(TestCase):
 
         with patch.object(cache, "get", side_effect=counting_get):
             start = time.perf_counter()
-            media_list(request, MediaTypes.MOVIE.value)
+            response = media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
 
         print("\n[PERF] Cache lookups (500 items, no DB metadata):")
@@ -245,9 +254,7 @@ class CacheLookupOverheadTests(TestCase):
 
     def test_cache_lookups_with_db_fields(self):
         """Items WITH DB-level metadata skip cache lookups."""
-        _bulk_create_movie_items_and_entries(
-            self.user, 500, populate_languages=True
-        )
+        _bulk_create_movie_items_and_entries(self.user, 500, populate_languages=True)
 
         from app.views import media_list
 
@@ -263,7 +270,7 @@ class CacheLookupOverheadTests(TestCase):
 
         with patch.object(cache, "get", side_effect=counting_get):
             start = time.perf_counter()
-            media_list(request, MediaTypes.MOVIE.value)
+            response = media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
 
         print("\n[PERF] Cache lookups (500 items, WITH DB metadata):")
@@ -292,21 +299,18 @@ class CollectionFilterN1Tests(TestCase):
 
         from app.views import media_list
 
-        request = self.factory.get(
-            "/medialist/movie", {"collection": "not_collected"}
-        )
+        request = self.factory.get("/medialist/movie", {"collection": "not_collected"})
         request.user = self.user
 
         with override_settings(DEBUG=True):
             reset_queries()
             start = time.perf_counter()
-            media_list(request, MediaTypes.MOVIE.value)
+            response = media_list(request, MediaTypes.MOVIE.value)
             elapsed_ms = (time.perf_counter() - start) * 1000
             queries = connection.queries[:]
 
         collection_queries = [
-            q for q in queries
-            if "app_collectionentry" in q["sql"].lower()
+            q for q in queries if "app_collectionentry" in q["sql"].lower()
         ]
         print("\n[PERF] Collection filter (50 movies, 'not_collected'):")
         print(f"  Total SQL queries: {len(queries)}")
@@ -348,13 +352,13 @@ class DuplicateAggregationTests(TestCase):
             )
             queries = connection.queries[:]
 
-        select_queries = [
-            q for q in queries if q["sql"].startswith("SELECT")
-        ]
+        select_queries = [q for q in queries if q["sql"].startswith("SELECT")]
         # Identify the aggregation query (fetches app_movie with item join)
         agg_queries = [
-            q for q in select_queries
-            if "app_movie" in q["sql"] and "row_number" not in q["sql"]
+            q
+            for q in select_queries
+            if "app_movie" in q["sql"]
+            and "row_number" not in q["sql"]
             and "events_event" not in q["sql"]
         ]
         print("\n[PERF] Aggregation overhead (500 items, no duplicates):")
@@ -369,7 +373,7 @@ class DuplicateAggregationTests(TestCase):
 
 @tag("slow", "benchmark")
 class MaterializationWasteTests(TestCase):
-    """Show that list() loads ALL items even though only 32 are displayed."""
+    """Regression coverage for SQL-first page slicing."""
 
     @classmethod
     def setUpTestData(cls):
@@ -381,35 +385,130 @@ class MaterializationWasteTests(TestCase):
         cls.factory = RequestFactory()
 
     def test_loads_all_items_for_one_page(self):
-        """1000 items loaded into Python for a 32-item page display.
-
-        The view does: media_list = list(media_queryset) which forces
-        evaluation of all 1000 items, runs build_filter_data_from_items
-        on all 1000, applies Python filters on all 1000, THEN paginates
-        to show 32.
-        """
+        """A cold first page and a later page request the database slice."""
         _bulk_create_movie_items_and_entries(self.user, 1000)
+        cache.clear()
 
-        from app.views import media_list
-
-        request = self.factory.get("/medialist/movie")
-        request.user = self.user
+        self.client.force_login(self.user)
 
         with override_settings(DEBUG=True):
             reset_queries()
             start = time.perf_counter()
-            media_list(request, MediaTypes.MOVIE.value)
+            with patch(
+                "app.media_list_views.media_list_entries_for_items",
+                wraps=media_list_entries_for_items,
+            ) as hydrate:
+                response = self.client.get("/medialist/movie", follow=True)
             elapsed_ms = (time.perf_counter() - start) * 1000
             queries = connection.queries[:]
 
         sql_ms = sum(float(q["time"]) for q in queries) * 1000
-        print("\n[PERF] Materialization waste (1000 items, page 1 of 32):")
+        hydrated = [len(call.args[1]) for call in hydrate.call_args_list]
+        print("\n[PERF] SQL-first pagination (1000 items, page 1 of 32):")
         print(f"  Wall-clock:   {elapsed_ms:.0f}ms")
         print(f"  SQL time:     {sql_ms:.0f}ms")
         print(f"  Python time:  {elapsed_ms - sql_ms:.0f}ms")
-        print("  Items loaded: 1000")
-        print("  Items shown:  32 (page 1)")
-        print(f"  Waste ratio:  {1000 / 32:.0f}x")
-        print("  All 1000 items go through: build_filter_data_from_items,")
-        print("  apply_latest_status_filter, and all Python filter functions")
-        print("  before pagination reduces to 32.")
+        print(f"  Items hydrated: {hydrated}")
+        self.assertEqual(response.context["media_list"].paginator.count, 1000)
+        self.assertEqual(len(response.context["media_list"].object_list), 32)
+        self.assertEqual(hydrated, [32])
+        self.assertTrue(
+            any("LIMIT 32" in query["sql"].upper() for query in queries),
+            "the visible tracker query should contain the SQL page limit",
+        )
+        first_page_ids = {
+            entry.item_id for entry in response.context["media_list"].object_list
+        }
+
+        with override_settings(DEBUG=True):
+            reset_queries()
+            second_response = self.client.get(
+                "/medialist/movie?page=2",
+                follow=True,
+            )
+            second_queries = connection.queries[:]
+
+        self.assertEqual(
+            len(second_response.context["media_list"].object_list),
+            32,
+        )
+        self.assertTrue(
+            first_page_ids.isdisjoint(
+                entry.item_id
+                for entry in second_response.context["media_list"].object_list
+            )
+        )
+        self.assertTrue(
+            any("OFFSET 32" in query["sql"].upper() for query in second_queries),
+            "the second page should advance the SQL offset",
+        )
+
+
+@tag("slow", "benchmark")
+class CachedPageScalingTests(TestCase):
+    """Issue #865: a warm-cache page-2+ request must not scale with library size.
+
+    Production logs showed /medialist/movie scroll requests taking 2.6-3.4s
+    on only 4 SQL queries — the cost was unpickling the ENTIRE cached library
+    just to slice out one page. The fix caches a compact {media_pk, item_pk}
+    order instead of full objects and hydrates only the requested page.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = get_user_model().objects.create_user(
+            username="scalepage", password="12345"
+        )
+        cls.user.movie_enabled = True
+        cls.user.save()
+        cls.factory = RequestFactory()
+
+    def _second_page_ms(self, count):
+        cache.clear()
+        Movie.objects.filter(user=self.user).delete()
+        Item.objects.filter(
+            media_id__startswith="perf_",
+            media_type=MediaTypes.MOVIE.value,
+        ).delete()
+        _bulk_create_movie_items_and_entries(self.user, count)
+
+        from app.views import media_list
+
+        # Warm both the order cache and the filter_data cache with page 1.
+        first_request = self.factory.get("/medialist/movie")
+        first_request.user = self.user
+        media_list(first_request, MediaTypes.MOVIE.value)
+
+        second_request = self.factory.get("/medialist/movie", {"page": 2})
+        second_request.user = self.user
+        with override_settings(DEBUG=True):
+            reset_queries()
+            start = time.perf_counter()
+            response = media_list(second_request, MediaTypes.MOVIE.value)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            n_queries = len(connection.queries)
+        self.assertEqual(response.status_code, 200)
+        return elapsed_ms, n_queries
+
+    def test_cached_second_page_does_not_scale_with_library_size(self):
+        """A warm-cache page-2 request should cost roughly the same at 100 vs 2000 items."""
+        print()
+        small_ms, small_queries = self._second_page_ms(100)
+        large_ms, large_queries = self._second_page_ms(2000)
+
+        print("[PERF] Cached page-2 request:")
+        print(f"  100 items:  {small_ms:.0f}ms, {small_queries} queries")
+        print(f"  2000 items: {large_ms:.0f}ms, {large_queries} queries")
+
+        # A generous bound: even accounting for noise, a page-2 request that
+        # only ever touches ~32 rows should not take meaningfully longer as
+        # the underlying library grows 20x. Before the fix this scaled
+        # roughly linearly with library size because the whole cached
+        # library was unpickled every request.
+        self.assertLess(
+            large_ms,
+            small_ms * 5 + 200,
+            "page-2 request time scaled with library size; the media_list "
+            "cache is likely storing/hydrating full objects instead of a "
+            "compact per-page order",
+        )

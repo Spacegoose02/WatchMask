@@ -6,17 +6,38 @@ from dataclasses import dataclass
 from datetime import date
 
 from django.conf import settings
+from django.core.cache import cache
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 
-from app import credits, helpers, metadata_utils
+from app import (
+    credits,  # noqa: A004  # app.credits module, not the site builtin
+    helpers,
+    metadata_utils,
+    view_constants,
+)
 from app import statistics as stats
-from app.models import Album, Artist, Item, MediaTypes, PodcastShow, Sources, Track
+from app.models import (
+    Album,
+    Artist,
+    HardcoverEditionPreference,
+    Item,
+    MediaTypes,
+    MetadataBackfillField,
+    PodcastShow,
+    Sources,
+    Track,
+)
 from app.providers import pocketcasts, services
 from app.services.metadata_resolution import (
     get_library_media_type,
     get_tracking_media_type,
+    metadata_language_default,
     upsert_provider_links,
+)
+from app.tasks_backfill_state import (
+    WATCH_PROVIDERS_BACKFILL_VERSION,
+    _record_backfill_pending,
 )
 
 
@@ -76,7 +97,9 @@ def _fallback_metadata(
     normalized.setdefault("source", source)
     normalized.setdefault("media_type", media_type)
 
-    title_fields = Item.title_fields_from_metadata(normalized, fallback_title=fallback_title)
+    title_fields = Item.title_fields_from_metadata(
+        normalized, fallback_title=fallback_title
+    )
     normalized.update(title_fields)
     if not normalized.get("image"):
         normalized["image"] = fallback_image or settings.IMG_NONE
@@ -85,7 +108,9 @@ def _fallback_metadata(
     return normalized
 
 
-def _enrich_podcast_lookup(metadata: dict, media_id: str) -> tuple[dict, PodcastShow | None]:
+def _enrich_podcast_lookup(
+    metadata: dict, media_id: str
+) -> tuple[dict, PodcastShow | None]:
     if not str(media_id).isdigit():
         return metadata, None
 
@@ -118,7 +143,9 @@ def _enrich_podcast_lookup(metadata: dict, media_id: str) -> tuple[dict, Podcast
         show, _ = PodcastShow.objects.get_or_create(
             podcast_uuid=podcast_uuid,
             defaults={
-                "title": lookup.get("title", "") or enriched.get("title", "") or f"Podcast {media_id}",
+                "title": lookup.get("title", "")
+                or enriched.get("title", "")
+                or f"Podcast {media_id}",
                 "author": lookup.get("author", ""),
                 "image": lookup.get("artwork_url", "") or enriched.get("image", ""),
                 "description": lookup.get("description", ""),
@@ -198,7 +225,12 @@ def _hydrate_music_relations(
             },
         )
         update_fields: list[str] = []
-        if not created and image_url and image_url != settings.IMG_NONE and not album_instance.image:
+        if (
+            not created
+            and image_url
+            and image_url != settings.IMG_NONE
+            and not album_instance.image
+        ):
             album_instance.image = image_url
             update_fields.append("image")
         if not album_instance.release_date and release_date:
@@ -248,20 +280,55 @@ def ensure_item_metadata(
     fallback_title: str = "",
     fallback_image: str | None = None,
     fallback_release_date: str | None = None,
+    edition_id: str | None = None,
+    prefetched_metadata: dict | None = None,
+    provider_link_retry_max_retries: int | None = None,
 ) -> HydratedItemResult:
-    """Get or create an Item with the same metadata quality used for tracked saves."""
+    """Get or create an Item with the same metadata quality used for tracked saves.
+
+    ``prefetched_metadata`` lets validate-first flows persist an already fetched
+    provider response without making network calls inside their transaction.
+    """
     season_numbers = [season_number]
-    metadata = services.get_media_metadata(
-        media_type,
-        media_id,
-        source,
-        season_numbers,
-        episode_number,
+    existing_item = None
+    if (
+        prefetched_metadata is None
+        and user
+        and getattr(user, "is_authenticated", False)
+    ):
+        existing_item = (
+            Item.objects.filter(
+                media_id=media_id,
+                source=source,
+                media_type=get_tracking_media_type(
+                    media_type,
+                    source=source,
+                    identity_media_type=identity_media_type,
+                ),
+                season_number=season_number,
+                episode_number=episode_number,
+            )
+            .only("id")
+            .first()
+        )
+    metadata = (
+        services.get_media_metadata(
+            media_type,
+            media_id,
+            source,
+            season_numbers,
+            episode_number,
+            edition_id=edition_id,
+            language=metadata_language_default(user, existing_item),
+        )
+        if prefetched_metadata is None
+        else dict(prefetched_metadata)
     )
     podcast_show = None
     if media_type == MediaTypes.PODCAST.value and source in {
         Sources.POCKETCASTS.value,
         Sources.GPODDER.value,
+        Sources.AUDIOBOOKSHELF.value,
     }:
         metadata, podcast_show = _enrich_podcast_lookup(metadata, str(media_id))
     metadata = _fallback_metadata(
@@ -295,7 +362,9 @@ def ensure_item_metadata(
     studios = [value for value in _coerce_list(details.get("studios")) if value]
     themes = [value for value in _coerce_list(details.get("themes")) if value]
 
-    raw_authors = details.get("authors") or details.get("author") or details.get("people")
+    raw_authors = (
+        details.get("authors") or details.get("author") or details.get("people")
+    )
     authors: list[str] = []
     for raw_author in _coerce_list(raw_authors):
         if isinstance(raw_author, dict):
@@ -324,6 +393,9 @@ def ensure_item_metadata(
     if not isinstance(creators, list):
         creators = []
     runtime = _coerce_text(details.get("runtime"))
+    watch_providers = metadata.get("providers")
+    if not isinstance(watch_providers, dict):
+        watch_providers = {}
     tracking_media_type = get_tracking_media_type(
         media_type,
         source=source,
@@ -365,12 +437,28 @@ def ensure_item_metadata(
             "source_material": source_material,
             "creators": creators,
             "runtime": runtime,
+            "watch_providers": watch_providers,
             "metadata_fetched_at": timezone.now(),
         },
     )
 
+    if (
+        edition_id
+        and source == Sources.HARDCOVER.value
+        and media_type == MediaTypes.BOOK.value
+        and user
+        and getattr(user, "is_authenticated", False)
+    ):
+        HardcoverEditionPreference.objects.update_or_create(
+            user=user,
+            item=item,
+            defaults={"edition_id": edition_id},
+        )
+
     update_fields: list[str] = []
-    title_fields = Item.title_fields_from_metadata(metadata, fallback_title=fallback_title)
+    title_fields = Item.title_fields_from_metadata(
+        metadata, fallback_title=fallback_title
+    )
     if not created:
         item.metadata_fetched_at = timezone.now()
         update_fields.append("metadata_fetched_at")
@@ -405,7 +493,11 @@ def ensure_item_metadata(
     if not item.format and format_type:
         item.format = format_type
         update_fields.append("format")
-    if not item.status and status:
+    # Production status is the one field here that legitimately changes over an
+    # item's life (a returning series ends), so refresh it instead of keeping
+    # whatever it was first tracked as - a stale "Returning Series" would stop
+    # the show from ever auto-completing.
+    if status and item.status != status:
         item.status = status
         update_fields.append("status")
     if not item.studios and studios:
@@ -432,14 +524,36 @@ def ensure_item_metadata(
     if not item.runtime and runtime:
         item.runtime = runtime
         update_fields.append("runtime")
-    if title_fields["original_title"] and item.original_title != title_fields["original_title"]:
+    if item.provider_episode_count is None:
+        update_fields.extend(
+            metadata_utils.apply_provider_episode_count(item, metadata),
+        )
+    if watch_providers and item.watch_providers != watch_providers:
+        item.watch_providers = watch_providers
+        update_fields.append("watch_providers")
+    if (
+        title_fields["original_title"]
+        and item.original_title != title_fields["original_title"]
+    ):
         item.original_title = title_fields["original_title"]
         update_fields.append("original_title")
-    if title_fields["localized_title"] and item.localized_title != title_fields["localized_title"]:
+    if (
+        title_fields["localized_title"]
+        and item.localized_title != title_fields["localized_title"]
+    ):
         item.localized_title = title_fields["localized_title"]
         update_fields.append("localized_title")
     if update_fields:
         item.save(update_fields=list(dict.fromkeys(update_fields)))
+
+    # A live fetch just happened: make sure the detail view's stored-metadata
+    # shortcut (media_details_views.can_skip_live_fetch) doesn't serve the
+    # impoverished Item-only fallback on the page load(s) that follow (#931, #992).
+    cache.set(
+        view_constants.force_live_metadata_cache_key(item.id),
+        True,
+        timeout=view_constants.FORCE_LIVE_METADATA_TIMEOUT,
+    )
 
     upsert_provider_links(
         item,
@@ -447,6 +561,7 @@ def ensure_item_metadata(
         provider=source,
         provider_media_type=tracking_media_type,
         season_number=season_number,
+        retry_max_retries=provider_link_retry_max_retries,
     )
 
     if source == Sources.TMDB.value and tracking_media_type in (
@@ -455,6 +570,26 @@ def ensure_item_metadata(
         MediaTypes.SEASON.value,
     ):
         credits.sync_item_credits_from_metadata(item, metadata)
+
+    if (
+        created
+        and source == Sources.TMDB.value
+        and tracking_media_type
+        in (
+            MediaTypes.MOVIE.value,
+            MediaTypes.TV.value,
+            MediaTypes.ANIME.value,
+        )
+        and not watch_providers
+    ):
+        # Keep empty titles in the retry queue so a later TMDB listing
+        # (Netflix added months after tracking) can still be picked up.
+        _record_backfill_pending(
+            item,
+            MetadataBackfillField.WATCH_PROVIDERS,
+            "empty providers",
+            strategy_version=WATCH_PROVIDERS_BACKFILL_VERSION,
+        )
 
     artist = None
     album = None
@@ -495,7 +630,9 @@ def ensure_item_metadata_from_discover_seed(
         fallback_image=fallback_image,
         fallback_release_date=fallback_release_date,
     )
-    title_fields = Item.title_fields_from_metadata(metadata, fallback_title=fallback_title)
+    title_fields = Item.title_fields_from_metadata(
+        metadata, fallback_title=fallback_title
+    )
     release_datetime = helpers.extract_release_datetime(metadata)
     tracking_media_type = get_tracking_media_type(
         media_type,

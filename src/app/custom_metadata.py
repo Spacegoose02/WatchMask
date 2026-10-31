@@ -9,7 +9,7 @@ from datetime import date, datetime
 from django import forms
 from django.conf import settings
 
-from app import helpers
+from app import helpers, local_covers
 from app.models import MediaTypes
 from app.statistics import parse_runtime_to_minutes
 
@@ -40,6 +40,7 @@ TITLE_MEDIA_TYPES = (
     MediaTypes.GAME.value,
     MediaTypes.BOOK.value,
     MediaTypes.COMIC.value,
+    MediaTypes.COMIC_ISSUE.value,
     MediaTypes.BOARDGAME.value,
 )
 
@@ -127,6 +128,7 @@ FIELD_SPECS: dict[str, CustomMetadataFieldSpec] = {
             MediaTypes.MOVIE.value,
             MediaTypes.GAME.value,
             MediaTypes.COMIC.value,
+            MediaTypes.COMIC_ISSUE.value,
             MediaTypes.BOARDGAME.value,
         ),
     ),
@@ -269,6 +271,7 @@ FIELD_SPECS: dict[str, CustomMetadataFieldSpec] = {
             MediaTypes.GAME.value,
             MediaTypes.BOOK.value,
             MediaTypes.COMIC.value,
+            MediaTypes.COMIC_ISSUE.value,
             MediaTypes.MANGA.value,
             MediaTypes.BOARDGAME.value,
         ),
@@ -303,6 +306,7 @@ FIELD_SPECS: dict[str, CustomMetadataFieldSpec] = {
             MediaTypes.GAME.value,
             MediaTypes.BOOK.value,
             MediaTypes.COMIC.value,
+            MediaTypes.COMIC_ISSUE.value,
             MediaTypes.BOARDGAME.value,
         ),
     ),
@@ -323,6 +327,7 @@ FIELD_SPECS: dict[str, CustomMetadataFieldSpec] = {
             MediaTypes.GAME.value,
             MediaTypes.BOOK.value,
             MediaTypes.COMIC.value,
+            MediaTypes.COMIC_ISSUE.value,
             MediaTypes.BOARDGAME.value,
         ),
     ),
@@ -338,6 +343,7 @@ FIELD_SPECS: dict[str, CustomMetadataFieldSpec] = {
         media_types=(
             MediaTypes.BOOK.value,
             MediaTypes.COMIC.value,
+            MediaTypes.COMIC_ISSUE.value,
             MediaTypes.MANGA.value,
         ),
     ),
@@ -350,6 +356,7 @@ FIELD_SPECS: dict[str, CustomMetadataFieldSpec] = {
         media_types=(
             MediaTypes.BOOK.value,
             MediaTypes.COMIC.value,
+            MediaTypes.COMIC_ISSUE.value,
             MediaTypes.MANGA.value,
             MediaTypes.BOARDGAME.value,
         ),
@@ -541,6 +548,20 @@ MEDIA_TYPE_FIELD_ORDER: dict[str, list[str]] = {
         "country",
         "languages",
     ],
+    MediaTypes.COMIC_ISSUE.value: [
+        "title",
+        "original_title",
+        "localized_title",
+        "image_url",
+        "synopsis",
+        "genres",
+        "release_date",
+        "authors",
+        "publishers",
+        "format",
+        "country",
+        "languages",
+    ],
     MediaTypes.BOARDGAME.value: [
         "title",
         "original_title",
@@ -560,9 +581,7 @@ MEDIA_TYPE_FIELD_ORDER: dict[str, list[str]] = {
 
 DETAIL_VALUE_ORDER: dict[str, list[str]] = {
     media_type: [
-        field_name
-        for field_name in field_names
-        if FIELD_SPECS[field_name].detail_key
+        field_name for field_name in field_names if FIELD_SPECS[field_name].detail_key
     ]
     for media_type, field_names in MEDIA_TYPE_FIELD_ORDER.items()
 }
@@ -685,8 +704,12 @@ def _build_field(spec: CustomMetadataFieldSpec) -> forms.Field:
             **common_kwargs,
         )
     if spec.widget == "url":
-        return forms.URLField(
-            widget=forms.URLInput(attrs={"placeholder": spec.placeholder}),
+        return _CoverAwareURLField(
+            # Plain text input: a type="url" box would make the browser refuse
+            # the /covers/... path of an uploaded cover. The field validates.
+            widget=forms.TextInput(
+                attrs={"placeholder": spec.placeholder, "inputmode": "url"}
+            ),
             **common_kwargs,
         )
     if spec.widget == "date":
@@ -705,6 +728,15 @@ def _build_field(spec: CustomMetadataFieldSpec) -> forms.Field:
         widget=forms.TextInput(attrs={"placeholder": spec.placeholder}),
         **common_kwargs,
     )
+
+
+class _CoverAwareURLField(forms.URLField):
+    """A URL field that also keeps a cover the person uploaded to Floppy."""
+
+    def clean(self, value):
+        if local_covers.is_local(value):
+            return value
+        return super().clean(value)
 
 
 def _manual_metadata_map(item) -> dict:
@@ -967,11 +999,7 @@ def snapshot_custom_metadata(item, metadata: dict) -> list[str]:
     assign("release_datetime", release_datetime)
 
     runtime_value = str(item.runtime or "").strip()
-    runtime_minutes = (
-        parse_runtime_to_minutes(runtime_value)
-        if runtime_value
-        else None
-    )
+    runtime_minutes = parse_runtime_to_minutes(runtime_value) if runtime_value else None
     assign("runtime_minutes", runtime_minutes)
 
     if update_fields:
@@ -1069,9 +1097,7 @@ class ManualMetadataForm(forms.Form):
     def _sync_runtime_minutes(self, update_fields: list[str]) -> None:
         runtime_value = str(self.item.runtime or "").strip()
         runtime_minutes = (
-            parse_runtime_to_minutes(runtime_value)
-            if runtime_value
-            else None
+            parse_runtime_to_minutes(runtime_value) if runtime_value else None
         )
         self._assign_item_value("runtime_minutes", runtime_minutes, update_fields)
 

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -55,8 +55,12 @@ class MusicBulkSaveViewTests(TestCase):
             release_date=date(2024, 1, 1),
             tracks_populated=True,
         )
-        Track.objects.create(album=album, title="Track One", track_number=1, duration_ms=180000)
-        Track.objects.create(album=album, title="Track Two", track_number=2, duration_ms=210000)
+        Track.objects.create(
+            album=album, title="Track One", track_number=1, duration_ms=180000
+        )
+        Track.objects.create(
+            album=album, title="Track Two", track_number=2, duration_ms=210000
+        )
 
         response = self.client.get(
             reverse("album_track_modal", args=[album.id]) + "?return_url=/music",
@@ -66,7 +70,12 @@ class MusicBulkSaveViewTests(TestCase):
         self.assertTrue(response.context["episode_plays_tab_available"])
         self.assertEqual(response.context["episode_plays_tab_label"], "Track Plays")
         self.assertContains(response, "Track Plays")
-        self.assertContains(response, "Release date")
+        self.assertContains(response, "Release Date")
+        # One "General" start/end picker plus one "Track Plays" bulk-range
+        # start/end picker, each split per #1243 so a field shows only its
+        # own shortcut (start: Start Now + Release Date, end: Just Finished).
+        self.assertContains(response, "Start Now", count=2)
+        self.assertContains(response, "Just Finished", count=2)
 
     def test_album_bulk_save_creates_music_entries_and_trackers(self):
         artist = Artist.objects.create(name="Bulk Artist")
@@ -121,10 +130,15 @@ class MusicBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        # Bulk saves run in the background; the modal closes instead of redirecting
+        # Bulk saves now dispatch a background task and close the modal
+        # instead of redirecting.
         self.assertIn("closeModal", response["HX-Trigger"])
-        self.assertTrue(ArtistTracker.objects.filter(user=self.user, artist=artist).exists())
-        self.assertTrue(AlbumTracker.objects.filter(user=self.user, album=album).exists())
+        self.assertTrue(
+            ArtistTracker.objects.filter(user=self.user, artist=artist).exists()
+        )
+        self.assertTrue(
+            AlbumTracker.objects.filter(user=self.user, album=album).exists()
+        )
 
         plays = list(
             Music.objects.filter(user=self.user, album=album)
@@ -202,11 +216,18 @@ class MusicBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        # Bulk saves run in the background; the modal closes instead of redirecting
+        # Bulk saves now dispatch a background task and close the modal
+        # instead of redirecting.
         self.assertIn("closeModal", response["HX-Trigger"])
-        self.assertTrue(ArtistTracker.objects.filter(user=self.user, artist=artist).exists())
-        self.assertTrue(AlbumTracker.objects.filter(user=self.user, album=first_album).exists())
-        self.assertTrue(AlbumTracker.objects.filter(user=self.user, album=second_album).exists())
+        self.assertTrue(
+            ArtistTracker.objects.filter(user=self.user, artist=artist).exists()
+        )
+        self.assertTrue(
+            AlbumTracker.objects.filter(user=self.user, album=first_album).exists()
+        )
+        self.assertTrue(
+            AlbumTracker.objects.filter(user=self.user, album=second_album).exists()
+        )
 
         plays = list(
             Music.objects.filter(user=self.user, album__artist=artist)
@@ -225,7 +246,7 @@ class MusicBulkSaveViewTests(TestCase):
         self.assertLess(plays[0].end_date, plays[1].end_date)
         self.assertLess(plays[1].end_date, plays[2].end_date)
 
-    def test_artist_bulk_save_falls_back_to_even_distribution_for_missing_release_dates(self):
+    def test_artist_bulk_save_biases_plays_toward_known_release_dates(self):
         artist = Artist.objects.create(name="Fallback Artist")
         dated_album = Album.objects.create(
             title="Dated Album",
@@ -284,7 +305,8 @@ class MusicBulkSaveViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 204)
-        # Bulk saves run in the background; the modal closes instead of redirecting
+        # Bulk saves now dispatch a background task and close the modal
+        # instead of redirecting.
         self.assertIn("closeModal", response["HX-Trigger"])
 
         plays = list(
@@ -300,13 +322,25 @@ class MusicBulkSaveViewTests(TestCase):
                 (undated_album.id, third_track.id),
             ],
         )
-        self.assertEqual(
-            [play.end_date.date().isoformat() for play in plays],
-            ["2024-03-01", "2024-03-02", "2024-03-03"],
-        )
+        # Timestamps are biased toward known release dates: the dated track
+        # anchors the start of the range, undated tracks cluster at the end.
+        # The two undated tracks land within a second of the range's end
+        # rather than exactly on it: they're normalized from the same
+        # `timezone.now()` fallback, so ensure_increasing_datetimes nudges
+        # the second one forward to keep them distinct, and the fitting step
+        # then compacts them back from the boundary by a second to avoid
+        # overshooting `end_date` — see #1232 (fixing that issue made this
+        # path run on real datetimes end-to-end instead of on bare dates,
+        # which had coincidentally hidden this one-second edge case).
+        end_of_range = datetime(2024, 3, 3, 0, 0, tzinfo=UTC)
+        self.assertEqual(plays[0].end_date.date().isoformat(), "2024-03-01")
+        for play in plays[1:]:
+            self.assertLessEqual(end_of_range - play.end_date, timedelta(seconds=1))
 
     @patch("app.services.bulk_music_tracking.flush_media_change_side_effects")
-    def test_music_bulk_save_flushes_side_effects_once_for_touched_days(self, mock_flush):
+    def test_music_bulk_save_flushes_side_effects_once_for_touched_days(
+        self, mock_flush
+    ):
         artist = Artist.objects.create(name="Flush Artist")
         album = Album.objects.create(
             title="Flush Album",

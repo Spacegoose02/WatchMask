@@ -2,6 +2,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from app.helpers import (
+    get_collection_completeness_map,
     get_collection_stats,
     get_season_collection_metadata,
     get_season_collection_stats,
@@ -131,7 +132,9 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Episode 2",
             image="http://example.com/episode2.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=self.tv_item, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=self.tv_item, media_type="digital"
+        )
 
         stats = get_tv_show_collection_stats(self.user, self.tv_item)
 
@@ -145,7 +148,9 @@ class CollectionHelpersTest(TestCase):
             },
         )
 
-    def test_get_tv_show_collection_stats_prefers_granular_entries_over_show_level_entry(self):
+    def test_get_tv_show_collection_stats_prefers_granular_entries_over_show_level_entry(
+        self,
+    ):
         """Granular collection rows should win over the show-level fallback."""
         Item.objects.create(
             media_id=self.tv_item.media_id,
@@ -190,8 +195,12 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Episode 3",
             image="http://example.com/episode3.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=self.tv_item, media_type="digital")
-        CollectionEntry.objects.create(user=self.user, item=first_episode, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=self.tv_item, media_type="digital"
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=first_episode, media_type="digital"
+        )
 
         stats = get_tv_show_collection_stats(self.user, self.tv_item)
 
@@ -205,7 +214,9 @@ class CollectionHelpersTest(TestCase):
             },
         )
 
-    def test_get_tv_show_collection_stats_excludes_specials_from_show_level_fallback(self):
+    def test_get_tv_show_collection_stats_excludes_specials_from_show_level_fallback(
+        self,
+    ):
         """Season 0 items should not affect fallback totals."""
         Item.objects.create(
             media_id=self.tv_item.media_id,
@@ -250,7 +261,9 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Special 1",
             image="http://example.com/special1.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=self.tv_item, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=self.tv_item, media_type="digital"
+        )
 
         stats = get_tv_show_collection_stats(self.user, self.tv_item)
 
@@ -264,7 +277,9 @@ class CollectionHelpersTest(TestCase):
             },
         )
 
-    def test_get_tv_show_collection_stats_counts_season_entry_as_full_season_episode_rollup(self):
+    def test_get_tv_show_collection_stats_counts_season_entry_as_full_season_episode_rollup(
+        self,
+    ):
         """Collected seasons should contribute all of their episodes on the show page."""
         season_item = Item.objects.create(
             media_id=self.tv_item.media_id,
@@ -309,7 +324,9 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Episode 3",
             image="http://example.com/episode3.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=season_item, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=season_item, media_type="digital"
+        )
 
         stats = get_tv_show_collection_stats(self.user, self.tv_item)
 
@@ -368,7 +385,9 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Episode 3",
             image="http://example.com/episode3.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=season_one_item, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=season_one_item, media_type="digital"
+        )
         CollectionEntry.objects.create(
             user=self.user,
             item=season_one_episode_one,
@@ -420,7 +439,9 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Episode 2",
             image="http://example.com/episode2.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=season_item, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=season_item, media_type="digital"
+        )
 
         stats = get_season_collection_stats(self.user, season_item)
 
@@ -432,7 +453,54 @@ class CollectionHelpersTest(TestCase):
             },
         )
 
-    def test_get_season_collection_stats_prefers_episode_rows_over_season_level_entry(self):
+    def test_get_season_collection_stats_counts_an_episode_once(self):
+        """Two copies of one episode count as one collected episode."""
+        season_item = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.SEASON.value,
+            season_number=1,
+            title="Test TV Season 1",
+            image="http://example.com/season1.jpg",
+        )
+        episode_one = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Test TV Episode 1",
+            image="http://example.com/episode1.jpg",
+        )
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=2,
+            title="Test TV Episode 2",
+            image="http://example.com/episode2.jpg",
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=episode_one, media_type="Blu-ray"
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=episode_one, media_type="digital"
+        )
+
+        stats = get_season_collection_stats(self.user, season_item)
+
+        self.assertEqual(
+            stats,
+            {
+                "collected_episodes": 1,
+                "total_episodes": 2,
+            },
+        )
+
+    def test_get_season_collection_stats_prefers_episode_rows_over_season_level_entry(
+        self,
+    ):
         """Episode rows should remain the source of truth when they exist."""
         season_item = Item.objects.create(
             media_id=self.tv_item.media_id,
@@ -460,8 +528,12 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Episode 2",
             image="http://example.com/episode2.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=season_item, media_type="digital")
-        CollectionEntry.objects.create(user=self.user, item=first_episode, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=season_item, media_type="digital"
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=first_episode, media_type="digital"
+        )
 
         stats = get_season_collection_stats(self.user, season_item)
 
@@ -473,7 +545,9 @@ class CollectionHelpersTest(TestCase):
             },
         )
 
-    def test_get_season_collection_stats_ignores_show_fallback_after_granular_collection_exists(self):
+    def test_get_season_collection_stats_ignores_show_fallback_after_granular_collection_exists(
+        self,
+    ):
         """Show-level fallback should stop once any granular collection rows exist for the show."""
         season_one_item = Item.objects.create(
             media_id=self.tv_item.media_id,
@@ -509,9 +583,15 @@ class CollectionHelpersTest(TestCase):
             title="Test TV Episode 2",
             image="http://example.com/episode2.jpg",
         )
-        CollectionEntry.objects.create(user=self.user, item=self.tv_item, media_type="digital")
-        CollectionEntry.objects.create(user=self.user, item=season_one_item, media_type="digital")
-        CollectionEntry.objects.create(user=self.user, item=first_episode, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=self.tv_item, media_type="digital"
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=season_one_item, media_type="digital"
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=first_episode, media_type="digital"
+        )
 
         stats = get_season_collection_stats(self.user, season_two_item)
 
@@ -523,7 +603,9 @@ class CollectionHelpersTest(TestCase):
             },
         )
 
-    def test_get_season_collection_metadata_ignores_show_fallback_after_granular_collection_exists(self):
+    def test_get_season_collection_metadata_ignores_show_fallback_after_granular_collection_exists(
+        self,
+    ):
         """Season metadata should not borrow a show-level row once episode/season rows exist."""
         season_one_item = Item.objects.create(
             media_id=self.tv_item.media_id,
@@ -565,9 +647,247 @@ class CollectionHelpersTest(TestCase):
             media_type="digital",
             resolution="1080p",
         )
-        CollectionEntry.objects.create(user=self.user, item=season_one_item, media_type="digital")
-        CollectionEntry.objects.create(user=self.user, item=first_episode, media_type="digital")
+        CollectionEntry.objects.create(
+            user=self.user, item=season_one_item, media_type="digital"
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=first_episode, media_type="digital"
+        )
 
         metadata = get_season_collection_metadata(self.user, season_two_item)
 
         self.assertIsNone(metadata)
+
+    def test_get_season_collection_stats_survives_duplicate_tv_bucket_items(self):
+        """A stray second TV-media-type Item in another bucket must not crash stats."""
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.SEASON.value,
+            title="Test TV (stray season bucket)",
+            image="http://example.com/tv-stray.jpg",
+        )
+        season_item = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.SEASON.value,
+            library_media_type=self.tv_item.library_media_type,
+            season_number=1,
+            title="Test TV Season 1",
+            image="http://example.com/season1.jpg",
+        )
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Test TV Episode 1",
+            image="http://example.com/episode1.jpg",
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=self.tv_item, media_type="digital"
+        )
+
+        stats = get_season_collection_stats(self.user, season_item)
+
+        self.assertEqual(
+            stats,
+            {
+                "collected_episodes": 1,
+                "total_episodes": 1,
+            },
+        )
+
+    def test_get_season_collection_metadata_survives_duplicate_tv_bucket_items(self):
+        """A stray second TV-media-type Item in another bucket must not crash metadata."""
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.SEASON.value,
+            title="Test TV (stray season bucket)",
+            image="http://example.com/tv-stray.jpg",
+        )
+        season_item = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.SEASON.value,
+            library_media_type=self.tv_item.library_media_type,
+            season_number=1,
+            title="Test TV Season 1",
+            image="http://example.com/season1.jpg",
+        )
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Test TV Episode 1",
+            image="http://example.com/episode1.jpg",
+        )
+        CollectionEntry.objects.create(
+            user=self.user,
+            item=self.tv_item,
+            media_type="digital",
+            resolution="1080p",
+        )
+
+        metadata = get_season_collection_metadata(self.user, season_item)
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["resolution"], "1080p")
+
+    def test_get_collection_completeness_map_empty_input(self):
+        """Passing no shows returns an empty map."""
+        self.assertEqual(get_collection_completeness_map(self.user, []), {})
+
+    def test_get_collection_completeness_map_partial_show(self):
+        """A show with some but not all episodes collected is flagged partial."""
+        season_item = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.SEASON.value,
+            season_number=1,
+            title="Test TV Season 1",
+            image="http://example.com/season1.jpg",
+        )
+        collected_episode = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Test TV Episode 1",
+            image="http://example.com/episode1.jpg",
+        )
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=2,
+            title="Test TV Episode 2",
+            image="http://example.com/episode2.jpg",
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=collected_episode, media_type="digital"
+        )
+
+        completeness = get_collection_completeness_map(self.user, [self.tv_item])
+
+        self.assertEqual(
+            completeness[self.tv_item.id],
+            {"collected": 1, "total": 2, "is_partial": True},
+        )
+        self.assertEqual(
+            completeness[season_item.id],
+            {"collected": 1, "total": 2, "is_partial": True},
+        )
+
+    def test_get_collection_completeness_map_fully_collected_show(self):
+        """A show with every episode collected is not flagged partial."""
+        episode_one = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Test TV Episode 1",
+            image="http://example.com/episode1.jpg",
+        )
+        episode_two = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=2,
+            title="Test TV Episode 2",
+            image="http://example.com/episode2.jpg",
+        )
+        CollectionEntry.objects.create(user=self.user, item=episode_one)
+        CollectionEntry.objects.create(user=self.user, item=episode_two)
+
+        completeness = get_collection_completeness_map(self.user, [self.tv_item])
+
+        self.assertEqual(
+            completeness[self.tv_item.id],
+            {"collected": 2, "total": 2, "is_partial": False},
+        )
+
+    def test_get_collection_completeness_map_zero_collected_is_not_partial(self):
+        """A show with no collected episodes is not flagged partial."""
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Test TV Episode 1",
+            image="http://example.com/episode1.jpg",
+        )
+
+        completeness = get_collection_completeness_map(self.user, [self.tv_item])
+
+        self.assertEqual(
+            completeness[self.tv_item.id],
+            {"collected": 0, "total": 1, "is_partial": False},
+        )
+
+    def test_get_collection_completeness_map_batches_multiple_shows(self):
+        """Stats for several shows are computed with a fixed number of queries."""
+        second_show = Item.objects.create(
+            media_id="tv2",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Second TV Show",
+            image="http://example.com/tv2.jpg",
+        )
+        first_show_episode_collected = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Test TV Episode 1",
+            image="http://example.com/episode1.jpg",
+        )
+        Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=self.tv_item.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=2,
+            title="Test TV Episode 2",
+            image="http://example.com/episode2.jpg",
+        )
+        second_show_episode = Item.objects.create(
+            media_id=second_show.media_id,
+            source=second_show.source,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Second Show Episode 1",
+            image="http://example.com/second-episode1.jpg",
+        )
+        CollectionEntry.objects.create(
+            user=self.user, item=first_show_episode_collected
+        )
+        CollectionEntry.objects.create(user=self.user, item=second_show_episode)
+
+        with self.assertNumQueries(4):
+            completeness = get_collection_completeness_map(
+                self.user,
+                [self.tv_item, second_show],
+            )
+
+        self.assertEqual(
+            completeness[self.tv_item.id],
+            {"collected": 1, "total": 2, "is_partial": True},
+        )
+        self.assertEqual(
+            completeness[second_show.id],
+            {"collected": 1, "total": 1, "is_partial": False},
+        )

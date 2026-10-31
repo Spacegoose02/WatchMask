@@ -4,14 +4,14 @@ from datetime import UTC
 
 import requests
 from django.apps import apps
-from django.conf import settings
 from django.urls import reverse
 from django.utils import timezone
 
 import app
 from app import helpers as app_helpers
 from app.models import MediaTypes, Sources, Status
-from app.providers import services
+from app.providers import credentials, services
+from integrations import import_progress
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 
@@ -25,11 +25,12 @@ def get_token(request, redirect_uri=None):
     url = "https://anilist.co/api/v2/oauth/token"
 
     params = {
-        "client_id": settings.ANILIST_ID,
-        "client_secret": settings.ANILIST_SECRET,
+        "client_id": credentials.get("anilist", "client_id"),
+        "client_secret": credentials.get("anilist", "client_secret"),
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": redirect_uri or app_helpers.build_absolute_app_url(
+        "redirect_uri": redirect_uri
+        or app_helpers.build_absolute_app_url(
             request,
             reverse("import_anilist_private"),
         ),
@@ -111,10 +112,11 @@ class AniListImporter:
         self.warnings = []
 
         if self.token is not None:
-            self.token = helpers.decrypt(self.token)
+            self.token = helpers.decrypt_or_raise(self.token)
 
         # Track existing media for "new" mode
         self.existing_media = helpers.get_existing_media(user)
+        self.deleted_media = helpers.get_deleted_media(user)
 
         # Track media IDs to delete in overwrite mode
         self.to_delete = defaultdict(lambda: defaultdict(set))
@@ -231,6 +233,14 @@ class AniListImporter:
                 raise MediaImportError(msg) from error
             raise
 
+        self._progress_total = sum(
+            len(status_list["entries"])
+            for media_data in (response["data"]["anime"], response["data"]["manga"])
+            for status_list in media_data["lists"]
+            if not status_list["isCustomList"]
+        )
+        self._progress_current = 0
+
         self._process_media_data(response["data"]["anime"], MediaTypes.ANIME.value)
         self._process_media_data(response["data"]["manga"], MediaTypes.MANGA.value)
 
@@ -252,6 +262,12 @@ class AniListImporter:
         for status_list in media_data["lists"]:
             if not status_list["isCustomList"]:
                 for content in status_list["entries"]:
+                    self._progress_current += 1
+                    import_progress.report(
+                        self._progress_current,
+                        self._progress_total,
+                        "AniList",
+                    )
                     try:
                         self._process_entry(content, media_type)
                     except Exception as e:
@@ -273,6 +289,7 @@ class AniListImporter:
             Sources.MAL.value,
             str(content["media"]["idMal"]),
             self.mode,
+            deleted_media=self.deleted_media,
         ):
             return
 
@@ -281,7 +298,8 @@ class AniListImporter:
         else:
             status = content["status"].capitalize()
 
-        item, _ = app.models.Item.objects.get_or_create(
+        item, _ = helpers.get_or_create_item_across_buckets(
+            user=self.user,
             media_id=str(content["media"]["idMal"]),
             source=Sources.MAL.value,
             media_type=media_type,

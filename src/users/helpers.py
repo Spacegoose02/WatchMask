@@ -4,7 +4,34 @@ import zoneinfo
 from datetime import datetime, timedelta
 
 import croniter
+from celery import states
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.utils import timezone
+
+# A cron expression "minute hour ..." needs at least this many space-separated
+# fields before its hour part can be inspected for an "every X hours" pattern.
+MIN_CRON_PARTS_FOR_HOUR_PATTERN = 2
+
+IS_FIRST_RUN_CACHE_KEY = "users_is_first_run"
+IS_FIRST_RUN_CACHE_TIMEOUT = 60  # seconds
+
+
+def is_first_run() -> bool:
+    """Return whether this instance has no real (non-demo) user account yet.
+
+    Cached briefly: once a real account exists this permanently flips to
+    False, so a short TTL is enough to avoid a DB query on every request
+    while still self-correcting quickly for the handful of requests before
+    the first account is created.
+    """
+    cached = cache.get(IS_FIRST_RUN_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    no_real_users = not get_user_model().objects.filter(is_demo=False).exists()
+    cache.set(IS_FIRST_RUN_CACHE_KEY, no_real_users, IS_FIRST_RUN_CACHE_TIMEOUT)
+    return no_real_users
 
 
 def _deserialize_task_result(result):
@@ -53,9 +80,7 @@ def _format_list_success_result(result):
     """Render a list-based Celery success payload."""
     if result and all(isinstance(item, str) for item in result):
         summary = result[0].strip() or "Task completed successfully."
-        error_lines = [
-            item.strip() for item in result[1:] if item and item.strip()
-        ]
+        error_lines = [item.strip() for item in result[1:] if item and item.strip()]
         return summary, "\n".join(error_lines) or None
 
     return "Queued follow-up import task.", None
@@ -75,9 +100,32 @@ def _format_structured_success_result(result):
     return str(result), None
 
 
+STATUS_SUMMARIES = {
+    states.PENDING: "This task has been queued and is waiting to run.",
+    states.RECEIVED: "This task has been picked up and is about to run.",
+    states.STARTED: "This task is currently running.",
+    states.RETRY: "This task failed and is waiting to be retried.",
+    states.REVOKED: "This task was cancelled before it finished.",
+    states.REJECTED: "This task was turned away by the worker and never ran.",
+    states.IGNORED: "This task ran without recording a result.",
+}
+
+
 def process_task_result(task):
-    """Process task result based on status and format appropriately."""
-    if task.status == "FAILURE":
+    """Process task result based on status and format appropriately.
+
+    A task can hold any Celery state, not just the four the activity panel
+    styles: cancelling an import leaves it REVOKED, and a worker can report
+    RETRY or REJECTED. Callers read `summary` and `errors` unconditionally,
+    so every state has to leave both set.
+    """
+    task.summary = STATUS_SUMMARIES.get(
+        task.status,
+        f"This task is in an unrecognised state ({task.status}).",
+    )
+    task.errors = None
+
+    if task.status == states.FAILURE:
         result_json = _deserialize_task_result(task.result)
         if (
             isinstance(result_json, dict)
@@ -85,22 +133,15 @@ def process_task_result(task):
             and result_json.get("exc_message")
         ):
             task.summary = result_json["exc_message"][0]
-            task.errors = task.traceback
         else:
             task.summary = "Unexpected error occurred while processing the task."
-            task.errors = task.traceback
-    elif task.status == "STARTED":
-        task.summary = "This task is currently running."
-        task.errors = None
-    elif task.status == "SUCCESS":
+        task.errors = task.traceback
+    elif task.status == states.SUCCESS:
         result_json = _deserialize_task_result(task.result)
         if isinstance(result_json, str):
             task.summary, task.errors = _split_success_result(result_json)
         else:
             task.summary, task.errors = _format_structured_success_result(result_json)
-    elif task.status == "PENDING":
-        task.summary = "This task has been queued and is waiting to run."
-        task.errors = None
 
     return task
 
@@ -161,7 +202,7 @@ def get_next_run_info(periodic_task):
         # Check for "every X hours" pattern by examining the cron expression
         # Pattern should be: "0 */X * * *" (minute=0, hour=*/X, all others *)
         cron_parts = cron_expr.split()
-        if len(cron_parts) >= 2:
+        if len(cron_parts) >= MIN_CRON_PARTS_FOR_HOUR_PATTERN:
             minute_part = str(cron_parts[0])
             hour_part = str(cron_parts[1])
             # Check if it matches "every 2 hours" pattern
@@ -226,9 +267,11 @@ def get_export_next_run_info(periodic_task):
         kwargs = json.loads(periodic_task.kwargs)
         media_types = kwargs.get("media_types")
         include_lists = kwargs.get("include_lists", True)
+        include_collection = kwargs.get("include_collection", True)
     except json.JSONDecodeError:
         media_types = None
         include_lists = True
+        include_collection = True
 
     cron = periodic_task.crontab
     tz = zoneinfo.ZoneInfo(str(cron.timezone))
@@ -244,7 +287,15 @@ def get_export_next_run_info(periodic_task):
     # Determine frequency
     if cron.day_of_week == "*/2":
         frequency = "Every 2 Days"
-    elif cron.day_of_month == "*/7" or cron.day_of_week in ("0", "1", "2", "3", "4", "5", "6"):
+    elif cron.day_of_month == "*/7" or cron.day_of_week in (
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+    ):
         frequency = "Weekly"
     else:
         frequency = "Daily"
@@ -254,4 +305,5 @@ def get_export_next_run_info(periodic_task):
         "frequency": frequency,
         "media_types": media_types,
         "include_lists": include_lists,
+        "include_collection": include_collection,
     }

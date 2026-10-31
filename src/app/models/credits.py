@@ -8,6 +8,10 @@ from app.models.item import Item
 CREDITS_BACKFILL_VERSION = 4
 DISCOVER_MOVIE_METADATA_BACKFILL_VERSION = 1
 TRAKT_POPULARITY_BACKFILL_VERSION = 1
+# Bump to re-open every IMDB person for a TMDB profile lookup, e.g. when the
+# matching strategy changes. Without a bump, a person whose lookup already
+# completed is never searched again (see Person.profile_backfill_version).
+PERSON_PROFILE_BACKFILL_VERSION = 1
 
 
 class ItemProviderLink(models.Model):
@@ -28,25 +32,41 @@ class ItemProviderLink(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["provider", "provider_media_type", "provider_media_id", "season_number"]
+        """Model and field configuration."""
+
+        ordering = [
+            "provider",
+            "provider_media_type",
+            "provider_media_id",
+            "season_number",
+        ]
         constraints = [
             UniqueConstraint(
                 fields=["item", "provider", "provider_media_type", "season_number"],
                 name="%(app_label)s_%(class)s_unique_item_provider_type",
             ),
             UniqueConstraint(
-                fields=["provider", "provider_media_type", "provider_media_id", "season_number"],
+                fields=[
+                    "provider",
+                    "provider_media_type",
+                    "provider_media_id",
+                    "season_number",
+                ],
                 name="%(app_label)s_%(class)s_unique_provider_lookup",
             ),
         ]
         indexes = [
-            models.Index(fields=["provider", "provider_media_type", "provider_media_id"]),
+            models.Index(
+                fields=["provider", "provider_media_type", "provider_media_id"]
+            ),
             models.Index(fields=["item", "provider"]),
         ]
 
     def __str__(self):
         """Return a readable mapping label."""
-        season_suffix = f" S{self.season_number}" if self.season_number is not None else ""
+        season_suffix = (
+            f" S{self.season_number}" if self.season_number is not None else ""
+        )
         return (
             f"{self.item_id}:{self.provider}/{self.provider_media_type}/"
             f"{self.provider_media_id}{season_suffix}"
@@ -66,11 +86,19 @@ class MetadataProviderPreference(models.Model):
         on_delete=models.CASCADE,
         related_name="metadata_provider_preferences",
     )
-    provider = models.CharField(max_length=20, choices=Sources.choices)
+    provider = models.CharField(
+        max_length=20,
+        choices=Sources.choices,
+        blank=True,
+        default="",
+    )
+    language = models.CharField(max_length=10, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        """Model and field configuration."""
+
         constraints = [
             UniqueConstraint(
                 fields=["user", "item"],
@@ -83,8 +111,40 @@ class MetadataProviderPreference(models.Model):
         ]
 
     def __str__(self):
-        """Return the display-provider preference label."""
-        return f"{self.user_id}:{self.item_id}->{self.provider}"
+        """Return the display-provider/language preference label."""
+        return f"{self.user_id}:{self.item_id}->{self.provider}/{self.language}"
+
+
+class HardcoverEditionPreference(models.Model):
+    """Per-user Hardcover edition override for a tracked book item."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="hardcover_edition_preferences",
+    )
+    item = models.ForeignKey(
+        Item,
+        on_delete=models.CASCADE,
+        related_name="hardcover_edition_preferences",
+    )
+    edition_id = models.CharField(max_length=32)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        constraints = [
+            UniqueConstraint(
+                fields=["user", "item"],
+                name="%(app_label)s_%(class)s_unique_user_item",
+            ),
+        ]
+
+    def __str__(self):
+        """Return the edition preference label."""
+        return f"{self.user_id}:{self.item_id}->edition/{self.edition_id}"
 
 
 class MetadataBackfillField(models.TextChoices):
@@ -98,6 +158,13 @@ class MetadataBackfillField(models.TextChoices):
     GAME_LENGTHS = "game_lengths", "Game Lengths"
     TRAKT_POPULARITY = "trakt_popularity", "Trakt Popularity"
     IGDB_RATINGS = "igdb_ratings", "IGDB Ratings"
+    GAME_GROUPS = "game_groups", "Game Groups"
+    WATCH_PROVIDERS = "watch_providers", "Watch Providers"
+    EXTERNAL_IDS = "external_ids", "External IDs"
+    STUDIOS = "studios", "Studios"
+    IMDB_MATCH = "imdb_match", "IMDB Title Match"
+    STATUS = "status", "Status"
+    TVDB_MIGRATION = "tvdb_migration", "TVDB Migration"
 
 
 class MetadataBackfillState(models.Model):
@@ -119,10 +186,16 @@ class MetadataBackfillState(models.Model):
     last_success_at = models.DateTimeField(null=True, blank=True)
     last_error = models.TextField(blank=True, default="")
     give_up = models.BooleanField(default=False)
+    # True when the last failure was the provider saying this identifier will
+    # never resolve (400/404/410/422), as opposed to an outage or an empty
+    # answer that a later retry might fill in.
+    terminal = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        """Model and field configuration."""
+
         constraints = [
             UniqueConstraint(
                 fields=["item", "field"],
@@ -133,6 +206,51 @@ class MetadataBackfillState(models.Model):
             models.Index(fields=["field", "next_retry_at"]),
             models.Index(fields=["field", "give_up"]),
         ]
+
+    def __str__(self):
+        """Return the item and field this backfill state tracks."""
+        return f"{self.item} {self.field}"
+
+
+class BackfillReconcileState(models.Model):
+    """Track whether a whole-library reconcile sweep still has work to do.
+
+    The reconcilers previously stored this in the cache, which meant it did not
+    survive a Redis restart or eviction, and the "done" marker was consulted so
+    loosely that a sweep re-enqueued every candidate in the library every five
+    minutes forever - the dominant source of idle CPU and Redis churn in issue
+    #521. Keeping it in the database makes "this strategy version is finished" a
+    durable fact, so the beat entry can poll infrequently and back off.
+
+    One row per reconcile key (not per item - that is MetadataBackfillState).
+    """
+
+    key = models.CharField(max_length=100, unique=True)
+    strategy_version = models.PositiveIntegerField(default=0)
+    # Set once a sweep finds no remaining candidates. Cleared when the strategy
+    # version changes, which is how a new backfill strategy re-runs.
+    completed_at = models.DateTimeField(null=True, blank=True)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    # Doubles as the fallback mutex: a sweep that started recently is assumed to
+    # still be running when the cache lock can't be consulted.
+    next_run_after = models.DateTimeField(null=True, blank=True)
+    consecutive_no_op_runs = models.PositiveIntegerField(default=0)
+    # Keyset cursor, so each sweep resumes where the last stopped instead of
+    # rescanning the whole table.
+    last_cursor_item_id = models.BigIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        indexes = [
+            models.Index(fields=["key", "strategy_version"]),
+        ]
+
+    def __str__(self):
+        """Return the reconcile key and its strategy version."""
+        return f"{self.key} v{self.strategy_version}"
 
 
 class PersonGender(models.TextChoices):
@@ -162,7 +280,7 @@ class Person(models.Model):
     )
     source_person_id = models.CharField(max_length=32)
     name = models.CharField(max_length=255)
-    image = models.URLField(blank=True, default="")
+    image = models.TextField(blank=True, default="")
     known_for_department = models.CharField(max_length=120, blank=True, default="")
     biography = models.TextField(blank=True, default="")
     gender = models.CharField(
@@ -173,6 +291,20 @@ class Person(models.Model):
     birth_date = models.DateField(null=True, blank=True)
     death_date = models.DateField(null=True, blank=True)
     place_of_birth = models.CharField(max_length=255, blank=True, default="")
+
+    # Profile backfill bookkeeping. IMDB's public dataset carries neither image
+    # nor gender, so those are recovered by a name-only TMDB search. Most of
+    # those searches legitimately find nothing, and without a record of "we
+    # already asked" every run re-searched every person forever - ~2000 provider
+    # calls and ~11 minutes of background worker time that changed no row.
+    # 0 means "never completed a lookup".
+    profile_backfill_version = models.PositiveIntegerField(default=0)
+    # The name the completed lookup used. The name is the entire lookup key, so
+    # a corrected name makes the old answer stale.
+    profile_backfill_name = models.CharField(max_length=255, blank=True, default="")
+    # Set only while a transient provider failure is waiting to be retried.
+    profile_backfill_next_retry_at = models.DateTimeField(null=True, blank=True)
+    profile_backfill_fail_count = models.PositiveIntegerField(default=0)
 
     class Meta:
         """Meta options for the model."""
@@ -186,6 +318,7 @@ class Person(models.Model):
         ]
         indexes = [
             models.Index(fields=["source", "source_person_id"]),
+            models.Index(fields=["source", "profile_backfill_version"]),
         ]
 
     def __str__(self):
@@ -203,7 +336,10 @@ class Studio(models.Model):
     )
     source_studio_id = models.CharField(max_length=32)
     name = models.CharField(max_length=255)
-    logo = models.URLField(blank=True, default="")
+    # Provider artwork is opaque metadata. Signed/CDN URLs can exceed the
+    # URLField default of 200 characters and are not indexed, so storing the
+    # complete value is safer than truncating it and works on SQLite/PostgreSQL.
+    logo = models.TextField(blank=True, default="")
 
     class Meta:
         """Meta options for the model."""

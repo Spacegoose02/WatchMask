@@ -9,9 +9,30 @@ from django_celery_results.models import TaskResult
 
 from users.models import (
     HomeSortChoices,
+    MediaSortChoices,
+    MediaStatusChoices,
     MediaTypes,
     QuickWatchDateChoices,
+    relabel_end_date_sort_choice,
 )
+
+
+class EndDateSortLabelTests(TestCase):
+    def test_relabels_end_date_for_media_type(self):
+        choices = [(MediaSortChoices.END_DATE, "Last Watched")]
+
+        for media_type, label in {
+            MediaTypes.BOOK.value: "Last Read",
+            MediaTypes.COMIC.value: "Last Read",
+            MediaTypes.MANGA.value: "Last Read",
+            MediaTypes.MUSIC.value: "Last Listened",
+            MediaTypes.PODCAST.value: "Last Listened",
+        }.items():
+            with self.subTest(media_type=media_type):
+                self.assertEqual(
+                    relabel_end_date_sort_choice(media_type, choices),
+                    [(MediaSortChoices.END_DATE, label)],
+                )
 
 
 class UserUpdatePreferenceTests(TestCase):
@@ -81,6 +102,32 @@ class UserUpdatePreferenceTests(TestCase):
         # Should not change the value
         self.user.refresh_from_db()
         self.assertEqual(self.user.home_sort, HomeSortChoices.UPCOMING)
+
+    def test_update_preference_accepts_multiple_statuses(self):
+        """Media-list status preferences accept a comma-separated selection."""
+        value = (
+            f"{MediaStatusChoices.COMPLETED.value},{MediaStatusChoices.DROPPED.value}"
+        )
+
+        result = self.user.update_preference("movie_status", value)
+
+        self.assertEqual(result, value)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.movie_status, value)
+
+    def test_update_preference_rejects_invalid_status_token(self):
+        """One invalid status token rejects the whole preference update."""
+        self.user.movie_status = MediaStatusChoices.COMPLETED.value
+        self.user.save(update_fields=["movie_status"])
+
+        result = self.user.update_preference(
+            "movie_status",
+            f"{MediaStatusChoices.COMPLETED.value},invalid",
+        )
+
+        self.assertEqual(result, MediaStatusChoices.COMPLETED.value)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.movie_status, MediaStatusChoices.COMPLETED.value)
 
     def test_update_preference_boolean_field(self):
         """Test update_preference with a boolean field."""
@@ -261,6 +308,33 @@ class UserColumnPrefsTests(TestCase):
         )
 
 
+class UserPinnedProvidersTests(TestCase):
+    """Tests for pinning/favoriting watch providers (issue #519)."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="pinnedproviders",
+            password="12345",
+        )
+
+    def test_toggle_pinned_provider_adds_new_provider(self):
+        result = self.user.toggle_pinned_provider("Netflix")
+
+        self.assertEqual(result, ["Netflix"])
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.pinned_watch_providers, ["Netflix"])
+
+    def test_toggle_pinned_provider_removes_existing_provider(self):
+        self.user.pinned_watch_providers = ["Netflix", "Hulu"]
+        self.user.save(update_fields=["pinned_watch_providers"])
+
+        result = self.user.toggle_pinned_provider("Netflix")
+
+        self.assertEqual(result, ["Hulu"])
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.pinned_watch_providers, ["Hulu"])
+
+
 class UserGetImportTasksTests(TestCase):
     """Tests for the User.get_import_tasks method."""
 
@@ -282,12 +356,9 @@ class UserGetImportTasksTests(TestCase):
             month_of_year="*",
         )
 
-    @patch("users.models.AsyncResult")
     @patch("users.helpers.process_task_result")
-    def test_get_import_tasks_results(self, mock_process_task_result, mock_async_result):
+    def test_get_import_tasks_results(self, mock_process_task_result):
         """Test get_import_tasks returns correct task results."""
-        # Failed rows without a traceback ask the result backend for one
-        mock_async_result.return_value.traceback = None
         # Create mock processed task
         mock_task = MagicMock()
         mock_task.summary = "Imported 10 items"
@@ -343,6 +414,89 @@ class UserGetImportTasksTests(TestCase):
         self.assertEqual(import_tasks["results"][0]["task"], mock_task)
         self.assertEqual(import_tasks["results"][0]["source"], "myanimelist")
         self.assertEqual(import_tasks["results"][0]["status"], "FAILURE")
+
+    def test_get_import_tasks_renders_a_cancelled_task(self):
+        """A revoked task is history like any other, not a 500 on every poll."""
+        TaskResult.objects.create(
+            task_id="revoked-task",
+            task_name="Import from Trakt",
+            task_kwargs=f"{{'user_id': {self.user.id}, 'username': 'testuser'}}",
+            status="REVOKED",
+            date_done=timezone.now(),
+            result="{}",
+        )
+
+        import_tasks = self.user.get_import_tasks()
+
+        self.assertEqual(len(import_tasks["results"]), 1)
+        self.assertEqual(import_tasks["results"][0]["status"], "REVOKED")
+        self.assertEqual(
+            import_tasks["results"][0]["summary"],
+            "This task was cancelled before it finished.",
+        )
+
+    @patch("users.helpers.process_task_result")
+    def test_get_import_tasks_results_includes_grouvee(self, mock_process_task_result):
+        """Test get_import_tasks surfaces Grouvee task results."""
+        mock_task = MagicMock()
+        mock_task.summary = "Imported 3 games"
+        mock_task.errors = []
+        mock_task.mode = "new"
+        mock_process_task_result.return_value = mock_task
+
+        TaskResult.objects.create(
+            task_id="grouvee-task",
+            task_name="Import from Grouvee",
+            task_kwargs=(f"{{'user_id': {self.user.id}}}"),
+            status="SUCCESS",
+            date_done=timezone.now(),
+            result="{}",
+        )
+
+        import_tasks = self.user.get_import_tasks()
+
+        self.assertEqual(len(import_tasks["results"]), 1)
+        self.assertEqual(import_tasks["results"][0]["source"], "grouvee")
+
+    @patch("users.helpers.process_task_result")
+    @patch("users.helpers.get_next_run_info")
+    def test_get_import_tasks_includes_stremio_results_and_schedule(
+        self,
+        mock_get_next_run_info,
+        mock_process_task_result,
+    ):
+        """Stremio recurring imports should appear in both activity panels."""
+        mock_task = MagicMock()
+        mock_task.summary = "Imported 3 items"
+        mock_task.errors = []
+        mock_process_task_result.return_value = mock_task
+        mock_get_next_run_info.return_value = {
+            "next_run": timezone.now() + timedelta(hours=2),
+            "frequency": "Every 2 hours",
+            "mode": "Only New Items",
+        }
+
+        TaskResult.objects.create(
+            task_id="stremio-task",
+            task_name="Import from Stremio (Recurring)",
+            task_kwargs=f'{{"user_id": {self.user.id}}}',
+            status="SUCCESS",
+            date_done=timezone.now(),
+            result="{}",
+        )
+        PeriodicTask.objects.create(
+            name="Import from Stremio for test (every 2 hours)",
+            task="Import from Stremio (Recurring)",
+            kwargs=f'{{"user_id": {self.user.id}}}',
+            crontab=self.crontab,
+            enabled=True,
+        )
+
+        import_tasks = self.user.get_import_tasks()
+
+        self.assertEqual(import_tasks["results"][0]["source"], "stremio")
+        self.assertEqual(import_tasks["schedules"][0]["source"], "stremio")
+        self.assertEqual(import_tasks["schedules"][0]["username"], "test")
 
     @patch("users.helpers.get_next_run_info")
     def test_get_import_tasks_schedules(self, mock_get_next_run_info):
@@ -506,6 +660,10 @@ class UserGetImportTasksTests(TestCase):
             date_done=timezone.now(),
             result='"Synced collection ownership."',
         )
+        # date_done is auto_now, so set the ordering timestamp explicitly.
+        TaskResult.objects.filter(task_id="task-radarr").update(
+            date_done=timezone.now() - timedelta(minutes=5),
+        )
 
         PeriodicTask.objects.create(
             name="Import from Radarr for test (every 2 hours)",
@@ -536,8 +694,49 @@ class UserGetImportTasksTests(TestCase):
         self.assertEqual(mock_get_next_run_info.call_count, 2)
 
     @patch("users.helpers.process_task_result")
+    def test_get_import_tasks_maps_koito_results_and_schedule(
+        self,
+        mock_process_task_result,
+    ):
+        """Koito's one-off import and per-user poll schedule should appear in
+        import history and Active Periodic Imports.
+        """
+        mock_task = MagicMock()
+        mock_task.summary = "Imported 10 Koito listen(s)."
+        mock_task.errors = None
+        mock_process_task_result.return_value = mock_task
+
+        TaskResult.objects.create(
+            task_id="task-koito",
+            task_name="Import from Koito History",
+            task_kwargs=(f'{{"user_id": {self.user.id}}}'),
+            status="SUCCESS",
+            date_done=timezone.now(),
+            result='"Imported 10 Koito listen(s)."',
+        )
+
+        PeriodicTask.objects.create(
+            name=f"Poll Koito for {self.user.username} (every 15 minutes)",
+            task="Poll Koito for user",
+            kwargs=(f'{{"user_id": {self.user.id}}}'),
+            crontab=self.crontab,
+            enabled=True,
+        )
+
+        import_tasks = self.user.get_import_tasks()
+
+        self.assertEqual(
+            [result["source"] for result in import_tasks["results"]],
+            ["koito"],
+        )
+        self.assertEqual(
+            [schedule["source"] for schedule in import_tasks["schedules"]],
+            ["koito"],
+        )
+
+    @patch("users.helpers.process_task_result")
     def test_get_import_tasks_unknown_source(self, mock_process_task_result):
-        """Test get_import_tasks with an unknown task source."""
+        """A newly named import appears without a source-specific mapping."""
         # Create mock processed task
         mock_task = MagicMock()
         mock_task.summary = "Imported 10 items"
@@ -558,8 +757,8 @@ class UserGetImportTasksTests(TestCase):
         # Get import tasks
         import_tasks = self.user.get_import_tasks()
 
-        # Check results
-        self.assertEqual(len(import_tasks["results"]), 0)
+        self.assertEqual(len(import_tasks["results"]), 1)
+        self.assertEqual(import_tasks["results"][0]["source"], "Unknown")
 
     @patch("users.helpers.process_task_result")
     def test_get_import_tasks_includes_recurring_audiobookshelf_results(
@@ -632,7 +831,9 @@ class UserGetImportTasksTests(TestCase):
         self.assertEqual(mock_process_task_result.call_count, 3)
 
     @patch("users.helpers.process_task_result")
-    def test_get_import_tasks_maps_lastfm_history_results(self, mock_process_task_result):
+    def test_get_import_tasks_maps_lastfm_history_results(
+        self, mock_process_task_result
+    ):
         """Last.fm history task results should appear under the Last.fm source."""
         mock_task = MagicMock()
         mock_task.summary = "Imported 42 Last.fm history scrobbles."
@@ -694,10 +895,11 @@ class UserGetImportTasksTests(TestCase):
         self.assertEqual(task_result.status, "SUCCESS")
         self.assertEqual(task_result.result, "Imported 3 movies.")
 
-
     @patch("users.helpers.process_task_result")
-    def test_get_import_tasks_yamtrack_user_id_first_in_kwargs(self, mock_process_task_result):
-        """Yamtrack tasks appear in history when user_id comes before the file bytes blob."""
+    def test_get_import_tasks_yamtrack_user_id_first_in_kwargs(
+        self, mock_process_task_result
+    ):
+        """CSV import tasks appear in history when user_id precedes the file bytes blob."""
         processed_task = MagicMock()
         processed_task.summary = "Imported 5 items."
         processed_task.errors = None
@@ -768,6 +970,10 @@ class UserGetImportTasksTests(TestCase):
             date_done=timezone.now(),
             result='"Synced collection."',
         )
+        # date_done is auto_now, so set the ordering timestamp explicitly.
+        TaskResult.objects.filter(task_id="task-radarr-recurring").update(
+            date_done=timezone.now() - timedelta(minutes=5),
+        )
 
         import_tasks = self.user.get_import_tasks()
 
@@ -793,7 +999,9 @@ class UserGetImportTasksTests(TestCase):
         lastfm_results = [r for r in import_tasks["results"] if r["source"] == "lastfm"]
         self.assertEqual(len(lastfm_results), 1)
         self.assertEqual(lastfm_results[0]["status"], "SUCCESS")
-        self.assertEqual(lastfm_results[0]["summary"], "Automatic Last.fm sync completed.")
+        self.assertEqual(
+            lastfm_results[0]["summary"], "Automatic Last.fm sync completed."
+        )
         self.assertIsNone(lastfm_results[0]["errors"])
 
     def test_get_import_tasks_lastfm_periodic_sync_older_than_7_days(self):
@@ -827,6 +1035,54 @@ class UserGetImportTasksTests(TestCase):
 
         lastfm_results = [r for r in import_tasks["results"] if r["source"] == "lastfm"]
         self.assertEqual(len(lastfm_results), 0)
+
+
+class UserGetExportTasksTests(TestCase):
+    """Tests for the User.get_export_tasks method."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="exporter",
+            password="12345",
+        )
+
+    @patch("users.helpers.process_task_result")
+    def test_get_export_tasks_only_includes_last_seven_days(
+        self,
+        mock_process_task_result,
+    ):
+        """Export history excludes completed tasks older than seven days."""
+        processed_task = MagicMock(summary="Exported data", errors=[])
+        mock_process_task_result.return_value = processed_task
+        task_kwargs = f"{{'user_id': {self.user.id}, 'media_types': []}}"
+
+        recent_task = TaskResult.objects.create(
+            task_id="recent-export",
+            task_name="Scheduled backup export",
+            task_kwargs=task_kwargs,
+            status="SUCCESS",
+            result="{}",
+        )
+        TaskResult.objects.filter(pk=recent_task.pk).update(
+            date_done=timezone.now() - timedelta(days=6),
+        )
+        recent_task.refresh_from_db()
+        old_task = TaskResult.objects.create(
+            task_id="old-export",
+            task_name="Scheduled backup export",
+            task_kwargs=task_kwargs,
+            status="SUCCESS",
+            result="{}",
+        )
+        TaskResult.objects.filter(pk=old_task.pk).update(
+            date_done=timezone.now() - timedelta(days=8),
+        )
+
+        export_tasks = self.user.get_export_tasks()
+
+        self.assertEqual(len(export_tasks["results"]), 1)
+        self.assertEqual(export_tasks["results"][0]["date"], recent_task.date_done)
+        mock_process_task_result.assert_called_once_with(recent_task)
 
 
 class UserResolveWatchDateTests(TestCase):

@@ -12,6 +12,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db.models import Q
 
+from app import backfill_queue
 from app.log_safety import exception_summary
 from app.models import MetadataBackfillField
 
@@ -22,46 +23,45 @@ logger = logging.getLogger(__name__)
 def populate_episode_runtime_queue(batch_size: int = 20):
     """Drain the episode runtime queue and process seasons in small batches."""
     # Deferred to avoid circular import: tasks.py re-exports this module.
-    from app.tasks import (  # noqa: PLC0415
+    from app.tasks import (
         RUNTIME_BACKFILL_EPISODES_QUEUE_KEY,
         RUNTIME_BACKFILL_EPISODES_SCHEDULED_KEY,
-        RUNTIME_BACKFILL_QUEUE_TTL,
     )
 
-    queue = cache.get(RUNTIME_BACKFILL_EPISODES_QUEUE_KEY) or []
-    if not queue:
-        cache.delete(RUNTIME_BACKFILL_EPISODES_SCHEDULED_KEY)
-        return {"processed": 0, "message": "No queued episode runtime seasons"}
+    # Season keys are encoded tokens, not integers.
+    with backfill_queue.drain(
+        RUNTIME_BACKFILL_EPISODES_QUEUE_KEY,
+        RUNTIME_BACKFILL_EPISODES_SCHEDULED_KEY,
+        batch_size,
+        drain_task=populate_episode_runtime_queue,
+        coerce=str,
+    ) as batch:
+        if not batch:
+            return {"processed": 0, "message": "No queued episode runtime seasons"}
 
-    cache.delete(RUNTIME_BACKFILL_EPISODES_SCHEDULED_KEY)
-    batch = queue[:batch_size]
-    remaining = queue[batch_size:]
-    if remaining:
-        cache.set(RUNTIME_BACKFILL_EPISODES_QUEUE_KEY, remaining, timeout=RUNTIME_BACKFILL_QUEUE_TTL)
-        if cache.add(RUNTIME_BACKFILL_EPISODES_SCHEDULED_KEY, True, timeout=30):
-            populate_episode_runtime_queue.apply_async(countdown=10)
-    else:
-        cache.delete(RUNTIME_BACKFILL_EPISODES_QUEUE_KEY)
-
-    return populate_episode_runtime_data(season_keys=batch)
+        return populate_episode_runtime_data(season_keys=batch)
 
 
 @shared_task(name="app.tasks.populate_episode_runtime_data")
 def populate_episode_runtime_data(season_keys: list[str] | None = None):
     """Populate runtime data for episodes by syncing season metadata."""
-    import time  # noqa: PLC0415
+    import time
 
-    from app.models import Item, MediaTypes  # noqa: PLC0415
-    from app.providers import services as _services  # noqa: PLC0415
-    from app.statistics import parse_runtime_to_minutes  # noqa: PLC0415
-
-    # Deferred to avoid circular import: tasks.py re-exports this module.
-    from app.tasks import (  # noqa: PLC0415
+    from app.models import Item, MediaTypes
+    from app.providers import services as _services
+    from app.statistics import parse_runtime_to_minutes
+    from app.tasks import (
         _episode_runtime_items_queryset,
         _normalize_season_keys,
         _record_backfill_failure,
         _record_backfill_success,
         _schedule_metadata_statistics_refresh,
+    )
+
+    # Deferred to avoid circular import: tasks.py re-exports this module.
+    from app.tasks_backfill_state import (
+        METADATA_BACKFILL_EMPTY_ANSWER_DELAY_SECONDS,
+        is_terminal_backfill_error,
     )
 
     normalized_seasons = _normalize_season_keys(season_keys)
@@ -98,6 +98,7 @@ def populate_episode_runtime_data(season_keys: list[str] | None = None):
         )
 
     for media_id, source, season_number in seasons_to_process:
+        eligible_missing = []
         try:
             if not media_id or season_number is None:
                 continue
@@ -162,7 +163,7 @@ def populate_episode_runtime_data(season_keys: list[str] | None = None):
 
             season_data = season_metadata[f"season/{season_number}"]
 
-            from app.providers import tmdb  # noqa: PLC0415
+            from app.providers import tmdb
 
             episodes_metadata = tmdb.process_episodes(season_data, [])
             if not episodes_metadata:
@@ -201,6 +202,7 @@ def populate_episode_runtime_data(season_keys: list[str] | None = None):
                             missing_item,
                             MetadataBackfillField.RUNTIME,
                             "no runtime",
+                            min_delay_seconds=METADATA_BACKFILL_EMPTY_ANSWER_DELAY_SECONDS,
                         )
                     continue
 
@@ -221,8 +223,14 @@ def populate_episode_runtime_data(season_keys: list[str] | None = None):
                     continue
 
                 existing_item = existing_by_number.get(episode_number)
-                existing_title, existing_image = episode_title_map.get(episode_number, ("", ""))
-                title = existing_title or ep_data.get("title") or f"Episode {episode_number}"
+                existing_title, existing_image = episode_title_map.get(
+                    episode_number, ("", "")
+                )
+                title = (
+                    existing_title
+                    or ep_data.get("title")
+                    or f"Episode {episode_number}"
+                )
                 image = ep_data.get("image") or existing_image or settings.IMG_NONE
 
                 if existing_item:
@@ -242,7 +250,9 @@ def populate_episode_runtime_data(season_keys: list[str] | None = None):
                         if runtime_changed:
                             updated_count += 1
                             updated_items.append(existing_item)
-                            _record_backfill_success(existing_item, MetadataBackfillField.RUNTIME)
+                            _record_backfill_success(
+                                existing_item, MetadataBackfillField.RUNTIME
+                            )
                             logger.info(
                                 "Updated episode runtime during backfill season=%s episode=%s minutes=%s",
                                 season_number,
@@ -264,21 +274,47 @@ def populate_episode_runtime_data(season_keys: list[str] | None = None):
                         episode_item,
                         MetadataBackfillField.RUNTIME,
                         "missing episode metadata",
+                        min_delay_seconds=METADATA_BACKFILL_EMPTY_ANSWER_DELAY_SECONDS,
                     )
 
             time.sleep(0.1)
 
         except Exception as e:
-            logger.error(
-                "Episode runtime backfill failed source=%s season=%s error=%s",
-                source,
-                season_number,
-                exception_summary(e),
-            )
+            error_summary = exception_summary(e)
+            terminal = is_terminal_backfill_error(e)
+            if terminal:
+                # A dead provider id fails the same way every night. One line,
+                # no traceback, and the per-item state below keeps the season
+                # out of future runs.
+                logger.warning(
+                    "Episode runtime backfill failed source=%s season=%s error=%s terminal=%s",
+                    source,
+                    season_number,
+                    error_summary,
+                    terminal,
+                )
+            else:
+                logger.exception(
+                    "Episode runtime backfill failed source=%s season=%s error=%s",
+                    source,
+                    season_number,
+                    error_summary,
+                )
+            for episode_item in eligible_missing:
+                _record_backfill_failure(
+                    episode_item,
+                    MetadataBackfillField.RUNTIME,
+                    f"exception: {error_summary}",
+                    terminal=terminal,
+                )
             error_count += 1
             continue
 
-    logger.info("Episode runtime population completed: %s episodes updated, %s errors", updated_count, error_count)
+    logger.info(
+        "Episode runtime population completed: %s episodes updated, %s errors",
+        updated_count,
+        error_count,
+    )
 
     if updated_items:
         _schedule_metadata_statistics_refresh(
@@ -289,7 +325,9 @@ def populate_episode_runtime_data(season_keys: list[str] | None = None):
 
     if not normalized_seasons:
         cache.set("runtime_population_completed", True, timeout=3600)
-        logger.info("🎉 All runtime data population completed! Movies, TV shows, anime, and episodes all processed.")
+        logger.info(
+            "🎉 All runtime data population completed! Movies, TV shows, anime, and episodes all processed."
+        )
 
     return {
         "updated": updated_count,

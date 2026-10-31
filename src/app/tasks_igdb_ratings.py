@@ -11,7 +11,7 @@ from celery import shared_task
 from django.conf import settings
 from django.core.cache import cache
 
-from app import metadata_utils
+from app import backfill_queue, metadata_utils
 from app.log_safety import exception_summary
 from app.models import Item, MediaTypes, MetadataBackfillField, Sources
 from app.providers import services
@@ -26,7 +26,7 @@ from app.tasks_backfill_state import (
 
 logger = logging.getLogger(__name__)
 
-BACKGROUND_TASK_PRIORITY = getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1)
+BACKGROUND_TASK_PRIORITY = getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9)
 
 IGDB_RATINGS_BACKFILL_VERSION = 1
 IGDB_RATINGS_BACKFILL_QUEUE_TTL = 60 * 60  # 1 hour
@@ -35,14 +35,16 @@ IGDB_RATINGS_BACKFILL_ITEMS_SCHEDULED_KEY = "igdb_ratings_backfill_items_schedul
 
 
 def _igdb_rating_items_queryset():
-    from app.models import MetadataBackfillState  # noqa: PLC0415
+    from app.models import MetadataBackfillState
 
     queryset = Item.objects.filter(
         source=Sources.IGDB.value,
         media_type=MediaTypes.GAME.value,
         metadata_fetched_at__isnull=False,
     )
-    queryset = _apply_backfill_state_filters(queryset, MetadataBackfillField.IGDB_RATINGS)
+    queryset = _apply_backfill_state_filters(
+        queryset, MetadataBackfillField.IGDB_RATINGS
+    )
     completed_ids = MetadataBackfillState.objects.filter(
         field=MetadataBackfillField.IGDB_RATINGS,
         give_up=False,
@@ -54,6 +56,7 @@ def _igdb_rating_items_queryset():
 
 
 def count_igdb_rating_backfill_items() -> int:
+    """Return the count igdb rating backfill items."""
     return _igdb_rating_items_queryset().count()
 
 
@@ -70,7 +73,9 @@ def _populate_igdb_ratings_for_items(items):
             )
             if not isinstance(metadata, dict):
                 error_count += 1
-                _record_backfill_failure(item, MetadataBackfillField.IGDB_RATINGS, "no metadata")
+                _record_backfill_failure(
+                    item, MetadataBackfillField.IGDB_RATINGS, "no metadata"
+                )
                 continue
 
             update_fields = metadata_utils.apply_item_metadata(
@@ -91,10 +96,10 @@ def _populate_igdb_ratings_for_items(items):
             updated_count += 1
         except Exception as exc:
             error_count += 1
-            logger.error(
+            logger.exception(
                 "Error backfilling IGDB ratings for %s: %s",
                 item.title,
-                exception_summary(exc),
+                exception_summary(exc),  # noqa: TRY401  # exception_summary() is the project's sanitised rendering
             )
             _record_backfill_failure(
                 item,
@@ -135,49 +140,42 @@ def populate_igdb_rating_data_for_items(item_ids: list[int]):
 
 
 def enqueue_igdb_rating_backfill_items(item_ids, countdown=10):
+    """Return the enqueue igdb rating backfill items."""
     normalized = _normalize_item_ids(item_ids)
-    normalized = _filter_backfill_item_ids(normalized, MetadataBackfillField.IGDB_RATINGS)
+    normalized = _filter_backfill_item_ids(
+        normalized, MetadataBackfillField.IGDB_RATINGS
+    )
     if not normalized:
         return 0
-    try:
-        queue = cache.get(IGDB_RATINGS_BACKFILL_ITEMS_QUEUE_KEY) or []
-        queue = list(set(queue).union(normalized))
-        cache.set(
-            IGDB_RATINGS_BACKFILL_ITEMS_QUEUE_KEY,
-            queue,
-            timeout=IGDB_RATINGS_BACKFILL_QUEUE_TTL,
+    queued = backfill_queue.enqueue(
+        IGDB_RATINGS_BACKFILL_ITEMS_QUEUE_KEY,
+        IGDB_RATINGS_BACKFILL_ITEMS_SCHEDULED_KEY,
+        normalized,
+        ttl=IGDB_RATINGS_BACKFILL_QUEUE_TTL,
+        drain_task=populate_igdb_rating_backfill_queue,
+        countdown=countdown,
+    )
+    if not queued:
+        logger.debug("IGDB ratings backfill queue unavailable, dispatching directly")
+        populate_igdb_rating_data_for_items.apply_async(
+            args=[normalized], countdown=countdown
         )
-        if cache.add(IGDB_RATINGS_BACKFILL_ITEMS_SCHEDULED_KEY, True, timeout=30):
-            populate_igdb_rating_backfill_queue.apply_async(countdown=countdown)
-    except Exception as exc:  # pragma: no cover - cache unavailable
-        logger.debug("IGDB ratings backfill queue unavailable: %s", exception_summary(exc))
-        populate_igdb_rating_data_for_items.apply_async(args=[normalized], countdown=countdown)
     return len(normalized)
 
 
 @shared_task(name="app.tasks.populate_igdb_rating_backfill_queue")
 def populate_igdb_rating_backfill_queue(batch_size: int = 25):
     """Drain the IGDB ratings backfill queue and process items in small batches."""
-    queue = cache.get(IGDB_RATINGS_BACKFILL_ITEMS_QUEUE_KEY) or []
-    if not queue:
-        cache.delete(IGDB_RATINGS_BACKFILL_ITEMS_SCHEDULED_KEY)
-        return {"processed": 0, "message": "No queued IGDB rating items"}
+    with backfill_queue.drain(
+        IGDB_RATINGS_BACKFILL_ITEMS_QUEUE_KEY,
+        IGDB_RATINGS_BACKFILL_ITEMS_SCHEDULED_KEY,
+        batch_size,
+        drain_task=populate_igdb_rating_backfill_queue,
+    ) as batch:
+        if not batch:
+            return {"processed": 0, "message": "No queued IGDB rating items"}
 
-    cache.delete(IGDB_RATINGS_BACKFILL_ITEMS_SCHEDULED_KEY)
-    batch = queue[:batch_size]
-    remaining = queue[batch_size:]
-    if remaining:
-        cache.set(
-            IGDB_RATINGS_BACKFILL_ITEMS_QUEUE_KEY,
-            remaining,
-            timeout=IGDB_RATINGS_BACKFILL_QUEUE_TTL,
-        )
-        if cache.add(IGDB_RATINGS_BACKFILL_ITEMS_SCHEDULED_KEY, True, timeout=30):
-            populate_igdb_rating_backfill_queue.apply_async(countdown=10)
-    else:
-        cache.delete(IGDB_RATINGS_BACKFILL_ITEMS_QUEUE_KEY)
-
-    return populate_igdb_rating_data_for_items(batch)
+        return populate_igdb_rating_data_for_items(batch)
 
 
 @shared_task(name="app.tasks.reconcile_igdb_rating_backfill")

@@ -1,10 +1,10 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from app.models import (
@@ -16,6 +16,8 @@ from app.models import (
     Sources,
     Status,
 )
+from events.calendar.helpers import date_parser
+from events.models import Event
 from users.models import QuickWatchDateChoices
 
 mock_path = Path(__file__).resolve().parent.parent / "mock_data"
@@ -79,7 +81,7 @@ class SeasonModel(TestCase):
         self.assertEqual(self.season.progress, 2)
 
     def test_completed_episode_count(self):
-        """Test completed episode count ignores duplicates and incomplete plays."""
+        """Test completed episode count ignores duplicates and non-completed plays."""
         item_ep2 = Item.objects.get(
             media_id="1668",
             source=Sources.TMDB.value,
@@ -93,6 +95,7 @@ class SeasonModel(TestCase):
             end_date=datetime(2023, 6, 3, 0, 0, tzinfo=UTC),
         )
 
+        # Completed with no end_date still counts (issue #498).
         item_ep3 = Item.objects.create(
             media_id="1668",
             source=Sources.TMDB.value,
@@ -108,7 +111,24 @@ class SeasonModel(TestCase):
             end_date=None,
         )
 
-        self.assertEqual(self.season.completed_episode_count, 2)
+        # Not-yet-watched status doesn't count, even with an end_date set.
+        item_ep4 = Item.objects.create(
+            media_id="1668",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="The One After",
+            image="http://example.com/image.jpg",
+            season_number=1,
+            episode_number=4,
+        )
+        Episode.objects.create(
+            item=item_ep4,
+            related_season=self.season,
+            end_date=datetime(2023, 6, 4, 0, 0, tzinfo=UTC),
+            status=Status.PLANNING.value,
+        )
+
+        self.assertEqual(self.season.completed_episode_count, 3)
         self.assertEqual(self.season.progress, 3)
 
     def test_progress_first_watch_with_gap(self):
@@ -173,9 +193,85 @@ class SeasonModel(TestCase):
                     end_date=datetime(2023, 7, ep_num, 0, 0, tzinfo=UTC),
                 )
 
-        # 5 of 6 episodes reached a second watch, a strict majority, so
-        # progress should advance to 6 rather than freeze at 4.
+        season.rewatch_started_at = datetime(2023, 7, 1, tzinfo=UTC)
+        season._invalidate_episode_stats()
+        # The explicit pass reaches episode 6 even with episode 5 skipped.
         self.assertEqual(season.progress, 6)
+
+    def _make_skip_ahead_season(self, media_id, runtime_minutes=None):
+        """Create a season with only episode 9 of 10 watched, nothing before it."""
+        item_season = Item.objects.create(
+            media_id=media_id,
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+            runtime_minutes=runtime_minutes,
+        )
+        season = Season.objects.create(
+            item=item_season,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        item_ep9 = Item.objects.create(
+            media_id=media_id,
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+            episode_number=9,
+        )
+        Episode.objects.create(
+            item=item_ep9,
+            related_season=season,
+            end_date=datetime(2023, 6, 9, 0, 0, tzinfo=UTC),
+        )
+        return season
+
+    def test_plays_sort_value_uses_completed_count_not_position(self):
+        """Regression for #527: watching only a later episode is 1 play, not the ep number."""
+        season = self._make_skip_ahead_season("8888")
+
+        self.assertEqual(season.progress, 9)
+        self.assertEqual(season._plays_sort_value(), 1)
+
+    def test_progress_percentage_uses_completed_count(self):
+        """Regression for #527: percentage should reflect episodes watched, not position."""
+        season = self._make_skip_ahead_season("8889")
+        season.max_progress = 10
+
+        self.assertEqual(season.progress_percentage, 10)
+
+    def test_progress_percentage_none_without_max_progress(self):
+        """No max_progress attribute means percentage can't be computed."""
+        item_season = Item.objects.create(
+            media_id="8891",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="No Episodes Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+        )
+        season = Season.objects.create(
+            item=item_season,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+
+        self.assertIsNone(season.progress_percentage)
+
+    def test_progress_percentage_clamped_at_100(self):
+        """Completed count exceeding max_progress should clamp to 100, not overshoot."""
+        self.season.max_progress = 1
+        self.assertEqual(self.season.progress_percentage, 100)
+
+    def test_time_watched_minutes_single_out_of_order_watch(self):
+        """Regression for #527: one watched episode reports one episode's runtime."""
+        season = self._make_skip_ahead_season("8890", runtime_minutes=30)
+
+        self.assertEqual(season.time_watched_minutes, 30)
 
     def test_season_start_date(self):
         """Test the start_date property of the Season model."""
@@ -433,6 +529,14 @@ class SeasonStatusTests(TestCase):
                 {"episode_number": 1, "image": "img1.jpg"},
             ],
             "image": "season_img.jpg",
+            "related": {
+                "seasons": [
+                    {
+                        "season_number": 2,
+                        "first_air_date": datetime(2020, 1, 1, tzinfo=UTC),
+                    },
+                ],
+            },
         }
 
         self.season.status = Status.COMPLETED.value
@@ -445,6 +549,51 @@ class SeasonStatusTests(TestCase):
         self.assertEqual(self.tv.status, Status.IN_PROGRESS.value)
 
     @patch("app.models.providers.services.get_media_metadata")
+    def test_completed_status_does_not_start_a_future_season(self, mock_get_metadata):
+        """A planning season with an unaired premiere stays planning."""
+        next_season_item = Item.objects.create(
+            media_id="123",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Test Show",
+            image="http://example.com/image2.jpg",
+            season_number=2,
+        )
+        next_season = Season.objects.create(
+            item=next_season_item,
+            user=self.user,
+            related_tv=self.tv,
+            status=Status.PLANNING.value,
+        )
+
+        future_air_date = timezone.now() + timedelta(days=365)
+        mock_get_metadata.return_value = {
+            "episodes": [
+                {"episode_number": 1, "image": "img1.jpg"},
+            ],
+            "image": "season_img.jpg",
+            "details": {"status": "Returning Series"},
+            "related": {
+                "seasons": [
+                    {"season_number": 1, "first_air_date": datetime(2020, 1, 1, tzinfo=UTC)},
+                    {"season_number": 2, "first_air_date": future_air_date},
+                ],
+            },
+        }
+        TV.objects.filter(pk=self.tv.pk).update(status=Status.IN_PROGRESS.value)
+
+        self.season.status = Status.COMPLETED.value
+        self.season.save()
+
+        next_season.refresh_from_db()
+        self.assertEqual(next_season.status, Status.PLANNING.value)
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.IN_PROGRESS.value)
+        self.assertFalse(
+            Season.objects.filter(related_tv=self.tv, item__season_number=3).exists(),
+        )
+
+    @patch("app.models.providers.services.get_media_metadata")
     def test_completed_last_season_completes_tv_show(self, mock_get_metadata):
         """Test completing the last season completes the TV show."""
         mock_get_metadata.side_effect = [
@@ -455,6 +604,7 @@ class SeasonStatusTests(TestCase):
                 "image": "season_img.jpg",
             },
             {
+                "details": {"status": "Ended"},
                 "related": {
                     "seasons": [{"season_number": 1, "image": "season_img.jpg"}],
                 },
@@ -583,6 +733,74 @@ class SeasonStatusTests(TestCase):
             self.assertIsNotNone(tv)
             self.assertEqual(tv.item.title, "Test Show")
             self.assertEqual(tv.status, Status.PLANNING.value)
+
+    def test_get_tv_prefers_matching_library_media_type_bucket(self):
+        """get_tv must not attach a season to a TV row from the other identity.
+
+        Regression test for GitHub issue #623: when a show is tracked under
+        both its TV identity and its anime identity (two separate TV rows,
+        distinguished only by Item.library_media_type), get_tv used to pick
+        whichever TV row matched media_id/source/user first, regardless of
+        bucket, silently mis-attaching the season.
+        """
+        self.tv_item.library_media_type = MediaTypes.TV.value
+        self.tv_item.save(update_fields=["library_media_type"])
+
+        anime_tv_item = Item.objects.create(
+            media_id="123",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Test Show",
+            image="http://example.com/image.jpg",
+            library_media_type=MediaTypes.ANIME.value,
+        )
+        anime_tv = TV.objects.create(
+            item=anime_tv_item,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+
+        self.season.related_tv = None
+        self.season.item.library_media_type = MediaTypes.ANIME.value
+        self.season.item.save(update_fields=["library_media_type"])
+
+        resolved = self.season.get_tv()
+
+        self.assertEqual(resolved.id, anime_tv.id)
+
+    def test_get_tv_creates_separate_tv_when_only_other_bucket_exists(self):
+        """get_tv must not collide with a TV row from the other bucket.
+
+        Regression test for GitHub issue #997: when the season's own bucket
+        has no TV row yet but the show already has one under the *other*
+        bucket (e.g. tracked as TV, then a season is added under its anime
+        identity), the fallback creation path used to look up the parent
+        Item without scoping by library_media_type, find the other bucket's
+        Item (which already has a TV row for this user), and then try to
+        create a second TV for that same (user, item) pair — raising
+        IntegrityError on app_tv_unique_item_user.
+        """
+        self.season.related_tv = None
+        self.season.item.library_media_type = MediaTypes.ANIME.value
+        self.season.item.save(update_fields=["library_media_type"])
+
+        with patch(
+            "app.models.providers.services.get_media_metadata",
+        ) as mock_get_metadata:
+            mock_get_metadata.return_value = {
+                "title": "Test Show",
+                "image": "tv_img.jpg",
+                "details": {"seasons": 1},
+            }
+
+            resolved = self.season.get_tv()
+
+        self.assertNotEqual(resolved.id, self.tv.id)
+        self.assertEqual(resolved.item.library_media_type, MediaTypes.ANIME.value)
+        self.assertEqual(
+            TV.objects.filter(user=self.user, item__media_id="123").count(),
+            2,
+        )
 
 
 class SeasonGetRemainingEpsQuickWatchDateTests(TestCase):
@@ -756,6 +974,80 @@ class SeasonGetRemainingEpsQuickWatchDateTests(TestCase):
         self.assertEqual(episodes[0].end_date, datetime(1994, 9, 22, tzinfo=UTC))
         self.assertEqual(episodes[1].end_date, datetime(1994, 9, 29, tzinfo=UTC))
 
+    @patch("app.models.Season.get_episode_item")
+    def test_get_remaining_eps_explicit_end_date_overrides_preference(
+        self,
+        mock_get_episode_item,
+    ):
+        """An explicit end_date argument wins over the user's quick_watch_date."""
+        self.user.quick_watch_date = self.QuickWatchDateChoices.CURRENT_DATE
+        self.user.save()
+
+        for i in range(1, 4):
+            mock_get_episode_item.return_value = Item.objects.create(
+                media_id="1668",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.EPISODE.value,
+                title=f"Episode {i}",
+                image=f"img{i}.jpg",
+                season_number=1,
+                episode_number=i,
+            )
+
+        episodes = self.season.get_remaining_eps(self.mock_metadata, end_date=None)
+
+        for ep in episodes:
+            self.assertIsNone(ep.end_date)
+
+    @patch("app.models.providers.services.get_media_metadata")
+    def test_season_completion_with_pending_end_date_blank(self, mock_get_metadata):
+        """Completing via the form with a blank end_date persists no date,
+        even when the user's quick_watch_date preference defaults to today.
+        """
+        self.user.quick_watch_date = self.QuickWatchDateChoices.CURRENT_DATE
+        self.user.save()
+
+        mock_get_metadata.return_value = {
+            "episodes": [
+                {"episode_number": 1, "image": "img1.jpg", "air_date": None},
+                {"episode_number": 2, "image": "img2.jpg", "air_date": None},
+            ],
+            "image": "season_img.jpg",
+        }
+
+        self.season.status = Status.COMPLETED.value
+        self.season._pending_end_date = None
+        self.season.save()
+
+        episodes = Episode.objects.filter(related_season=self.season)
+        self.assertEqual(episodes.count(), 2)
+        for ep in episodes:
+            self.assertIsNone(ep.end_date)
+
+    @patch("app.models.providers.services.get_media_metadata")
+    def test_season_completion_with_pending_end_date_explicit(self, mock_get_metadata):
+        """Completing via the form with an explicit end_date applies it to all episodes."""
+        self.user.quick_watch_date = self.QuickWatchDateChoices.CURRENT_DATE
+        self.user.save()
+
+        mock_get_metadata.return_value = {
+            "episodes": [
+                {"episode_number": 1, "image": "img1.jpg", "air_date": None},
+                {"episode_number": 2, "image": "img2.jpg", "air_date": None},
+            ],
+            "image": "season_img.jpg",
+        }
+
+        chosen_date = datetime(2000, 1, 1, tzinfo=UTC)
+        self.season.status = Status.COMPLETED.value
+        self.season._pending_end_date = chosen_date
+        self.season.save()
+
+        episodes = Episode.objects.filter(related_season=self.season)
+        self.assertEqual(episodes.count(), 2)
+        for ep in episodes:
+            self.assertEqual(ep.end_date, chosen_date)
+
 
 class SeasonEpisodeItemModelTests(TestCase):
     """Focused tests for season episode item creation/updating."""
@@ -778,6 +1070,50 @@ class SeasonEpisodeItemModelTests(TestCase):
             user=self.user,
             status=Status.IN_PROGRESS.value,
         )
+
+    @override_settings(TIME_ZONE="Europe/Berlin")
+    def test_get_episode_item_keeps_date_only_air_date_on_its_calendar_day(self):
+        """A date-only air_date must not shift with the server's TIME_ZONE.
+
+        Regression test: get_episode_item() used to interpret a "YYYY-MM-DD"
+        air_date as midnight in a timezone, which either shifted the stored
+        release_datetime into the previous UTC day or made release state treat
+        the episode as released part-way through its listed date. Date-only
+        values use the unknown-time sentinel so the calendar day is stable.
+        """
+        item = self.season.get_episode_item(
+            5,
+            {
+                "episodes": [
+                    {
+                        "episode_number": 5,
+                        "name": "No Shortcuts",
+                        "air_date": "2026-07-15",
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(
+            item.release_datetime,
+            date_parser("2026-07-15"),
+            "a date-only air_date must use the unknown-time sentinel, "
+            "regardless of the server's configured TIME_ZONE",
+        )
+        self.assertEqual(item.release_datetime.date().isoformat(), "2026-07-15")
+
+    def test_available_episode_numbers_waits_for_a_date_only_release_day_to_end(self):
+        """A date-only episode is not available on its listed day."""
+        today = timezone.localdate()
+        Event.objects.create(
+            item=self.season.item,
+            content_number=1,
+            datetime=date_parser(today),
+        )
+        now = datetime(today.year, today.month, today.day, 14, tzinfo=UTC)
+
+        with patch("django.utils.timezone.now", return_value=now):
+            self.assertEqual(self.season.available_episode_numbers(), [])
 
     def test_get_episode_item_updates_existing_item_with_episode_title(self):
         """Episode items should store the episode title instead of the show title."""

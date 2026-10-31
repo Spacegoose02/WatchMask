@@ -1,11 +1,12 @@
 from unittest.mock import patch
 
+import requests
 from django.contrib.auth import get_user_model
-from django.core.cache import cache
+from django.db import OperationalError
 from django.test import TestCase
 from django.utils import timezone
 
-from app import tasks
+from app import backfill_queue, tasks
 from app.models import (
     CREDITS_BACKFILL_VERSION,
     TV,
@@ -25,15 +26,20 @@ from app.models import (
     Status,
     Studio,
 )
+from app.providers import services
 
 
 class CreditsBackfillTaskTests(TestCase):
     def setUp(self):
-        cache.delete(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY)
-        cache.delete(tasks.CREDITS_BACKFILL_ITEMS_SCHEDULED_KEY)
+        backfill_queue.clear(
+            tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY,
+            tasks.CREDITS_BACKFILL_ITEMS_SCHEDULED_KEY,
+        )
 
     @patch("app.tasks.populate_credits_backfill_queue.apply_async")
-    def test_enqueue_credits_backfill_filters_unsupported_or_complete_items(self, mock_apply_async):
+    def test_enqueue_credits_backfill_filters_unsupported_or_complete_items(
+        self, mock_apply_async
+    ):
         missing_item = Item.objects.create(
             media_id="1001",
             source=Sources.TMDB.value,
@@ -105,8 +111,10 @@ class CreditsBackfillTaskTests(TestCase):
             last_success_at=timezone.now(),
             strategy_version=CREDITS_BACKFILL_VERSION,
         )
-        cache.delete(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY)
-        cache.delete(tasks.CREDITS_BACKFILL_ITEMS_SCHEDULED_KEY)
+        backfill_queue.clear(
+            tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY,
+            tasks.CREDITS_BACKFILL_ITEMS_SCHEDULED_KEY,
+        )
         mock_apply_async.reset_mock()
 
         queued = tasks.enqueue_credits_backfill_items(
@@ -121,14 +129,16 @@ class CreditsBackfillTaskTests(TestCase):
         )
 
         self.assertEqual(queued, 2)
-        self.assertCountEqual(
-            cache.get(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY),
-            [missing_item.id, missing_episode_item.id],
+        self.assertEqual(
+            backfill_queue.members(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY),
+            {missing_item.id, missing_episode_item.id},
         )
-        mock_apply_async.assert_called_once_with(countdown=1)
+        mock_apply_async.assert_called_once_with(countdown=1, kwargs={})
 
     @patch("app.tasks.populate_credits_backfill_queue.apply_async")
-    def test_enqueue_credits_backfill_requeues_episode_with_old_strategy_version(self, mock_apply_async):
+    def test_enqueue_credits_backfill_requeues_episode_with_old_strategy_version(
+        self, mock_apply_async
+    ):
         episode_item = Item.objects.create(
             media_id="1006",
             source=Sources.TMDB.value,
@@ -156,20 +166,27 @@ class CreditsBackfillTaskTests(TestCase):
             strategy_version=max(CREDITS_BACKFILL_VERSION - 1, 1),
         )
 
-        cache.delete(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY)
-        cache.delete(tasks.CREDITS_BACKFILL_ITEMS_SCHEDULED_KEY)
+        backfill_queue.clear(
+            tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY,
+            tasks.CREDITS_BACKFILL_ITEMS_SCHEDULED_KEY,
+        )
         mock_apply_async.reset_mock()
 
         queued = tasks.enqueue_credits_backfill_items([episode_item.id], countdown=1)
 
         self.assertEqual(queued, 1)
-        self.assertEqual(cache.get(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY), [episode_item.id])
-        mock_apply_async.assert_called_once_with(countdown=1)
+        self.assertEqual(
+            backfill_queue.members(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY),
+            {episode_item.id},
+        )
+        mock_apply_async.assert_called_once_with(countdown=1, kwargs={})
 
     @patch("app.tasks.enqueue_credits_backfill_items")
     @patch("app.credits.sync_item_credits_from_metadata")
     @patch("app.providers.services.get_media_metadata")
-    def test_populate_credits_data_for_items_records_success(self, mock_get_metadata, mock_sync, _mock_enqueue):
+    def test_populate_credits_data_for_items_records_success(
+        self, mock_get_metadata, mock_sync, _mock_enqueue
+    ):
         item = Item.objects.create(
             media_id="2001",
             source=Sources.TMDB.value,
@@ -187,18 +204,124 @@ class CreditsBackfillTaskTests(TestCase):
             "crew": [],
             "studios_full": [],
         }
-        MetadataBackfillState.objects.filter(item=item, field=MetadataBackfillField.CREDITS).delete()
+        MetadataBackfillState.objects.filter(
+            item=item, field=MetadataBackfillField.CREDITS
+        ).delete()
 
         result = tasks.populate_credits_data_for_items([item.id])
 
         self.assertEqual(result["updated"], 1)
         self.assertEqual(result["errors"], 0)
         mock_sync.assert_called_once()
-        state = MetadataBackfillState.objects.get(item=item, field=MetadataBackfillField.CREDITS)
+        state = MetadataBackfillState.objects.get(
+            item=item, field=MetadataBackfillField.CREDITS
+        )
         self.assertEqual(state.fail_count, 0)
         self.assertEqual(state.strategy_version, CREDITS_BACKFILL_VERSION)
         self.assertFalse(state.give_up)
         self.assertIsNotNone(state.last_success_at)
+
+    @patch("app.db_retry.time.sleep")
+    @patch("app.tasks.enqueue_credits_backfill_items")
+    @patch("app.credits.sync_item_credits_from_metadata")
+    @patch("app.providers.services.get_media_metadata")
+    def test_populate_credits_retries_a_sqlite_lock_before_recording_failure(
+        self, mock_get_metadata, mock_sync, _mock_enqueue, _mock_sleep
+    ):
+        item = Item.objects.create(
+            media_id="2002",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Locked Movie",
+            runtime_minutes=100,
+            genres=["Action"],
+        )
+        mock_get_metadata.return_value = {"cast": [], "crew": [], "studios_full": []}
+        mock_sync.side_effect = [OperationalError("database is locked"), None]
+
+        result = tasks.populate_credits_data_for_items([item.id])
+
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["errors"], 0)
+        self.assertEqual(mock_sync.call_count, 2)
+
+    @patch("app.tasks_credits._clear_items_metadata_cache")
+    @patch("app.providers.services.get_media_metadata")
+    def test_credits_404_is_terminal_and_clears_stale_metadata_cache(
+        self,
+        mock_get_metadata,
+        mock_clear_cache,
+    ):
+        item = Item.objects.create(
+            media_id="2008",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Missing Credits Movie",
+        )
+        response = type(
+            "NotFoundResponse",
+            (),
+            {
+                "status_code": 404,
+                "headers": {},
+                "text": "not found",
+                "json": lambda self: {},
+            },
+        )()
+        mock_get_metadata.side_effect = services.ProviderAPIError(
+            Sources.TMDB.value,
+            requests.exceptions.HTTPError(response=response),
+        )
+
+        result = tasks.populate_credits_data_for_items([item.id])
+
+        self.assertEqual(result["updated"], 0)
+        self.assertEqual(result["errors"], 1)
+        mock_clear_cache.assert_called_once_with([item])
+        state = MetadataBackfillState.objects.get(
+            item=item,
+            field=MetadataBackfillField.CREDITS,
+        )
+        self.assertTrue(state.give_up)
+        self.assertIsNone(state.next_retry_at)
+        self.assertEqual(state.fail_count, tasks.METADATA_BACKFILL_MAX_ATTEMPTS)
+        self.assertEqual(tasks.enqueue_credits_backfill_items([item.id]), 0)
+
+    @patch("app.providers.services.get_media_metadata")
+    def test_transient_credits_provider_error_keeps_exponential_retry(
+        self,
+        mock_get_metadata,
+    ):
+        item = Item.objects.create(
+            media_id="2009",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Transient Credits Movie",
+        )
+        response = type(
+            "ServerErrorResponse",
+            (),
+            {
+                "status_code": 503,
+                "headers": {},
+                "text": "unavailable",
+                "json": lambda self: {},
+            },
+        )()
+        mock_get_metadata.side_effect = services.ProviderAPIError(
+            Sources.TMDB.value,
+            requests.exceptions.HTTPError(response=response),
+        )
+
+        result = tasks.populate_credits_data_for_items([item.id])
+
+        self.assertEqual(result["errors"], 1)
+        state = MetadataBackfillState.objects.get(
+            item=item,
+            field=MetadataBackfillField.CREDITS,
+        )
+        self.assertFalse(state.give_up)
+        self.assertIsNotNone(state.next_retry_at)
 
     @patch("app.tasks.enqueue_credits_backfill_items")
     @patch("app.credits.sync_item_credits_from_metadata")
@@ -225,7 +348,9 @@ class CreditsBackfillTaskTests(TestCase):
             "cast": [],
             "crew": [],
         }
-        MetadataBackfillState.objects.filter(item=item, field=MetadataBackfillField.CREDITS).delete()
+        MetadataBackfillState.objects.filter(
+            item=item, field=MetadataBackfillField.CREDITS
+        ).delete()
 
         result = tasks.populate_credits_data_for_items([item.id])
 
@@ -239,7 +364,9 @@ class CreditsBackfillTaskTests(TestCase):
             item.episode_number,
         )
         mock_sync.assert_called_once()
-        state = MetadataBackfillState.objects.get(item=item, field=MetadataBackfillField.CREDITS)
+        state = MetadataBackfillState.objects.get(
+            item=item, field=MetadataBackfillField.CREDITS
+        )
         self.assertEqual(state.strategy_version, CREDITS_BACKFILL_VERSION)
 
     @patch("app.tasks.enqueue_credits_backfill_items")
@@ -266,7 +393,9 @@ class CreditsBackfillTaskTests(TestCase):
             "crew": [],
             "studios_full": [],
         }
-        MetadataBackfillState.objects.filter(item=item, field=MetadataBackfillField.CREDITS).delete()
+        MetadataBackfillState.objects.filter(
+            item=item, field=MetadataBackfillField.CREDITS
+        ).delete()
 
         result = tasks.populate_credits_data_for_items([item.id])
 
@@ -279,7 +408,9 @@ class CreditsBackfillTaskTests(TestCase):
             [item.season_number],
         )
         mock_sync.assert_called_once()
-        state = MetadataBackfillState.objects.get(item=item, field=MetadataBackfillField.CREDITS)
+        state = MetadataBackfillState.objects.get(
+            item=item, field=MetadataBackfillField.CREDITS
+        )
         self.assertEqual(state.fail_count, 0)
         self.assertEqual(state.strategy_version, CREDITS_BACKFILL_VERSION)
         self.assertFalse(state.give_up)
@@ -321,7 +452,9 @@ class CreditsBackfillTaskTests(TestCase):
             },
         )
 
-        missing_ids = tasks._missing_credits_item_ids([season_complete.id, season_missing.id])
+        missing_ids = tasks._missing_credits_item_ids(
+            [season_complete.id, season_missing.id]
+        )
 
         self.assertEqual(missing_ids, [season_missing.id])
 
@@ -386,6 +519,95 @@ class CreditsBackfillTaskTests(TestCase):
 
         self.assertCountEqual(missing_ids, [tv_item.id, season_item.id])
 
+    def test_missing_credits_item_ids_does_not_require_studios_for_tvdb_tv(self):
+        """TVDB never returns studio data, so cast alone should satisfy TV items."""
+        tvdb_item = Item.objects.create(
+            media_id="81189",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="TVDB Show",
+        )
+        person = Person.objects.create(
+            source=Sources.TVDB.value,
+            source_person_id="291115",
+            name="TVDB Cast Member",
+            gender=PersonGender.UNKNOWN.value,
+        )
+        ItemPersonCredit.objects.create(
+            item=tvdb_item,
+            person=person,
+            role_type=CreditRoleType.CAST.value,
+            role="Lead",
+        )
+        MetadataBackfillState.objects.update_or_create(
+            item=tvdb_item,
+            field=MetadataBackfillField.CREDITS,
+            defaults={
+                "last_success_at": timezone.now(),
+                "strategy_version": CREDITS_BACKFILL_VERSION,
+            },
+        )
+
+        missing_ids = tasks._missing_credits_item_ids([tvdb_item.id])
+
+        self.assertEqual(missing_ids, [])
+
+    def test_missing_credits_item_ids_excludes_tvdb_seasons_and_episodes(self):
+        """TVDB seasons/episodes never carry a credits payload; skip them entirely.
+
+        Otherwise a season would record a permanent backfill failure and an
+        episode (whose provider payload hardcodes empty cast/crew) would be
+        reprocessed forever since it "succeeds" with zero credits every time.
+        """
+        tvdb_season = Item.objects.create(
+            media_id="81189",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=1,
+            title="TVDB Season",
+        )
+        tvdb_episode = Item.objects.create(
+            media_id="81189",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="TVDB Episode",
+        )
+
+        missing_ids = tasks._missing_credits_item_ids(
+            [tvdb_season.id, tvdb_episode.id]
+        )
+
+        self.assertEqual(missing_ids, [])
+
+    @patch("app.tasks.populate_credits_backfill_queue.apply_async")
+    def test_enqueue_credits_backfill_excludes_tvdb_seasons_and_episodes(
+        self, mock_apply_async
+    ):
+        tvdb_season = Item.objects.create(
+            media_id="81190",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=1,
+            title="TVDB Season Needing Credits",
+        )
+        tvdb_episode = Item.objects.create(
+            media_id="81190",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="TVDB Episode Needing Credits",
+        )
+
+        queued = tasks.enqueue_credits_backfill_items(
+            [tvdb_season.id, tvdb_episode.id], countdown=1
+        )
+
+        self.assertEqual(queued, 0)
+        mock_apply_async.assert_not_called()
+
     @patch("app.tasks.populate_credits_backfill_queue.apply_async")
     def test_enqueue_credits_backfill_requeues_tv_and_season_with_old_strategy_version(
         self,
@@ -444,20 +666,24 @@ class CreditsBackfillTaskTests(TestCase):
             strategy_version=max(CREDITS_BACKFILL_VERSION - 1, 1),
         )
 
-        queued = tasks.enqueue_credits_backfill_items([tv_item.id, season_item.id], countdown=1)
+        queued = tasks.enqueue_credits_backfill_items(
+            [tv_item.id, season_item.id], countdown=1
+        )
 
         self.assertEqual(queued, 2)
-        self.assertCountEqual(
-            cache.get(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY),
-            [tv_item.id, season_item.id],
+        self.assertEqual(
+            backfill_queue.members(tasks.CREDITS_BACKFILL_ITEMS_QUEUE_KEY),
+            {tv_item.id, season_item.id},
         )
-        mock_apply_async.assert_called_once_with(countdown=1)
+        mock_apply_async.assert_called_once_with(countdown=1, kwargs={})
 
 
 class CreditsBackfillSignalTests(TestCase):
     @patch("app.tasks.enqueue_credits_backfill_items")
     def test_movie_play_save_queues_credits_backfill(self, mock_enqueue):
-        user = get_user_model().objects.create_user(username="signal-user", password="test12345")
+        user = get_user_model().objects.create_user(
+            username="signal-user", password="test12345"
+        )
         item = Item.objects.create(
             media_id="3001",
             source=Sources.TMDB.value,
@@ -468,14 +694,15 @@ class CreditsBackfillSignalTests(TestCase):
         )
         mock_enqueue.reset_mock()
 
-        Movie.objects.create(
-            item=item,
-            user=user,
-            status=Status.COMPLETED.value,
-            progress=1,
-            start_date=timezone.now(),
-            end_date=timezone.now(),
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            Movie.objects.create(
+                item=item,
+                user=user,
+                status=Status.COMPLETED.value,
+                progress=1,
+                start_date=timezone.now(),
+                end_date=timezone.now(),
+            )
 
         mock_enqueue.assert_called_once_with([item.id], countdown=3)
 
@@ -486,7 +713,9 @@ class CreditsBackfillSignalTests(TestCase):
         mock_enqueue,
         mock_get_metadata,
     ):
-        user = get_user_model().objects.create_user(username="episode-signal-user", password="test12345")
+        user = get_user_model().objects.create_user(
+            username="episode-signal-user", password="test12345"
+        )
         tv_item = Item.objects.create(
             media_id="4001",
             source=Sources.TMDB.value,
@@ -532,11 +761,12 @@ class CreditsBackfillSignalTests(TestCase):
         }
         mock_enqueue.reset_mock()
 
-        Episode.objects.create(
-            item=episode_item,
-            related_season=season,
-            end_date=timezone.now(),
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            Episode.objects.create(
+                item=episode_item,
+                related_season=season,
+                end_date=timezone.now(),
+            )
 
         self.assertEqual(mock_enqueue.call_count, 3)
         mock_enqueue.assert_any_call([episode_item.id], countdown=3)

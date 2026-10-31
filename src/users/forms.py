@@ -1,11 +1,16 @@
-import apprise
+from allauth.account.adapter import get_adapter
 from allauth.account.forms import LoginForm, SignupForm
+from allauth.socialaccount.forms import SignupForm as SocialSignupForm
 from django import forms
 from django.contrib.auth.forms import PasswordChangeForm, SetPasswordForm
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 
-from .models import User
+from .models import PLAYBACK_WEBHOOK_SECRET_MAX_LENGTH, User
+
+USERNAME_TAKEN_ERROR_CODE = "username_taken"
 
 
 class CustomLoginForm(LoginForm):
@@ -15,9 +20,9 @@ class CustomLoginForm(LoginForm):
         """Remove email field and change password2 label."""
         super().__init__(*args, **kwargs)
 
-        self.fields["login"].widget.attrs["placeholder"] = "Enter your username"
+        self.fields["login"].widget.attrs["placeholder"] = _("Enter your username")
 
-        self.fields["password"].widget.attrs["placeholder"] = "Enter your password"
+        self.fields["password"].widget.attrs["placeholder"] = _("Enter your password")
 
 
 class CustomSignupForm(SignupForm):
@@ -27,11 +32,38 @@ class CustomSignupForm(SignupForm):
         """Remove email field and change password2 label."""
         super().__init__(*args, **kwargs)
 
-        del self.fields["email"]
+        # Use pop instead of del: allauth already omits this field when
+        # ACCOUNT_SIGNUP_FIELDS excludes email, so a plain `del` would raise
+        # an unhandled KeyError (-> 500) in that configuration.
+        self.fields.pop("email", None)
 
         # Change label and placeholder for password2 field
-        self.fields["password2"].label = "Confirm Password"
-        self.fields["password2"].widget.attrs["placeholder"] = "Confirm your password"
+        self.fields["password2"].label = _("Confirm Password")
+        self.fields["password2"].widget.attrs["placeholder"] = _("Confirm your password")
+
+    def save(self, request):
+        """Save the new user, turning a race-condition IntegrityError into a form error."""
+        try:
+            return super().save(request)
+        except IntegrityError as exc:
+            raise get_adapter().validation_error(USERNAME_TAKEN_ERROR_CODE) from exc
+
+
+class CustomSocialSignupForm(SocialSignupForm):
+    """Custom OIDC/social account signup form for django-allauth."""
+
+    def __init__(self, *args, **kwargs):
+        """Remove email field, mirroring local signup."""
+        super().__init__(*args, **kwargs)
+
+        self.fields.pop("email", None)
+
+    def save(self, request):
+        """Save the new user, turning a race-condition IntegrityError into a form error."""
+        try:
+            return super().save(request)
+        except IntegrityError as exc:
+            raise get_adapter().validation_error(USERNAME_TAKEN_ERROR_CODE) from exc
 
 
 class UserUpdateForm(forms.ModelForm):
@@ -41,7 +73,7 @@ class UserUpdateForm(forms.ModelForm):
         """Check if the user is demo before changing the password."""
         cleaned_data = super().clean()
         if self.instance.is_demo:
-            msg = "Changing the username is not allowed for the demo account."
+            msg = _("Changing the username is not allowed for the demo account.")
             self.add_error("username", msg)
         return cleaned_data
 
@@ -64,7 +96,7 @@ class PasswordChangeForm(PasswordChangeForm):
         """Check if the user is demo before changing the password."""
         cleaned_data = super().clean()
         if self.user.is_demo:
-            msg = "Changing the password is not allowed for the demo account."
+            msg = _("Changing the password is not allowed for the demo account.")
             self.add_error("new_password2", msg)
         return cleaned_data
 
@@ -86,19 +118,42 @@ class NotificationSettingsForm(forms.ModelForm):
             "notification_urls",
             "daily_digest_enabled",
             "release_notifications_enabled",
+            "premiere_notifications_enabled",
+            "playback_webhook_url",
+            "playback_webhook_secret",
         ]
         widgets = {
             "notification_urls": forms.Textarea(
                 attrs={
                     "rows": 5,
                     "wrap": "off",
-                    "placeholder": "discord://webhook_id/webhook_token\ntgram://bot_token/chat_id",
+                    "placeholder": (
+                        "discord://webhook_id/webhook_token\n"
+                        "tgram://bot_token/chat_id\n"
+                        "notifiarr://api_key/#channel_id"
+                    ),
                 },
+            ),
+            "playback_webhook_url": forms.URLInput(
+                attrs={"placeholder": _("https://example.com/playback")},
+            ),
+            # `render_value=False`: the whole point of moving the credential out
+            # of the URL is that the page stops showing it, so a screenshot or a
+            # screen-share of this form leaks nothing. It is never written back
+            # into the HTML, not even masked.
+            "playback_webhook_secret": forms.PasswordInput(
+                render_value=False,
+                attrs={"placeholder": _("Leave blank to keep the current secret")},
             ),
         }
 
     def clean_notification_urls(self):
         """Validate that each URL is a valid Apprise URL."""
+        # Imported here, not at module scope: apprise loads its whole notification
+        # plugin registry on import, and that cost lands in every long-lived
+        # process that merely imports this module.
+        import apprise
+
         notification_urls = self.cleaned_data.get("notification_urls", "")
 
         if not notification_urls.strip():
@@ -112,18 +167,50 @@ class NotificationSettingsForm(forms.ModelForm):
 
         for url in urls:
             if not apobj.add(url):
-                message = f"'{url}' is not a valid Apprise URL."
+                message = _("'%(url)s' is not a valid Apprise URL.") % {"url": url}
                 raise ValidationError(message)
 
         return notification_urls
+
+    def clean_playback_webhook_secret(self):
+        """Encrypt the submitted secret, or keep the stored one when blank.
+
+        A `render_value=False` password field always posts empty, so without
+        this every unrelated save on this page — toggling the daily digest —
+        would silently wipe the secret and start sending unsigned requests.
+        Clearing it is done by clearing the webhook URL, which turns the whole
+        feature off.
+
+        What is returned here is what lands in the column, so it is ciphertext:
+        the column stores the secret the way every other credential in this app
+        is stored, and the blank branch passes the stored ciphertext straight
+        back through untouched.
+        """
+        submitted = (self.cleaned_data.get("playback_webhook_secret") or "").strip()
+        if not submitted:
+            return self.instance.playback_webhook_secret if self.instance else ""
+
+        if len(submitted) > PLAYBACK_WEBHOOK_SECRET_MAX_LENGTH:
+            message = (
+                f"Keep the secret to {PLAYBACK_WEBHOOK_SECRET_MAX_LENGTH} "
+                "characters or fewer."
+            )
+            raise ValidationError(message)
+
+        # Local import, the way `users.views` reaches for it: the helper
+        # pulls in the import stack, which this module has no other need of.
+        from integrations.imports.helpers import encrypt
+
+        return encrypt(submitted)
 
 
 class AuthenticatorSetupForm(forms.Form):
     """Confirm authenticator app setup with a TOTP code."""
 
-    code = forms.CharField(max_length=6, min_length=6)
+    code = forms.CharField(label=_("Code"), max_length=6, min_length=6)
 
     def __init__(self, *args, user, **kwargs):
+        """Store the extra keyword arguments this form needs."""
         self.user = user
         super().__init__(*args, **kwargs)
 
@@ -131,54 +218,66 @@ class AuthenticatorSetupForm(forms.Form):
         """Validate TOTP code against the user's pending secret."""
         code = self.cleaned_data["code"].strip()
         if not self.user.verify_totp_code(code):
-            raise ValidationError("Invalid authenticator code.")
+            msg = _("Invalid authenticator code.")
+            raise ValidationError(msg)
         return code
 
 
 class RegenerateRecoveryCodesForm(forms.Form):
     """Regenerate recovery codes with password confirmation."""
 
-    current_password = forms.CharField(widget=forms.PasswordInput)
+    current_password = forms.CharField(label=_("Current password"), widget=forms.PasswordInput)
 
     def __init__(self, *args, user, **kwargs):
+        """Store the extra keyword arguments this form needs."""
         self.user = user
         super().__init__(*args, **kwargs)
 
     def clean_current_password(self):
+        """Validate the current password field."""
         password = self.cleaned_data["current_password"]
         if not self.user.check_password(password):
-            raise ValidationError("Current password is incorrect.")
+            msg = _("Current password is incorrect.")
+            raise ValidationError(msg)
         return password
 
 
 class PasswordRecoveryForm(SetPasswordForm):
     """Self-service password recovery using recovery codes and authenticator."""
 
-    username = forms.CharField(max_length=150)
-    recovery_code = forms.CharField(max_length=32, required=False)
-    authenticator_code = forms.CharField(required=False, max_length=6)
+    username = forms.CharField(label=_("Username"), max_length=150)
+    recovery_code = forms.CharField(label=_("Recovery code"), max_length=32, required=False)
+    authenticator_code = forms.CharField(label=_("Authenticator code"), required=False, max_length=6)
 
     error_messages = {
-        "invalid_recovery": "Unable to verify recovery details.",
+        "invalid_recovery": _("Unable to verify recovery details."),
     }
 
     def __init__(self, *args, **kwargs):
+        """Store the extra keyword arguments this form needs."""
         super().__init__(None, *args, **kwargs)
         self.recovery_instance = None
 
     def clean(self):
+        """Validate the submitted data as a whole."""
         cleaned_data = super().clean()
         username = cleaned_data.get("username", "").strip()
         recovery_code = cleaned_data.get("recovery_code", "").strip().upper()
         authenticator_code = cleaned_data.get("authenticator_code", "").strip()
 
         user = User.objects.filter(username__iexact=username).first()
-        if user is None:
+        # The demo password is public, so an authenticator someone attached to
+        # it must not become a way to reset it.
+        if user is None or user.is_demo:
             raise ValidationError(self.error_messages["invalid_recovery"])
 
-        has_valid_authenticator_code = user.has_authenticator_configured and bool(
-            authenticator_code,
-        ) and user.verify_totp_code(authenticator_code)
+        has_valid_authenticator_code = (
+            user.has_authenticator_configured
+            and bool(
+                authenticator_code,
+            )
+            and user.verify_totp_code(authenticator_code)
+        )
 
         matching_recovery = None
         if recovery_code:
@@ -201,6 +300,7 @@ class PasswordRecoveryForm(SetPasswordForm):
         return cleaned_data
 
     def save(self, commit=True):
+        """Return the save."""
         user = super().save(commit=commit)
         if self.recovery_instance:
             self.recovery_instance.used_at = timezone.now()

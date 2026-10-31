@@ -1,11 +1,14 @@
+
+{% load i18n %}
 {% load widget_tweaks %}
 {% load app_tags %}
 
 {# djlint:off #}
-<div x-show="showModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-  <div @click.outside="showModal = false" class="bg-[#2a2f35] p-6 rounded-lg w-152 max-h-[90vh] overflow-y-auto"
+<div x-show="showModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @mousedown.self="showModal = false">
+  <div class="bg-[var(--color-surface)] p-6 rounded-lg w-152 max-h-[90dvh] overflow-y-auto"
     x-data="{
       isPublic: {{ form.instance.is_public|yesno:'true,false' }},
+      includeNotes: {{ form.instance.include_notes|yesno:'true,false' }},
       isSmart: {{ form.instance.is_smart|yesno:'true,false' }} || (typeof listMode !== 'undefined' && listMode === 'smart'),
       slugValue: '{{ form.public_slug.value|default_if_none:''|escapejs }}',
       listId: '{{ form.instance.id|default_if_none:'' }}',
@@ -40,12 +43,12 @@
     <div class="flex items-center justify-between mb-6">
       <h2 class="text-2xl font-bold">
         {% if form.instance.pk %}
-          Edit List
+          {% translate "Edit List" %}
         {% else %}
-          Create New List
+          {% translate "Create New List" %}
         {% endif %}
       </h2>
-      <button @click="showModal = false" class="text-gray-400 hover:text-white transition-colors cursor-pointer">
+      <button @click="showModal = false" class="text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors cursor-pointer">
         {% include "app/icons/x.svg" with classes="w-6 h-6" %}
       </button>
     </div>
@@ -59,88 +62,116 @@
       {% for field in form %}
         <div>
           {% if field.name == 'is_public' %}
-            <div class="flex items-center justify-between p-3 bg-[#39404b] rounded-md">
-              <div class="flex-1">
-                <div class="flex items-center text-gray-200 mb-1">
-                  {% include "app/icons/globe.svg" with classes="w-5 h-5 mr-2" %}
-                  <span class="text-sm font-medium">{{ field.label }}</span>
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md">
+                <div class="flex-1">
+                  <div class="flex items-center text-[var(--color-text-secondary)] mb-1">
+                    {% include "app/icons/globe.svg" with classes="w-5 h-5 mr-2" %}
+                    <span class="text-sm font-medium">{% translate field.label %}</span>
+                  </div>
+                  <p class="text-xs text-[var(--color-text-muted)] ml-7">{% translate field.help_text %}</p>
                 </div>
-                <p class="text-xs text-gray-400 ml-7">{{ field.help_text }}</p>
+                <label class="relative inline-flex items-center cursor-pointer ml-4">
+                  <input class="sr-only peer" type="checkbox" name="{{ field.name }}" x-model="isPublic" {% if form.instance.is_public %}checked{% endif %}>
+                  <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600"></div>
+                </label>
               </div>
-              <label class="relative inline-flex items-center cursor-pointer ml-4">
-                <input class="sr-only peer" type="checkbox" name="{{ field.name }}" x-model="isPublic" {% if form.instance.is_public %}checked{% endif %}>
-                <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600"></div>
-              </label>
-            </div>
-          {% elif field.name == 'is_smart' %}
-            <div class="flex items-center justify-between p-3 bg-[#39404b] rounded-md">
-              <div class="flex-1">
-                <div class="flex items-center text-gray-200 mb-1">
-                  {% include "app/icons/horizontal-sliders.svg" with classes="w-5 h-5 mr-2" %}
-                  <span class="text-sm font-medium">{{ field.label }}</span>
+              <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md" :class="{ 'opacity-50': !isPublic }">
+                <div class="flex-1">
+                  <div class="flex items-center text-[var(--color-text-secondary)] mb-1">
+                    {% include "app/icons/eye.svg" with classes="w-5 h-5 mr-2" %}
+                    <span class="text-sm font-medium">{% translate form.include_notes.label %}</span>
+                  </div>
+                  <p class="text-xs text-[var(--color-text-muted)] ml-7">{{ form.include_notes.help_text }}</p>
                 </div>
-                <p class="text-xs text-gray-400 ml-7">{{ field.help_text }}</p>
+                <label class="relative inline-flex items-center ml-4" :class="isPublic ? 'cursor-pointer' : 'cursor-not-allowed'">
+                  <input class="sr-only peer" type="checkbox" name="{{ form.include_notes.name }}" x-model="includeNotes" :disabled="!isPublic" {% if form.instance.include_notes %}checked{% endif %}>
+                  <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600"></div>
+                </label>
               </div>
-              <label class="relative inline-flex items-center cursor-pointer ml-4">
-                <input class="sr-only peer" type="checkbox" name="{{ field.name }}" x-model="isSmart" :checked="listMode === 'smart'">
-                <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600"></div>
-              </label>
             </div>
           {% elif field.name == 'allow_recommendations' %}
-            <div class="flex items-center justify-between p-3 bg-[#39404b] rounded-md" :class="{ 'opacity-50': !isPublic }">
-              <div class="flex-1">
-                <div class="flex items-center text-gray-200 mb-1">
-                  {% include "app/icons/bell.svg" with classes="w-5 h-5 mr-2" %}
-                  <span class="text-sm font-medium">{{ field.label }}</span>
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md" :class="{ 'opacity-50': !isPublic }">
+                <div class="flex-1">
+                  <div class="flex items-center text-[var(--color-text-secondary)] mb-1">
+                    {% include "app/icons/bell.svg" with classes="w-5 h-5 mr-2" %}
+                    <span class="text-sm font-medium">{% translate field.label %}</span>
+                  </div>
+                  <p class="text-xs text-[var(--color-text-muted)] ml-7">{% translate field.help_text %}</p>
                 </div>
-                <p class="text-xs text-gray-400 ml-7">{{ field.help_text }}</p>
-              </div>
-              <label class="relative inline-flex items-center ml-4" :class="isPublic ? 'cursor-pointer' : 'cursor-not-allowed'">
-                <input class="sr-only peer" type="checkbox" name="{{ field.name }}" :disabled="!isPublic" {% if form.instance.allow_recommendations %}checked{% endif %}>
-                <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600"></div>
-              </label>
-            </div>
-          {% elif field.name == 'public_slug' %}
-            <div class="p-3 bg-[#39404b] rounded-md space-y-3">
-              <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <label for="{{ field.id_for_label }}" class="flex items-center text-gray-200 text-sm font-medium">
-                  {% include "app/icons/link.svg" with classes="w-5 h-5 mr-2 text-gray-300" %}
-                  <span>{{ field.label }}</span>
+                <label class="relative inline-flex items-center ml-4" :class="isPublic ? 'cursor-pointer' : 'cursor-not-allowed'">
+                  <input class="sr-only peer" type="checkbox" name="{{ field.name }}" :disabled="!isPublic" {% if form.instance.allow_recommendations %}checked{% endif %}>
+                  <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600"></div>
                 </label>
-                <p class="text-xs text-gray-400 break-all sm:text-right" x-show="currentListUrl()" x-cloak>
-                  Current URL:
-                  <a class="underline hover:text-white transition-colors"
+              </div>
+              <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md">
+                <div class="flex-1">
+                  <div class="flex items-center text-[var(--color-text-secondary)] mb-1">
+                    {% include "app/icons/horizontal-sliders.svg" with classes="w-5 h-5 mr-2" %}
+                    <span class="text-sm font-medium">{% translate form.is_smart.label %}</span>
+                  </div>
+                  <p class="text-xs text-[var(--color-text-muted)] ml-7">{{ form.is_smart.help_text }}</p>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer ml-4">
+                  <input class="sr-only peer" type="checkbox" name="{{ form.is_smart.name }}" x-model="isSmart" :checked="typeof listMode !== 'undefined' && listMode === 'smart'" {% if form.instance.is_smart %}checked{% endif %}>
+                  <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600"></div>
+                </label>
+              </div>
+            </div>
+          {% elif field.name == 'is_smart' or field.name == 'include_notes' %}
+            {# Rendered in the grouped controls above. #}
+          {% elif field.name == 'public_slug' %}
+            <div class="p-3 bg-[var(--color-surface-strong)] rounded-md space-y-3">
+              <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <label for="{{ field.id_for_label }}" class="flex items-center text-[var(--color-text-secondary)] text-sm font-medium">
+                  {% include "app/icons/link.svg" with classes="w-5 h-5 mr-2 text-[var(--color-text-secondary)]" %}
+                  <span>{% translate field.label %}</span>
+                </label>
+                <p class="text-xs text-[var(--color-text-muted)] break-all sm:text-right" x-show="currentListUrl()" x-cloak>
+                  {% translate "Current URL:" %}
+                  <a class="underline hover:text-[var(--color-text)] transition-colors"
                      :href="currentListUrl()"
                      x-text="currentListUrl()"></a>
                 </p>
-                <p class="text-xs text-gray-400 sm:text-right" x-show="!currentListUrl()" x-cloak>
-                  Save the list to generate its URL.
+                <p class="text-xs text-[var(--color-text-muted)] sm:text-right" x-show="!currentListUrl()" x-cloak>
+                  {% translate "Save the list to generate its URL." %}
                 </p>
               </div>
 
               <div x-show="isPublic" x-cloak class="space-y-2">
-                <div class="flex flex-col sm:flex-row rounded-md overflow-hidden border border-gray-600 bg-[#272c31]">
-                  <span class="px-3 py-2 text-xs sm:text-sm text-gray-400 border-b sm:border-b-0 sm:border-r border-gray-600 break-all"
+                <div class="flex flex-col sm:flex-row rounded-md overflow-hidden border border-gray-600 bg-[var(--color-panel)]">
+                  <span class="px-3 py-2 text-xs sm:text-sm text-[var(--color-text-muted)] border-b sm:border-b-0 sm:border-r border-gray-600 break-all"
                         x-text="listUrlPrefix()"></span>
-                  {{ field|attr:"x-model:slugValue"|attr:"autocapitalize:none"|attr:"spellcheck:false"|attr:"aria-label:Custom URL"|add_class:"flex-1 min-w-0 px-3 py-2 bg-[#272c31] text-gray-200 placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-inset" }}
+                  {{ field|attr:"x-model:slugValue"|attr:"autocapitalize:none"|attr:"spellcheck:false"|attr:"aria-label:Custom URL"|add_class:"flex-1 min-w-0 px-3 py-2 bg-[var(--color-panel)] text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-inset" }}
                 </div>
-                <p class="text-xs text-gray-400">{{ field.help_text }} Leave blank to keep the numeric URL.</p>
+                <p class="text-xs text-[var(--color-text-muted)]">{% blocktranslate trimmed with value_1=field.help_text %}{{ value_1 }} Leave blank to keep the numeric URL.{% endblocktranslate %}</p>
                 {% if field.errors %}
                   <p class="text-sm text-red-400">{{ field.errors|join:", " }}</p>
                 {% endif %}
               </div>
 
-              <p x-show="!isPublic" x-cloak class="text-xs text-gray-400">
-                Make this list public to customize the share URL.
+              <p x-show="!isPublic" x-cloak class="text-xs text-[var(--color-text-muted)]">
+                {% translate "Make this list public to customize the share URL." %}
               </p>
             </div>
-          {% elif field.name == 'collaborators' or field.name == 'tags' %}
-            <label class="block text text-sm font-medium mb-2 text-gray-300">{{ field.label }}</label>
-            {{ field }}
+          {% elif field.name == 'tags' %}
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <label class="block text text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate field.label %}</label>
+                {{ field }}
+              </div>
+              <div>
+                <label class="block text text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate form.collaborators.label %}</label>
+                {{ form.collaborators }}
+              </div>
+            </div>
+          {% elif field.name == 'collaborators' %}
+            {# Rendered with List Tags above. #}
           {% elif field.name|slice:':6' == 'smart_' %}
           {% else %}
-            <label class="block text text-sm font-medium mb-2 text-gray-300">{{ field.label }}</label>
-            {{ field|add_class:"w-full p-2 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none" }}
+            <label class="block text text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate field.label %}</label>
+            {{ field|add_class:"w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none" }}
           {% endif %}
         </div>
       {% endfor %}
@@ -148,28 +179,28 @@
       {% if form.instance.pk %}
         <div class="flex flex-wrap items-center justify-between gap-3 mt-6">
           <a href="{% url 'list_activity' custom_list.id %}"
-             class="px-4 py-2 bg-[#39404b] text-gray-200 rounded-md hover:bg-[#454d5a] transition-colors">
-            Activity History
+             class="px-4 py-2 bg-[var(--color-surface-strong)] text-[var(--color-text-secondary)] rounded-md hover:bg-[var(--color-surface-hover)] transition-colors">
+            {% translate "Activity History" %}
           </a>
           <div class="flex flex-row-reverse gap-2">
-            <button type="submit" formaction="{% url 'list_edit' %}?next={{ request.path }}"
+            <button type="submit" formaction="{% url 'list_edit' %}?next={{ next_url|default:request.path }}"
               class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 cursor-pointer">
-              Save
+              {% translate "Save" %}
             </button>
             {% if request.user == custom_list.owner %}
-              <button type="submit" formaction="{% url 'list_delete' %}?next={{ request.path }}"
-                class="px-4 py-2 rounded-md transition duration-300 bg-red-700 text-white hover:bg-red-800 cursor-pointer">Delete</button>
+              <button type="submit" formaction="{% url 'list_delete' %}?next={{ next_url|default:request.path }}"
+                class="px-4 py-2 rounded-md transition duration-300 bg-red-700 text-white hover:bg-red-800 cursor-pointer">{% translate "Delete" %}</button>
             {% else %}
-              <button type="submit" formaction="{% url 'list_delete' %}?next={{ request.path }}"
-                class="px-4 py-2 rounded-md transition duration-300 bg-gray-600 text-gray-300 cursor-not-allowed" disabled>Delete</button>
+              <button type="submit" formaction="{% url 'list_delete' %}?next={{ next_url|default:request.path }}"
+                class="px-4 py-2 rounded-md transition duration-300 bg-[var(--color-surface-strong)] text-[var(--color-text-secondary)] cursor-not-allowed" disabled>{% translate "Delete" %}</button>
             {% endif %}
           </div>
         </div>
       {% else %}
         <div class="flex justify-end pt-4">
-          <button type="submit" formaction="{% url 'list_create' %}?next={{ request.path }}"
+          <button type="submit" formaction="{% url 'list_create' %}?next={{ next_url|default:request.path }}"
             class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors cursor-pointer">
-            Create List
+            {% translate "Create List" %}
           </button>
         </div>
       {% endif %}

@@ -1,49 +1,45 @@
 {% extends "users/base.html" %}
+{% load i18n %}
+
 {% load user_tags %}
 {% load app_tags %}
 
 {% block title %}
-  Preferences - Watchmask
+  {% translate "Preferences - Watchmask" %}
 {% endblock title %}
 
 {% block settings_content %}
-  <div class="bg-[#2a2f35] rounded-lg p-6">
-    <div class="flex items-center mb-4">
-      <svg xmlns="http://www.w3.org/2000/svg"
-           width="24"
-           height="24"
-           viewBox="0 0 24 24"
-           fill="none"
-           stroke="currentColor"
-           stroke-width="2"
-           stroke-linecap="round"
-           stroke-linejoin="round"
-           class="w-6 h-6 text-indigo-400 mr-3">
-        <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
-        <circle cx="12" cy="12" r="3"></circle>
-      </svg>
-      <h2 class="text-xl font-semibold">User Preferences</h2>
-    </div>
-    <p class="text-gray-400 mb-5 text-sm">Customize your Watchmask experience with these preference settings.</p>
-    
-    <form method="post">
+  <div class="preferences-page">
+    <form method="post"
+          x-data="formDirtyTracker()"
+          @input="onFormChange()"
+          @change="onFormChange()"
+          @click="onFormChange()">
       {% csrf_token %}
-      
-      <!-- Display & Layout Section -->
-      <div class="mb-6">
-        <h3 class="text-lg font-medium text-gray-200 mb-3">Display & Layout</h3>
 
-        <!-- Date Format -->
-        <div class="p-3 bg-[#39404b] rounded-md mb-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Date Format</label>
-            <span class="text-gray-400 text-xs">Choose how dates are displayed throughout the application.</span>
+      <!-- Display & Layout Section -->
+      <section id="display-layout" class="preferences-section">
+        <div class="preferences-section-header">
+          <div class="preferences-section-icon">{% include "app/icons/settings.svg" with classes="w-5 h-5" %}</div>
+          <div>
+            <h3>{% translate "Display & Layout" %}</h3>
+            <p>{% translate "Control content display." %}</p>
           </div>
-          <div class="relative" x-data="{ open: false, selectedValue: '{{ user.date_format }}', selectedLabel: '{{ user.date_format|date_format_display }}' }">
+        </div>
+        <div class="preferences-grid preferences-display-grid">
+
+        <!-- Theme -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Theme" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "App color theme." %}</span>
+          </div>
+          <div class="relative"
+               x-data="{ open: false, selectedValue: '{{ user.theme }}', selectedLabel: gettext('{{ user.theme|theme_display|escapejs }}') }">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
               <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
@@ -54,7 +50,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -65,46 +61,150 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
-              <button type="button" 
-                      @click="selectedValue = 'system_default'; selectedLabel = 'System default (locale) — Aug 12, 2025 / 12 Aug 2025'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                System default (locale) — Aug 12, 2025 / 12 Aug 2025
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+              <button type="button"
+                      @click="selectedValue = 'system'; selectedLabel = gettext('System default'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "System default" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'iso_8601'; selectedLabel = 'ISO 8601 — 2025-08-12'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                ISO 8601 — 2025-08-12
+              <button type="button"
+                      @click="selectedValue = 'dark'; selectedLabel = gettext('Dark'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Dark" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'month_d_yyyy'; selectedLabel = 'Month D, YYYY — Aug 12, 2025'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Month D, YYYY — Aug 12, 2025
+              <button type="button"
+                      @click="selectedValue = 'light'; selectedLabel = gettext('Light'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Light" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'd_mon_yyyy'; selectedLabel = 'D Mon YYYY — 12 Aug 2025'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                D Mon YYYY — 12 Aug 2025
+            </div>
+            <input type="hidden" name="theme" x-bind:value="selectedValue">
+          </div>
+        </div>
+
+        <!-- Logo -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Logo" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Watchmask logo style." %}</span>
+          </div>
+          <div class="relative"
+               x-data="{ open: false, selectedValue: '{{ user.logo_style|default:'colorful' }}', selectedLabel: '' }"
+               x-init="selectedLabel = selectedValue === 'monochrome' ? gettext('Monochrome') : gettext('Colorful')">
+            <button type="button"
+                    @click="open = !open"
+                    @click.outside="open = false"
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+              <span x-text="selectedLabel"></span>
+              <svg xmlns="http://www.w3.org/2000/svg"
+                   width="24"
+                   height="24"
+                   viewBox="0 0 24 24"
+                   fill="none"
+                   stroke="currentColor"
+                   stroke-width="2"
+                   stroke-linecap="round"
+                   stroke-linejoin="round"
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
+                <path d="m6 9 6 6 6-6"></path>
+              </svg>
+            </button>
+            <div x-show="open"
+                 x-transition:enter="transition ease-out duration-100"
+                 x-transition:enter-start="transform opacity-0 scale-95"
+                 x-transition:enter-end="transform opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-75"
+                 x-transition:leave-start="transform opacity-100 scale-100"
+                 x-transition:leave-end="transform opacity-0 scale-95"
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+              <button type="button"
+                      @click="selectedValue = 'colorful'; selectedLabel = gettext('Colorful'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Colorful" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'm_d_yyyy'; selectedLabel = 'M/D/YYYY — 08/12/2025'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                M/D/YYYY — 08/12/2025
+              <button type="button"
+                      @click="selectedValue = 'monochrome'; selectedLabel = gettext('Monochrome'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Monochrome" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'd_m_yyyy'; selectedLabel = 'D/M/YYYY — 12/08/2025'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                D/M/YYYY — 12/08/2025
+            </div>
+            <input type="hidden" name="logo_style" x-bind:value="selectedValue">
+          </div>
+        </div>
+
+        <!-- Date Format -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Date Format" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "How dates appear." %}</span>
+          </div>
+          <div class="relative"
+               x-data="{ open: false, selectedValue: '{{ user.date_format }}', selectedLabel: gettext('{{ user.date_format|date_format_display|escapejs }}') }">
+            <button type="button"
+                    @click="open = !open"
+                    @click.outside="open = false"
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+              <span x-text="selectedLabel"></span>
+              <svg xmlns="http://www.w3.org/2000/svg"
+                   width="24"
+                   height="24"
+                   viewBox="0 0 24 24"
+                   fill="none"
+                   stroke="currentColor"
+                   stroke-width="2"
+                   stroke-linecap="round"
+                   stroke-linejoin="round"
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
+                <path d="m6 9 6 6 6-6"></path>
+              </svg>
+            </button>
+            <div x-show="open"
+                 x-transition:enter="transition ease-out duration-100"
+                 x-transition:enter-start="transform opacity-0 scale-95"
+                 x-transition:enter-end="transform opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-75"
+                 x-transition:leave-start="transform opacity-100 scale-100"
+                 x-transition:leave-end="transform opacity-0 scale-95"
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+              <button type="button"
+                      @click="selectedValue = 'system_default'; selectedLabel = gettext('System default — Aug 12, 2025 / 12 Aug 2025'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "System default — Aug 12, 2025 / 12 Aug 2025" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'dd_mm_yyyy'; selectedLabel = 'DD.MM.YYYY — 12.08.2025'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                DD.MM.YYYY — 12.08.2025
+              <button type="button"
+                      @click="selectedValue = 'iso_8601'; selectedLabel = gettext('ISO 8601 — 2025-08-12'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "ISO 8601 — 2025-08-12" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'yyyy_mm_dd'; selectedLabel = 'YYYY/MM/DD — 2025/08/12'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                YYYY/MM/DD — 2025/08/12
+              <button type="button"
+                      @click="selectedValue = 'month_d_yyyy'; selectedLabel = gettext('Month D, YYYY — Aug 12, 2025'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Month D, YYYY — Aug 12, 2025" %}
+              </button>
+              <button type="button"
+                      @click="selectedValue = 'd_mon_yyyy'; selectedLabel = gettext('D Mon YYYY — 12 Aug 2025'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "D Mon YYYY — 12 Aug 2025" %}
+              </button>
+              <button type="button"
+                      @click="selectedValue = 'm_d_yyyy'; selectedLabel = gettext('M/D/YYYY — 08/12/2025'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "M/D/YYYY — 08/12/2025" %}
+              </button>
+              <button type="button"
+                      @click="selectedValue = 'd_m_yyyy'; selectedLabel = gettext('D/M/YYYY — 12/08/2025'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "D/M/YYYY — 12/08/2025" %}
+              </button>
+              <button type="button"
+                      @click="selectedValue = 'dd_mm_yyyy'; selectedLabel = gettext('DD.MM.YYYY — 12.08.2025'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "DD.MM.YYYY — 12.08.2025" %}
+              </button>
+              <button type="button"
+                      @click="selectedValue = 'yyyy_mm_dd'; selectedLabel = gettext('YYYY/MM/DD — 2025/08/12'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "YYYY/MM/DD — 2025/08/12" %}
               </button>
             </div>
             <input type="hidden" name="date_format" x-bind:value="selectedValue">
@@ -112,16 +212,17 @@
         </div>
 
         <!-- Time Format -->
-        <div class="p-3 bg-[#39404b] rounded-md mb-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Time Format</label>
-            <span class="text-gray-400 text-xs">Choose how times are displayed throughout the application.</span>
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Time Format" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "How times appear." %}</span>
           </div>
-          <div class="relative" x-data="{ open: false, selectedValue: '{{ user.time_format }}', selectedLabel: '{{ user.time_format|time_format_display }}' }">
+          <div class="relative"
+               x-data="{ open: false, selectedValue: '{{ user.time_format }}', selectedLabel: gettext('{{ user.time_format|time_format_display|escapejs }}') }">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
               <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
@@ -132,7 +233,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -143,49 +244,60 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
-              <button type="button" 
-                      @click="selectedValue = 'system_default'; selectedLabel = 'System default (locale) — 6:45 PM / 18:45'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                System default (locale) — 6:45 PM / 18:45
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+              <button type="button"
+                      @click="selectedValue = 'system_default'; selectedLabel = gettext('System default — 6:45 PM / 18:45'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "System default — 6:45 PM / 18:45" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'h_mm_ampm'; selectedLabel = '12-hour (h:mm AM/PM) — 6:45 PM'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                12-hour (h:mm AM/PM) — 6:45 PM
+              <button type="button"
+                      @click="selectedValue = 'h_mm_ampm'; selectedLabel = gettext('12-hour (h:mm AM/PM) — 6:45 PM'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "12-hour (h:mm AM/PM) — 6:45 PM" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'hh_mm_ampm'; selectedLabel = '12-hour, leading zero (hh:mm AM/PM) — 06:45 PM'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                12-hour, leading zero (hh:mm AM/PM) — 06:45 PM
+              <button type="button"
+                      @click="selectedValue = 'hh_mm_ampm'; selectedLabel = gettext('12-hour, leading zero (hh:mm AM/PM) — 06:45 PM'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "12-hour, leading zero (hh:mm AM/PM) — 06:45 PM" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'hh_mm'; selectedLabel = '24-hour (HH:mm) — 18:45'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                24-hour (HH:mm) — 18:45
+              <button type="button"
+                      @click="selectedValue = 'hh_mm'; selectedLabel = gettext('24-hour (HH:mm) — 18:45'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "24-hour (HH:mm) — 18:45" %}
               </button>
-              <button type="button" 
-                      @click="selectedValue = 'hh_mm_ss'; selectedLabel = '24-hour with seconds (HH:mm:ss) — 18:45:00'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                24-hour with seconds (HH:mm:ss) — 18:45:00
+              <button type="button"
+                      @click="selectedValue = 'hh_mm_ss'; selectedLabel = gettext('24-hour with seconds (HH:mm:ss) — 18:45:00'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "24-hour with seconds (HH:mm:ss) — 18:45:00" %}
               </button>
             </div>
             <input type="hidden" name="time_format" x-bind:value="selectedValue">
           </div>
         </div>
 
-        <!-- Mobile Grid Layout -->
-        <div class="p-3 bg-[#39404b] rounded-md">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Mobile Grid Layout</label>
-            <span class="text-gray-400 text-xs">Choose how many columns to show on mobile layouts only.</span>
+        <!-- Currency -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Currency" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Symbol shown on collection prices." %}</span>
           </div>
-          <div class="relative" x-data="{ open: false, selectedValue: '{{ user.mobile_grid_layout|default:'compact' }}', selectedLabel: '{{ user.mobile_grid_layout|default:'compact' }}' }">
+          <div class="relative"
+               x-data="{
+                 open: false,
+                 selectedValue: '{{ user.currency }}',
+                 selectedLabel: '',
+                 options: [{% for value, label in currency_choices %}{ value: '{{ value }}', label: '{{ label|escapejs }}' }{% if not forloop.last %},{% endif %}{% endfor %}],
+                 init() {
+                   const match = this.options.find(o => o.value === this.selectedValue);
+                   this.selectedLabel = match ? match.label : this.options[0]?.label ?? '';
+                 }
+               }"
+               x-init="init()">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
-              <span x-text="selectedValue === 'comfortable' ? 'Comfortable (2 columns)' : 'Compact (3 columns)'"></span>
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+              <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
                    height="24"
@@ -195,7 +307,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -206,105 +318,88 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
+              <template x-for="option in options" :key="option.value">
+                <button type="button"
+                        @click="selectedValue = option.value; selectedLabel = option.label; open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
+                        :class="{ 'text-[var(--color-text)] bg-[var(--color-surface-strong)]': selectedValue === option.value }">
+                  <span x-text="option.label"></span>
+                </button>
+              </template>
+            </div>
+            <input type="hidden" name="currency" x-bind:value="selectedValue">
+          </div>
+        </div>
+
+        <!-- Mobile Grid Layout -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Mobile Grid" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Mobile column count." %}</span>
+          </div>
+          <div class="relative"
+               x-data="{ open: false, selectedValue: '{{ user.mobile_grid_layout|default:'compact' }}', selectedLabel: gettext('{{ user.mobile_grid_layout|default:'compact'|escapejs }}') }">
+            <button type="button"
+                    @click="open = !open"
+                    @click.outside="open = false"
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+              <span x-text="selectedValue === 'comfortable' ? gettext('Comfortable (2 columns)') : gettext('Compact (3 columns)')"></span>
+              <svg xmlns="http://www.w3.org/2000/svg"
+                   width="24"
+                   height="24"
+                   viewBox="0 0 24 24"
+                   fill="none"
+                   stroke="currentColor"
+                   stroke-width="2"
+                   stroke-linecap="round"
+                   stroke-linejoin="round"
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
+                <path d="m6 9 6 6 6-6"></path>
+              </svg>
+            </button>
+            <div x-show="open"
+                 x-transition:enter="transition ease-out duration-100"
+                 x-transition:enter-start="transform opacity-0 scale-95"
+                 x-transition:enter-end="transform opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-75"
+                 x-transition:leave-start="transform opacity-100 scale-100"
+                 x-transition:leave-end="transform opacity-0 scale-95"
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
               <button type="button"
-                      @click="selectedValue = 'comfortable'; selectedLabel = 'Comfortable (2 columns)'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Comfortable (2 columns)
+                      @click="selectedValue = 'comfortable'; selectedLabel = gettext('Comfortable (2 columns)'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Comfortable (2 columns)" %}
               </button>
               <button type="button"
-                      @click="selectedValue = 'compact'; selectedLabel = 'Compact (3 columns)'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Compact (3 columns)
+                      @click="selectedValue = 'compact'; selectedLabel = gettext('Compact (3 columns)'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Compact (3 columns)" %}
               </button>
             </div>
             <input type="hidden" name="mobile_grid_layout" x-bind:value="selectedValue">
           </div>
         </div>
 
-        <!-- Media Card Subtitle Display -->
-        <div class="p-3 bg-[#39404b] rounded-md mt-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Media Card Subtitle</label>
-            <span class="text-gray-400 text-xs">Control when subtitles (year, progress, watched time) are shown on media cards.</span>
-          </div>
-          <div class="relative"
-               x-data="{ open: false, selectedValue: '{{ user.media_card_subtitle_display|default:'hover' }}', selectedLabel: '' }"
-               x-init="selectedLabel = selectedValue === 'always' ? 'Always visible' : 'On hover'">
-            <button type="button"
-                    @click="open = !open"
-                    @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
-              <span x-text="selectedLabel"></span>
-              <svg xmlns="http://www.w3.org/2000/svg"
-                   width="24"
-                   height="24"
-                   viewBox="0 0 24 24"
-                   fill="none"
-                   stroke="currentColor"
-                   stroke-width="2"
-                   stroke-linecap="round"
-                   stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
-                <path d="m6 9 6 6 6-6"></path>
-              </svg>
-            </button>
-            <div x-show="open"
-                 x-transition:enter="transition ease-out duration-100"
-                 x-transition:enter-start="transform opacity-0 scale-95"
-                 x-transition:enter-end="transform opacity-100 scale-100"
-                 x-transition:leave="transition ease-in duration-75"
-                 x-transition:leave-start="transform opacity-100 scale-100"
-                 x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
-              <button type="button"
-                      @click="selectedValue = 'hover'; selectedLabel = 'On hover'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                On hover
-              </button>
-              <button type="button"
-                      @click="selectedValue = 'always'; selectedLabel = 'Always visible'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Always visible
-              </button>
-            </div>
-            <input type="hidden" name="media_card_subtitle_display" x-bind:value="selectedValue">
-          </div>
-        </div>
-
-        <!-- Media Card Progress Bar -->
-        <div class="p-3 bg-[#39404b] rounded-md mt-4">
-          <div class="flex items-center justify-between">
-            <div>
-              <label class="text-gray-200 text-sm font-medium">Media Card Progress Bar</label>
-              <p class="text-gray-400 text-xs mt-1">Show a progress bar on in-progress and paused media cards.</p>
-            </div>
-            <label class="relative inline-flex items-center cursor-pointer">
-              <input type="hidden" name="progress_bar" value="0">
-              <input class="sr-only peer"
-                     type="checkbox"
-                     name="progress_bar"
-                     value="1"
-                     {% if user.progress_bar %}checked{% endif %}>
-              <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600">
-              </div>
-            </label>
-          </div>
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+          <p class="text-sm text-[var(--color-text-secondary)]">
+            <a class="text-[var(--color-link)]" href="{% url 'cards' %}">{% translate "Card subtitles, the progress bar, and zero ratings are on the Media Cards page." %}</a>
+          </p>
         </div>
 
         <!-- Title Display Preference -->
-        <div class="p-3 bg-[#39404b] rounded-md mt-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Title Display Preference</label>
-            <span class="text-gray-400 text-xs">Choose whether cards show localized titles, original titles, or automatic fallback.</span>
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Title Display" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Card title style." %}</span>
           </div>
           <div class="relative"
                x-data="{ open: false, selectedValue: '{{ user.title_display_preference|default:'localized' }}', selectedLabel: '' }"
-               x-init="selectedLabel = selectedValue === 'original' ? 'Show Original Titles' : (selectedValue === 'auto' ? 'Auto (if available)' : 'Show Localized Titles')">
+               x-init="selectedLabel = selectedValue === 'original' ? gettext('Show Original Titles') : (selectedValue === 'auto' ? gettext('Auto (if available)') : gettext('Show Localized Titles'))">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
               <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
@@ -315,7 +410,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -326,40 +421,42 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
               <button type="button"
-                      @click="selectedValue = 'localized'; selectedLabel = 'Show Localized Titles'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Show Localized Titles
+                      @click="selectedValue = 'localized'; selectedLabel = gettext('Show Localized Titles'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Show Localized Titles" %}
               </button>
               <button type="button"
-                      @click="selectedValue = 'original'; selectedLabel = 'Show Original Titles'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Show Original Titles
+                      @click="selectedValue = 'original'; selectedLabel = gettext('Show Original Titles'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Show Original Titles" %}
               </button>
               <button type="button"
-                      @click="selectedValue = 'auto'; selectedLabel = 'Auto (if available)'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Auto (if available)
+                      @click="selectedValue = 'auto'; selectedLabel = gettext('Auto (if available)'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Auto (if available)" %}
               </button>
             </div>
-            <input type="hidden" name="title_display_preference" x-bind:value="selectedValue">
+            <input type="hidden"
+                   name="title_display_preference"
+                   x-bind:value="selectedValue">
           </div>
         </div>
 
         <!-- Top Talent Sort -->
-        <div class="p-3 bg-[#39404b] rounded-md mt-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Top Talent Sort</label>
-            <span class="text-gray-400 text-xs">Choose how Cast &amp; Crew cards rank on Statistics.</span>
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Talent Sort" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Statistics sort order." %}</span>
           </div>
           <div class="relative"
                x-data="{ open: false, selectedValue: '{{ user.top_talent_sort_by|default:'plays' }}', selectedLabel: '' }"
-               x-init="selectedLabel = selectedValue === 'time' ? 'Time' : (selectedValue === 'titles' ? 'Titles' : 'Plays')">
+               x-init="selectedLabel = selectedValue === 'time' ? gettext('Time') : (selectedValue === 'titles' ? gettext('Titles') : gettext('Plays'))">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
               <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
@@ -370,7 +467,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -381,53 +478,60 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
               <button type="button"
-                      @click="selectedValue = 'plays'; selectedLabel = 'Plays'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Plays
+                      @click="selectedValue = 'plays'; selectedLabel = gettext('Plays'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Plays" %}
               </button>
               <button type="button"
-                      @click="selectedValue = 'time'; selectedLabel = 'Time'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Time
+                      @click="selectedValue = 'time'; selectedLabel = gettext('Time'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Time" %}
               </button>
               <button type="button"
-                      @click="selectedValue = 'titles'; selectedLabel = 'Titles'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Titles
+                      @click="selectedValue = 'titles'; selectedLabel = gettext('Titles'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Titles" %}
               </button>
             </div>
             <input type="hidden" name="top_talent_sort_by" x-bind:value="selectedValue">
           </div>
         </div>
-      </div>
+
+        </div>
+      </section>
+
+      <!-- Language & Metadata Section -->
+      <section id="language-metadata" class="preferences-section">
+        <div class="preferences-section-header">
+          <div class="preferences-section-icon">{% include "app/icons/globe.svg" with classes="w-5 h-5" %}</div>
+          <div>
+            <h3>{% translate "Language & Metadata" %}</h3>
+            <p>{% translate "Manage languages and providers." %}</p>
+          </div>
+        </div>
+        <div class="preferences-grid preferences-metadata-grid">
 
       {# Watch Provider Region #}
-      <div class="p-3 bg-[#39404b] rounded-md mt-4">
-        <div class="flex items-center justify-between mb-2">
-          <label class="text-gray-200 text-sm font-medium flex items-center gap-2">
+      <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+        <div class="flex flex-col items-start gap-1 mb-2">
+          <label class="text-[var(--color-text-secondary)] text-sm font-medium flex items-center gap-2">
             {% include "app/icons/globe.svg" with classes="w-4 h-4" %}
-            Watch Provider Region
+            {% translate "Provider Region" %}
           </label>
-          <span class="text-gray-400 text-xs">Choose the region to show watch providers for. Disable to hide the section entirely.</span>
+          <span class="text-[var(--color-text-muted)] text-xs">{% translate "Provider region." %}</span>
         </div>
-        <div class="relative"
-             x-data="{
-               open: false,
-               selectedValue: '{{ user.watch_provider_region|default:'UNSET' }}',
-               selectedLabel: '',
-               options: [{% for choice in watch_provider_choices %}{ value: '{{ choice.0 }}', label: '{{ choice.1|escapejs }}' }{% if not forloop.last %},{% endif %}{% endfor %}],
-               init() {
-                 const match = this.options.find(o => o.value === this.selectedValue);
-                 this.selectedLabel = match ? match.label : this.options[0]?.label ?? '';
-               }
-             }"
-             x-init="init()">
+        <div class="relative" x-data="{ open: false, selectedValue: '{{ user.watch_provider_region|default:'UNSET' }}', selectedLabel: '', options: [
+          {% for choice in watch_provider_choices %}
+            { value: '{{ choice.0 }}', label: '{{ choice.1|escapejs }}' }
+            {% if not forloop.last %},{% endif %}
+          {% endfor %}
+          ], init() { const match = this.options.find(o => o.value === this.selectedValue); this.selectedLabel = match ? match.label : this.options[0]?.label ?? ''; } }" x-init="init()">
           <button type="button"
                   @click="open = !open"
                   @click.outside="open = false"
-                  class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                  class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
             <span x-text="selectedLabel"></span>
             <svg xmlns="http://www.w3.org/2000/svg"
                  width="24"
@@ -438,7 +542,7 @@
                  stroke-width="2"
                  stroke-linecap="round"
                  stroke-linejoin="round"
-                 class="w-4 h-4 text-gray-400">
+                 class="w-4 h-4 text-[var(--color-text-muted)]">
               <path d="m6 9 6 6 6-6"></path>
             </svg>
           </button>
@@ -449,298 +553,169 @@
                x-transition:leave="transition ease-in duration-75"
                x-transition:leave-start="transform opacity-100 scale-100"
                x-transition:leave-end="transform opacity-0 scale-95"
-               class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
+               class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
             <template x-for="option in options" :key="option.value">
               <button type="button"
                       @click="selectedValue = option.value; selectedLabel = option.label; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white"
-                      :class="{ 'text-white bg-[#39404b]': selectedValue === option.value }">
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
+                      :class="{ 'text-[var(--color-text)] bg-[var(--color-surface-strong)]': selectedValue === option.value }">
                 <span x-text="option.label"></span>
               </button>
             </template>
           </div>
-          <input type="hidden" name="watch_provider_region" x-bind:value="selectedValue">
+          <input type="hidden"
+                 name="watch_provider_region"
+                 x-bind:value="selectedValue">
         </div>
       </div>
 
-      <div class="p-3 bg-[#39404b] rounded-md mt-4">
-        <div class="flex items-center justify-between mb-3">
-          <div>
-            <label class="text-gray-200 text-sm font-medium">Metadata Providers</label>
-            <p class="text-gray-400 text-xs mt-1">Choose the default display provider for TV and Anime. Tracking stays on the original provider until you migrate a title.</p>
-          </div>
-          {% if not tvdb_enabled %}
-            <span class="text-amber-300 text-xs">TVDB unavailable until `TVDB_API_KEY` is configured.</span>
-          {% endif %}
+      {# Metadata Language #}
+      <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+        <div class="flex flex-col items-start gap-1 mb-2">
+          <label class="text-[var(--color-text-secondary)] text-sm font-medium flex items-center gap-2">
+            {% include "app/icons/globe.svg" with classes="w-4 h-4" %}
+            {% translate "Metadata Language" %}
+          </label>
+          <span class="text-[var(--color-text-muted)] text-xs">{% translate "Metadata language." %}</span>
         </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div>
-            <label class="block text-gray-300 text-xs font-medium mb-2">TV Metadata Provider</label>
-            <div class="relative"
-                 x-data="{
-                   open: false,
-                   selectedValue: '{{ user.tv_metadata_source_default }}',
-                   selectedLabel: '',
-                   options: [{% for choice in tv_metadata_source_choices %}{ value: '{{ choice.0 }}', label: '{{ choice.1|escapejs }}' }{% if not forloop.last %},{% endif %}{% endfor %}],
-                   init() {
-                     const match = this.options.find(o => o.value === this.selectedValue);
-                     this.selectedValue = match ? match.value : this.options[0]?.value ?? '';
-                     this.selectedLabel = match ? match.label : this.options[0]?.label ?? '';
-                   }
-                 }"
-                 x-init="init()">
+        <div class="relative"
+             x-data="{
+               open: false,
+               selectedValue: '{{ user.metadata_language|default:'' }}',
+               selectedLabel: '',
+               options: [{% for choice in metadata_language_choices %}{ value: '{{ choice.0 }}', label: '{{ choice.1|escapejs }}' }{% if not forloop.last %},{% endif %}{% endfor %}],
+               init() {
+                 const match = this.options.find(o => o.value === this.selectedValue);
+                 this.selectedLabel = match ? match.label : this.options[0]?.label ?? '';
+               }
+             }"
+             x-init="init()">
+          <button type="button"
+                  @click="open = !open"
+                  @click.outside="open = false"
+                  class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+            <span x-text="selectedLabel"></span>
+            <svg xmlns="http://www.w3.org/2000/svg"
+                 width="24"
+                 height="24"
+                 viewBox="0 0 24 24"
+                 fill="none"
+                 stroke="currentColor"
+                 stroke-width="2"
+                 stroke-linecap="round"
+                 stroke-linejoin="round"
+                 class="w-4 h-4 text-[var(--color-text-muted)]">
+              <path d="m6 9 6 6 6-6"></path>
+            </svg>
+          </button>
+          <div x-show="open"
+               x-transition:enter="transition ease-out duration-100"
+               x-transition:enter-start="transform opacity-0 scale-95"
+               x-transition:enter-end="transform opacity-100 scale-100"
+               x-transition:leave="transition ease-in duration-75"
+               x-transition:leave-start="transform opacity-100 scale-100"
+               x-transition:leave-end="transform opacity-0 scale-95"
+               class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
+            <template x-for="option in options" :key="option.value">
               <button type="button"
-                      @click="open = !open"
-                      @click.outside="open = false"
-                      class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
-                <span x-text="selectedLabel"></span>
-                <svg xmlns="http://www.w3.org/2000/svg"
-                     width="24"
-                     height="24"
-                     viewBox="0 0 24 24"
-                     fill="none"
-                     stroke="currentColor"
-                     stroke-width="2"
-                     stroke-linecap="round"
-                     stroke-linejoin="round"
-                     class="w-4 h-4 text-gray-400">
-                  <path d="m6 9 6 6 6-6"></path>
-                </svg>
+                      @click="selectedValue = option.value; selectedLabel = option.label; open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
+                      :class="{ 'text-[var(--color-text)] bg-[var(--color-surface-strong)]': selectedValue === option.value }">
+                <span x-text="option.label"></span>
               </button>
-              <div x-show="open"
-                   x-transition:enter="transition ease-out duration-100"
-                   x-transition:enter-start="transform opacity-0 scale-95"
-                   x-transition:enter-end="transform opacity-100 scale-100"
-                   x-transition:leave="transition ease-in duration-75"
-                   x-transition:leave-start="transform opacity-100 scale-100"
-                   x-transition:leave-end="transform opacity-0 scale-95"
-                   class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
-                <template x-for="option in options" :key="option.value">
-                  <button type="button"
-                          @click="selectedValue = option.value; selectedLabel = option.label; open = false"
-                          class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white"
-                          :class="{ 'text-white bg-[#39404b]': selectedValue === option.value }">
-                    <span x-text="option.label"></span>
-                  </button>
-                </template>
-              </div>
-              <input type="hidden" name="tv_metadata_source_default" x-bind:value="selectedValue">
-            </div>
+            </template>
           </div>
-
-          <div>
-            <label class="block text-gray-300 text-xs font-medium mb-2">Anime Metadata Provider</label>
-            <div class="relative"
-                 x-data="{
-                   open: false,
-                   selectedValue: '{{ user.anime_metadata_source_default }}',
-                   selectedLabel: '',
-                   options: [{% for choice in anime_metadata_source_choices %}{ value: '{{ choice.0 }}', label: '{{ choice.1|escapejs }}' }{% if not forloop.last %},{% endif %}{% endfor %}],
-                   init() {
-                     const match = this.options.find(o => o.value === this.selectedValue);
-                     this.selectedValue = match ? match.value : this.options[0]?.value ?? '';
-                     this.selectedLabel = match ? match.label : this.options[0]?.label ?? '';
-                   }
-                 }"
-                 x-init="init()">
-              <button type="button"
-                      @click="open = !open"
-                      @click.outside="open = false"
-                      class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
-                <span x-text="selectedLabel"></span>
-                <svg xmlns="http://www.w3.org/2000/svg"
-                     width="24"
-                     height="24"
-                     viewBox="0 0 24 24"
-                     fill="none"
-                     stroke="currentColor"
-                     stroke-width="2"
-                     stroke-linecap="round"
-                     stroke-linejoin="round"
-                     class="w-4 h-4 text-gray-400">
-                  <path d="m6 9 6 6 6-6"></path>
-                </svg>
-              </button>
-              <div x-show="open"
-                   x-transition:enter="transition ease-out duration-100"
-                   x-transition:enter-start="transform opacity-0 scale-95"
-                   x-transition:enter-end="transform opacity-100 scale-100"
-                   x-transition:leave="transition ease-in duration-75"
-                   x-transition:leave-start="transform opacity-100 scale-100"
-                   x-transition:leave-end="transform opacity-0 scale-95"
-                   class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
-                <template x-for="option in options" :key="option.value">
-                  <button type="button"
-                          @click="selectedValue = option.value; selectedLabel = option.label; open = false"
-                          class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white"
-                          :class="{ 'text-white bg-[#39404b]': selectedValue === option.value }">
-                    <span x-text="option.label"></span>
-                  </button>
-                </template>
-              </div>
-              <input type="hidden" name="anime_metadata_source_default" x-bind:value="selectedValue">
-            </div>
-          </div>
-
-          <div>
-            <label class="block text-gray-300 text-xs font-medium mb-2">Grouped Anime Library</label>
-            <div class="relative"
-                 x-data="{
-                   open: false,
-                   selectedValue: '{{ user.anime_library_mode }}',
-                   selectedLabel: '',
-                   options: [{% for choice in anime_library_mode_choices %}{ value: '{{ choice.0 }}', label: '{{ choice.1|escapejs }}' }{% if not forloop.last %},{% endif %}{% endfor %}],
-                   init() {
-                     const match = this.options.find(o => o.value === this.selectedValue);
-                     this.selectedLabel = match ? match.label : this.options[0]?.label ?? '';
-                   }
-                 }"
-                 x-init="init()">
-              <button type="button"
-                      @click="open = !open"
-                      @click.outside="open = false"
-                      class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
-                <span x-text="selectedLabel"></span>
-                <svg xmlns="http://www.w3.org/2000/svg"
-                     width="24"
-                     height="24"
-                     viewBox="0 0 24 24"
-                     fill="none"
-                     stroke="currentColor"
-                     stroke-width="2"
-                     stroke-linecap="round"
-                     stroke-linejoin="round"
-                     class="w-4 h-4 text-gray-400">
-                  <path d="m6 9 6 6 6-6"></path>
-                </svg>
-              </button>
-              <div x-show="open"
-                   x-transition:enter="transition ease-out duration-100"
-                   x-transition:enter-start="transform opacity-0 scale-95"
-                   x-transition:enter-end="transform opacity-100 scale-100"
-                   x-transition:leave="transition ease-in duration-75"
-                   x-transition:leave-start="transform opacity-100 scale-100"
-                   x-transition:leave-end="transform opacity-0 scale-95"
-                   class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
-                <template x-for="option in options" :key="option.value">
-                  <button type="button"
-                          @click="selectedValue = option.value; selectedLabel = option.label; open = false"
-                          class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white"
-                          :class="{ 'text-white bg-[#39404b]': selectedValue === option.value }">
-                    <span x-text="option.label"></span>
-                  </button>
-                </template>
-              </div>
-              <input type="hidden" name="anime_library_mode" x-bind:value="selectedValue">
-            </div>
-          </div>
+          <input type="hidden" name="metadata_language" x-bind:value="selectedValue">
         </div>
       </div>
 
-      <div class="border-t border-gray-600 my-5"></div>
+      {# UI Language #}
+      <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+        <div class="flex flex-col items-start gap-1 mb-2">
+          <label class="text-[var(--color-text-secondary)] text-sm font-medium flex items-center gap-2">
+            {% include "app/icons/globe.svg" with classes="w-4 h-4" %}
+            {% translate "UI Language" %}
+          </label>
+          <span class="text-[var(--color-text-muted)] text-xs">{% translate "Interface display language." %}</span>
+        </div>
+        <div class="relative"
+             x-data="{
+               open: false,
+               selectedValue: '{{ user.ui_language }}',
+               selectedLabel: '',
+               options: [{% for value, label in ui_language_choices %}{ value: '{{ value }}', label: '{{ label|escapejs }}' }{% if not forloop.last %},{% endif %}{% endfor %}],
+               init() {
+                 const match = this.options.find(o => o.value === this.selectedValue);
+                 this.selectedLabel = match ? match.label : this.options[0]?.label ?? '';
+               }
+             }"
+             x-init="init()">
+          <button type="button"
+                  @click="open = !open"
+                  @click.outside="open = false"
+                  class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+            <span x-text="selectedLabel"></span>
+            <svg xmlns="http://www.w3.org/2000/svg"
+                 width="24"
+                 height="24"
+                 viewBox="0 0 24 24"
+                 fill="none"
+                 stroke="currentColor"
+                 stroke-width="2"
+                 stroke-linecap="round"
+                 stroke-linejoin="round"
+                 class="w-4 h-4 text-[var(--color-text-muted)]">
+              <path d="m6 9 6 6 6-6"></path>
+            </svg>
+          </button>
+          <div x-show="open"
+               x-transition:enter="transition ease-out duration-100"
+               x-transition:enter-start="transform opacity-0 scale-95"
+               x-transition:enter-end="transform opacity-100 scale-100"
+               x-transition:leave="transition ease-in duration-75"
+               x-transition:leave-start="transform opacity-100 scale-100"
+               x-transition:leave-end="transform opacity-0 scale-95"
+               class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-y-auto max-h-60 z-10 border border-gray-600">
+            <template x-for="option in options" :key="option.value">
+              <button type="button"
+                      @click="selectedValue = option.value; selectedLabel = option.label; open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
+                      :class="{ 'text-[var(--color-text)] bg-[var(--color-surface-strong)]': selectedValue === option.value }">
+                <span x-text="option.label"></span>
+              </button>
+            </template>
+          </div>
+          <input type="hidden" name="ui_language" x-bind:value="selectedValue">
+        </div>
+      </div>
+
+        </div>
+      </section>
 
       <!-- Tracking & Interaction Section -->
-      <div class="mb-6">
-        <h3 class="text-lg font-medium text-gray-200 mb-3">Tracking & Interaction</h3>
+      <section id="tracking-interaction" class="preferences-section">
+        <div class="preferences-section-header">
+          <div class="preferences-section-icon">{% include "app/icons/pulse.svg" with classes="w-5 h-5" %}</div>
+          <div>
+            <h3>{% translate "Tracking & Interaction" %}</h3>
+            <p>{% translate "Control how Watchmask tracks and interacts with your activity." %}</p>
+          </div>
+        </div>
+        <div class="preferences-grid preferences-tracking-grid">
 
         <!-- Hide Completed Recommendations -->
-        <div class="p-3 bg-[#39404b] rounded-md mb-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Hide Completed Recommendations</label>
-            <span class="text-gray-400 text-xs">Hide already completed items from recommendation sections.</span>
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Hide Completed" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Hide completed items." %}</span>
           </div>
           <div class="relative w-full"
-               x-data="{
-                 open: false,
-                 selectedValue: '{{ user.hide_completed_recommendations|yesno:'1,0' }}',
-                 selectedLabel: '',
-                 options: [
-                   { value: '1', label: 'Enabled - hide completed items' },
-                   { value: '0', label: 'Disabled - show completed items' }
-                 ],
-                 init() {
-                   const match = this.options.find(o => o.value === this.selectedValue);
-                   this.selectedLabel = match ? match.label : this.options[1]?.label ?? '';
-                 }
-               }"
+               x-data="{ open: false, selectedValue: '{{ user.hide_completed_recommendations|yesno:'1,0' }}', selectedLabel: '', options: [ { value: '1', label: gettext('Enabled - hide completed items') }, { value: '0', label: gettext('Disabled - show completed items') } ], init() { const match = this.options.find(o => o.value === this.selectedValue); this.selectedLabel = match ? match.label : this.options[1]?.label ?? ''; } }"
                x-init="init()">
-              <button type="button"
-                      @click="open = !open"
-                      @click.outside="open = false"
-                      class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
-                <span x-text="selectedLabel"></span>
-                <svg xmlns="http://www.w3.org/2000/svg"
-                     width="24"
-                     height="24"
-                     viewBox="0 0 24 24"
-                     fill="none"
-                     stroke="currentColor"
-                     stroke-width="2"
-                     stroke-linecap="round"
-                     stroke-linejoin="round"
-                     class="w-4 h-4 text-gray-400">
-                  <path d="m6 9 6 6 6-6"></path>
-                </svg>
-              </button>
-              <div x-show="open"
-                   x-transition:enter="transition ease-out duration-100"
-                   x-transition:enter-start="transform opacity-0 scale-95"
-                   x-transition:enter-end="transform opacity-100 scale-100"
-                   x-transition:leave="transition ease-in duration-75"
-                   x-transition:leave-start="transform opacity-100 scale-100"
-                   x-transition:leave-end="transform opacity-0 scale-95"
-                   class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
-                <template x-for="option in options" :key="option.value">
-                  <button type="button"
-                          @click="selectedValue = option.value; selectedLabel = option.label; open = false"
-                          class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white"
-                          :class="{ 'text-white bg-[#39404b]': selectedValue === option.value }">
-                    <span x-text="option.label"></span>
-                  </button>
-                </template>
-              </div>
-              <input type="hidden" name="hide_completed_recommendations" x-bind:value="selectedValue">
-            </div>
-          </div>
-        </div>
-
-        <!-- Hide Zero Ratings -->
-        <div class="p-3 bg-[#39404b] rounded-md mb-4">
-          <div class="flex items-center justify-between">
-            <div>
-              <label class="text-gray-200 text-sm font-medium">Hide Zero Ratings</label>
-              <p class="text-gray-400 text-xs mt-1">Hide score badges when the rating value is zero.</p>
-            </div>
-            <label class="relative inline-flex items-center cursor-pointer">
-              <input type="hidden" name="hide_zero_rating" value="0">
-              <input class="sr-only peer"
-                     type="checkbox"
-                     name="hide_zero_rating"
-                     value="1"
-                     {% if user.hide_zero_rating %}checked{% endif %}>
-              <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600">
-              </div>
-            </label>
-          </div>
-        </div>
-
-        <!-- Quick Season Updates -->
-        <div class="p-3 bg-[#39404b] rounded-md mb-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Home Screen Card Buttons</label>
-            <span class="text-gray-400 text-xs">Quick season update buttons and/or the next episode pill on home screen cards.</span>
-          </div>
-          {% with qsu=user.quick_season_update_mobile %}
-          <div class="relative" x-data="{
-            open: false,
-            selectedValue: '{{ qsu|default:'none' }}',
-            selectedLabel: '{% if qsu == 'season_update' %}Quick Season Update buttons only{% elif qsu == 'next_episode' %}Next Episode button only{% elif qsu == 'both' %}Both{% else %}None{% endif %}'
-          }">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
               <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
@@ -751,7 +726,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -762,45 +737,36 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
-              <button type="button"
-                      @click="selectedValue = 'none'; selectedLabel = 'None'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                None
-              </button>
-              <button type="button"
-                      @click="selectedValue = 'season_update'; selectedLabel = 'Quick Season Update buttons only'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Quick Season Update buttons only
-              </button>
-              <button type="button"
-                      @click="selectedValue = 'next_episode'; selectedLabel = 'Next Episode button only'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Next Episode button only
-              </button>
-              <button type="button"
-                      @click="selectedValue = 'both'; selectedLabel = 'Both'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Both
-              </button>
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+              <template x-for="option in options" :key="option.value">
+                <button type="button"
+                        @click="selectedValue = option.value; selectedLabel = option.label; open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
+                        :class="{ 'text-[var(--color-text)] bg-[var(--color-surface-strong)]': selectedValue === option.value }">
+                  <span x-text="option.label"></span>
+                </button>
+              </template>
             </div>
-            <input type="hidden" name="quick_season_update_mobile" x-bind:value="selectedValue">
+            <input type="hidden"
+                   name="hide_completed_recommendations"
+                   x-bind:value="selectedValue">
           </div>
-          {% endwith %}
         </div>
 
-        <!-- Game Logging Style -->
-        <div class="p-3 bg-[#39404b] rounded-md mt-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Game &amp; Board Game Logging Style</label>
-            <span class="text-gray-400 text-xs">Choose how game and board game entries are displayed on the History page.</span>
+        <!-- Show Recommendations -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Recommendations" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Show recommendations on detail pages." %}</span>
           </div>
-          <div class="relative" x-data="{ open: false, selectedValue: '{{ user.game_logging_style|default:'repeats' }}', selectedLabel: '{{ user.game_logging_style|default:'repeats' }}' }">
+          <div class="relative w-full"
+               x-data="{ open: false, selectedValue: '{{ user.show_recommendations|yesno:'1,0' }}', selectedLabel: '', options: [ { value: '1', label: gettext('Enabled - show recommendations') }, { value: '0', label: gettext('Disabled - hide recommendations') } ], init() { const match = this.options.find(o => o.value === this.selectedValue); this.selectedLabel = match ? match.label : this.options[0]?.label ?? ''; } }"
+               x-init="init()">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
-              <span x-text="selectedValue === 'sessions' ? 'Sessions — new entry per play; exact history' : 'Repeats — update one entry; spreads time across range'"></span>
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+              <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
                    height="24"
@@ -810,7 +776,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -821,16 +787,176 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+              <template x-for="option in options" :key="option.value">
+                <button type="button"
+                        @click="selectedValue = option.value; selectedLabel = option.label; open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
+                        :class="{ 'text-[var(--color-text)] bg-[var(--color-surface-strong)]': selectedValue === option.value }">
+                  <span x-text="option.label"></span>
+                </button>
+              </template>
+            </div>
+            <input type="hidden"
+                   name="show_recommendations"
+                   x-bind:value="selectedValue">
+          </div>
+        </div>
+
+        <!-- Rating Scale -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Rating Scale" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Choose a rating scale, or turn ratings off." %}</span>
+          </div>
+          <div class="relative w-full"
+               x-data="{ open: false, selectedValue: '{{ user.rating_scale }}', selectedLabel: '', options: [ { value: '10', label: gettext('1-10 stars') }, { value: '5', label: gettext('1-5 stars') }, { value: '0', label: gettext('Disabled') } ], init() { const match = this.options.find(o => o.value === this.selectedValue); this.selectedLabel = match ? match.label : this.options[0]?.label ?? ''; } }"
+               x-init="init()">
+            <button type="button"
+                    @click="open = !open"
+                    @click.outside="open = false"
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+              <span x-text="selectedLabel"></span>
+              <svg xmlns="http://www.w3.org/2000/svg"
+                   width="24"
+                   height="24"
+                   viewBox="0 0 24 24"
+                   fill="none"
+                   stroke="currentColor"
+                   stroke-width="2"
+                   stroke-linecap="round"
+                   stroke-linejoin="round"
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
+                <path d="m6 9 6 6 6-6"></path>
+              </svg>
+            </button>
+            <div x-show="open"
+                 x-transition:enter="transition ease-out duration-100"
+                 x-transition:enter-start="transform opacity-0 scale-95"
+                 x-transition:enter-end="transform opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-75"
+                 x-transition:leave-start="transform opacity-100 scale-100"
+                 x-transition:leave-end="transform opacity-0 scale-95"
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+              <template x-for="option in options" :key="option.value">
+                <button type="button"
+                        @click="selectedValue = option.value; selectedLabel = option.label; open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
+                        :class="{ 'text-[var(--color-text)] bg-[var(--color-surface-strong)]': selectedValue === option.value }">
+                  <span x-text="option.label"></span>
+                </button>
+              </template>
+            </div>
+            <input type="hidden"
+                   name="rating_scale"
+                   x-bind:value="selectedValue">
+          </div>
+        </div>
+
+
+        <!-- Quick Season Updates -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Home Buttons" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Home card actions." %}</span>
+          </div>
+            <div class="relative" x-data="{ open: false, selectedValue: '{{ user.quick_season_update_mobile|default:'none' }}', selectedLabel: gettext('{{ user.get_quick_season_update_mobile_display|escapejs }}') }">
+              <button type="button"
+                      @click="open = !open"
+                      @click.outside="open = false"
+                      class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                <span x-text="selectedLabel"></span>
+                <svg xmlns="http://www.w3.org/2000/svg"
+                     width="24"
+                     height="24"
+                     viewBox="0 0 24 24"
+                     fill="none"
+                     stroke="currentColor"
+                     stroke-width="2"
+                     stroke-linecap="round"
+                     stroke-linejoin="round"
+                     class="w-4 h-4 text-[var(--color-text-muted)]">
+                  <path d="m6 9 6 6 6-6"></path>
+                </svg>
+              </button>
+              <div x-show="open"
+                   x-transition:enter="transition ease-out duration-100"
+                   x-transition:enter-start="transform opacity-0 scale-95"
+                   x-transition:enter-end="transform opacity-100 scale-100"
+                   x-transition:leave="transition ease-in duration-75"
+                   x-transition:leave-start="transform opacity-100 scale-100"
+                   x-transition:leave-end="transform opacity-0 scale-95"
+                   class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                <button type="button"
+                        @click="selectedValue = 'none'; selectedLabel = gettext('None'); open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                  {% translate "None" %}
+                </button>
+                <button type="button"
+                        @click="selectedValue = 'season_update'; selectedLabel = gettext('Quick Season Update buttons only'); open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                  {% translate "Quick Season Update buttons only" %}
+                </button>
+                <button type="button"
+                        @click="selectedValue = 'next_episode'; selectedLabel = gettext('Next Episode button only'); open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                  {% translate "Next Episode button only" %}
+                </button>
+                <button type="button"
+                        @click="selectedValue = 'both'; selectedLabel = gettext('Both'); open = false"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                  {% translate "Both" %}
+                </button>
+              </div>
+              <input type="hidden"
+                     name="quick_season_update_mobile"
+                     x-bind:value="selectedValue">
+            </div>
+        </div>
+
+        <!-- Game Logging Style -->
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Game Logging" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Game history style." %}</span>
+          </div>
+          <div class="relative"
+               x-data="{ open: false, selectedValue: '{{ user.game_logging_style|default:'repeats' }}', selectedLabel: gettext('{{ user.game_logging_style|default:'repeats'|escapejs }}') }">
+            <button type="button"
+                    @click="open = !open"
+                    @click.outside="open = false"
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+              <span x-text="selectedValue === 'sessions' ? gettext('Sessions — new entry per play; exact history') : gettext('Repeats — update one entry; spreads time across range')"></span>
+              <svg xmlns="http://www.w3.org/2000/svg"
+                   width="24"
+                   height="24"
+                   viewBox="0 0 24 24"
+                   fill="none"
+                   stroke="currentColor"
+                   stroke-width="2"
+                   stroke-linecap="round"
+                   stroke-linejoin="round"
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
+                <path d="m6 9 6 6 6-6"></path>
+              </svg>
+            </button>
+            <div x-show="open"
+                 x-transition:enter="transition ease-out duration-100"
+                 x-transition:enter-start="transform opacity-0 scale-95"
+                 x-transition:enter-end="transform opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-75"
+                 x-transition:leave-start="transform opacity-100 scale-100"
+                 x-transition:leave-end="transform opacity-0 scale-95"
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
               <button type="button"
                       @click="selectedValue = 'sessions'; selectedLabel = 'sessions'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Sessions — new entry per play; exact history
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Sessions — new entry per play; exact history" %}
               </button>
               <button type="button"
                       @click="selectedValue = 'repeats'; selectedLabel = 'repeats'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Repeats — update one entry; spreads time across range
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Repeats — update one entry; spreads time across range" %}
               </button>
             </div>
             <input type="hidden" name="game_logging_style" x-bind:value="selectedValue">
@@ -838,16 +964,17 @@
         </div>
 
         <!-- Book, Comic & Manga Progress Format -->
-        <div class="p-3 bg-[#39404b] rounded-md mt-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Book, Comic &amp; Manga Progress Format</label>
-            <span class="text-gray-400 text-xs">Choose whether to track progress as percentage (0-100) or pages/issues/chapters.</span>
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Progress Format" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Percent or pages." %}</span>
           </div>
-          <div class="relative" x-data="{ open: false, selectedValue: '{{ user.book_comic_manga_progress_percentage|yesno:'percentage,pages_issues_chapters' }}', selectedLabel: '{{ user.book_comic_manga_progress_percentage|yesno:'Percentage,Pages/Issues/Chapters' }}' }">
+          <div class="relative"
+               x-data="{ open: false, selectedValue: '{{ user.book_comic_manga_progress_percentage|yesno:'percentage,pages_issues_chapters' }}', selectedLabel: gettext('{{ user.book_comic_manga_progress_percentage|yesno:'Percentage,Pages/Issues/Chapters'|escapejs }}') }">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
               <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
@@ -858,7 +985,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -869,38 +996,40 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
               <button type="button"
-                      @click="selectedValue = 'pages_issues_chapters'; selectedLabel = 'Pages/Issues/Chapters'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Pages/Issues/Chapters
+                      @click="selectedValue = 'pages_issues_chapters'; selectedLabel = gettext('Pages/Issues/Chapters'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Pages/Issues/Chapters" %}
               </button>
               <button type="button"
-                      @click="selectedValue = 'percentage'; selectedLabel = 'Percentage'; open = false"
-                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-                Percentage
+                      @click="selectedValue = 'percentage'; selectedLabel = gettext('Percentage'); open = false"
+                      class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+                {% translate "Percentage" %}
               </button>
             </div>
-            <input type="hidden" name="book_comic_manga_progress_percentage" x-bind:value="selectedValue === 'percentage' ? '1' : '0'">
+            <input type="hidden"
+                   name="book_comic_manga_progress_percentage"
+                   x-bind:value="selectedValue === 'percentage' ? '1' : '0'">
           </div>
         </div>
 
         <!-- Session Duration -->
-        <div class="p-3 bg-[#39404b] rounded-md mt-4">
-          <div class="flex items-center justify-between mb-2">
-            <label class="text-gray-200 text-sm font-medium">Session Duration</label>
-            <span class="text-gray-400 text-xs">How long you stay logged in before needing to sign in again.</span>
+        <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mt-4">
+          <div class="flex flex-col items-start gap-1 mb-2">
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Session Duration" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Sign-in timeout." %}</span>
           </div>
-          <div class="relative" x-data="{
-            open: false,
-            selectedValue: '{{ user.session_duration }}',
-            selectedLabel: '{% for choice in session_duration_choices %}{% if choice.0 == user.session_duration %}{{ choice.1 }}{% endif %}{% endfor %}',
-            options: [{% for choice in session_duration_choices %}{ value: '{{ choice.0 }}', label: '{{ choice.1 }}' }{% if not forloop.last %}, {% endif %}{% endfor %}]
-          }">
+          <div class="relative" x-data="{ open: false, selectedValue: '{{ user.session_duration }}', selectedLabel: gettext('{{ user.get_session_duration_display|escapejs }}'), options: [
+            {% for choice in session_duration_choices %}
+              { value: '{{ choice.0 }}', label: '{{ choice.1|escapejs }}' }
+              {% if not forloop.last %},{% endif %}
+            {% endfor %}
+            ] }">
             <button type="button"
                     @click="open = !open"
                     @click.outside="open = false"
-                    class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                    class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
               <span x-text="selectedLabel"></span>
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
@@ -911,7 +1040,7 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-4 h-4 text-gray-400">
+                   class="w-4 h-4 text-[var(--color-text-muted)]">
                 <path d="m6 9 6 6 6-6"></path>
               </svg>
             </button>
@@ -922,59 +1051,39 @@
                  x-transition:leave="transition ease-in duration-75"
                  x-transition:leave-start="transform opacity-100 scale-100"
                  x-transition:leave-end="transform opacity-0 scale-95"
-                 class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                 class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
               <template x-for="option in options" :key="option.value">
                 <button type="button"
                         @click="selectedValue = option.value; selectedLabel = option.label; open = false"
-                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white"
+                        class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]"
                         x-text="option.label"></button>
               </template>
             </div>
             <input type="hidden" name="session_duration" x-bind:value="selectedValue">
           </div>
         </div>
-      </div>
-
-      <div class="border-t border-gray-600 my-5"></div>
+        </div>
+      </section>
 
       <!-- Automation Section -->
-      <div class="mb-6"
-           x-data="{
-             enabled: {{ auto_pause_enabled|yesno:'true,false' }},
-             rules: JSON.parse('{{ auto_pause_rules_json|escapejs }}') || [],
-             defaultLibrary: 'all',
-             libraryLabels: JSON.parse('{{ library_labels_json|escapejs }}'),
-             init() {
-               this.enabled = this.rules.length > 0;
-             },
-             addRule() {
-               const library = this.defaultLibrary || 'all';
-               this.rules.push({ library, weeks: 16 });
-               this.enabled = this.rules.length > 0;
-             },
-             removeRule(index) {
-               this.rules.splice(index, 1);
-               this.enabled = this.rules.length > 0;
-             },
-             primaryButtonLabel() {
-               return this.rules.length
-                 ? 'Enabled. Click to add additional rule.'
-                 : 'Disabled. Click to add rule.';
-             },
-             handlePrimaryAction() {
-               this.addRule();
-             }
-           }">
-        <h3 class="text-lg font-medium text-gray-200 mb-3">Automation</h3>
-        <div class="p-4 bg-[#39404b] rounded-md border border-gray-700">
+      <section id="automation" class="preferences-section"
+           x-data="{ enabled: {{ auto_pause_enabled|yesno:'true,false' }}, rules: JSON.parse('{{ auto_pause_rules_json|escapejs }}') || [], defaultLibrary: 'all', libraryLabels: JSON.parse('{{ library_labels_json|escapejs }}'), init() { this.enabled = this.rules.length > 0; }, addRule() { const library = this.defaultLibrary || 'all'; this.rules.push({ library, weeks: 16 }); this.enabled = this.rules.length > 0; }, removeRule(index) { this.rules.splice(index, 1); this.enabled = this.rules.length > 0; }, primaryButtonLabel() { return this.rules.length ? gettext('Enabled. Click to add additional rule.') : gettext('Disabled. Click to add rule.'); }, handlePrimaryAction() { this.addRule(); } }">
+        <div class="preferences-section-header">
+          <div class="preferences-section-icon">{% include "app/icons/signal.svg" with classes="w-5 h-5" %}</div>
+          <div>
+            <h3>{% translate "Automation" %}</h3>
+            <p>{% translate "Manage automated rules." %}</p>
+          </div>
+        </div>
+        <div class="p-4 bg-[var(--color-surface-strong)] rounded-md border border-gray-700">
           <div class="flex items-start justify-between mb-3 space-x-4">
-            <label class="text-gray-200 text-sm font-medium">Library Management</label>
-            <span class="text-gray-400 text-xs text-right">Change “In Progress” items to "Paused" after a set time.</span>
+            <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Library Management" %}</label>
+            <span class="text-[var(--color-text-muted)] text-xs text-right">{% translate "Pause in-progress items." %}</span>
           </div>
 
           <button type="button"
                   @click="handlePrimaryAction"
-                  class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                  class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
             <span x-text="primaryButtonLabel()"></span>
             <svg xmlns="http://www.w3.org/2000/svg"
                  width="24"
@@ -985,7 +1094,7 @@
                  stroke-width="2"
                  stroke-linecap="round"
                  stroke-linejoin="round"
-                 class="w-4 h-4 text-gray-400">
+                 class="w-4 h-4 text-[var(--color-text-muted)]">
               <path d="m6 9 6 6 6-6"></path>
             </svg>
           </button>
@@ -998,18 +1107,20 @@
                    x-bind:value="JSON.stringify(rules)">
 
             <template x-if="!rules.length">
-              <p class="text-sm text-gray-400 italic">No auto-pause rules yet. Add one to get started.</p>
+              <p class="text-sm text-[var(--color-text-muted)] italic">{% translate "No auto-pause rules yet. Add one to get started." %}</p>
             </template>
 
             <div class="space-y-3 mt-3">
               <template x-for="(rule, index) in rules" :key="`auto-pause-${index}`">
-                <div class="flex flex-col md:flex-row md:items-center gap-3 bg-[#2f353f] rounded-md border border-gray-700 p-0 md:p-0">
-                  <div class="flex-1" x-data="{ hasValue: !!rule.library }" x-init="$watch('rule.library', value => hasValue = !!value)">
+                <div class="flex flex-col md:flex-row md:items-center gap-3 bg-[var(--color-surface-muted)] rounded-md border border-gray-700 p-0 md:p-0">
+                  <div class="flex-1"
+                       x-data="{ hasValue: !!rule.library }"
+                       x-init="$watch('rule.library', value => hasValue = !!value)">
                     <div class="relative">
                       <button type="button"
-                              class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer"
+                              class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer"
                               @click="$refs.librarySelect.focus()">
-                        <span x-text="libraryLabels[rule.library] || 'All Libraries'"></span>
+                        <span x-text="libraryLabels[rule.library] || gettext('All Libraries')"></span>
                         <svg xmlns="http://www.w3.org/2000/svg"
                              width="24"
                              height="24"
@@ -1019,7 +1130,7 @@
                              stroke-width="2"
                              stroke-linecap="round"
                              stroke-linejoin="round"
-                             class="w-4 h-4 text-gray-400 pointer-events-none">
+                             class="w-4 h-4 text-[var(--color-text-muted)] pointer-events-none">
                           <path d="m6 9 6 6 6-6"></path>
                         </svg>
                       </button>
@@ -1027,7 +1138,7 @@
                               x-ref="librarySelect"
                               x-model="rule.library"
                               @change="hasValue = !!rule.library">
-                        <option value="all">All Libraries</option>
+                        <option value="all">{% translate "All Libraries" %}</option>
                         {% for media_type in active_libraries %}
                           <option value="{{ media_type }}">{{ media_type|media_type_readable_plural }}</option>
                         {% endfor %}
@@ -1038,9 +1149,9 @@
                     <div class="relative">
                       <input type="number"
                              min="1"
-                             class="w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent pr-10 appearance-none"
+                             class="w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent pr-10 appearance-none"
                              x-model.number="rule.weeks"
-                             style="-moz-appearance: textfield;">
+                             style="-moz-appearance: textfield">
                       <style>
                         input[type=number]::-webkit-inner-spin-button,
                         input[type=number]::-webkit-outer-spin-button {
@@ -1048,46 +1159,23 @@
                           margin: 0;
                         }
                       </style>
-                      <span class="absolute inset-y-0 right-3 flex items-center text-gray-400 text-xs">weeks</span>
+                      <span class="absolute inset-y-0 right-3 flex items-center text-[var(--color-text-muted)] text-xs">{% translate "weeks" %}</span>
                     </div>
                   </div>
                   <div class="md:w-32">
                     <button type="button"
                             class="w-full h-10 px-4 text-sm text-white bg-indigo-600 rounded-md hover:bg-indigo-700"
-                            @click="removeRule(index)">
-                      Remove
-                    </button>
+                            @click="removeRule(index)">{% translate "Remove" %}</button>
                   </div>
                 </div>
               </template>
             </div>
           </div>
         </div>
-      </div>
-
-      <div class="border-t border-gray-600 my-5"></div>
+      </section>
 
       <!-- Save Button -->
-      <div class="mt-5 pt-4 border-gray-600">
-        <button type="submit"
-                class="flex items-center px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
-          <svg xmlns="http://www.w3.org/2000/svg"
-               width="24"
-               height="24"
-               viewBox="0 0 24 24"
-               fill="none"
-               stroke="currentColor"
-               stroke-width="2"
-               stroke-linecap="round"
-               stroke-linejoin="round"
-               class="w-4 h-4 mr-2">
-            <path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 0 2 2H5a2 2 0 0 0-2-2V5a2 2 0 0 1 2-2z"></path>
-            <path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"></path>
-            <path d="M7 3v4a1 1 0 0 0 1 1h7"></path>
-          </svg>
-          Save Preferences
-        </button>
-      </div>
+      {% include "users/components/form_save_bar.html" with button_label="Save Preferences" %}
     </form>
   </div>
 {% endblock settings_content %}

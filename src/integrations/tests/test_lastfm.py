@@ -1,16 +1,19 @@
-from datetime import UTC
+from contextlib import suppress
+from datetime import UTC, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 from django_celery_beat.models import IntervalSchedule, PeriodicTask
 
 from app.models import Music
+from app.services.watch_state import is_importing_watch_state
 from integrations import lastfm_sync, tasks
 from integrations.lastfm_api import LastFMRecentTracksResult
-from integrations.models import LastFMAccount, LastFMHistoryImportStatus
+from integrations.models import ImportRun, LastFMAccount, LastFMHistoryImportStatus
 
 
 class LastFMViewTests(TestCase):
@@ -23,6 +26,19 @@ class LastFMViewTests(TestCase):
             username="lastfm-user",
         )
         self.client.force_login(self.user)
+
+    def test_lastfm_disconnect_flags_running_import_run_for_cancellation(self):
+        """Disconnecting must flag any in-flight backfill so it stops requeuing."""
+        LastFMAccount.objects.create(user=self.user, lastfm_username="listener")
+        run = ImportRun.objects.create(
+            user=self.user, source="lastfm", status=ImportRun.Status.RUNNING
+        )
+
+        response = self.client.post(reverse("lastfm_disconnect"))
+
+        self.assertEqual(response.status_code, 302)
+        run.refresh_from_db()
+        self.assertTrue(run.cancel_requested)
 
     @patch("integrations.views.tasks.import_lastfm_history.delay")
     @patch("integrations.views.tasks.poll_lastfm_for_user.delay")
@@ -202,6 +218,39 @@ class LastFMTaskTests(TestCase):
 
     @patch("integrations.tasks.import_lastfm_history.delay")
     @patch("integrations.lastfm_sync.sync_lastfm_account")
+    def test_import_lastfm_history_marks_its_listens_as_imported(
+        self,
+        mock_sync,
+        mock_delay,
+    ):
+        """A history backfill is history, not something just listened to."""
+        seen = []
+
+        def spy(*args, **kwargs):
+            seen.append(is_importing_watch_state())
+            return {
+                "tracks": [],
+                "pages_fetched": 1,
+                "total_pages": 1,
+                "complete": True,
+                "interrupted": False,
+                "max_seen_uts": 1699999999,
+                "processed": 0,
+                "skipped": 0,
+                "errors": 0,
+                "affected_day_keys": set(),
+            }
+
+        mock_sync.side_effect = spy
+        self.account.reset_history_import(1699999999)
+        self.account.save()
+
+        tasks.import_lastfm_history(self.user.id)
+
+        self.assertEqual(seen, [True])
+
+    @patch("integrations.tasks.import_lastfm_history.delay")
+    @patch("integrations.lastfm_sync.sync_lastfm_account")
     def test_import_lastfm_history_advances_page_and_requeues(
         self,
         mock_sync,
@@ -244,7 +293,75 @@ class LastFMTaskTests(TestCase):
         self.assertEqual(self.account.history_import_next_page, 6)
         self.assertEqual(self.account.last_fetch_timestamp_uts, 1700000000)
         self.assertIn("Continuing with page 6 of 12", result["message"])
-        mock_delay.assert_called_once_with(user_id=self.user.id, reset=False)
+        run = ImportRun.objects.get(user=self.user, source="lastfm")
+        mock_delay.assert_called_once_with(
+            user_id=self.user.id, reset=False, import_run_id=run.id
+        )
+
+    @patch("integrations.tasks.import_lastfm_history.delay")
+    @patch("integrations.lastfm_sync.sync_lastfm_account")
+    def test_import_lastfm_history_skips_requeue_when_cancelled_mid_chunk(
+        self,
+        mock_sync,
+        mock_delay,
+    ):
+        """A cancel requested while a chunk runs stops the next requeue."""
+        self.account.reset_history_import(1699999999)
+        self.account.save(
+            update_fields=[
+                "history_import_status",
+                "history_import_cutoff_uts",
+                "history_import_next_page",
+                "history_import_total_pages",
+                "history_import_started_at",
+                "history_import_completed_at",
+                "history_import_last_error_message",
+            ],
+        )
+        mock_sync.return_value = {
+            "tracks": [],
+            "pages_fetched": 5,
+            "total_pages": 12,
+            "complete": False,
+            "interrupted": False,
+            "max_seen_uts": 1699999999,
+            "processed": 30,
+            "skipped": 0,
+            "errors": 0,
+            "affected_day_keys": set(),
+        }
+
+        run = ImportRun.objects.create(user=self.user, source="lastfm")
+
+        def _cancel_mid_run(*args, **kwargs):
+            ImportRun.objects.filter(id=run.id).update(cancel_requested=True)
+            return mock_sync.return_value
+
+        mock_sync.side_effect = _cancel_mid_run
+
+        result = tasks.import_lastfm_history(self.user.id, import_run_id=run.id)
+
+        mock_delay.assert_not_called()
+        self.assertEqual(result["message"], "Last.fm history import cancelled.")
+        self.account.refresh_from_db()
+        self.assertEqual(
+            self.account.history_import_status, LastFMHistoryImportStatus.FAILED
+        )
+
+    @patch("integrations.tasks.import_lastfm_history.delay")
+    def test_import_lastfm_history_skips_entirely_when_already_cancelled(
+        self,
+        mock_delay,
+    ):
+        """A run already marked cancelled before this chunk starts is a no-op."""
+        run = ImportRun.objects.create(
+            user=self.user, source="lastfm", cancel_requested=True
+        )
+
+        result = tasks.import_lastfm_history(self.user.id, import_run_id=run.id)
+
+        mock_delay.assert_not_called()
+        self.assertEqual(result["message"], "Last.fm history import cancelled.")
 
     @patch("integrations.tasks._lastfm._enqueue_lastfm_music_enrichment")
     @patch("integrations.lastfm_sync.sync_lastfm_account")
@@ -294,6 +411,55 @@ class LastFMTaskTests(TestCase):
             "Completed Last.fm history import. Music enrichment queued.",
         )
         mock_enqueue_enrichment.assert_called_once_with(self.user.id)
+
+        run = ImportRun.objects.get(user=self.user, source="lastfm")
+        self.assertEqual(run.status, ImportRun.Status.COMPLETED)
+        self.assertEqual(run.created_count, 42)
+        self.assertEqual(run.remaining_estimate, 0)
+        self.assertIsNotNone(run.finished_at)
+
+    @patch("integrations.tasks.import_lastfm_history.delay")
+    @patch("integrations.lastfm_sync.sync_lastfm_account")
+    def test_import_lastfm_history_reuses_run_across_requeued_chunks(
+        self,
+        mock_sync,
+        mock_delay,
+    ):
+        """Counts from a later chunk accumulate onto the same ImportRun."""
+        self.account.reset_history_import(1699999999)
+        self.account.save(
+            update_fields=[
+                "history_import_status",
+                "history_import_cutoff_uts",
+                "history_import_next_page",
+                "history_import_total_pages",
+                "history_import_started_at",
+                "history_import_completed_at",
+                "history_import_last_error_message",
+            ],
+        )
+        mock_sync.return_value = {
+            "tracks": [],
+            "pages_fetched": 5,
+            "total_pages": 12,
+            "complete": False,
+            "interrupted": False,
+            "max_seen_uts": 1699999999,
+            "processed": 30,
+            "skipped": 2,
+            "errors": 1,
+            "affected_day_keys": set(),
+        }
+
+        first_run = ImportRun.objects.create(user=self.user, source="lastfm")
+        tasks.import_lastfm_history(self.user.id, import_run_id=first_run.id)
+
+        first_run.refresh_from_db()
+        self.assertEqual(first_run.status, ImportRun.Status.RUNNING)
+        self.assertEqual(first_run.created_count, 30)
+        self.assertEqual(first_run.skipped_count, 2)
+        self.assertEqual(first_run.failed_count, 1)
+        self.assertEqual(ImportRun.objects.filter(user=self.user).count(), 1)
 
 
 class LastFMSyncHelperTests(TestCase):
@@ -346,3 +512,98 @@ class LastFMSyncHelperTests(TestCase):
             int(music.end_date.astimezone(UTC).timestamp()),
             newer_uts,
         )
+
+
+class LastFMFanOutTests(TestCase):
+    """The global poll queues one task per account instead of looping."""
+
+    def setUp(self):
+        cache.clear()
+        self.accounts = []
+        for index in range(3):
+            user = get_user_model().objects.create_user(username=f"fan{index}")
+            self.accounts.append(
+                LastFMAccount.objects.create(user=user, lastfm_username=f"fan{index}")
+            )
+
+    @patch("integrations.tasks._lastfm.poll_lastfm_account.apply_async")
+    def test_queues_one_task_per_account_with_jitter(self, mock_apply):
+        result = tasks.poll_all_lastfm_scrobbles()
+
+        self.assertEqual(result["queued"], 3)
+        queued_ids = {call.kwargs["args"][0] for call in mock_apply.call_args_list}
+        self.assertEqual(queued_ids, {a.pk for a in self.accounts})
+        for call in mock_apply.call_args_list:
+            self.assertTrue(0 <= call.kwargs["countdown"] <= 3)
+
+    @patch("integrations.tasks._lastfm.poll_lastfm_account.apply_async")
+    def test_repeat_run_skips_accounts_already_queued(self, mock_apply):
+        tasks.poll_all_lastfm_scrobbles()
+        result = tasks.poll_all_lastfm_scrobbles()
+
+        self.assertEqual(result["queued"], 0)
+        self.assertEqual(mock_apply.call_count, 3)
+
+    @patch("integrations.tasks._lastfm._run_incremental_lastfm_sync")
+    def test_one_failing_account_does_not_block_the_others(self, mock_run):
+        def run(account):
+            if account.pk == self.accounts[0].pk:
+                raise RuntimeError("provider down")
+            return {"status": "success"}
+
+        mock_run.side_effect = run
+
+        # Eager mode surfaces the first account's failure when it runs inline.
+        with patch("integrations.tasks._lastfm.poll_lastfm_account.apply_async") as mock_apply:
+            tasks.poll_all_lastfm_scrobbles()
+        for call in mock_apply.call_args_list:
+            with suppress(RuntimeError):
+                tasks.poll_lastfm_account(*call.kwargs["args"])
+
+        self.assertEqual(mock_run.call_count, 3)
+
+    @patch("integrations.tasks._lastfm._run_incremental_lastfm_sync")
+    def test_account_task_skips_broken_account_not_yet_due(self, mock_run):
+        account = self.accounts[0]
+        account.connection_broken = True
+        account.last_failed_at = timezone.now()
+        account.save(update_fields=["connection_broken", "last_failed_at"])
+
+        result = tasks.poll_lastfm_account(account.pk)
+
+        self.assertEqual(result["status"], "skipped")
+        mock_run.assert_not_called()
+
+
+class LastFMFanOutProbeTests(TestCase):
+    """The scheduled poll re-probes a broken account instead of skipping it forever."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(username="lastfm-probe")
+        self.account = LastFMAccount.objects.create(
+            user=self.user,
+            lastfm_username="listener",
+            connection_broken=True,
+        )
+
+    def _failed_ago(self, delta):
+        self.account.last_failed_at = timezone.now() - delta
+        self.account.save(update_fields=["last_failed_at"])
+
+    @patch("integrations.tasks._lastfm._run_incremental_lastfm_sync")
+    def test_broken_account_is_reprobed_once_due(self, mock_run):
+        mock_run.return_value = {"status": "success"}
+        self._failed_ago(timedelta(hours=2))
+
+        tasks.poll_all_lastfm_scrobbles()
+
+        mock_run.assert_called_once()
+
+    @patch("integrations.tasks._lastfm._run_incremental_lastfm_sync")
+    def test_recently_rejected_account_waits_for_next_probe(self, mock_run):
+        self._failed_ago(timedelta(minutes=5))
+
+        tasks.poll_all_lastfm_scrobbles()
+
+        mock_run.assert_not_called()

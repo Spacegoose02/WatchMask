@@ -1,12 +1,39 @@
+import contextlib
+import logging
+from datetime import timedelta
 from io import BytesIO
+
+from django.conf import settings
+from django.db.models import Q
+from django.utils import timezone
 
 from app.log_safety import exception_summary
 from app.models import MediaTypes
 from app.templatetags import app_tags
 from integrations import plex as plex_api
 from integrations.imports import helpers
+from integrations.upload_staging import open_import_file
+
+logger = logging.getLogger(__name__)
 
 ERROR_TITLE = "\n\n\n Couldn't import the following media: \n\n"
+IMPORT_COUNT_METRIC_KEYS = frozenset(
+    {
+        "created",
+        "failed",
+        "rejected",
+        "updated",
+        "skipped",
+        "baseline",
+        "skipped_ignored",
+        "skipped_missing_ids",
+        "skipped_numbering_mismatch",
+        "skipped_existing",
+        "skipped_unknown_type",
+        "skipped_other_user",
+        "music_unique_tracks",
+    },
+)
 GOODREADS_IMPORT_TASK_NAME = "Import from Goodreads"
 LEGACY_GOODREADS_IMPORT_TASK_NAMES = (
     "Import from GoodReads",
@@ -30,10 +57,8 @@ def _is_expected_plex_lookup_error(exc):
 def _coerce_uploaded_file(file):
     """Normalize uploaded file task args to a binary file-like object."""
     if hasattr(file, "read"):
-        try:
+        with contextlib.suppress(AttributeError, OSError):
             file.seek(0)
-        except (AttributeError, OSError):
-            pass
         return file
     if isinstance(file, str):
         return BytesIO(file.encode("utf-8"))
@@ -41,6 +66,83 @@ def _coerce_uploaded_file(file):
         return BytesIO(file)
     msg = f"Unsupported uploaded file payload type: {type(file)!r}"
     raise TypeError(msg)
+
+
+# Last.fm and Koito backfills reschedule themselves across many task
+# invocations, so one run legitimately outlives any single task's time limit.
+SELF_RESCHEDULING_IMPORT_SOURCES = ("lastfm", "koito")
+
+# Stremio imports set their own limits, which can exceed a lowered global one.
+STREMIO_IMPORT_SOFT_TIME_LIMIT = 20 * 60
+STREMIO_IMPORT_TIME_LIMIT = 30 * 60
+
+
+def close_abandoned_import_runs():
+    """Mark import runs FAILED once their task can no longer be running.
+
+    A hard time limit or a container restart kills the task without running
+    any of its code, so its ImportRun would read "running" for ever. A run
+    older than the task time limit plus a margin cannot still be alive.
+    """
+    from integrations.imports.durable import recover_outboxes
+    from integrations.models import ImportRun
+
+    recover_outboxes()
+
+    time_limit = settings.CELERY_TASK_TIME_LIMIT
+    if not time_limit:
+        return 0
+    time_limit = max(time_limit, STREMIO_IMPORT_TIME_LIMIT)
+    now = timezone.now()
+    closed = (
+        ImportRun.objects.filter(
+            status=ImportRun.Status.RUNNING,
+            started_at__lt=now - timedelta(seconds=time_limit + 300),
+        ).filter(Q(lease_expires_at__isnull=True) | Q(lease_expires_at__lte=now))
+        .exclude(source__in=SELF_RESCHEDULING_IMPORT_SOURCES)
+        .update(status=ImportRun.Status.FAILED, finished_at=now)
+    )
+    if closed:
+        logger.warning(
+            "Marked %s import run(s) failed: still running past the task time "
+            "limit, so the worker was killed or restarted mid-import",
+            closed,
+        )
+    return closed
+
+
+def _run_file_import(importer_func, file, user_id, mode, **extra_kwargs):
+    """Run a file-backed importer while cleaning staged task payloads."""
+    from integrations.tasks._media_imports import import_media
+
+    with open_import_file(file) as uploaded_file:
+        return import_media(
+            importer_func,
+            uploaded_file,
+            user_id,
+            mode,
+            **extra_kwargs,
+        )
+
+
+def import_run_counts(imported_counts):
+    """Return ``(created_count, updated_count)`` for an ``ImportRun`` row."""
+    created = imported_counts.get("created")
+    updated = imported_counts.get("updated")
+    if created is not None or updated is not None:
+        return created or 0, updated or 0
+    media_total = sum(
+        count
+        for key, count in imported_counts.items()
+        if key not in IMPORT_COUNT_METRIC_KEYS and isinstance(count, int)
+    )
+    return media_total, 0
+
+
+def has_imported_media(imported_counts):
+    """Return whether an importer run changed any media rows."""
+    created, updated = import_run_counts(imported_counts)
+    return created + updated > 0
 
 
 def format_media_type_display(count, media_type):
@@ -69,20 +171,32 @@ def format_import_message(imported_counts, warning_messages=None):
             )
         else:
             # Fallback to standard format if unique tracks not available
-            parts.append(format_media_type_display(music_play_events, MediaTypes.MUSIC.value))
+            parts.append(
+                format_media_type_display(music_play_events, MediaTypes.MUSIC.value)
+            )
 
     # Add other media types (excluding music which we handled above)
     media_type_values = set(MediaTypes.values)
     for media_type, count in imported_counts.items():
         if (
-            media_type == MediaTypes.MUSIC.value
-            or media_type == "music_unique_tracks"
+            media_type in (MediaTypes.MUSIC.value, "music_unique_tracks")
             or media_type not in media_type_values
         ):
             continue
         formatted = format_media_type_display(count, media_type)
         if formatted:
             parts.append(formatted)
+
+    collection_count = imported_counts.get("collection", 0)
+    if collection_count > 0:
+        parts.append(
+            f"{collection_count} collection "
+            f"entr{'ies' if collection_count != 1 else 'y'}",
+        )
+
+    lists_count = imported_counts.get("lists", 0)
+    if lists_count > 0:
+        parts.append(f"{lists_count} list{'s' if lists_count != 1 else ''}")
 
     parts = [p for p in parts if p is not None]
 
@@ -95,6 +209,8 @@ def format_import_message(imported_counts, warning_messages=None):
     metric_mappings = [
         ("created", "created"),
         ("updated", "updated"),
+        ("skipped", "skipped (unchanged)"),
+        ("baseline", "starting playtimes remembered"),
         ("skipped_missing_ids", "skipped (missing IDs)"),
         ("skipped_existing", "skipped (existing)"),
         ("skipped_unknown_type", "skipped (unknown type)"),

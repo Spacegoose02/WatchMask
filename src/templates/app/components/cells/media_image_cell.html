@@ -1,9 +1,8 @@
 {% load app_tags %}
 {% with track_id=media.id|default_if_none:'' %}
-  <img alt="{{ media.item }}"
-       class="lazyload min-w-10 w-10 h-10 object-cover rounded-md{% if not public_view|default:False %} parent-hover-tap:hidden{% endif %}"
-       data-src="{{ media.item.image|default:IMG_NONE }}"
-       src="{{ IMG_NONE }}">
+  <img data-media-artwork loading="lazy" decoding="sync" alt="{{ media.item }}"
+       class="min-w-10 w-10 h-10 object-cover rounded-md{% if not public_view|default:False %} parent-hover-tap:hidden{% endif %}"
+       src="{{ media.item.image|default:IMG_NONE|image_url }}">
   {% if not public_view|default:False %}
     <button class="w-10 h-10 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md transition-colors items-center justify-center hidden cursor-pointer parent-hover-tap:flex"
             hx-get="{% media_view_url 'track_modal' media.item %}"
@@ -14,11 +13,12 @@
 
     {# Track Modal #}
     <div x-show="trackOpen"
+         @mousedown.self="trackOpen = false"
+         x-cloak
          @keydown.escape.window="trackOpen = false"
          class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
       <div class="modal-max-height overflow-y-auto px-4 md:px-0 relative z-60 w-full"
-           style="width: min(96vw, 72rem);"
-           @click.outside="trackOpen = false">
+           style="width: min(96vw, 72rem);">
         <div id="{% component_id 'track' media.item track_id %}"></div>
       </div>
     </div>

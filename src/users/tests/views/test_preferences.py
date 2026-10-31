@@ -1,0 +1,230 @@
+from unittest.mock import patch
+
+from bs4 import BeautifulSoup
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.urls import reverse
+from django.utils import timezone
+
+from app.models import BackfillReconcileState
+
+
+class PreferencesViewTests(TestCase):
+    """Tests for the preferences view."""
+
+    def setUp(self):
+        """Create user for the tests."""
+        self.credentials = {"username": "testuser", "password": "testpass123"}
+        self.user = get_user_model().objects.create_user(**self.credentials)
+        self.client.login(**self.credentials)
+
+    def test_preferences_post_persists_date_format(self):
+        """POSTing a new date_format should persist to the DB, not just render."""
+        response = self.client.post(
+            reverse("preferences"),
+            {"date_format": "m_d_yyyy", "time_format": "hh_mm"},
+        )
+        self.assertRedirects(response, reverse("preferences"))
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.date_format, "m_d_yyyy")
+        self.assertEqual(self.user.time_format, "hh_mm")
+
+    @patch("users.views.tmdb.metadata_languages")
+    @patch("app.tasks.backfill_item_metadata_task.apply_async")
+    def test_language_changes_restart_and_schedule_automatic_metadata_repair(
+        self, mock_schedule, mock_languages,
+    ):
+        mock_languages.return_value = [
+            ("", "Server default"), ("es-ES", "Spanish"), ("fr", "French"),
+        ]
+        for language in ("es-ES", "fr", "es-ES", ""):
+            with self.subTest(language=language):
+                BackfillReconcileState.objects.filter(
+                    key__startswith=f"metadata_language:{self.user.pk}:",
+                ).update(completed_at=timezone.now(), last_cursor_item_id=100)
+                with self.captureOnCommitCallbacks(execute=True):
+                    response = self.client.post(
+                        reverse("preferences"), {"metadata_language": language},
+                    )
+                self.assertEqual(response.status_code, 302)
+                self.user.refresh_from_db()
+                self.assertEqual(self.user.metadata_language, language)
+                state = BackfillReconcileState.objects.get(
+                    key__startswith=f"metadata_language:{self.user.pk}:",
+                )
+                self.assertIsNone(state.completed_at)
+                self.assertEqual(state.last_cursor_item_id, 0)
+        self.assertEqual(mock_schedule.call_count, 4)
+
+        state.completed_at = timezone.now()
+        state.save(update_fields=["completed_at"])
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(reverse("preferences"), {"metadata_language": ""})
+        state.refresh_from_db()
+        self.assertIsNotNone(state.completed_at)
+        self.assertEqual(mock_schedule.call_count, 4)
+
+    def test_preferences_post_can_disable_ratings(self):
+        """Disabled is a rating scale choice and does not change the max used for stored scores."""
+        response = self.client.post(reverse("preferences"), {"rating_scale": "0"})
+        self.assertRedirects(response, reverse("preferences"))
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.rating_scale, "0")
+        self.assertFalse(self.user.ratings_enabled)
+        self.assertEqual(self.user.rating_scale_max, 10)
+        self.assertEqual(self.user.scale_score_for_display(8), 8)
+
+        response = self.client.get(reverse("preferences"))
+        self.assertContains(response, "Disabled")
+
+    def test_preferences_post_persists_theme(self):
+        """POSTing a new theme should persist to the DB."""
+        response = self.client.post(reverse("preferences"), {"theme": "light"})
+        self.assertRedirects(response, reverse("preferences"))
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.theme, "light")
+
+    def test_preferences_post_persists_logo_style(self):
+        """POSTing a supported logo style should persist to the DB."""
+        response = self.client.post(
+            reverse("preferences"),
+            {"logo_style": "monochrome"},
+        )
+        self.assertRedirects(response, reverse("preferences"))
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.logo_style, "monochrome")
+
+    def test_preferences_post_rejects_invalid_logo_style(self):
+        """POSTing an invalid logo style should be ignored."""
+        response = self.client.post(
+            reverse("preferences"),
+            {"logo_style": "neon"},
+        )
+        self.assertRedirects(response, reverse("preferences"))
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.logo_style, "colorful")
+
+    def test_preferences_post_rejects_invalid_theme(self):
+        """POSTing an invalid theme value should be ignored, not persisted."""
+        response = self.client.post(reverse("preferences"), {"theme": "solarized"})
+        self.assertRedirects(response, reverse("preferences"))
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.theme, "system")
+
+    def test_preferences_does_not_manage_home_media_type_label_appearance(self):
+        response = self.client.get(reverse("preferences"))
+
+        self.assertNotContains(response, 'name="home_media_type_chips_enabled"')
+        self.assertNotContains(response, 'name="home_media_type_chip_style"')
+        self.assertNotContains(response, "home_media_type_chip_color_")
+
+    def test_preferences_display_labels_and_logo(self):
+        """The display cards expose the simplified labels and logo choice."""
+        response = self.client.get(reverse("preferences"))
+
+        self.assertContains(response, 'name="logo_style"')
+        self.assertContains(response, "Colorful")
+        self.assertContains(response, "System default — Aug 12, 2025 / 12 Aug 2025")
+        self.assertContains(response, "System default — 6:45 PM / 18:45")
+        self.assertNotContains(response, "System default (locale)")
+        self.assertContains(response, "/static/img/floppy-logo.png")
+        self.assertNotContains(response, "/static/img/floppy-logo-white.png")
+
+    def test_preferences_uses_monochrome_logo_for_authenticated_user(self):
+        """Authenticated branding should follow the saved logo style."""
+        self.user.logo_style = "monochrome"
+        self.user.save(update_fields=["logo_style"])
+
+        response = self.client.get(reverse("preferences"))
+
+        self.assertContains(response, "/static/img/floppy-logo-white.png")
+        self.assertNotContains(response, "/static/img/floppy-logo@2x.png")
+
+    def test_preferences_save_button_is_inside_form(self):
+        """Regression test for #345.
+
+        A stray closing </div> in the template caused browsers to implicitly
+        close the <form> before the submit button, making Save a silent
+        no-op. Django's test client posts form data directly and never
+        catches this, so assert on parsed HTML structure instead.
+        """
+        response = self.client.get(reverse("preferences"))
+        soup = BeautifulSoup(response.content, "html.parser")
+
+        forms = soup.find_all("form")
+        preferences_form = next(
+            (f for f in forms if f.find("input", {"name": "date_format"})),
+            None,
+        )
+        self.assertIsNotNone(preferences_form, "preferences form not found")
+
+        save_button = preferences_form.find("button", {"type": "submit"})
+        self.assertIsNotNone(
+            save_button,
+            "Save button must be inside the preferences <form> or clicking "
+            "it silently does nothing",
+        )
+
+    def test_tracking_dropdown_labels_are_valid_alpine_expressions(self):
+        """Localized choice labels remain valid gettext calls without newlines."""
+        self.user.quick_season_update_mobile = "next_episode"
+        self.user.save(update_fields=["quick_season_update_mobile"])
+
+        labels_by_language = {
+            "en": ("Next Episode button only", "2 weeks"),
+            "de": ("Nur Schaltfläche für die nächste Folge", "2 Wochen"),
+        }
+        for language, (quick_label, session_label) in labels_by_language.items():
+            with self.subTest(language=language):
+                self.user.ui_language = language
+                self.user.save(update_fields=["ui_language"])
+                response = self.client.get(reverse("preferences"))
+                self.assertEqual(response.status_code, 200)
+                soup = BeautifulSoup(response.content, "html.parser")
+
+                controls = (
+                    ("quick_season_update_mobile", "next_episode", quick_label),
+                    ("session_duration", "1209600", session_label),
+                )
+                for field, value, label in controls:
+                    with self.subTest(field=field):
+                        field_input = soup.find("input", {"name": field})
+                        control = field_input.find_parent("div", class_="relative")
+                        expression = control["x-data"]
+                        self.assertIn(f"selectedValue: '{value}'", expression)
+                        self.assertIn(
+                            f"selectedLabel: gettext('{label}')",
+                            expression,
+                        )
+                        # A JavaScript string literal cannot contain a raw newline.
+                        # Keep the original whitespace-regression guard inside the
+                        # gettext wrapper now used for localized Alpine labels.
+                        self.assertRegex(
+                            expression,
+                            r"selectedLabel: gettext\('[^'\r\n]*'\)",
+                        )
+
+    def test_preferences_save_bar_renders_with_dirty_tracking_and_a11y(self):
+        """Regression test for #796.
+
+        The save bar must dynamically track dirty state, initialize with clean
+        text ('All changes saved'), and expose an aria-live region for accessibility.
+        """
+        response = self.client.get(reverse("preferences"))
+        self.assertContains(response, "formDirtyTracker()")
+        self.assertContains(response, 'aria-live="polite"')
+        self.assertContains(response, "All changes saved")
+        self.assertContains(response, "Your preferences are up to date.")
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        preferences_form = soup.find("form", {"x-data": "formDirtyTracker()"})
+        self.assertIsNotNone(preferences_form, "formDirtyTracker form not found")
+        self.assertEqual(preferences_form.get("@input"), "onFormChange()")
+        self.assertEqual(preferences_form.get("@change"), "onFormChange()")
+        self.assertEqual(preferences_form.get("@click"), "onFormChange()")
+
+        save_bar = preferences_form.find("div", class_="preferences-actions")
+        self.assertIsNotNone(save_bar, "preferences-actions save bar not found")
+        live_region = save_bar.find("div", attrs={"aria-live": "polite"})
+        self.assertIsNotNone(live_region, "aria-live region not found in save bar")
+        self.assertEqual(live_region.get("aria-atomic"), "true")

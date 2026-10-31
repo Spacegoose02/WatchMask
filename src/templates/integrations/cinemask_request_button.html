@@ -7,7 +7,7 @@
       {% elif cinemask_request.status == "declined" %}
         {% include "app/icons/circle-x.svg" with classes="w-4 h-4 text-red-400" %}
       {% else %}
-        {% include "app/icons/clock.svg" with classes="w-4 h-4 text-indigo-400" %}
+        {% include "app/icons/clock.svg" with classes="w-4 h-4 text-[var(--color-link)]" %}
       {% endif %}
       {{ cinemask_request.get_status_display }}
     </span>

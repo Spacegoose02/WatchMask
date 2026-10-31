@@ -1,0 +1,384 @@
+{
+  "asyncapi": "3.0.0",
+  "info": {
+    "title": "Watchmask asynchronous channels",
+    "version": "1.0.0",
+    "description": "Verified inbound message channels and Celery queue ownership for a Watchmask instance. Scope is deliberately narrow: polling importers, Apprise notification destinations, and shared base classes are not channels and are excluded.",
+    "contact": {
+      "url": "https://github.com/dannyvfilms/Floppy/issues"
+    },
+    "license": {
+      "name": "AGPL-3.0",
+      "url": "https://www.gnu.org/licenses/agpl-3.0.html"
+    }
+  },
+  "defaultContentType": "application/json",
+  "channels": {
+    "plexWebhook": {
+      "address": "/webhook/plex/{token}",
+      "title": "plexWebhook",
+      "summary": "Plex playback and scrobble webhook.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/plexWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "plex",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "jellyfinWebhook": {
+      "address": "/webhook/jellyfin/{token}",
+      "title": "jellyfinWebhook",
+      "summary": "Jellyfin playback, user-rating, and watched-toggle webhook.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/jellyfinWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "jellyfin",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "embyWebhook": {
+      "address": "/webhook/emby/{token}",
+      "title": "embyWebhook",
+      "summary": "Emby playback webhook.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/embyWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "emby",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "jellyseerrWebhook": {
+      "address": "/webhook/jellyseerr/{token}",
+      "title": "jellyseerrWebhook",
+      "summary": "Jellyseerr request webhook scoped to one user token.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/jellyseerrWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "seerr",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "seerrGlobalWebhook": {
+      "address": "/webhook/seerr/global/",
+      "title": "seerrGlobalWebhook",
+      "summary": "Overseerr or Jellyseerr global webhook. Watchmask resolves the owning user from the payload instead of a token in the path.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/seerrGlobalWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "seerr",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "bingebanditWebhook": {
+      "address": "/webhook/bingebandit/{token}",
+      "title": "bingebanditWebhook",
+      "summary": "BingeBandit JSON webhook: playback.start and playback.finished track progress, player.* events drive Now Playing, and playback.stop saves a resume point.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/bingebanditWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "bingebandit",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "cinemaskWebhook": {
+      "address": "/webhook/cinemask/{token}",
+      "title": "cinemaskWebhook",
+      "summary": "Cinemask request.created and request.available events, which refresh request status and add requests as Planning.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/cinemaskWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "cinemask",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "kodiWebhook": {
+      "address": "/webhook/kodi/{token}",
+      "title": "kodiWebhook",
+      "summary": "Kodi playback webhook.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/kodiWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "kodi",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "stremioAddonSubtitles": {
+      "address": "/stremio-addon/{token}/subtitles/{media_type}/{media_id}.json",
+      "title": "stremioAddonSubtitles",
+      "summary": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Watchmask throttles to one scrobble per item per window.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/stremioAddonSubtitlesRequest"
+        }
+      },
+      "x-floppy-provider": "stremio",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "stremioAddonPlayer": {
+      "address": "/stremio-addon/{token}/player/{media_type}/{media_id}/position=0&duration=0.json",
+      "title": "stremioAddonPlayer",
+      "summary": "Stremio player event carrying a playback position and duration in the extra. Sent on play, pause, and stop, and the one source of a resume position for a client that cannot emit a stop.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/stremioAddonPlayerRequest"
+        }
+      },
+      "x-floppy-provider": "stremio",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "stremioAddonLibrary": {
+      "address": "/stremio-addon/{token}/library/{media_type}/{media_id}/action=watched.json",
+      "title": "stremioAddonLibrary",
+      "summary": "Stremio library change (add, remove, watched, unwatched) for one item, carrying the affected episode ids in `videoId` so a batch arrives as one request.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/stremioAddonLibraryRequest"
+        }
+      },
+      "x-floppy-provider": "stremio",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "listenBrainzSubmitListens": {
+      "address": "/apis/listenbrainz/1/submit-listens",
+      "title": "listenBrainzSubmitListens",
+      "summary": "ListenBrainz-compatible listen submission. Handled synchronously by the REST API, not by the webhook task, and described in OpenAPI as well because it has an exact HTTP wire shape.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/listenBrainzSubmitListensRequest"
+        }
+      },
+      "x-floppy-provider": "listenbrainz"
+    }
+  },
+  "operations": {
+    "receivePlexWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/plexWebhook"
+      },
+      "summary": "Plex playback and scrobble webhook."
+    },
+    "receiveJellyfinWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/jellyfinWebhook"
+      },
+      "summary": "Jellyfin playback, user-rating, and watched-toggle webhook."
+    },
+    "receiveEmbyWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/embyWebhook"
+      },
+      "summary": "Emby playback webhook."
+    },
+    "receiveJellyseerrWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/jellyseerrWebhook"
+      },
+      "summary": "Jellyseerr request webhook scoped to one user token."
+    },
+    "receiveSeerrGlobalWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/seerrGlobalWebhook"
+      },
+      "summary": "Overseerr or Jellyseerr global webhook. Watchmask resolves the owning user from the payload instead of a token in the path."
+    },
+    "receiveBingebanditWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/bingebanditWebhook"
+      },
+      "summary": "BingeBandit JSON webhook: playback.start and playback.finished track progress, player.* events drive Now Playing, and playback.stop saves a resume point."
+    },
+    "receiveCinemaskWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/cinemaskWebhook"
+      },
+      "summary": "Cinemask request.created and request.available events, which refresh request status and add requests as Planning."
+    },
+    "receiveKodiWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/kodiWebhook"
+      },
+      "summary": "Kodi playback webhook."
+    },
+    "receiveStremioAddonSubtitles": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/stremioAddonSubtitles"
+      },
+      "summary": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Watchmask throttles to one scrobble per item per window."
+    },
+    "receiveStremioAddonPlayer": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/stremioAddonPlayer"
+      },
+      "summary": "Stremio player event carrying a playback position and duration in the extra. Sent on play, pause, and stop, and the one source of a resume position for a client that cannot emit a stop."
+    },
+    "receiveStremioAddonLibrary": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/stremioAddonLibrary"
+      },
+      "summary": "Stremio library change (add, remove, watched, unwatched) for one item, carrying the affected episode ids in `videoId` so a batch arrives as one request."
+    },
+    "receiveListenBrainzSubmitListens": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/listenBrainzSubmitListens"
+      },
+      "summary": "ListenBrainz-compatible listen submission. Handled synchronously by the REST API, not by the webhook task, and described in OpenAPI as well because it has an exact HTTP wire shape."
+    }
+  },
+  "components": {
+    "messages": {
+      "plexWebhookRequest": {
+        "name": "plexWebhookRequest",
+        "title": "Plex playback and scrobble webhook.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "jellyfinWebhookRequest": {
+        "name": "jellyfinWebhookRequest",
+        "title": "Jellyfin playback, user-rating, and watched-toggle webhook.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "embyWebhookRequest": {
+        "name": "embyWebhookRequest",
+        "title": "Emby playback webhook.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "jellyseerrWebhookRequest": {
+        "name": "jellyseerrWebhookRequest",
+        "title": "Jellyseerr request webhook scoped to one user token.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "seerrGlobalWebhookRequest": {
+        "name": "seerrGlobalWebhookRequest",
+        "title": "Overseerr or Jellyseerr global webhook. Watchmask resolves the owning user from the payload instead of a token in the path.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "bingebanditWebhookRequest": {
+        "name": "bingebanditWebhookRequest",
+        "title": "BingeBandit JSON webhook: playback.start and playback.finished track progress, player.* events drive Now Playing, and playback.stop saves a resume point.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "cinemaskWebhookRequest": {
+        "name": "cinemaskWebhookRequest",
+        "title": "Cinemask request.created and request.available events, which refresh request status and add requests as Planning.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "kodiWebhookRequest": {
+        "name": "kodiWebhookRequest",
+        "title": "Kodi playback webhook.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "stremioAddonSubtitlesRequest": {
+        "name": "stremioAddonSubtitlesRequest",
+        "title": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Watchmask throttles to one scrobble per item per window.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "stremioAddonPlayerRequest": {
+        "name": "stremioAddonPlayerRequest",
+        "title": "Stremio player event carrying a playback position and duration in the extra. Sent on play, pause, and stop, and the one source of a resume position for a client that cannot emit a stop.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "stremioAddonLibraryRequest": {
+        "name": "stremioAddonLibraryRequest",
+        "title": "Stremio library change (add, remove, watched, unwatched) for one item, carrying the affected episode ids in `videoId` so a batch arrives as one request.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "listenBrainzSubmitListensRequest": {
+        "name": "listenBrainzSubmitListensRequest",
+        "title": "ListenBrainz-compatible listen submission. Handled synchronously by the REST API, not by the webhook task, and described in OpenAPI as well because it has an exact HTTP wire shape.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "floppy"
+      }
+    }
+  },
+  "x-floppy-celery-queues": {
+    "celery": {
+      "summary": "Background work. Default queue for tasks with no explicit override, including webhook processing and metadata backfills.",
+      "defaultPriority": 5,
+      "contentType": "application/x-python-serialize"
+    },
+    "interactive": {
+      "summary": "Latency-sensitive work a user is waiting on. Kept isolated so bulk backfills cannot starve it.",
+      "defaultPriority": 0,
+      "contentType": "application/x-python-serialize"
+    },
+    "discover": {
+      "summary": "Discover cache rebuilds.",
+      "defaultPriority": 9,
+      "contentType": "application/x-python-serialize"
+    }
+  },
+  "x-floppy-worker-plan": {
+    "description": "Queues the background worker consumes at each resource tier. A tier that omits a queue from this list starts a dedicated worker for it instead; no queue is ever dropped.",
+    "byTier": {
+      "minimal": "celery,interactive,discover",
+      "constrained": "celery,discover",
+      "standard": "celery,discover"
+    }
+  }
+}

@@ -1,7 +1,7 @@
-import json
 import logging
 
 from app import live_playback
+from app.log_safety import mapping_keys
 from app.models import MediaTypes, Sources
 
 from .base import BaseWebhookProcessor
@@ -27,11 +27,15 @@ def _ticks_to_seconds(ticks) -> int | None:
 class EmbyWebhookProcessor(BaseWebhookProcessor):
     """Processor for Emby webhook events."""
 
+    SOURCE_LABEL = "emby"
+    TV_IDS_ARE_EPISODE_LEVEL = True
+
     def process_payload(self, payload, user):
         """Process the incoming Emby webhook payload."""
         logger.debug(
-            "Processing Emby webhook payload: %s",
-            json.dumps(payload, indent=2),
+            "Processing Emby webhook payload keys=%s item_keys=%s",
+            mapping_keys(payload),
+            mapping_keys(payload.get("Item")),
         )
 
         event_type = payload.get("Event")
@@ -43,19 +47,51 @@ class EmbyWebhookProcessor(BaseWebhookProcessor):
         logger.info("Extracted IDs from payload: %s", ids)
 
         playback_media_type = self._get_live_playback_media_type(payload)
-        self._update_live_playback_state(payload, user, ids, playback_media_type)
+        playback_context = self._update_live_playback_state(
+            payload,
+            user,
+            ids,
+            playback_media_type,
+        )
+
+        if not self._should_record(
+            EMBY_EVENT_MAP[event_type],
+            played=self._is_played(payload),
+            position_seconds=self._get_position_seconds(payload),
+            duration_seconds=_ticks_to_seconds(
+                (payload.get("Item") or {}).get("RunTimeTicks"),
+            ),
+        ):
+            return
 
         if not any(ids.values()):
             logger.warning("Ignoring Emby webhook call because no ID was found.")
             return
 
-        self._process_media(payload, user, ids)
+        processed_item = self._process_media(payload, user, ids)
+        if event_type == "playback.stop" and processed_item and playback_context:
+            live_playback.store_playback_progress(
+                user.id,
+                item=processed_item,
+                **playback_context,
+            )
 
     def _is_supported_event(self, event_type):
         return event_type in ("playback.start", "playback.stop")
 
     def _is_played(self, payload):
         return payload.get("PlaybackInfo", {}).get("PlayedToCompletion", False) is True
+
+    def _get_position_seconds(self, payload):
+        """Return the playback position in seconds, or None when not sent."""
+        item = payload.get("Item") or {}
+        candidates = (
+            payload.get("PlaybackPositionTicks"),
+            item.get("PlaybackPositionTicks"),
+            (payload.get("PlaybackInfo") or {}).get("PositionTicks"),
+        )
+        # First field present, so a real zero is not mistaken for missing.
+        return _ticks_to_seconds(next((t for t in candidates if t is not None), None))
 
     def _get_media_type(self, payload):
         return self.MEDIA_TYPE_MAPPING.get(payload["Item"].get("Type"))
@@ -118,19 +154,27 @@ class EmbyWebhookProcessor(BaseWebhookProcessor):
             return MediaTypes.MOVIE.value
         return None
 
-    def _update_live_playback_state(  # noqa: C901
-        self, payload, user, ids, playback_media_type,
+    def _playback_rating_key(self, payload):
+        item = payload.get("Item") or {}
+        return str(item.get("Id") or "").strip() or None
+
+    def _update_live_playback_state(
+        self,
+        payload,
+        user,
+        ids,
+        playback_media_type,
     ):
         """Update cache-backed live playback state for home-page UI."""
         event_type = EMBY_EVENT_MAP.get(payload.get("Event"))
         if not event_type:
-            return
+            return None
 
         if playback_media_type not in (
             MediaTypes.MOVIE.value,
             MediaTypes.EPISODE.value,
         ):
-            return
+            return None
 
         item = payload.get("Item", {})
         media_id = None
@@ -140,15 +184,18 @@ class EmbyWebhookProcessor(BaseWebhookProcessor):
         if playback_media_type == MediaTypes.MOVIE.value:
             media_id = ids.get("tmdb_id")
         else:
-            season_number, episode_number = (
-                self._extract_season_episode_from_payload(payload)
+            season_number, episode_number = self._extract_season_episode_from_payload(
+                payload
             )
             # Prefer TVDB/IMDB resolution — they reliably return the
             # show-level TMDB ID via the TMDB find API.
             if ids.get("tvdb_id") or ids.get("imdb_id"):
                 alt_ids = dict(ids)
                 alt_ids["tmdb_id"] = None
-                resolved_id, _, _ = super()._find_tv_media_id(alt_ids)
+                resolved_id, _, _ = super()._find_tv_media_id(
+                    alt_ids,
+                    episode_ids=True,
+                )
                 if resolved_id:
                     media_id = str(resolved_id)
 
@@ -159,6 +206,7 @@ class EmbyWebhookProcessor(BaseWebhookProcessor):
                     ids,
                     series_title=series_title,
                     allow_title_fallback=True,
+                    episode_ids=True,
                 )
                 if resolved_id:
                     media_id = str(resolved_id)
@@ -168,10 +216,12 @@ class EmbyWebhookProcessor(BaseWebhookProcessor):
 
         # Duration / offset from ticks (100 ns units, same as Jellyfin)
         duration_seconds = _ticks_to_seconds(item.get("RunTimeTicks"))
-        offset_seconds = _ticks_to_seconds(
-            payload.get("PlaybackPositionTicks")
-            or item.get("PlaybackPositionTicks"),
-        )
+        offset_seconds = self._get_position_seconds(payload)
+        provider_completed = None
+        if payload.get("Event") == "playback.stop":
+            played = (payload.get("PlaybackInfo") or {}).get("PlayedToCompletion")
+            if isinstance(played, bool):
+                provider_completed = played
 
         live_playback.apply_playback_event(
             user_id=user.id,
@@ -191,4 +241,14 @@ class EmbyWebhookProcessor(BaseWebhookProcessor):
             episode_number=episode_number,
             view_offset_seconds=offset_seconds,
             duration_seconds=duration_seconds,
+            store_progress=event_type != "media.stop",
+            provider_completed=provider_completed,
+            event_ts=getattr(self, "_event_ts", None),
         )
+        return {
+            "event_type": event_type,
+            "playback_media_type": playback_media_type,
+            "view_offset_seconds": offset_seconds,
+            "duration_seconds": duration_seconds,
+            "provider_completed": provider_completed,
+        }

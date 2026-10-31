@@ -1,480 +1,189 @@
-<p align="center"><img src="src/static/img/watchmask-logo.png" alt="Watchmask logo" width="160"></p>
+<p align="center">
+  <img alt="Watchmask" src="src/static/img/floppy-logo@2x.png" width="317" />
+</p>
 
-# Watchmask
+<p align="center">
+  <b>Your own private Trakt, Letterboxd, and Goodreads — in one app, on your own hardware.</b><br>
+  Track movies, TV, anime, books, comics, manga and games in one place, with BingeBandit built in.
+</p>
 
-Watchmask is a self-hosted Trakt replacement built on Yamtrack, with unified History, Time Left / Progress, richer stats, smarter lists, deeper integrations, and the daily-driver polish former Trakt users usually miss.
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="https://github.com/dannyvfilms/Floppy/wiki">Docs (Floppy wiki)</a> ·
+  <a href="https://github.com/Spacegoose02/Yamtrack/releases">Releases</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-> **Naming note:** Watchmask is the new name for this fork. Deployment identifiers such as the `/yamtrack` container paths, `YAMTRACK_*` environment variables, and database names are unchanged, so existing data keeps working. The Docker image is now published as `ghcr.io/spacegoose02/watchmask`; to switch an existing install, change the `image:` line and keep your volumes and environment as they are.
+Watchmask is a self-hosted media tracker and diary for everything you watch, read,
+play, and listen to. Log
+what you finish, see what to pick up next, and get a yearly recap of how you spent
+your time. Connect Plex, Jellyfin, Emby, Pocket Casts, or Last.fm and your history
+fills itself in.
 
-[Demo](https://yamtrack.dannyvfilms.com) | [Docker Image](https://github.com/Spacegoose02/Yamtrack/pkgs/container/watchmask) | [Releases](https://github.com/Spacegoose02/Yamtrack/releases) | [Changelog](CHANGELOG.md)
+It is free and open source. You run it on a computer or server at
+home and open it from any browser, on desktop or phone. Your data never leaves
+your machine unless you connect a service that needs it.
 
-Credentials for Demo:
-- Username: `demo`
-- Password: `demodemo`
+<p align="center">
+  <img alt="A movie's detail page in Watchmask, with backdrop, ratings, and check-in button" src="docs/screenshots/readme/details.jpg" width="880" />
+</p>
 
-## What this fork adds
-
-The fork is built around the workflows Trakt used to cover well: Time Left progress, a unified history feed, recap-style stats, public list sharing, and all-in-one tracking. The sections below show what has been added to get there.
-
-### Major additions
-
-- **Music**: artist and album pages, track-level history and scoring, play-count and listening-time statistics, bulk save and mark-all-listened; MusicBrainz-backed metadata with discography sync and cover art; fully native in history, search, home rows, and collection, not a thin importer.
-- **Podcasts**: dedicated show and episode pages, episode-level tracking, mark-all-played; Pocket Casts account sync as a live integration, not a one-shot file import; podcast listening appears naturally in history, runtime stats, and search.
-- **Collections / owned media**: track what you physically or digitally own with copy-level detail: source, resolution, HDR, format, codec, and bitrate; filtered collection views, per-item collection status tied into detail pages and list/smart-list rules; supports Plex collection sync.
-- **Discover**: personalized recommendation rows that improve with use: genre, studio, cast, and tag affinity built from your library; not-interested and hide feedback that sticks; background refresh so rows stay current, individually refreshable from the UI, not a static recommendations page.
-- **History and statistics**: history rebuilt as a filterable feed with month navigation, media-type and genre filters, inline duplicate-play cleanup, and a delete flow; statistics rebuilt with explicit refresh, compare mode, custom date ranges, top-talent breakdowns, and per-type splits covering TV, film, music, podcasts, and reading with pages read, top authors, reading streaks, and listening time.
-- **Lists: public, social, and smart**: public and private lists, custom slugs, public profile pages; RSS and JSON feeds per list; smart-list rules for collection status, release state, platform, origin, author, and tags; recommendations with approval flow; list completion percentages and media-type breakdowns in the index; Trakt list and watchlist import; sort by rating, progress, release date, last watched, or custom manual order.
-- **Integration coverage**: Plex full library import, watchlist sync, and ratings sync; Pocket Casts account sync; Last.fm history import and live poll; Audiobookshelf account import; Radarr and Sonarr scheduled library sync; Jellyseerr webhook auto-add, each with dedicated settings and status display.
-
-### Minor additions
-
-- **Richer metadata and title control**: localized and original titles switchable per user preference; critic ratings and popularity scores displayed; game-length data; manual metadata overrides; metadata-provider preference; image refresh flows.
-- **People, studios, and credit browsing**: actor, director, author, and studio pages with filmographies and top works; person credits visible from detail pages rather than hidden as tooltip data; author pages with top-read breakdowns.
-- **Better anime handling**: proper separation of anime and TV library concerns so mixed libraries stay organized; anime-specific season and episode navigation; grouped-anime routing for franchise-spanning series.
-- **Richer episode and book workflows**: episode detail pages with individual scoring; bulk episode save; drop an episode without logging it to history; book-specific: barcode and ISBN scanning from a photo, percentage-based reading progress, top-authors stats, and more resilient import flows.
-- **Configurable home screen**: choose what rows appear and in what order; rows from library queries, custom lists, smart lists, or recently played but not rated; direction and media-type filters stored per user.
-- **Configurable table columns**: choose and reorder visible columns per view, with media tables and list-detail tables configured independently; available columns include critic rating, episodes left, time left, time to beat, runtime, time watched, last watched, next air date, date added, popularity, and more.
-- **Scheduled backups and richer export management**: recurring export scheduling with media-type and list inclusion options; export history and backup destination visible in settings.
-- **Account security**: TOTP authenticator setup and management; recovery codes; password recovery via authenticator or recovery code; session duration as a per-user preference.
-
-### Quality-of-life changes
-
-- **Much deeper preferences**: sort modes for critic rating, popularity, runtime, time to beat, plays, time watched, release date, last watched, next air date, and time left; display preferences for duration format, rating scale, stats default range, compare mode, mobile grid density, subtitle visibility on cards, localized vs. original title display, progress-bar visibility, planned-item home visibility, and obfuscating unseen episode titles.
-- **Livelier UI**: a now-playing card showing what is actively playing via Plex, Jellyfin, or Emby webhook; explicit stale and refreshing indicators on history and stats with one-click refresh; lazy-loaded covers and asynchronous fragments throughout.
-- **Better search and add flows**: music-native search that creates artist and album entries from search results; improved anime and localized-title search results.
-- **Deeper filters**: rated and unrated, collected and not collected, caught-up and not-caught-up, no-status, language, country, platform, origin, format, author, tag inclusion, and tag exclusion; smart-list rules use the same expanded vocabulary, making them meaningfully programmable.
-- **More reliable under load**: WAL mode and timeout configuration for SQLite; retry logic for lock and I/O failures; prioritized background task queues for a smoother experience with large libraries.
-- **Integration settings and import UX**: import history and status visible per integration in settings; watchlist-only and collection-update-only import modes; Jellyseerr allowed usernames and defaults persisted as preferences; per-user Plex webhook library selection.
-
-## Screenshots
-
-### Time Left / Progress
-
-The Progress view is built to make active shows, backlog triage, and planning visible at a glance.
-
-<img alt="Time Left progress view" src="https://github.com/user-attachments/assets/ab5594ea-6ddc-4512-9837-87b68ec874c2" />
-
-### History
-
-History keeps watches and listens in one place so recent activity is easy to scan.
-
-<img alt="History page" src="https://github.com/user-attachments/assets/18927954-dd57-40ba-86ef-11ae986cf9ee" />
-
-### Statistics
-
-Statistics are designed for recap-style browsing across time ranges and media types.
-
-<img alt="Statistics dashboard" src="https://github.com/user-attachments/assets/be9da320-d745-45aa-8c6a-23efa66d0c6c" />
-
-### Shareable Lists
-
-Lists can be shared publicly, surfaced on profiles, and used as more than a private backlog.
-
-<img alt="Shareable lists" src="https://github.com/user-attachments/assets/ef13eff1-dc14-4ab6-b5d0-39598a1264ec" />
-
-### Collections / Owned Media
-
-Collections add ownership context alongside tracking, with room for copy-level detail.
+## A look around
 
 <table>
   <tr>
+    <td width="50%" valign="top">
+      <img alt="Home screen with In Progress and Planning rows" src="docs/screenshots/readme/home.jpg" /><br>
+      <b>Home</b> — what you're in the middle of, what's next, and rows you choose.
+    </td>
+    <td width="50%" valign="top">
+      <img alt="Statistics page with hours, streaks, and charts" src="docs/screenshots/readme/statistics.jpg" /><br>
+      <b>Statistics</b> — a recap of your year, by media type, day, and hour.
+    </td>
+  </tr>
+  <tr>
     <td valign="top">
-      <img width="1296" height="643" alt="Screenshot 2026-04-10 at 7 47 58 PM" src="https://github.com/user-attachments/assets/28bdac5a-1678-4144-a227-0d361912882c" />
+      <img alt="Lists page with shareable list covers" src="docs/screenshots/readme/lists.jpg" /><br>
+      <b>Lists</b> — private, public, or smart lists that fill themselves.
     </td>
     <td valign="top">
-      <img width="508" height="631" alt="Screenshot 2026-04-10 at 7 48 52 PM" src="https://github.com/user-attachments/assets/a2c8deb9-2d92-4aaa-b605-758871f36634" />
+      <img alt="Collection page of owned media" src="docs/screenshots/readme/collection.jpg" /><br>
+      <b>Collection</b> — what you own, down to the format and resolution.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <img alt="Release calendar for tracked shows and games" src="docs/screenshots/readme/calendar.jpg" /><br>
+      <b>Calendar</b> — upcoming episodes and releases for everything you track.
+    </td>
+    <td valign="top">
+      <img alt="Watchmask on a phone: home, a movie, and statistics" src="docs/screenshots/readme/mobile.jpg" /><br>
+      <b>On your phone</b> — built for mobile, and installable as an app.
     </td>
   </tr>
 </table>
 
-### Music and Podcasts
+Light and dark themes follow your device; switch with the moon icon or under
+**Settings → Appearance**.
 
-Music and podcasts are treated as first-class parts of the same tracker, not side imports.
+## What it does
 
-<img alt="Music and podcasts" src="https://github.com/user-attachments/assets/0c6da813-d73e-4f7c-9d2b-ba42d65221a7" />
+- **One library for every kind of media.** Movies and TV through to music
+  albums, podcast episodes, board games, and comics — each with pages, progress,
+  and ratings that fit it.
+- **Knows what's next.** In-progress shows show the next episode and time
+  left; the calendar and optional notifications tell you when new ones arrive.
+- **History that fills itself in.** Plays from Plex, Jellyfin, Emby, Pocket
+  Casts, and Last.fm are logged automatically. Manual check-ins take one tap.
+- **Recaps worth reading.** Hours by media type, streaks, top people, and
+  year-over-year comparisons.
+- **Lists you can share.** Public pages, RSS feeds, and smart lists built
+  from rules.
+- **Your collection, too.** Track physical and digital copies alongside what
+  you've watched or read, with Plex collection sync.
+- **Recommendations from your own taste.** Discover rows learn from what you
+  rate and finish, and you can send requests to Seerr in one click.
+- **Bring your history with you.** Import from Trakt, TV Time, Simkl, IMDb,
+  MyAnimeList, AniList, Goodreads, StoryGraph, Steam, PlayStation, Xbox, and
+  more. Export
+  everything to CSV at any time.
 
-## What you still keep from upstream Yamtrack
+The [full feature tour](https://github.com/dannyvfilms/Floppy/wiki/Features) on
+the wiki lists everything, including multi-user accounts, OIDC sign-in, a REST
+API, and an MCP server.
 
-This fork builds on Yamtrack's foundation instead of replacing it. You still keep:
+## Try it
 
-- Tracking for movies, TV, anime, manga, games, books, comics, and board games, plus manual entries for hard-to-find media
-- Multi-user accounts, OIDC and social login support, and per-user tracking data
-- Calendar and iCalendar feeds for upcoming releases
-- Release notifications through Apprise
-- Jellyfin, Plex, and Emby playback integrations
-- Import/export flows for Trakt, Simkl, MyAnimeList, AniList, Kitsu, Yamtrack CSV, and more
-- Docker deployment with SQLite or PostgreSQL
-- CSV export/import and self-hosted control over your data
+The [live demo](https://yamtrack.dannyvfilms.com) is open — sign in with
+username `demo` and password `demodemo`. It's one shared account, so what
+you add is visible to everyone else trying it.
 
-## Quick Start
+## Install
 
-If you already know you want the fork, start here.
+Watchmask runs in Docker. On a machine with Docker installed, paste this into a terminal
+(PowerShell on Windows) and follow the prompts:
 
-### Docker Compose (Recommended)
-
-The easiest way to get started is with Docker Compose. This works well with Portainer stacks or a plain local Docker install.
-
-Important:
-
-- Watchmask uses PostgreSQL only when `DB_HOST` is set.
-- If `DB_HOST` is not set, Watchmask uses SQLite at `/yamtrack/db/db.sqlite3`.
-- `DATABASE_URL` is not currently supported.
-
-**For SQLite (simple setup):**
-
-This single stack runs the app and Redis together — paste it into a Portainer Stack (or an Unraid stack via the Portainer plugin) and deploy, or save it as `docker-compose.yml` and run `docker compose up -d`. Either way, it's a complete, working setup on its own; you only need to edit the placeholder values.
-
-```yaml
-services:
-  yamtrack:
-    image: ghcr.io/spacegoose02/watchmask:latest
-    container_name: yamtrack
-    restart: unless-stopped
-    depends_on:
-      - redis
-    environment:
-      - ALLOWED_HOSTS=yamtrack.yourdomain.com,your.lan.ip.address
-      - DEBUG=False
-      - GUNICORN_THREADS=4
-      - IGDB_ID=your_igdb_client_id
-      - IGDB_SECRET=your_igdb_client_secret
-      - LASTFM_API_KEY=your_lastfm_api_key
-      - MAL_API=your_mal_client_id
-      - PGID=1000
-      - PUID=1000
-      - REDIS_URL=redis://redis:6379
-      - REGISTRATION=True
-      - SECRET=your_django_secret_key
-      - TMDB_API=your_tmdb_api_key
-      - TVDB_API_KEY=your_tvdb_api_key
-      - TZ=America/Chicago
-      - WEB_CONCURRENCY=2
-    volumes:
-      - ./db:/yamtrack/db
-    ports:
-      - "8000:8000"
-
-  redis:
-    image: redis:8-alpine
-    container_name: yamtrack-redis
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    volumes:
-      - redis_data:/data
-
-volumes:
-  redis_data:
+```text
+echo "\" | Out-Null; irm 'https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/scripts/install.ps1' -ErrorAction Stop | iex; #" >/dev/null; bash -c 'p=$(mktemp) || exit; cleanup() { rm -f "$p"; }; trap cleanup EXIT; curl -fsSL https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/scripts/install.sh -o "$p" && bash "$p"'
 ```
 
-Leave `REGISTRATION=True` for your first run so you can create an account, then set it back to `False` and redeploy the stack once you're the only user who needs one — this keeps randos from signing up if your instance is reachable from the internet.
-
-Only the vars above need values you provide; everything else (metadata language/NSFW toggles, build/version info, etc.) ships with sane defaults. See [Environment Variables](#environment-variables) below for the full optional list.
-
-If you use SQLite, you must persist `/yamtrack/db`. Without that mount, recreating the container also recreates an empty database.
-
-Then visit `http://localhost:8000` and log in with the account you created.
-
-**For PostgreSQL (production setup):**
-
-```yaml
-services:
-  yamtrack:
-    image: ghcr.io/spacegoose02/watchmask:latest
-    container_name: yamtrack
-    restart: unless-stopped
-    depends_on:
-      - db
-      - redis
-    environment:
-      - SECRET=your-secret-key-here-change-this
-      - REDIS_URL=redis://redis:6379
-      - TZ=America/New_York
-      - DB_HOST=db
-      - DB_NAME=yamtrack
-      - DB_USER=yamtrack
-      - DB_PASSWORD=change-this-password
-      - DB_PORT=5432
-    ports:
-      - "8000:8000"
-
-  db:
-    image: postgres:16-alpine
-    container_name: yamtrack-db
-    restart: unless-stopped
-    environment:
-      - POSTGRES_DB=yamtrack
-      - POSTGRES_USER=yamtrack
-      - POSTGRES_PASSWORD=change-this-password
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-  redis:
-    image: redis:8-alpine
-    container_name: yamtrack-redis
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-
-volumes:
-  postgres_data:
-  redis_data:
-```
-
-For PostgreSQL, use `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `DB_PORT`. Do not replace these with `DATABASE_URL`; Watchmask falls back to SQLite if `DB_HOST` is missing.
-
-### Docker Run
-
-If you don't have Portainer, paste this into a terminal and you're up and running — no compose file needed:
-
-```bash
-docker network create yamtrack-net
-
-docker run -d \
-  --name yamtrack-redis \
-  --network yamtrack-net \
-  --restart unless-stopped \
-  -v yamtrack-redis-data:/data \
-  redis:8-alpine \
-  redis-server --appendonly yes
-
-docker run -d \
-  --name yamtrack \
-  --network yamtrack-net \
-  --restart unless-stopped \
-  -e ALLOWED_HOSTS=yamtrack.yourdomain.com,your.lan.ip.address \
-  -e DEBUG=False \
-  -e GUNICORN_THREADS=4 \
-  -e IGDB_ID=your_igdb_client_id \
-  -e IGDB_SECRET=your_igdb_client_secret \
-  -e LASTFM_API_KEY=your_lastfm_api_key \
-  -e MAL_API=your_mal_client_id \
-  -e PGID=1000 \
-  -e PUID=1000 \
-  -e REDIS_URL=redis://yamtrack-redis:6379 \
-  -e REGISTRATION=True \
-  -e SECRET=your_django_secret_key \
-  -e TMDB_API=your_tmdb_api_key \
-  -e TVDB_API_KEY=your_tvdb_api_key \
-  -e TZ=America/Chicago \
-  -e WEB_CONCURRENCY=2 \
-  -v yamtrack-db:/yamtrack/db \
-  -p 8000:8000 \
-  ghcr.io/spacegoose02/watchmask:latest
-```
-
-Leave `REGISTRATION=True` for your first run so you can create an account, then set it back to `False` (`docker rm -f yamtrack` and re-run with the updated value, or use `docker update`/recreate) once you're the only user who needs one.
-
-This setup uses named volumes (`yamtrack-db` and `yamtrack-redis-data`) and a shared network (`yamtrack-net`). Only the vars above need values you provide — see [Environment Variables](#environment-variables) for the full optional list. For more options, use Docker Compose.
-
-### Portainer
-
-Portainer users should prefer **Stacks** over **Containers -> Add container**. Stacks let you paste the working compose file directly and avoid missing required volumes or env vars. This is also the recommended path for **Unraid**: rather than installing the app from a Community Applications template and standing up Redis separately, paste one compose file into a stack (via the Portainer plugin) and both containers come up together as a single unit.
-
-**Recommended: Portainer Stacks**
-
-1. In Portainer, go to **Stacks** -> **Add Stack**
-2. Name it `yamtrack`
-3. Paste one of the compose configurations above
-4. Update the `SECRET` environment variable with a secure random string, and fill in whichever metadata API keys you have
-5. Deploy the stack
-6. Create your account while `REGISTRATION=True`, then set it to `False` and redeploy
-
-**If you use Containers -> Add container anyway**
-
-- Always set `SECRET` and `REDIS_URL`.
-- For SQLite, mount persistent storage to `/yamtrack/db`.
-- For PostgreSQL, set `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `DB_PORT` on the Watchmask container.
-- For PostgreSQL, also persist `/var/lib/postgresql/data` on the Postgres container.
-- Publish port `8000` from the container to a host port.
-- Leave `Command` and `Entrypoint` empty unless you know you need to override them.
-
-### Environment Variables
-
-The only universally required variable is `SECRET` for Django's secret key. For Docker installs, you should also set `REDIS_URL` to a reachable Redis instance.
-
-**Optional but recommended:**
-
-- `TMDB_API` - movie and TV metadata from [TMDB](https://www.themoviedb.org/settings/api)
-- `TVDB_API_KEY` / `TVDB_PIN` - TVDB-backed metadata and grouped anime support (`TVDB_PIN` is your **Subscriber PIN**, only required for user-supported API keys)
-- `MAL_API` - MyAnimeList **Client ID** for anime metadata ([register here](https://myanimelist.net/apiconfig))
-- `IGDB_ID` / `IGDB_SECRET` - game metadata from [IGDB](https://www.igdb.com/api)
-- `STEAM_API_KEY` - Steam game imports
-- `BGG_API_TOKEN` - board game metadata from [BoardGameGeek](https://boardgamegeek.com/using_the_xml_api)
-- `HARDCOVER_API` - Hardcover book metadata/imports
-- `COMICVINE_API` - comic metadata
-- `LASTFM_API_KEY` - Last.fm integration and scrobble polling
-- `TRAKT_API` / `TRAKT_API_SECRET` - Trakt private-profile OAuth imports
-- `URLS` - your public URL if using a reverse proxy, for example `https://yamtrack.mydomain.com`
-- `ADMIN_ENABLED` - set to `True` to enable the Django admin interface at `/admin/` (see the [Admin Guide](wiki/6.-Admin-and-Operations.md#admin-guide))
-- `WEB_CONCURRENCY` / `GUNICORN_THREADS` - web server concurrency (defaults: 2 worker processes x 4 threads). Total concurrent requests = workers x threads; keep at least 2 workers so one slow request never blocks the whole UI
-- `DEBUG` - leave unset or `False` in production; enabling it slows every request (debug toolbar, no template caching) and is only meant for troubleshooting
-- `REGISTRATION` - set to `True` to allow new signups (needed for your first account), then set to `False` afterward to stop strangers from registering if your instance is reachable from the internet
-- `ALLOWED_HOSTS` / `PUID` / `PGID` - `ALLOWED_HOSTS` is a comma-separated list of hostnames/IPs Django will accept requests for; `PUID` / `PGID` set the file-ownership user/group inside the container (match your host user, e.g. Unraid's `99`/`100`, if you hit permission errors)
-
-For a complete list, see the [Environment Variables documentation](wiki/6.-Admin-and-Operations.md#environment-variables).
-
-### Persistence Checklist
-
-- SQLite stores the app database at `/yamtrack/db/db.sqlite3`; persist `/yamtrack/db`.
-- PostgreSQL stores its database files at `/var/lib/postgresql/data`; persist that path on the Postgres container.
-- Redis stores sessions and background-task state; resetting Redis can log users out, but it should not delete accounts if the database is persisted.
-- Do not assume `DATABASE_URL` enables PostgreSQL. Watchmask uses Postgres only when `DB_HOST` is set.
-
-Example `.env` file:
-
-```bash
-TMDB_API=API_KEY
-TVDB_API_KEY=TVDB_API_KEY
-TVDB_PIN=SUBSCRIBER_PIN (Optional, only for user-supported keys)
-MAL_API=CLIENT_ID
-IGDB_ID=IGDB_ID
-IGDB_SECRET=IGDB_SECRET
-STEAM_API_KEY=STEAM_API_SECRET
-BGG_API_TOKEN=BGG_API_TOKEN
-HARDCOVER_API=HARDCOVER_API
-COMICVINE_API=COMICVINE_API
-LASTFM_API_KEY=LASTFM_API_KEY
-SECRET=SECRET
-DEBUG=False
-WEB_CONCURRENCY=2
-GUNICORN_THREADS=4
-```
-
-#### Trakt private profile import (OAuth)
-
-If you import from a private Trakt profile, configure OAuth first:
-
-1. Create an app in [Trakt API Apps](https://trakt.tv/oauth/applications).
-2. Add this Redirect URI in the Trakt app:
-   - `https://your_domain.com/import/trakt/private`
-3. Set these environment variables in Watchmask:
-   - `TRAKT_API` = your Trakt client ID
-   - `TRAKT_API_SECRET` = your Trakt client secret
-
-If you run Watchmask behind a reverse proxy, set `URLS=https://your_domain.com` so Watchmask generates the correct external callback URL.
-
-
-### Troubleshooting: I Updated and My Login Is Gone
-
-If an update recreated the container and your account is gone:
-
-1. If you intended to use PostgreSQL, confirm `DB_HOST` is set. `DATABASE_URL` alone will not enable Postgres.
-2. If you intended to use SQLite, confirm `/yamtrack/db` is mounted to persistent storage.
-3. If you were only logged out but can sign in again, Redis/session data was reset; your account database is still intact.
-4. Do not remove database volumes during updates unless you intentionally want a fresh install.
-
-### Reverse Proxy Setup
-
-If you are using a reverse proxy (Nginx, Traefik, Caddy, and so on) and see a `403 Forbidden` error, add your URL to the environment variables:
-
-```yaml
-environment:
-  - URLS=https://yamtrack.mydomain.com
-```
-
-Multiple origins can be specified with commas, for example `https://yamtrack.mydomain.com,https://yamtrack-alt.mydomain.com`.
-
-If Watchmask does not generate the correct callback URLs for authenticating with Anilist and other imports, add this to your environment variables:
-
-```yaml
-environment:
-  - USE_X_FORWARDED=True
-```
-
-> **Note:** If you are using a Cloudflare Tunnel or any HTTPS-terminating proxy, also set `USE_X_FORWARDED_PROTO=True` — otherwise Django cannot detect the correct scheme and CSRF checks will fail.
-
-### Docker Image Tags
-
-The Docker image is available at `ghcr.io/spacegoose02/watchmask` with these tags:
-
-- `:latest` - the latest commit on this fork's `latest` branch
-- `:release` - builds published from GitHub release tags
-- `:vX.Y.Z` - versioned release builds
-- `:dev` - the `dev` branch, which this fork keeps aligned with upstream Yamtrack
-
-## Local Development
-
-If you want to contribute or customize the app locally:
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/Spacegoose02/Yamtrack.git
-   cd Yamtrack
-   ```
-
-2. Start Redis:
-
-   ```bash
-   docker run -d --name redis -p 6379:6379 --restart unless-stopped redis:8-alpine
-   ```
-
-3. Create a `.env` file:
-
-   ```bash
-   TMDB_API=your_key
-   TVDB_API_KEY=your_tvdb_key
-   TVDB_PIN=your_subscriber_pin (Optional)
-   MAL_API=your_mal_client_id
-   IGDB_ID=your_id
-   IGDB_SECRET=your_secret
-   STEAM_API_KEY=your_key
-   BGG_API_TOKEN=your_bgg_token
-   HARDCOVER_API=your_hardcover_token
-   COMICVINE_API=your_comicvine_key
-   LASTFM_API_KEY=your_lastfm_key
-   SECRET=your_secret
-   DEBUG=True
-   ```
-
-4. Install dependencies and initialize the app:
-
-   ```bash
-   python -m pip install -U -r requirements-dev.txt
-   cd src
-   python manage.py migrate
-   python manage.py createsuperuser
-   ```
-
-5. Start services in separate terminals:
-
-   ```bash
-   python manage.py runserver
-   ```
-
-   ```bash
-   celery -A config worker --queues interactive --hostname celery-interactive@%h --loglevel DEBUG
-
-   celery -A config worker --queues celery --beat --scheduler django --hostname celery@%h --loglevel DEBUG
-   ```
-
-   ```bash
-   npx @tailwindcss/cli -i ./static/css/input.css -o ./static/css/main.css --watch
-   ```
-
-Visit `http://localhost:8000` to use your local instance.
-
-The fork also provisions a built-in demo account after migrations:
-
-- Username: `demo`
-- Password: `demodemo`
-
-## Support the Project
-
-- Star the repository if you want to help more people discover the fork.
-- Open an [issue](https://github.com/Spacegoose02/Yamtrack/issues) for bugs or missing migration workflows you run into.
-- Use [GitHub issues](https://github.com/Spacegoose02/Yamtrack/issues) for feature requests and fork-specific improvement ideas.
-- Open a pull request if you want to contribute code, docs, or polish.
+Or use the [Docker Compose example](docs/deployment.md#docker-compose-recommended)
+with the `ghcr.io/spacegoose02/watchmask` image; `SECRET` is the only setting you must fill in.
+[Docker Run](docs/deployment.md#docker-run) and the [deployment reference](docs/deployment.md)
+cover PostgreSQL, reverse proxies, environment variables and upgrades.
+
+Once it is running, open it in your phone's browser and add it to your home screen.
+
+## Privacy and trust
+
+Your library, ratings, and activity stay in the database you run. Watchmask has no
+analytics and no central update check. It does contact metadata providers (such
+as TMDB) to look up titles and artwork, and connected services receive what their
+features need. Run it for yourself or people you trust, and turn off sign-ups
+after creating your account. Details:
+[security notes](docs/security-hardening.md) ·
+[reporting a vulnerability](SECURITY.md).
+
+## Watchmask, Watchmask and Yamtrack
+
+Watchmask is built on [Floppy](https://github.com/dannyvfilms/Floppy), which
+started as a fork of [Yamtrack](https://github.com/FuzzyGrim/Yamtrack). It
+follows Watchmask closely and adds a native [BingeBandit](https://github.com/Spacegoose02/BingeBandit)
+integration (webhook tracking, history import, Play/Resume and Continue
+Watching) and Cinemask requests. Existing Watchmask and Yamtrack data keep
+working; Yamtrack CSV exports import under **Settings → Import**.
+
+## Building on Watchmask
+
+Watchmask has a REST API at `/api/v1` and an [MCP server](mcp_server/) for AI
+assistants. Start with the
+[API and MCP guide](https://github.com/dannyvfilms/Floppy/wiki/7.-API-and-MCP-Server);
+your running instance serves its own API index at `/api/docs/`. Download tools
+can read lists and report owned media ([FlexGet guide](docs/integrations/flexget.md)).
+
+## Support
+
+Report Watchmask bugs on [this repository's issues](https://github.com/Spacegoose02/Yamtrack/issues).
+Thank you to everyone who has contributed to Watchmask, and to Yamtrack before it.
+
+## Configuration and deployment
+
+The full operator reference moved to [docs/deployment.md](docs/deployment.md).
+Links into the old sections of this page land here:
+
+<a name="floppy-cant-reach-redis"></a><a name="sqlite-data-paths"></a><a name="postgresql"></a><a name="environment-variables"></a><a name="running-on-a-small-host"></a><a name="upgrading-container-images"></a><a name="verifying-a-published-image-actually-has-a-fix"></a><a name="reverse-proxy-setup"></a><a name="docker-image-tags"></a>
+
+- [Docker Compose example](docs/deployment.md#docker-compose-recommended) ·
+  [Docker Run](docs/deployment.md#docker-run) ·
+  [Portainer and Unraid](docs/deployment.md#portainer-and-unraid)
+- [SQLite data paths](docs/deployment.md#sqlite-data-paths) ·
+  [SQLite startup and migration preparation](docs/architecture/sqlite-startup.md) ·
+  [PostgreSQL](docs/deployment.md#postgresql) ·
+  [Persistence checklist](docs/deployment.md#persistence-checklist)
+- [Environment variables](docs/deployment.md#environment-variables) ·
+  [Running on a small host](docs/deployment.md#running-on-a-small-host) ·
+  [Reverse proxy setup](docs/deployment.md#reverse-proxy-setup)
+- [Watchmask can't reach Redis](docs/deployment.md#floppy-cant-reach-redis) ·
+  [Startup diagnostics](docs/deployment.md#startup-diagnostics) ·
+  [I updated and my login is gone](docs/deployment.md#troubleshooting-i-updated-and-my-login-is-gone)
+- [Upgrading container images](docs/deployment.md#upgrading-container-images) ·
+  [Verifying a published image](docs/deployment.md#verifying-a-published-image-actually-has-a-fix) ·
+  [Docker image tags](docs/deployment.md#docker-image-tags)
+- Developing locally: [contributing guide](CONTRIBUTING.md#local-development)
 
 ## License
 
-This project is licensed under the AGPL-3.0 License.
+AGPL-3.0.
 
-## Acknowledgments
+## Origins and AI use
 
-This fork is based on [FuzzyGrim/Yamtrack](https://github.com/FuzzyGrim/Yamtrack), which remains the foundation. This repository focuses on the Trakt-replacement, daily-driver direction for users who want a more opinionated and feature-dense Yamtrack experience.
+Watchmask began as a fork of [FuzzyGrim/Yamtrack](https://github.com/FuzzyGrim/Yamtrack)
+and still shares its foundation and data model; this repository keeps the fork
+link. It has since grown into its own project. Thanks to FuzzyGrim and Yamtrack's
+contributors for the groundwork.
+
+Watchmask uses AI coding agents for implementation, tests, and documentation under
+maintainer direction. This describes Watchmask's development, not all inherited
+Yamtrack history. PRs should disclose the model/workflow used and record human
+review only when it actually occurred. Agent reviews and passing checks are
+not independent security certification.

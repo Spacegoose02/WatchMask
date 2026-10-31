@@ -1,0 +1,244 @@
+# Grouped anime
+
+Floppy stores TV-shaped anime as grouped anime: the parent remains an `Item`
+with `media_type="tv"`, while the parent, seasons, and episodes use
+`library_media_type="anime"`. This preserves Floppy's TV season/episode
+history model and keeps the title in the Anime library.
+
+## Which shape the Anime library uses
+
+The Anime library's storage shape follows each user's **Anime Provider**:
+
+- **TMDB or TVDB** (the default) stores anime as grouped anime - a TV-shaped
+  row with a real season and episode tree, exactly like TV Shows.
+- **MyAnimeList** stores flat `Anime` rows, one per cour, with progress but no
+  per-episode history.
+
+The shape is decided once, when a show is first tracked, and then stays put.
+Changing the Anime Provider only affects newly added shows: MAL identity is per
+cour while TMDB/TVDB identity is per show, so the mapping is N:1 and cannot be
+re-derived in bulk without guessing at or dropping history. Existing entries
+keep their shape and keep receiving new plays. The Metadata settings page shows
+how many entries are in the other shape and offers conversion as a separate,
+optional action; anything it cannot convert safely is left alone.
+
+## Where a scrobble lands
+
+Routing is sticky. Once a show has a home in the Anime library - in either
+shape - every later episode goes there, whether or not the Anime-IDs snapshot
+happens to load on that request and whether or not the per-season mapping
+covers that episode. An episode that no MAL entry can accept is dropped with a
+warning rather than opening a row in TV Shows.
+
+Before this rule existed, a show could land in Anime on one episode and in TV
+Shows on the next and accrue progress in both. The **Repair duplicated anime
+libraries** task folds any such pairs back into one row; affected users can
+start it from Metadata settings, and a pair it cannot resolve safely is
+reported and left untouched.
+
+An anime-native id in the payload - an AniDB id from Plex/HAMA or from a
+scrobble client - selects *which entry* the episode belongs to. It never selects
+the shape. When such a payload carries no TMDB or TVDB id, the franchise
+identity is derived from the pinned mapping first, so the rule above still
+decides where the episode lands. The one case that has no choice is a MAL entry
+the mapping gives no TMDB or TVDB identity for: nothing can be resolved or
+classified, so the flat row is the only shape available and the reason is
+logged.
+
+The one exception to stickiness is opt-in. With **Track scrobbled anime per
+episode** (`User.group_scrobbled_anime`, on the Sync to Trackers page) turned on, a
+played episode that routes to a flat MAL entry is instead logged against the
+entry's TMDB season in the grouped shape. An existing flat entry is converted
+first with the same migration as marking an episode by hand. If the mapping has
+no TMDB season, or the migration refuses, the flat entry is updated as before.
+
+`anime_library_mode` is a display setting on top of this. It decides which
+library surfaces grouped anime - Anime, TV Shows, or both - and never changes
+where a scrobble is stored.
+
+## Which paths follow this rule
+
+Every path that can create a show now shares one decision, so a title lands in
+the same library whichever way it arrived. The shared pieces are
+`metadata_resolution.prefers_grouped_anime`,
+`metadata_resolution.find_existing_anime_home` and `grouped_anime.classify`;
+importers compose them through `grouped_anime.AnimeRouteResolver`, which caches
+per run because importers buffer their rows and flush at the end.
+
+| Path | Follows the rule |
+|---|---|
+| Webhooks (Plex, Jellyfin, Emby, Kodi, Stremio) | Yes |
+| Trakt import | Yes, decided once per show and inherited by season and episode rows |
+| Plex import | Yes. A section named "Anime" still routes a title the classifier has no verdict on, but cannot override a positive "not animation" verdict |
+| Stremio import | Yes |
+| Simkl import | Yes. Anime always lands in the Anime library; the old per-import destination option is gone |
+| Sonarr | No, deliberately. Its `seriesType` is a downloader release-parsing mode, not a claim about the title |
+| MyAnimeList, AniList, Kitsu | No, deliberately. These are MAL-identity-native and carry no TMDB/TVDB identity to key the lookup on |
+| Yamtrack CSV | No, deliberately. A CSV import is a restore; the exported bucket is honoured verbatim |
+
+A show whose Anime home is a flat MAL row is skipped by importers that can only
+resolve TMDB identities, rather than being imported as TV: importing it would
+track the same show in both libraries.
+
+To move existing shows between shapes, use the per-show Move action or the
+"Convert anime library shape" task, both of which ask first.
+
+## MyAnimeList Sync
+
+MAL sync projects grouped anime episode history into one update per MAL cour,
+using the AniBridge episode mappings also used by webhooks. Preview and full
+sync use current grouped progress instead of stale migrated flat Anime rows.
+Rewatches do not count as additional episodes. Unmapped episodes are skipped;
+sync does not guess a MAL title from a show name or season number.
+A Planning show with nothing watched is matched through episode 1 of its first
+season and synced as plan to watch; other shows without episode history are
+skipped.
+
+Episode watch-state changes, show/season edits, and bulk episode actions queue
+automatic sync after commit when per-item sync is enabled. Triggers for the
+same show within five seconds collapse into one push, sent after that window. Full sync continues
+to respect the account's status and rating filters. Preview requests unfiltered
+MAL lists so provider-filtered titles are not repeatedly reported as missing.
+
+The Sync to Trackers page restores the complete latest full-sync report from
+the database on every page load. All write results remain visible, alongside
+an "Anime with mapping issues" list naming unresolved episode coordinates.
+Preview also shows these issues before confirmation. A new full sync replaces
+the previous report; per-item sync does not erase it.
+
+Each preview title links to its Floppy detail page and has a checkbox; only
+checked titles are synced. A checked title can instead be set to pull from
+MyAnimeList, which overwrites Floppy's status, progress and score with the MAL
+list values. For grouped anime, only the score is pulled, onto that cour's own
+seasons: its progress comes from episode history, and one MAL cour's status is
+not the whole show's.
+Scheduled and scripted full syncs, which
+post no selection, still sync every entry.
+
+The "Pull into Floppy" list only offers what a sync applies. Pulling progress
+needs "pull higher progress" and never applies to grouped anime; pulling a
+missing rating needs "pull ratings" and does apply to grouped anime. The rating
+lands on the seasons that feed only that MAL entry, never on the show, whose
+rating other cours would inherit; a season split across cours is not rated.
+With "pull higher progress" on, a full sync that cannot load the MyAnimeList
+lists fails without pushing, so a higher count on MAL is never lowered.
+Removing a rating in Floppy, on an entry, show or season, clears it on MAL on
+the next per-item push, so a later pull cannot bring it back. An entry that
+was never rated in Floppy leaves MAL's rating alone.
+
+Preview runs as a read-only Celery task on the background queue. The page starts
+it with a CSRF-protected POST and polls with an expiring, user-bound token, so
+large libraries do not have to finish within a web/proxy request timeout. The
+background worker must be running; restart it along with the web process after
+deploying changes to preview tasks. HTML proxy errors and expired logins are
+reported separately from provider errors.
+
+When AniBridge cannot uniquely map an episode, the Mapping Issues tab accepts
+a MAL title ID and MAL episode number for that grouped episode. These overrides
+are stored as user-scoped `ExternalReference` decisions and take precedence
+over automatic mappings on later previews, full syncs, and per-item syncs.
+Saving the same grouped episode again updates its override. Floppy does not
+guess through ambiguous, split, or ratio mappings because MAL only accepts a
+single watched-episode count.
+
+The repair wizard searches the complete MAL anime catalogue, including titles
+hidden by the normal search preference, then loads the selected title's episode
+count. A single unresolved episode can be mapped independently. When every
+tracked episode in a season is unresolved, "Fix whole season" stores one
+override per episode that still has no mapping, counting from the selected MAL
+episode for the first of them. Episodes that already resolve keep their
+mapping. Gaps in the episode numbers are kept, so an episode watched later
+maps to its own MAL episode.
+
+## Classification policy
+
+The shared classifier is intentionally fail-closed. A title is routed to
+grouped anime only when:
+
+1. TMDB resolves the series and reports the `Animation` genre; and
+2. an exact TMDB, TVDB, or IMDb identifier is present in Kometa's Anime-IDs
+   mapping and has a MAL identity.
+
+Titles that only share a name, are merely animated, or cannot be resolved stay
+in TV. TVDB remains optional; TMDB plus exact Anime-IDs matches are sufficient.
+
+The mapping is pinned to an Anime-IDs commit and canonical JSON digest in
+`integrations/anime_mapping.py`. Workers compile that revision once and cache
+the raw payload, reverse indexes, identity groups, revision, and digest. The
+snapshot is immutable at the classifier boundary. A refresh validates the
+payload before writing a versioned cache entry and last-known-good pointer:
+
+```bash
+python manage.py refresh_anime_mapping \
+  --revision <40-character-commit-sha> \
+  --expected-digest <64-character-sha256>
+```
+
+`--activate` may be used after review to mark a validated snapshot as the
+fallback; changing the production pin still requires a code review and deploy.
+If the pinned source is unavailable, the last-known-good snapshot is used. If
+no valid snapshot exists, grouping is skipped and the item remains TV.
+
+## Integration points
+
+- Stremio library import classifies the resolved TMDB show before creating its
+  TV, season, and episode rows.
+- The Stremio playback-start webhook uses the same classifier before creating
+  the in-progress episode structure.
+- When a grouped anime title has split provider numbering, the importer,
+  Plex history path, and playback webhooks resolve the watched episode through
+  the cached AniBridge v3 graph and accept only a target season belonging to
+  the already-resolved TMDB show. This keeps identities such as TVDB S4E19 →
+  TMDB S1E85 together across integrations. The graph is AniBridge's v3 release
+  asset (`mappings.min.json`), cached in Redis under the key
+  `anibridge_v3_mapping_data` with a 300-second per-process memo in front of
+  it. A source that maps an episode onto more than one distinct target season
+  is ambiguous and is refused rather than resolved by serialisation order.
+- In the Plex import and the webhook paths a missing or ambiguous mapping, or
+  a target season that does not contain the episode, fails open to the existing
+  provider/TMDB recovery paths. The Stremio playback path has no recovery path,
+  so it keeps the source coordinates instead.
+- The importer loads one snapshot per run instead of rebuilding indexes for
+  each series. Webhook tasks do the same for their eligible TV event.
+- Exact IDs that resolve to separate connected-provider groups are reported as
+  `conflicting_exact_external_ids` and left in TV. Multiple MAL seasons are
+  combined only inside one stable `mapping_group_key`.
+- Promotion locks the parent and descendants in primary-key order, checks
+  target collisions inside the transaction, preserves row IDs and user-owned
+  state, and uses the shared race-safe provider-link upsert.
+- Playback-start admission is per-user and Redis-backed: duplicate events are
+  deduplicated, at most eight pending items are admitted, entries expire after
+  ten minutes, and Redis failure returns the normal empty subtitles response
+  without direct dispatch. The 30-minute per-item throttle remains in place.
+- Existing TV trees can be reviewed and promoted in place with:
+
+```bash
+python manage.py classify_grouped_anime --user <username>
+python manage.py classify_grouped_anime --user <username> --apply
+```
+
+The command never changes primary keys or watch-history rows. It aborts an
+individual title when the target anime bucket is already occupied by another
+item, so a collision cannot create duplicate history.
+
+## Validation
+
+The normal application suite remains the source of truth. PostgreSQL row-lock
+coverage is tagged `postgres` and can be run reproducibly with:
+
+```bash
+scripts/test_postgres.sh
+```
+
+The script starts an ephemeral PostgreSQL 16 container and removes only that
+test container on exit. The upstream PR intentionally does not modify CI
+workflow files because this repository rejects workflow changes from fork PRs;
+the maintainer should enable the trusted PostgreSQL service job for the tagged
+test.
+
+## Upstream contribution boundary
+
+The classifier, Stremio integrations, tests, and this document are product
+changes suitable for an upstream pull request. Deployment image workflows,
+private compose files, credentials, and host-specific migration reports stay
+in the downstream fork/deployment branch.

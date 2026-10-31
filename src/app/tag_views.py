@@ -1,16 +1,22 @@
 import json
+from urllib.parse import urlencode
 
 from django.contrib import messages
+from django.db.models import Count
 from django.http import HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, render
 from django.template.loader import render_to_string
+from django.urls import reverse
+from django.utils.translation import gettext
 from django.views.decorators.http import require_GET, require_POST
 
+from app import cache_utils
 from app import statistics as stats
 from app.models import Item, ItemTag, MediaTypes, Tag
 from app.providers import services
 from app.services import metadata_resolution
 from app.templatetags import app_tags
+from users.models import MediaStatusChoices
 
 
 def _detail_request_url(request, *, fragment: str | None = None) -> str:
@@ -59,11 +65,7 @@ def _resolve_detail_tag_implied_genres(
         details = media_metadata.get("details")
         implied_genres = stats._coerce_genre_list(
             media_metadata.get("implied_genres")
-            or (
-                details.get("implied_genres")
-                if isinstance(details, dict)
-                else None
-            ),
+            or (details.get("implied_genres") if isinstance(details, dict) else None),
         )
     if not implied_genres and fallback_implied_genres:
         implied_genres = stats._coerce_genre_list(fallback_implied_genres)
@@ -78,6 +80,7 @@ def _build_detail_tag_sections(
     user,
     fallback_genres=None,
     fallback_implied_genres=None,
+    genre_list_media_type=None,
 ):
     """Return grouped genre and tag preview sections for the media detail action row."""
     sections = []
@@ -89,13 +92,23 @@ def _build_detail_tag_sections(
     )
 
     if genres:
+        genre_list_url = (
+            reverse("medialist", kwargs={"media_type": genre_list_media_type})
+            if genre_list_media_type
+            else None
+        )
         sections.append(
             {
                 "title": "Genres",
                 "entries": [
                     {
                         "label": genre,
-                        "chip_classes": "border-violet-400/18 bg-violet-500/[0.07] text-violet-100",
+                        "chip_classes": "border-violet-400/18 bg-violet-500/[0.07] text-[var(--color-text)]",
+                        "url": (
+                            f"{genre_list_url}?{urlencode({'genre': genre})}"
+                            if genre_list_url
+                            else None
+                        ),
                     }
                     for genre in genres
                 ],
@@ -114,7 +127,7 @@ def _build_detail_tag_sections(
                 "entries": [
                     {
                         "label": genre,
-                        "chip_classes": "border-slate-400/18 bg-slate-500/[0.07] text-slate-100",
+                        "chip_classes": "border-slate-400/18 bg-slate-500/[0.07] text-[var(--color-text)]",
                     }
                     for genre in implied_genres
                 ],
@@ -136,7 +149,7 @@ def _build_detail_tag_sections(
                 "entries": [
                     {
                         "label": theme,
-                        "chip_classes": "border-sky-400/18 bg-sky-500/[0.07] text-sky-100",
+                        "chip_classes": "border-sky-400/18 bg-sky-500/[0.07] text-[var(--color-text)]",
                     }
                     for theme in themes
                 ],
@@ -145,14 +158,13 @@ def _build_detail_tag_sections(
 
     tag_names = []
     is_authenticated_user = getattr(user, "is_authenticated", False)
-    if is_authenticated_user:
-        if item is not None:
-            tag_names = list(
-                ItemTag.objects.filter(item=item, tag__user=user)
-                .select_related("tag")
-                .order_by("tag__name")
-                .values_list("tag__name", flat=True)
-            )
+    if is_authenticated_user and item is not None:
+        tag_names = list(
+            ItemTag.objects.filter(item=item, tag__user=user)
+            .select_related("tag")
+            .order_by("tag__name")
+            .values_list("tag__name", flat=True)
+        )
 
     if is_authenticated_user:
         tag_section = {
@@ -160,13 +172,13 @@ def _build_detail_tag_sections(
             "entries": [
                 {
                     "label": tag_name,
-                    "chip_classes": "border-slate-400/18 bg-slate-500/[0.07] text-slate-100",
+                    "chip_classes": "border-slate-400/18 bg-slate-500/[0.07] text-[var(--color-text)]",
                 }
                 for tag_name in tag_names
             ],
         }
         if not tag_names:
-            tag_section["empty_label"] = "Click to add tags"
+            tag_section["empty_label"] = gettext("Click to add tags")
 
         sections.append(
             tag_section,
@@ -218,6 +230,7 @@ def _render_tag_modal_response(
             "user_tags": _user_tags_for_item(request.user, item),
             "preview_genres_json": json.dumps(preview_genres),
             "preview_implied_genres_json": json.dumps(preview_implied_genres or []),
+            "tag_surface": request.POST.get("tag_surface") or "modal",
         },
         request=request,
     )
@@ -237,6 +250,87 @@ def _render_tag_modal_response(
         request=request,
     )
     return HttpResponse(modal_html + preview_html)
+
+
+TAG_INDEX_LINKABLE_MEDIA_TYPES = {
+    MediaTypes.TV.value,
+    MediaTypes.MOVIE.value,
+    MediaTypes.ANIME.value,
+    MediaTypes.MANGA.value,
+    MediaTypes.GAME.value,
+    MediaTypes.BOOK.value,
+    MediaTypes.COMIC.value,
+    MediaTypes.BOARDGAME.value,
+    MediaTypes.MUSIC.value,
+    MediaTypes.PODCAST.value,
+}
+
+
+@require_GET
+def tag_index(request):
+    """Render a page listing the user's tags with per-media-type usage counts."""
+    sort = request.GET.get("sort") or "name"
+
+    tags = list(
+        Tag.objects.filter(user=request.user).annotate(
+            item_count=Count("item_tags", distinct=True),
+        ),
+    )
+    include_anime, _include_tv = metadata_resolution.anime_library_visibility(
+        request.user,
+    )
+    type_counts = (
+        ItemTag.objects.filter(tag__user=request.user)
+        .values("tag_id", "item__media_type", "item__library_media_type")
+        .annotate(count=Count("id"))
+        .order_by()
+    )
+    counts_by_tag = {}
+    for row in type_counts:
+        media_type = row["item__media_type"]
+        # Grouped anime is a TV item in the anime bucket; the library that
+        # lists it follows the user's anime library mode.
+        if (
+            media_type == MediaTypes.TV.value
+            and row["item__library_media_type"] == MediaTypes.ANIME.value
+            and include_anime
+        ):
+            media_type = MediaTypes.ANIME.value
+        if media_type not in TAG_INDEX_LINKABLE_MEDIA_TYPES:
+            continue
+        counts = counts_by_tag.setdefault(row["tag_id"], {})
+        counts[media_type] = counts.get(media_type, 0) + row["count"]
+
+    # Every status plus "no status", so the list shows what the count counts:
+    # rating-only and tagged-only items sit outside any status view.
+    all_statuses = [
+        value for value in MediaStatusChoices.values if value != MediaStatusChoices.ALL
+    ]
+    for tag in tags:
+        tag.type_breakdown = []
+        for media_type, count in counts_by_tag.get(tag.id, {}).items():
+            query = {"tag": tag.name, "status": [*all_statuses, "no_status"]}
+            if media_type == MediaTypes.MUSIC.value:
+                # Tags sit on tracks, not the default artists view.
+                query["subview"] = "tracks"
+            tag.type_breakdown.append(
+                {
+                    "media_type": media_type,
+                    "count": count,
+                    "url": f"{reverse('medialist', kwargs={'media_type': media_type})}?{urlencode(query, doseq=True)}",
+                },
+            )
+
+    if sort == "count":
+        tags.sort(key=lambda tag: (-tag.item_count, tag.name.lower()))
+    else:
+        tags.sort(key=lambda tag: tag.name.lower())
+
+    return render(
+        request,
+        "app/tag_index.html",
+        {"tags": tags, "sort": sort},
+    )
 
 
 @require_GET
@@ -300,7 +394,9 @@ def tags_modal(
     if preview_genres and list(item.genres or []) != list(preview_genres):
         item.genres = list(preview_genres)
         item_updates.append("genres")
-    if preview_implied_genres and list(getattr(item, "implied_genres", None) or []) != list(preview_implied_genres):
+    if preview_implied_genres and list(
+        getattr(item, "implied_genres", None) or []
+    ) != list(preview_implied_genres):
         item.implied_genres = list(preview_implied_genres)
         item_updates.append("implied_genres")
     if item_updates:
@@ -334,6 +430,7 @@ def tag_item_toggle(request):
     else:
         ItemTag.objects.create(tag=tag, item=item)
         has_tag = True
+    cache_utils.clear_media_list_cache_for_user(request.user.id)
 
     preview_genres = _parse_detail_tag_preview_genres(
         request.POST.get("preview_genres_json"),
@@ -372,6 +469,32 @@ def tag_item_toggle(request):
 
 
 @require_POST
+def tag_bulk_toggle(request):
+    """Add or remove a tag across multiple items for the current user."""
+    tag_name = (request.POST.get("tag_name") or "").strip()
+    action = request.POST.get("action")
+    item_ids = [value for value in request.POST.getlist("item_ids") if value]
+
+    if not tag_name or action not in {"add", "remove"} or not item_ids:
+        return HttpResponseBadRequest(
+            "tag_name, action, and item_ids are required.",
+        )
+
+    tag = get_object_or_404(Tag, user=request.user, name__iexact=tag_name)
+
+    if action == "add":
+        ItemTag.objects.bulk_create(
+            [ItemTag(tag=tag, item_id=item_id) for item_id in item_ids],
+            ignore_conflicts=True,
+        )
+    else:
+        ItemTag.objects.filter(tag=tag, item_id__in=item_ids).delete()
+    cache_utils.clear_media_list_cache_for_user(request.user.id)
+
+    return HttpResponse(status=204)
+
+
+@require_POST
 def tag_create(request):
     """Create a new tag for the user and optionally apply it to an item."""
     name = (request.POST.get("name") or "").strip()
@@ -381,7 +504,9 @@ def tag_create(request):
         return HttpResponseBadRequest("Tag name is required.")
 
     if Tag.objects.filter(user=request.user, name__iexact=name).exists():
-        messages.error(request, f'Tag "{name}" already exists.')
+        messages.error(
+            request, gettext('Tag "%(value_1)s" already exists.') % {"value_1": name}
+        )
     else:
         tag = Tag.objects.create(user=request.user, name=name)
         if item_id:
@@ -390,6 +515,7 @@ def tag_create(request):
                 ItemTag.objects.get_or_create(tag=tag, item=item)
             except Item.DoesNotExist:
                 pass
+        cache_utils.clear_media_list_cache_for_user(request.user.id)
 
     if item_id:
         try:
@@ -424,6 +550,7 @@ def tag_delete(request):
 
     tag = get_object_or_404(Tag, id=tag_id, user=request.user)
     tag.delete()
+    cache_utils.clear_media_list_cache_for_user(request.user.id)
 
     if item_id:
         try:
@@ -444,4 +571,6 @@ def tag_delete(request):
             preview_implied_genres,
         )
 
-    return HttpResponse(status=204)
+    # No item_id: called from a context (e.g. the tag index page) that
+    # swap-removes the tag's own row on any 2xx response.
+    return HttpResponse(status=200)

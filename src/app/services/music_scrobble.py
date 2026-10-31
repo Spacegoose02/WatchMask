@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import Mock
 
 from django.conf import settings
@@ -27,13 +27,32 @@ from app.models import (
 from app.providers import musicbrainz
 from app.services.music import (
     get_artist_hero_image,
+    populate_album_implied_genres,
     prefetch_album_covers,
     refresh_album_cover_art,
+    store_matched_genres,
     sync_artist_discography,
     sync_music_item_genres_from_album,
 )
+from integrations import import_progress
 
 logger = logging.getLogger(__name__)
+
+# MusicBrainz MBIDs are UUIDs (36 chars); shorter values are not valid IDs.
+MUSICBRAINZ_MBID_MIN_LENGTH = 30
+
+# A MusicBrainz search returning more results than this is considered too
+# noisy to reliably auto-attach MBIDs from.
+NOISY_SEARCH_RESULT_THRESHOLD = 50
+
+# Maximum allowed difference (in milliseconds) between two track durations
+# for them to be considered a match ("within 2 seconds").
+DURATION_MATCH_TOLERANCE_MS = 2000
+
+# Lengths of the partial-date strings MusicBrainz can return for a release
+# date: "YYYY" or "YYYY-MM" (a full "YYYY-MM-DD" needs no adjustment).
+DATE_STR_LEN_YEAR_ONLY = 4
+DATE_STR_LEN_YEAR_MONTH = 7
 
 
 @dataclass
@@ -51,6 +70,13 @@ class MusicPlaybackEvent:
     completed: bool = False
     played_at: timezone.datetime | None = None
     defer_cover_prefetch: bool = False
+    # How this play was created ("koito", "lastfm", "listenbrainz", "manual",
+    # …). Distinct from ResolvedMusicMetadata.source (the metadata provider,
+    # e.g. "musicbrainz") and stored on Music.entry_source.
+    entry_source: str = ""
+    # ListenBrainz additional_info.origin_url. Empty when the client
+    # did not send one. Hooks key off this; core code does not.
+    origin_url: str = ""
 
 
 @dataclass
@@ -80,13 +106,78 @@ class ResolvedMusicMetadata:
     artist_image: str = ""
 
 
+def is_duplicate_scrobble(
+    user,
+    played_at_uts: int,
+    artist_name: str,
+    track_title: str,
+    album_title: str | None,
+) -> bool:
+    """Check if a scrobble has already been recorded.
+
+    Matches on (user, played_at_uts, artist, track, album) to prevent duplicates
+    from pagination overlap, API inconsistencies, or the same listen arriving
+    through more than one ingest path.
+
+    Args:
+        user: User instance
+        played_at_uts: Unix timestamp in seconds
+        artist_name: Artist name
+        track_title: Track title
+        album_title: Album title, or None when unknown
+
+    Returns:
+        True if duplicate found, False otherwise
+    """
+    # Convert Unix timestamp to datetime for comparison
+    try:
+        played_at = datetime.fromtimestamp(played_at_uts, tz=UTC)
+        played_at = timezone.localtime(played_at)
+    except (ValueError, TypeError, OSError):
+        return False
+
+    # Find existing Music entries with same end_date (within 1 second tolerance
+    # for timezone conversion) and matching artist/track/album
+    existing = Music.objects.filter(
+        user=user,
+        end_date__gte=played_at - timedelta(seconds=1),
+        end_date__lte=played_at + timedelta(seconds=1),
+    ).select_related("artist", "album", "track")
+
+    for music in existing:
+        # Check exact match on all fields
+        if (
+            music.artist
+            and music.artist.name == artist_name
+            and music.track
+            and music.track.title == track_title
+        ):
+            # Album match (can be None)
+            music_album = music.album.title if music.album else None
+            if music_album == album_title or (not music_album and not album_title):
+                return True
+
+    return False
+
+
 def record_music_playback(event: MusicPlaybackEvent) -> Music | None:
     """Record a music play or scrobble.
 
     This resolves canonical metadata (MusicBrainz when possible), ensures
     Artist/Album/Track/Item existence, and updates the per-user Music row.
+    Provider enrichment (artist lookup, discography sync and cover prefetch)
+    runs after that transaction commits: it makes several rate-limited HTTP
+    requests, and holding SQLite's single write lock across them starves every
+    other writer until the network finishes. An album saved without genres is
+    then filled from its MusicBrainz release group, outside the write
+    transaction.
+    The play then copies the album's genres, or the artist's when the album still
+    has none. After that, any genre list found on the album, item, track, or
+    artist is stored on the others that are still empty.
+    A client origin URL is stored on the Music row when the scrobble sent one,
+    in the same save as the play so history gets one row per play.
     """
-    played_at = event.played_at or timezone.now().replace(second=0, microsecond=0)
+    played_at = event.played_at or timezone.now()
 
     if getattr(event, "defer_cover_prefetch", False):
         recording_id = event.external_ids.get("musicbrainz_recording")
@@ -123,31 +214,87 @@ def record_music_playback(event: MusicPlaybackEvent) -> Music | None:
     with transaction.atomic():
         artist, artist_created, artist_mbid_attached = _get_or_create_artist(metadata)
         album, album_created = _get_or_create_album(metadata, artist)
+        # Creating the item copies the artist's genres onto an empty album, so
+        # note now whether the release group still needs to be asked.
+        album_needs_genre_fill = bool(
+            not album.genres and album.musicbrainz_release_group_id
+        )
         track = _get_or_create_track(metadata, album)
         item = _get_or_create_item(metadata, track, album)
-        music = _update_music_entry(event, metadata, item, artist, album, track, played_at)
+        music = _update_music_entry(
+            event, metadata, item, artist, album, track, played_at
+        )
         if music is None:
             return None
         _ensure_trackers(event.user, artist, album, played_at)
 
-        if metadata.musicbrainz_artist_id and not getattr(event, "defer_cover_prefetch", False):
-            _sync_artist_metadata(artist, metadata.musicbrainz_artist_id, force=artist_created)
-            if (
-                (artist_created or artist_mbid_attached or album_created)
-                and not _is_various_artist(artist)
-            ):
-                try:
-                    sync_artist_discography(artist, force=artist_created or artist_mbid_attached)
-                    dedupe_artist_albums(artist)
-                    force_cover_prefetch = True
-                except Exception as exc:  # pragma: no cover - defensive network guard
-                    logger.debug("Failed discography sync for %s: %s", artist, exception_summary(exc))
-        elif not getattr(event, "defer_cover_prefetch", False):
-            _enrich_missing_artist_metadata(artist, album, track, music, metadata)
+    enrich = not getattr(event, "defer_cover_prefetch", False)
+    if enrich and metadata.musicbrainz_artist_id:
+        _sync_artist_metadata(
+            artist, metadata.musicbrainz_artist_id, force=artist_created
+        )
+        if (
+            artist_created or artist_mbid_attached or album_created
+        ) and not _is_various_artist(artist):
+            try:
+                sync_artist_discography(
+                    artist, force=artist_created or artist_mbid_attached
+                )
+                dedupe_artist_albums(artist)
+                force_cover_prefetch = True
+            except Exception as exc:  # pragma: no cover - defensive network guard
+                logger.debug(
+                    "Failed discography sync for %s: %s",
+                    artist,
+                    exception_summary(exc),
+                )
+    elif enrich:
+        _enrich_missing_artist_metadata(artist, album, track, music, metadata)
 
-        if not getattr(event, "defer_cover_prefetch", False):
-            _maybe_refresh_album_cover(album)
-            _prefetch_missing_covers(artist, force=force_cover_prefetch)
+    if enrich:
+        _maybe_refresh_album_cover(album)
+        _prefetch_missing_covers(artist, force=force_cover_prefetch)
+
+    if album and enrich:
+        if album_needs_genre_fill:
+            try:
+                # The album may already hold the artist's genres, which
+                # populate_album_implied_genres would keep, so put the release
+                # group's own list on the album first.
+                release_group_genres = musicbrainz.get_release_group_genres(
+                    album.musicbrainz_release_group_id,
+                )
+                if release_group_genres:
+                    album.genres = list(release_group_genres)
+                    album.save(update_fields=["genres"])
+                populate_album_implied_genres(album)
+            except Exception as exc:  # pragma: no cover - defensive network guard
+                logger.debug(
+                    "Failed album genre fill for %s: %s",
+                    album,
+                    exception_summary(exc),
+                )
+        sync_music_item_genres_from_album(item, album)
+
+    if event.completed:
+        from app.signals_music import music_listen_recorded
+
+        # send_robust: a failing hook is logged, never a failed scrobble.
+        for receiver, result in music_listen_recorded.send_robust(
+            sender=Music, music=music, event=event
+        ):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Music listen hook %r failed: %s",
+                    receiver,
+                    exception_summary(result),
+                )
+
+    # A listen hook may have written genres, so match them after it has run.
+    for row in (item, album, track, artist):
+        if row is not None and row.pk:
+            row.refresh_from_db(fields=["genres"])
+    store_matched_genres(artist=artist, album=album, track=track, item=item)
 
     return music
 
@@ -161,7 +308,11 @@ def _resolve_metadata(event: MusicPlaybackEvent) -> ResolvedMusicMetadata:
 
     # Ignore obviously invalid MBIDs up front to avoid noisy lookups unless recording is mocked
     recording_is_mocked = isinstance(musicbrainz.recording, Mock)
-    if recording_id and len(str(recording_id)) < 30 and not recording_is_mocked:
+    if (
+        recording_id
+        and len(str(recording_id)) < MUSICBRAINZ_MBID_MIN_LENGTH
+        and not recording_is_mocked
+    ):
         recording_id = None
         event.external_ids["musicbrainz_recording"] = None
 
@@ -203,7 +354,9 @@ def _resolve_metadata(event: MusicPlaybackEvent) -> ResolvedMusicMetadata:
             metadata.source = Sources.MANUAL.value
             _populate_from_search(metadata)
     elif release_id or release_group_id:
-        success = _populate_from_release(metadata, release_id, release_group_id, event.track_title)
+        success = _populate_from_release(
+            metadata, release_id, release_group_id, event.track_title
+        )
         if not success:
             metadata.musicbrainz_release_id = None
             metadata.musicbrainz_release_group_id = None
@@ -232,20 +385,28 @@ def _resolve_metadata(event: MusicPlaybackEvent) -> ResolvedMusicMetadata:
     return metadata
 
 
-def _populate_from_recording(metadata: ResolvedMusicMetadata, recording_id: str) -> bool:
+def _populate_from_recording(
+    metadata: ResolvedMusicMetadata, recording_id: str
+) -> bool:
     """Apply MusicBrainz recording metadata."""
     try:
         recording = musicbrainz.recording(recording_id)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Failed to fetch recording %s: %s", recording_id, exception_summary(exc))
+        logger.debug(
+            "Failed to fetch recording %s: %s", recording_id, exception_summary(exc)
+        )
         return False
 
     metadata.musicbrainz_recording_id = recording_id
     metadata.track_title = recording.get("title") or metadata.track_title
     metadata.artist_name = recording.get("_artist_name") or metadata.artist_name
     metadata.album_title = recording.get("_album_title") or metadata.album_title
-    metadata.musicbrainz_artist_id = recording.get("_artist_id") or metadata.musicbrainz_artist_id
-    metadata.musicbrainz_release_id = recording.get("_album_id") or metadata.musicbrainz_release_id
+    metadata.musicbrainz_artist_id = (
+        recording.get("_artist_id") or metadata.musicbrainz_artist_id
+    )
+    metadata.musicbrainz_release_id = (
+        recording.get("_album_id") or metadata.musicbrainz_release_id
+    )
     metadata.track_genres = recording.get("genres") or metadata.track_genres
 
     details = recording.get("details") or {}
@@ -284,13 +445,17 @@ def _populate_from_release(
     try:
         release = musicbrainz.get_release(release_lookup_id)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Failed to fetch release %s: %s", release_lookup_id, exception_summary(exc))
+        logger.debug(
+            "Failed to fetch release %s: %s", release_lookup_id, exception_summary(exc)
+        )
         return False
 
     metadata.musicbrainz_release_id = release_lookup_id
     metadata.artist_name = release.get("artist_name") or metadata.artist_name
     metadata.album_title = release.get("title") or metadata.album_title
-    metadata.musicbrainz_artist_id = release.get("artist_id") or metadata.musicbrainz_artist_id
+    metadata.musicbrainz_artist_id = (
+        release.get("artist_id") or metadata.musicbrainz_artist_id
+    )
     metadata.album_genres = release.get("genres") or metadata.album_genres
 
     parsed_release_date = _parse_release_date(release.get("release_date"))
@@ -306,7 +471,9 @@ def _populate_from_release(
         metadata.duration_ms,
     )
     if track:
-        metadata.musicbrainz_recording_id = track.get("recording_id") or metadata.musicbrainz_recording_id
+        metadata.musicbrainz_recording_id = (
+            track.get("recording_id") or metadata.musicbrainz_recording_id
+        )
         metadata.track_title = track.get("title") or metadata.track_title
         metadata.track_number = track.get("track_number")
         metadata.disc_number = track.get("disc_number") or metadata.disc_number
@@ -325,7 +492,10 @@ def _populate_from_search(metadata: ResolvedMusicMetadata) -> None:
     if metadata.artist_name:
         query_parts.insert(0, metadata.artist_name)
     # Only include album if it's meaningful (not a placeholder)
-    if metadata.album_title and metadata.album_title not in ("Unknown Album", "Unknown"):
+    if metadata.album_title and metadata.album_title not in (
+        "Unknown Album",
+        "Unknown",
+    ):
         query_parts.append(metadata.album_title)
 
     query = " ".join(part for part in query_parts if part)
@@ -338,7 +508,9 @@ def _populate_from_search(metadata: ResolvedMusicMetadata) -> None:
             (results or {}).get("total_results"),
         )
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Music search failed for query '%s': %s", query, exception_summary(exc))
+        logger.debug(
+            "Music search failed for query '%s': %s", query, exception_summary(exc)
+        )
         return
 
     expected_artist = _normalize(metadata.artist_name or "")
@@ -350,7 +522,7 @@ def _populate_from_search(metadata: ResolvedMusicMetadata) -> None:
     _log_search_candidates(query, result_list[:5])
 
     # If search is extremely noisy, avoid attaching MBIDs
-    if (results.get("total_results") or 0) > 50:
+    if (results.get("total_results") or 0) > NOISY_SEARCH_RESULT_THRESHOLD:
         logger.debug(
             "Skipping MBIDs due to high result count (%s) for query '%s'",
             results.get("total_results"),
@@ -364,9 +536,8 @@ def _populate_from_search(metadata: ResolvedMusicMetadata) -> None:
         res_title = _normalize(result.get("title") or metadata.track_title or "")
 
         # Require track title match when present
-        if expected_track:
-            if not res_title or res_title != expected_track:
-                continue
+        if expected_track and (not res_title or res_title != expected_track):
+            continue
 
         artist_match = False
         if artist_is_various:
@@ -395,9 +566,15 @@ def _populate_from_search(metadata: ResolvedMusicMetadata) -> None:
         metadata.album_title = result.get("album_title") or metadata.album_title
         # Avoid attaching artist MBID for Various Artists comps
         if not artist_is_various:
-            metadata.musicbrainz_artist_id = result.get("artist_id") or metadata.musicbrainz_artist_id
-        metadata.musicbrainz_release_id = result.get("release_id") or metadata.musicbrainz_release_id
-        metadata.musicbrainz_release_group_id = result.get("release_group_id") or metadata.musicbrainz_release_group_id
+            metadata.musicbrainz_artist_id = (
+                result.get("artist_id") or metadata.musicbrainz_artist_id
+            )
+        metadata.musicbrainz_release_id = (
+            result.get("release_id") or metadata.musicbrainz_release_id
+        )
+        metadata.musicbrainz_release_group_id = (
+            result.get("release_group_id") or metadata.musicbrainz_release_group_id
+        )
         if result.get("duration_minutes") and not metadata.duration_ms:
             metadata.duration_ms = int(result["duration_minutes"] * 60000)
         metadata.source = Sources.MUSICBRAINZ.value
@@ -419,7 +596,7 @@ def _match_release_track(tracks, track_title: str, duration_ms: int | None):
             if not track.get("duration_ms"):
                 continue
             diff = abs(track["duration_ms"] - duration_ms)
-            if diff <= 2000:  # within 2 seconds
+            if diff <= DURATION_MATCH_TOLERANCE_MS:  # within 2 seconds
                 return track
 
     return tracks[0]
@@ -433,7 +610,9 @@ def _get_or_create_artist(metadata: ResolvedMusicMetadata) -> tuple[Artist, bool
     attached_mbid = False
 
     if metadata.musicbrainz_artist_id:
-        artist = Artist.objects.filter(musicbrainz_id=metadata.musicbrainz_artist_id).first()
+        artist = Artist.objects.filter(
+            musicbrainz_id=metadata.musicbrainz_artist_id
+        ).first()
         # If the MBID we found belongs to an artist whose name doesn't resemble the Plex artist, ignore it
         if artist:
             resolved_name = _normalize(artist.name)
@@ -461,7 +640,9 @@ def _get_or_create_artist(metadata: ResolvedMusicMetadata) -> tuple[Artist, bool
         )
         if not artist:
             # Do NOT reuse an existing MBID-carrying artist when no MBID was supplied
-            artist_with_mbid = Artist.objects.filter(name__iexact=name, musicbrainz_id__isnull=False).first()
+            artist_with_mbid = Artist.objects.filter(
+                name__iexact=name, musicbrainz_id__isnull=False
+            ).first()
             if artist_with_mbid:
                 logger.debug(
                     "Skipping existing artist with MBID %s for name '%s' due to missing MBID in payload",
@@ -496,7 +677,9 @@ def _get_or_create_artist(metadata: ResolvedMusicMetadata) -> tuple[Artist, bool
     return artist, created, attached_mbid
 
 
-def _get_or_create_album(metadata: ResolvedMusicMetadata, artist: Artist) -> tuple[Album, bool]:
+def _get_or_create_album(
+    metadata: ResolvedMusicMetadata, artist: Artist
+) -> tuple[Album, bool]:
     """Get or create an Album for the track."""
     title = metadata.album_title or "Unknown Album"
     album = None
@@ -561,7 +744,8 @@ def _get_or_create_album(metadata: ResolvedMusicMetadata, artist: Artist) -> tup
 
     # Find all albums with the same normalized title for deduplication
     matching_albums = [
-        a for a in Album.objects.filter(artist=artist)
+        a
+        for a in Album.objects.filter(artist=artist)
         if _normalize(a.title) == normalized_title
     ]
     if len(matching_albums) > 1:
@@ -580,7 +764,9 @@ def _get_or_create_track(metadata: ResolvedMusicMetadata, album: Album) -> Track
         if not normalized_title:
             return None
         if metadata.track_number:
-            by_number = album.tracklist.filter(track_number=metadata.track_number).first()
+            by_number = album.tracklist.filter(
+                track_number=metadata.track_number
+            ).first()
             if by_number:
                 return by_number
         for existing in album.tracklist.all():
@@ -639,10 +825,13 @@ def _get_or_create_track(metadata: ResolvedMusicMetadata, album: Album) -> Track
 
 def _dedupe_null_tracks(album: Album, keep_track: Track, normalized_title: str) -> None:
     """Delete duplicate tracks on the album that lack track_number but match the title."""
-    duplicates = []
-    for extra in album.tracklist.exclude(id=keep_track.id).filter(track_number__isnull=True):
-        if _normalize(extra.title) == normalized_title:
-            duplicates.append(extra.id)
+    duplicates = [
+        extra.id
+        for extra in album.tracklist.exclude(id=keep_track.id).filter(
+            track_number__isnull=True
+        )
+        if _normalize(extra.title) == normalized_title
+    ]
     if duplicates:
         album.tracklist.filter(id__in=duplicates).delete()
         logger.debug(
@@ -655,7 +844,9 @@ def _dedupe_null_tracks(album: Album, keep_track: Track, normalized_title: str) 
 
 def is_incomplete_album(album: Album) -> bool:
     """Heuristic to detect placeholder/partial albums that should be replaced."""
-    missing_mb = not album.musicbrainz_release_id and not album.musicbrainz_release_group_id
+    missing_mb = (
+        not album.musicbrainz_release_id and not album.musicbrainz_release_group_id
+    )
     sparse_tracks = (album.tracklist.count() <= 1) or not album.tracks_populated
     missing_image = (not album.image) or album.image == settings.IMG_NONE
     return missing_mb and sparse_tracks and missing_image
@@ -672,10 +863,14 @@ def dedupe_artist_albums(artist: Artist) -> None:
     for norm, group in groups.items():
         if len(group) <= 1:
             continue
-        preferred = next((a for a in group if Music.objects.filter(album=a).exists()), group[0])
+        preferred = next(
+            (a for a in group if Music.objects.filter(album=a).exists()), group[0]
+        )
         identity_groups: dict[str | None, list[Album]] = {}
         for album in group:
-            identity = album.musicbrainz_release_group_id or album.musicbrainz_release_id
+            identity = (
+                album.musicbrainz_release_group_id or album.musicbrainz_release_id
+            )
             identity_groups.setdefault(identity, []).append(album)
 
         non_null_identities = [key for key in identity_groups if key]
@@ -684,7 +879,11 @@ def dedupe_artist_albums(artist: Artist) -> None:
                 albums_with_identity = identity_groups[identity]
                 if len(albums_with_identity) <= 1:
                     continue
-                keep_album = preferred if preferred in albums_with_identity else albums_with_identity[0]
+                keep_album = (
+                    preferred
+                    if preferred in albums_with_identity
+                    else albums_with_identity[0]
+                )
                 _dedupe_albums(artist, albums_with_identity, keep_album, norm)
             continue
 
@@ -708,18 +907,31 @@ def _dedupe_albums(
     for dup in duplicates:
         # Merge metadata from dup into primary if missing
         meta_updates = {}
-        if (not primary.image or primary.image == settings.IMG_NONE) and dup.image and dup.image != settings.IMG_NONE:
+        if (
+            (not primary.image or primary.image == settings.IMG_NONE)
+            and dup.image
+            and dup.image != settings.IMG_NONE
+        ):
             meta_updates["image"] = dup.image
         if not primary.musicbrainz_release_id and dup.musicbrainz_release_id:
             meta_updates["musicbrainz_release_id"] = dup.musicbrainz_release_id
-        if not primary.musicbrainz_release_group_id and dup.musicbrainz_release_group_id:
+        if (
+            not primary.musicbrainz_release_group_id
+            and dup.musicbrainz_release_group_id
+        ):
             # Double-check no conflict before setting
-            conflict = Album.objects.filter(
-                artist=artist,
-                musicbrainz_release_group_id=dup.musicbrainz_release_group_id,
-            ).exclude(id=primary.id).first()
+            conflict = (
+                Album.objects.filter(
+                    artist=artist,
+                    musicbrainz_release_group_id=dup.musicbrainz_release_group_id,
+                )
+                .exclude(id=primary.id)
+                .first()
+            )
             if not conflict:
-                meta_updates["musicbrainz_release_group_id"] = dup.musicbrainz_release_group_id
+                meta_updates["musicbrainz_release_group_id"] = (
+                    dup.musicbrainz_release_group_id
+                )
             else:
                 logger.debug(
                     "Skipping musicbrainz_release_group_id for primary album '%s' (id=%s): "
@@ -756,7 +968,9 @@ def _dedupe_albums(
 
         # Reassign album trackers
         for tracker in AlbumTracker.objects.filter(album=dup):
-            existing = AlbumTracker.objects.filter(user=tracker.user, album=primary).first()
+            existing = AlbumTracker.objects.filter(
+                user=tracker.user, album=primary
+            ).first()
             if existing:
                 if tracker.start_date and (
                     not existing.start_date or tracker.start_date < existing.start_date
@@ -848,7 +1062,9 @@ def _choose_primary_album(albums: list[Album], preferred: Album) -> Album:
     return best
 
 
-def _match_track_in_album(album: Album, source_track: Track, strict: bool = False) -> Track | None:
+def _match_track_in_album(
+    album: Album, source_track: Track, strict: bool = False
+) -> Track | None:
     """Find a track in album matching source by number or normalized title."""
     if source_track.track_number:
         match = album.tracklist.filter(track_number=source_track.track_number).first()
@@ -909,6 +1125,14 @@ def _get_or_create_item(
     return item
 
 
+def _storable_origin_url(event: MusicPlaybackEvent) -> str:
+    """Return the event's origin URL, or "" when it would not fit the column."""
+    url = event.origin_url
+    if len(url) > Music._meta.get_field("origin_url").max_length:
+        return ""
+    return url
+
+
 def _update_music_entry(
     event: MusicPlaybackEvent,
     metadata: ResolvedMusicMetadata,
@@ -940,7 +1164,15 @@ def _update_music_entry(
             "progress": 1,
             "start_date": played_at,
             "end_date": played_at,
+            "entry_source": event.entry_source,
+            "origin_url": _storable_origin_url(event),
         }
+        import_run_id = import_progress.get_current_import_run_id()
+        if import_run_id:
+            # get_or_create() only applies defaults on creation, so a fresh
+            # row can be fully populated (and thus never hit the `changed`
+            # save() below) -- tag provenance here too, not only there.
+            defaults["import_run_id"] = import_run_id
 
         music, created = Music.objects.get_or_create(
             item=item,
@@ -967,6 +1199,9 @@ def _update_music_entry(
         changed = True
     if music.track_id != track.id:
         music.track = track
+        changed = True
+    if event.entry_source and music.entry_source != event.entry_source:
+        music.entry_source = event.entry_source
         changed = True
 
     if event.completed:
@@ -1004,6 +1239,10 @@ def _update_music_entry(
         if music.end_date != played_at:
             music.end_date = played_at
             changed = True
+        origin_url = _storable_origin_url(event)
+        if origin_url and music.origin_url != origin_url:
+            music.origin_url = origin_url
+            changed = True
         if not music.start_date:
             music.start_date = played_at
             changed = True
@@ -1016,9 +1255,59 @@ def _update_music_entry(
             changed = True
 
     if changed:
+        import_run_id = import_progress.get_current_import_run_id()
+        if import_run_id:
+            music.import_run_id = import_run_id
         music.save()
 
     return music
+
+
+# Fields a scrobble import can change on an existing Music row (see the
+# `if changed:` block above) -- the only ones a revert needs to restore.
+_REVERTIBLE_SCROBBLE_FIELDS = ("progress", "status", "start_date", "end_date")
+
+
+def revert_music_import_run(run, user) -> dict[str, int]:
+    """Undo a Music import run's effect on rows it created or mutated.
+
+    Music rows are mutated in place (one row per user+item, `progress`
+    incremented per play), so a run may have only incremented an existing
+    row rather than inserted one -- deleting rows tagged with this run
+    would destroy plays from other runs or manual entries sharing that
+    row. Instead, for each row still tagged with this run, find its
+    historical state immediately before the run's first touch (via
+    django-simple-history) and restore the fields a scrobble import can
+    change. Rows this run created outright (no prior history) are deleted.
+    """
+    deleted = 0
+    reverted = 0
+
+    for music in Music.objects.filter(user=user, import_run=run):
+        history_qs = list(music.history.all().order_by("history_date"))
+        first_touch_index = next(
+            (
+                index
+                for index, record in enumerate(history_qs)
+                if record.import_run_id == run.id
+            ),
+            None,
+        )
+
+        if first_touch_index is None or first_touch_index == 0:
+            # No prior state recorded: this run created the row.
+            music.delete()
+            deleted += 1
+            continue
+
+        pre_run_record = history_qs[first_touch_index - 1]
+        for field_name in _REVERTIBLE_SCROBBLE_FIELDS:
+            setattr(music, field_name, getattr(pre_run_record, field_name))
+        music.import_run_id = pre_run_record.import_run_id
+        music.save()
+        reverted += 1
+
+    return {"deleted": deleted, "reverted": reverted}
 
 
 def _select_media_id(
@@ -1033,14 +1322,18 @@ def _select_media_id(
     if plex_rating_key:
         return _limit_media_id(str(plex_rating_key))
 
-    slug_base = slugify(f"{artist_name or 'music'}-{track_title or 'track'}") or "music-track"
+    slug_base = (
+        slugify(f"{artist_name or 'music'}-{track_title or 'track'}") or "music-track"
+    )
     return _limit_media_id(slug_base)
 
 
 def _limit_media_id(media_id: str) -> str:
     """Ensure media_id fits Item field constraints."""
     max_length = Item._meta.get_field("media_id").max_length or 0
-    return media_id[:max_length] if max_length and len(media_id) > max_length else media_id
+    return (
+        media_id[:max_length] if max_length and len(media_id) > max_length else media_id
+    )
 
 
 def _runtime_minutes_from_ms(duration_ms: int | None) -> int | None:
@@ -1057,9 +1350,9 @@ def _parse_release_date(release_date: str | None):
         return None
     try:
         # MusicBrainz may provide YYYY, YYYY-MM, or YYYY-MM-DD
-        if len(release_date) == 4:
+        if len(release_date) == DATE_STR_LEN_YEAR_ONLY:
             release_date = f"{release_date}-01-01"
-        elif len(release_date) == 7:
+        elif len(release_date) == DATE_STR_LEN_YEAR_MONTH:
             release_date = f"{release_date}-01"
         return parse_date(release_date)
     except Exception:
@@ -1077,7 +1370,10 @@ def _coerce_int(value: int | None) -> int | None:
 def _is_various_artist(artist: Artist) -> bool:
     """Return True if artist is the generic 'Various Artists' bucket."""
     name = (artist.name or "").strip().lower()
-    return name in ("various artists", "various") or artist.musicbrainz_id == "89ad4ac3-39f7-470e-963a-56509c546377"
+    return (
+        name in ("various artists", "various")
+        or artist.musicbrainz_id == "89ad4ac3-39f7-470e-963a-56509c546377"
+    )
 
 
 def _normalize(text: str) -> str:
@@ -1090,23 +1386,24 @@ def _log_search_candidates(query: str, candidates: list[dict]) -> None:
     if not candidates:
         logger.debug("MusicBrainz search for '%s' returned no candidates", query)
         return
-    summary = []
-    for cand in candidates:
-        summary.append(
-            {
-                "title": cand.get("title"),
-                "artist": cand.get("artist_name"),
-                "album": cand.get("album_title"),
-                "recording_id": cand.get("media_id"),
-                "artist_id": cand.get("artist_id"),
-                "release_id": cand.get("release_id"),
-                "release_group_id": cand.get("release_group_id"),
-            },
-        )
+    summary = [
+        {
+            "title": cand.get("title"),
+            "artist": cand.get("artist_name"),
+            "album": cand.get("album_title"),
+            "recording_id": cand.get("media_id"),
+            "artist_id": cand.get("artist_id"),
+            "release_id": cand.get("release_id"),
+            "release_group_id": cand.get("release_group_id"),
+        }
+        for cand in candidates
+    ]
     logger.debug("Top MusicBrainz candidates for '%s': %s", query, summary)
 
 
-def _validate_against_payload(metadata: ResolvedMusicMetadata, event: MusicPlaybackEvent) -> None:
+def _validate_against_payload(
+    metadata: ResolvedMusicMetadata, event: MusicPlaybackEvent
+) -> None:
     """Drop MBIDs if they don't align with the Plex payload artist/album/track."""
     expected_artist = _normalize(event.artist_name or "")
     expected_album = _normalize(event.album_title or "")
@@ -1131,7 +1428,9 @@ def _validate_against_payload(metadata: ResolvedMusicMetadata, event: MusicPlayb
             return
 
 
-def _clear_musicbrainz_ids(metadata: ResolvedMusicMetadata, event: MusicPlaybackEvent) -> None:
+def _clear_musicbrainz_ids(
+    metadata: ResolvedMusicMetadata, event: MusicPlaybackEvent
+) -> None:
     """Remove MusicBrainz identifiers and revert to manual source, restoring Plex names."""
     metadata.musicbrainz_recording_id = None
     metadata.musicbrainz_release_id = None
@@ -1176,7 +1475,11 @@ def _maybe_refresh_album_cover(album: Album) -> None:
     try:
         refresh_album_cover_art(album)
     except Exception as exc:  # pragma: no cover - defensive network guard
-        logger.debug("Cover art refresh failed for album %s: %s", album.id, exception_summary(exc))
+        logger.debug(
+            "Cover art refresh failed for album %s: %s",
+            album.id,
+            exception_summary(exc),
+        )
 
 
 def _prefetch_missing_covers(artist: Artist, force: bool = False) -> None:
@@ -1192,14 +1495,24 @@ def _prefetch_missing_covers(artist: Artist, force: bool = False) -> None:
     if not albums_with_mbids.exists():
         return
 
-    if not force and not albums_with_mbids.filter(
-        models.Q(image="") | models.Q(image=settings.IMG_NONE),
-    ).exists():
+    if (
+        not force
+        and not albums_with_mbids.filter(
+            models.Q(image="") | models.Q(image=settings.IMG_NONE),
+        ).exists()
+    ):
         return
     try:
-        prefetch_album_covers(artist, limit=None)  # fetch all missing art for this artist
+        prefetch_album_covers(
+            artist, limit=None
+        )  # fetch all missing art for this artist
     except Exception as exc:  # pragma: no cover - defensive network guard
-        logger.debug("Prefetch covers failed for artist %s: %s", artist.id, exception_summary(exc))
+        logger.debug(
+            "Prefetch covers failed for artist %s: %s",
+            artist.id,
+            exception_summary(exc),
+        )
+
 
 def _enrich_missing_artist_metadata(
     artist: Artist,
@@ -1225,11 +1538,13 @@ def _enrich_missing_artist_metadata(
     try:
         results = musicbrainz.search(query, page=1, skip_cover_art=True)
     except Exception as exc:  # pragma: no cover - defensive network guard
-        logger.debug("Artist enrichment search failed for %s: %s", query, exception_summary(exc))
+        logger.debug(
+            "Artist enrichment search failed for %s: %s", query, exception_summary(exc)
+        )
         return
 
     total_results = (results or {}).get("total_results") or 0
-    if total_results > 50:
+    if total_results > NOISY_SEARCH_RESULT_THRESHOLD:
         logger.debug(
             "Skipping enrichment for '%s' due to noisy search results (%s)",
             query,
@@ -1272,24 +1587,36 @@ def _enrich_missing_artist_metadata(
             try:
                 sync_artist_discography(artist, force=True)
             except Exception as exc:  # pragma: no cover
-                logger.debug("Discography sync failed during enrichment for %s: %s", artist, exception_summary(exc))
+                logger.debug(
+                    "Discography sync failed during enrichment for %s: %s",
+                    artist,
+                    exception_summary(exc),
+                )
 
     release_id = result.get("release_id")
     release_group_id = result.get("release_group_id")
 
     target_album = album
     if artist and release_group_id:
-        existing_album = Album.objects.filter(
-            artist=artist,
-            musicbrainz_release_group_id=release_group_id,
-        ).exclude(id=album.id).first()
+        existing_album = (
+            Album.objects.filter(
+                artist=artist,
+                musicbrainz_release_group_id=release_group_id,
+            )
+            .exclude(id=album.id)
+            .first()
+        )
         if existing_album:
             target_album = existing_album
     if artist and release_id and target_album == album:
-        existing_album = Album.objects.filter(
-            artist=artist,
-            musicbrainz_release_id=release_id,
-        ).exclude(id=album.id).first()
+        existing_album = (
+            Album.objects.filter(
+                artist=artist,
+                musicbrainz_release_id=release_id,
+            )
+            .exclude(id=album.id)
+            .first()
+        )
         if existing_album:
             target_album = existing_album
 
@@ -1301,8 +1628,8 @@ def _enrich_missing_artist_metadata(
             updates["musicbrainz_release_group_id"] = release_group_id
         if updates:
             try:
-                for field_name, value in updates.items():
-                    setattr(target_album, field_name, value)
+                for field, value in updates.items():
+                    setattr(target_album, field, value)
                 target_album.save(update_fields=list(updates.keys()))
             except IntegrityError:
                 logger.debug(
@@ -1320,16 +1647,24 @@ def _enrich_missing_artist_metadata(
         music.save(update_fields=["album"])
 
 
-def _maybe_attach_artist_from_artist_search(metadata: ResolvedMusicMetadata, event: MusicPlaybackEvent):
+def _maybe_attach_artist_from_artist_search(
+    metadata: ResolvedMusicMetadata, event: MusicPlaybackEvent
+):
     """Fallback to artist-only search when track search is too noisy."""
-    if metadata.musicbrainz_artist_id or not (metadata.artist_name or event.artist_name):
+    if metadata.musicbrainz_artist_id or not (
+        metadata.artist_name or event.artist_name
+    ):
         return
 
     artist_query = metadata.artist_name or event.artist_name
     try:
         results = musicbrainz.search_artists(artist_query, page=1)
     except Exception as exc:  # pragma: no cover - defensive network guard
-        logger.debug("Artist-only search failed for '%s': %s", artist_query, exception_summary(exc))
+        logger.debug(
+            "Artist-only search failed for '%s': %s",
+            artist_query,
+            exception_summary(exc),
+        )
         return
 
     candidates = (results or {}).get("results") or []
@@ -1354,7 +1689,11 @@ def _sync_artist_metadata(artist: Artist, musicbrainz_id: str, force: bool = Fal
     try:
         data = musicbrainz.get_artist(musicbrainz_id)
     except Exception as exc:  # pragma: no cover - defensive network guard
-        logger.debug("Failed to fetch artist metadata for %s: %s", musicbrainz_id, exception_summary(exc))
+        logger.debug(
+            "Failed to fetch artist metadata for %s: %s",
+            musicbrainz_id,
+            exception_summary(exc),
+        )
         return
 
     updates = {}
@@ -1364,8 +1703,9 @@ def _sync_artist_metadata(artist: Artist, musicbrainz_id: str, force: bool = Fal
         updates["country"] = data["country"]
     if data.get("image"):
         updates["image"] = data["image"]
-    if data.get("genres"):
-        updates["genres"] = data["genres"]
+    genre_names = [g.get("name") for g in data.get("genres") or [] if g.get("name")]
+    if genre_names:
+        updates["genres"] = genre_names
 
     changed_fields = []
     for field_name, value in updates.items():
@@ -1375,7 +1715,9 @@ def _sync_artist_metadata(artist: Artist, musicbrainz_id: str, force: bool = Fal
 
     if changed_fields:
         artist.save(update_fields=changed_fields)
-    elif (not artist.image or artist.image == settings.IMG_NONE) and artist.albums.exists():
+    elif (
+        not artist.image or artist.image == settings.IMG_NONE
+    ) and artist.albums.exists():
         hero_image = get_artist_hero_image(artist)
         if hero_image and hero_image != settings.IMG_NONE:
             artist.image = hero_image

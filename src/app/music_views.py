@@ -1,5 +1,6 @@
 import json
 import logging
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from django.conf import settings
@@ -9,31 +10,68 @@ from django.db import IntegrityError, models
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
-from django.views.decorators.http import require_GET, require_POST
+from django.utils.http import url_has_allowed_host_and_scheme
+from django.utils.translation import gettext, gettext_noop
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from app.discover import tab_cache as discover_tab_cache
-from app.forms import BulkEpisodeTrackForm
+from app.forms import BulkEpisodeTrackForm, MusicTrackNotesForm
 from app.log_safety import exception_summary
 from app.models import (
-    TV,
     Album,
+    AlbumTracker,
     Artist,
     CollectionEntry,
     Item,
     MediaTypes,
     Music,
-    Season,
     Sources,
     Status,
     Track,
 )
 from app.services import bulk_music_tracking
 from app.services import music as sync_services
-from app.signals import suppress_media_cache_change_signals
 from app.tag_views import _build_detail_tag_sections
 from app.templatetags import app_tags
 
 logger = logging.getLogger(__name__)
+
+MINUTES_PER_HOUR = 60
+
+# How often viewing an artist may call MusicBrainz on the viewer's time: an
+# MBID search when the artist has none, and a discography sync.
+ARTIST_VIEW_MBID_RESOLVE_SECONDS = 24 * 60 * 60
+ARTIST_VIEW_SYNC_SECONDS = 60 * 60
+# The artist page's cover and member-photo pollers run every 5 seconds; this
+# bounds each to about two minutes per page view.
+ARTIST_IMAGE_POLL_MAX_ATTEMPTS = 24
+
+# Lengths of the partial-date strings MusicBrainz can return for a release
+# date: "YYYY", "YYYY-MM", or a full "YYYY-MM-DD" (10+ chars).
+DATE_STR_LEN_YEAR_ONLY = 4
+DATE_STR_LEN_YEAR_MONTH = 7
+DATE_STR_LEN_FULL_DATE = 10
+
+
+def _play_counts_by_music_id(music_entries):
+    """Return each album track's play count in one grouped history query."""
+    return dict(
+        Music.history.model.objects.filter(
+            id__in=[music.id for music in music_entries if music.album_id],
+        )
+        .order_by()
+        .values("id")
+        .annotate(play_count=models.Count("history_id"))
+        .values_list("id", "play_count"),
+    )
+
+
+def _poll_attempt(request):
+    """Return the poll attempt number an HTMX poller sent back."""
+    try:
+        return max(int(request.GET.get("attempt", 0)), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _music_artist_detail_url(artist):
@@ -44,6 +82,222 @@ def _music_artist_detail_url(artist):
 def _music_album_detail_url(album):
     """Return the canonical shared media-details URL for a music album."""
     return app_tags.music_album_url(album)
+
+
+def _music_track_detail_url(track):
+    """Return the canonical shared media-details URL for a music track."""
+    return app_tags.music_track_url(track)
+
+
+def _nonempty_genre_names(genres):
+    """Return genre labels that are not blank."""
+    if not genres:
+        return []
+    names = []
+    for genre in genres:
+        text = str(genre).strip()
+        if text:
+            names.append(text)
+    return names
+
+
+def _track_page_genres(track):
+    """Return track genres, or the album's genres when the track has none."""
+    track_genres = _nonempty_genre_names(track.genres)
+    if track_genres:
+        return track_genres
+    return _nonempty_genre_names(getattr(track.album, "genres", None))
+
+
+def _safe_origin_url(value):
+    """Return an http(s) origin URL, or an empty string."""
+    text = (value or "").strip()
+    if text.lower().startswith(("https://", "http://")):
+        return text
+    return ""
+
+
+def _music_entry_for_track(user, track):
+    """Resolve this user's Music row the same way the album track list does."""
+    user_music_by_track = {}
+    music_entries = Music.objects.filter(
+        user=user,
+        album=track.album,
+    ).select_related("item", "track")
+    for music in music_entries:
+        if music.track_id:
+            user_music_by_track[music.track_id] = music
+        if music.item and music.item.media_id:
+            user_music_by_track[f"recording_{music.item.media_id}"] = music
+
+    music_entry = user_music_by_track.get(track.id)
+    if not music_entry and track.musicbrainz_recording_id:
+        music_entry = user_music_by_track.get(
+            f"recording_{track.musicbrainz_recording_id}",
+        )
+    return music_entry
+
+
+def _lookup_text(value):
+    """Return a comparable lowercase form of a title or artist."""
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def _search_recording_id(track):
+    """Return a MusicBrainz recording id from an artist and title search."""
+    from app.providers import musicbrainz
+
+    artist = track.album.artist
+    artist_name = artist.name if artist else ""
+    query = " ".join(part for part in (artist_name, track.title) if part).strip()
+    if not query:
+        return ""
+
+    results = musicbrainz.search(query, page=1, skip_cover_art=True)
+    expected_title = _lookup_text(track.title)
+    for result in (results or {}).get("results") or []:
+        if expected_title and expected_title in _lookup_text(result.get("title")):
+            return result.get("media_id") or ""
+    return ""
+
+
+def _lookup_unlistened_recording(track):
+    """Fetch MusicBrainz recording metadata when this user has no listen."""
+    from app.providers import musicbrainz
+
+    recording_id = (track.musicbrainz_recording_id or "").strip()
+    try:
+        if not recording_id:
+            recording_id = _search_recording_id(track)
+        if not recording_id:
+            return None
+        return musicbrainz.recording(recording_id)
+    except Exception as exc:
+        logger.debug(
+            "Track %s recording lookup failed: %s",
+            track.id,
+            exception_summary(exc),
+        )
+        return None
+
+
+def _recording_genre_names(recording):
+    """Return title-cased genre labels from a MusicBrainz recording payload."""
+    return [
+        name.title() for name in _nonempty_genre_names((recording or {}).get("genres"))
+    ]
+
+
+def _recording_display(track, recording):
+    """Return the recording fields the track page does not already show.
+
+    Artist and album stay in the header. Ids and the minute-rounded duration
+    stay off the page. Runtime is included only when the track has no duration.
+    """
+    if not recording:
+        return {"release_date": "", "runtime": "", "image": ""}
+
+    details = recording.get("details") or {}
+    image = recording.get("image") or ""
+    if image == settings.IMG_NONE:
+        image = ""
+    runtime = ""
+    if details.get("runtime") and not track.duration_formatted:
+        runtime = details["runtime"]
+    return {
+        "release_date": details.get("release_date") or "",
+        "runtime": runtime,
+        "image": image,
+    }
+
+
+def _track_play_history(music_entry):
+    """Return completed listens for a Music row, newest first."""
+    if music_entry is None:
+        return []
+    history = []
+    rows = music_entry.history.all().order_by("-end_date")
+    for row in rows:
+        if not row.end_date:
+            continue
+        history.append(
+            {
+                "end_date": row.end_date,
+                "origin_url": _safe_origin_url(getattr(row, "origin_url", "")),
+            },
+        )
+    return history
+
+
+def _album_display_genres(album):
+    """Return album genres, or the artist's when the album has none."""
+    if album is None:
+        return []
+    return sync_services._music_item_direct_genres(album)
+
+
+def _play_link_label(url):
+    """Return the play-link label for a SoundCloud or Spotify URL."""
+    host = (urlparse(url or "").hostname or "").lower()
+    if host == "soundcloud.com" or host.endswith(".soundcloud.com"):
+        return "SoundCloud"
+    if host == "spotify.com" or host.endswith(".spotify.com"):
+        return "Spotify"
+    return ""
+
+
+def _external_play_links(tracks_with_data):
+    """Return one play chip per distinct SoundCloud or Spotify URL on this album."""
+    links = {}
+    seen_urls = set()
+    for track_data in tracks_with_data:
+        url = track_data.get("origin_url") or ""
+        label = _play_link_label(url)
+        if not label or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        if label in links:
+            label = track_data["track"].title or url
+        base_label, suffix = label, 2
+        while label in links:
+            label = f"{base_label} ({suffix})"
+            suffix += 1
+        links[label] = url
+    return links
+
+
+def _selected_music_release(user, album):
+    """Return the user's valid release preference and its detailed metadata."""
+    from app.models import MusicReleasePreference
+    from app.providers import musicbrainz
+
+    preference = MusicReleasePreference.objects.filter(
+        user=user,
+        album=album,
+    ).first()
+    selected_release = None
+    if preference and album.musicbrainz_release_group_id:
+        try:
+            candidate_release = musicbrainz.get_release(preference.release_id)
+            if (
+                candidate_release.get("release_group_id")
+                == album.musicbrainz_release_group_id
+            ):
+                selected_release = candidate_release
+            else:
+                logger.warning(
+                    "Saved release %s does not belong to album %s release group",
+                    preference.release_id,
+                    album.id,
+                )
+        except Exception as exc:  # pragma: no cover - defensive provider boundary
+            logger.warning(
+                "Failed to load saved release %s for album %s: %s",
+                preference.release_id,
+                album.id,
+                exc,
+            )
+    return preference, selected_release
 
 
 def _music_activity_date_range(entries):
@@ -58,9 +312,7 @@ def _music_activity_date_range(entries):
     first_date = min(start_candidates) if start_candidates else None
     last_date = max(end_candidates) if end_candidates else None
     collapse_same_day = bool(
-        first_date
-        and last_date
-        and first_date.date() == last_date.date()
+        first_date and last_date and first_date.date() == last_date.date()
     )
     return first_date, last_date, collapse_same_day
 
@@ -78,7 +330,9 @@ def _build_music_artist_activity_subtitle(
 
     primary_text = None
     if total_plays:
-        primary_text = "Played once" if total_plays == 1 else f"Played {total_plays} times"
+        primary_text = (
+            "Played once" if total_plays == 1 else f"Played {total_plays} times"
+        )
 
     return {
         "primary_text": primary_text,
@@ -160,6 +414,7 @@ def _render_music_tracker_modal(
     title,
     tracker,
     form,
+    album=None,
     save_url,
     delete_url,
     release_date_shortcut="",
@@ -171,12 +426,15 @@ def _render_music_tracker_modal(
     from app import views as view_barrel
 
     return_url = request.GET.get("return_url") or request.POST.get("return_url", "")
+    home_row_id = (
+        request.GET.get("home_row_id") or request.POST.get("home_row_id") or ""
+    )
     track_form_id = f"track-form-{uuid4().hex}"
     field_groups = view_barrel._track_modal_field_groups(
         form,
-        hidden_field_names=set(
+        hidden_field_names={
             field_name for field_name in form.fields if field_name.endswith("_id")
-        ),
+        },
         metadata_field_names=set(),
     )
     episode_plays_tab_available = bool(bulk_domain)
@@ -193,12 +451,28 @@ def _render_music_tracker_modal(
                 initial=bulk_initial,
                 domain=bulk_domain,
             )
-        episode_plays_tab_label = bulk_domain.get("tab_label") or "Track Plays"
+        episode_plays_tab_label = bulk_domain.get("tab_label") or gettext("Track Plays")
         episode_plays_submit_label = bulk_domain.get("submit_label") or "Save plays"
     else:
         episode_plays_form = None
-        episode_plays_tab_label = "Track Plays"
+        episode_plays_tab_label = gettext("Track Plays")
         episode_plays_submit_label = "Save plays"
+
+    music_release_preference = None
+    selected_music_release = None
+    music_release_picker = {"available": False, "list_url": ""}
+    if album is not None:
+        music_release_preference, selected_music_release = _selected_music_release(
+            request.user,
+            album,
+        )
+        music_release_picker = {
+            "available": bool(album.musicbrainz_release_group_id),
+            "list_url": reverse(
+                "list_music_releases",
+                kwargs={"album_id": album.id},
+            ),
+        }
 
     response = render(
         request,
@@ -210,17 +484,26 @@ def _render_music_tracker_modal(
             "form": form,
             "media": tracker,
             "return_url": return_url,
-            "metadata_tab_available": False,
+            "metadata_tab_available": music_release_picker["available"],
             "metadata_fields": [],
+            "can_manage_hardcover_edition": False,
+            "music_release_preference": music_release_preference,
+            "selected_music_release": selected_music_release,
+            "music_release_picker": music_release_picker,
             "general_hidden_fields": field_groups["hidden_fields"],
             "general_fields": field_groups["general_fields"],
-            "general_submit_formaction": f"{save_url}?next={return_url}",
+            "general_submit_formaction": (
+                f"{save_url}?next={return_url}"
+                + (f"&home_row_id={home_row_id}" if home_row_id else "")
+            ),
             "general_delete_formaction": f"{delete_url}?next={return_url}",
             "general_existing_instance": tracker,
             "image_field": None,
             "image_save_item_id": None,
-            "release_date_shortcut": release_date_shortcut,
-            "release_date_runtime_minutes": "",
+            "date_suggestion": view_barrel._track_modal_date_suggestion(
+                "Release Date",
+                release_date_shortcut,
+            ),
             "track_form_id": track_form_id,
             "initial_active_tab": initial_active_tab,
             "episode_plays_tab_available": episode_plays_tab_available,
@@ -232,9 +515,7 @@ def _render_music_tracker_modal(
                 bulk_domain,
             ),
             "episode_plays_mode_notice": (
-                bulk_domain.get("mode_notice", "")
-                if bulk_domain
-                else ""
+                bulk_domain.get("mode_notice", "") if bulk_domain else ""
             ),
             "episode_plays_domain_script_id": f"{track_form_id}-episode-domain",
         },
@@ -257,6 +538,88 @@ def _music_bulk_redirect_url(request, *, artist=None, album=None):
     return reverse("medialist", args=[MediaTypes.MUSIC.value])
 
 
+def _build_artist_relations(user, artist):
+    """Return normalized band-member / also-in relation lists for an artist.
+
+    Each relation is a dict with `artist`, `role`, `is_current`, and `tracker`
+    (the viewing user's ArtistTracker for that related artist, or None) so a
+    single card template can render both "Members" and "Also In" sections.
+    """
+    from app.models import ArtistTracker
+
+    band_memberships = list(
+        artist.members.select_related("member").order_by("-is_current", "member__name"),
+    )
+    band_of_memberships = list(
+        artist.bands.select_related("band").order_by("-is_current", "band__name"),
+    )
+
+    related_artists = {membership.member for membership in band_memberships}
+    related_artists.update(membership.band for membership in band_of_memberships)
+    related_artist_ids = [related_artist.id for related_artist in related_artists]
+
+    trackers_by_artist_id = {}
+    if related_artist_ids:
+        trackers_by_artist_id = {
+            tracker.artist_id: tracker
+            for tracker in ArtistTracker.objects.filter(
+                user=user,
+                artist_id__in=related_artist_ids,
+            )
+        }
+
+    def _to_relations(memberships, attr):
+        relations = []
+        for membership in memberships:
+            related_artist = getattr(membership, attr)
+            relations.append(
+                {
+                    "artist": related_artist,
+                    "role": membership.role,
+                    "is_current": membership.is_current,
+                    "tracker": trackers_by_artist_id.get(related_artist.id),
+                }
+            )
+        return relations
+
+    band_members = _to_relations(band_memberships, "member")
+    member_of_bands = _to_relations(band_of_memberships, "band")
+
+    missing_relation_image_count = sum(
+        1 for related_artist in related_artists if not related_artist.image
+    )
+
+    return band_members, member_of_bands, missing_relation_image_count
+
+
+def _queue_artist_relation_image_prefetch(artist, band_members, member_of_bands):
+    """Debounced enqueue of the async photo backfill for missing relation images."""
+    from app.tasks import prefetch_artist_images_batch
+
+    missing_ids = [
+        relation["artist"].id
+        for relation in band_members + member_of_bands
+        if not relation["artist"].image
+    ]
+    if not missing_ids:
+        return
+
+    cache_key = f"music:artist-image-prefetch:{artist.id}"
+    try:
+        if cache.add(cache_key, True, 60 * 10):
+            try:
+                prefetch_artist_images_batch.delay(missing_ids)
+            except Exception:  # pragma: no cover - defensive
+                cache.delete(cache_key)
+                raise
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "Artist relation image prefetch queue failed for artist %s: %s",
+            artist.id,
+            exception_summary(exc),
+        )
+
+
 def _render_music_artist_details(request, artist):
     """Render a music artist through the shared media details template."""
     from app import views as view_barrel
@@ -265,14 +628,21 @@ def _render_music_artist_details(request, artist):
     from app.providers import musicbrainz
     from app.services.music import (
         build_discography_groups,
-        canonicalize_album,
+        canonicalize_albums,
         needs_discography_sync,
         sync_artist_discography,
         sync_artist_members,
     )
     from app.services.music_scrobble import dedupe_artist_albums
 
-    if not artist.musicbrainz_id:
+    # Resolving an MBID searches MusicBrainz under several name variants, each
+    # a rate-limited call. An artist with no match would repeat that search on
+    # every view, so a view tries at most once a day.
+    if not artist.musicbrainz_id and cache.add(
+        f"music:artist-mbid-resolve:{artist.id}",
+        True,
+        ARTIST_VIEW_MBID_RESOLVE_SECONDS,
+    ):
         try:
             mbid, cand_count, variant = sync_services.resolve_artist_mbid(
                 artist.name or "",
@@ -335,8 +705,20 @@ def _render_music_artist_details(request, artist):
     )
     force_sync = existing_album_count == 0 or missing_mbids
 
+    # A forced sync re-reads the whole discography from MusicBrainz. Albums the
+    # provider cannot match keep ``missing_mbids`` true forever, so without a
+    # gate every view of such an artist paid for a full sync. The page's sync
+    # button still forces one on demand.
     synced_count = 0
-    if should_sync and artist.musicbrainz_id:
+    if (
+        should_sync
+        and artist.musicbrainz_id
+        and cache.add(
+            f"music:artist-view-sync:{artist.id}",
+            True,
+            ARTIST_VIEW_SYNC_SECONDS,
+        )
+    ):
         synced_count = sync_artist_discography(artist, force=force_sync)
         if synced_count:
             dedupe_artist_albums(artist)
@@ -350,27 +732,30 @@ def _render_music_artist_details(request, artist):
         Album.objects.filter(
             models.Q(artist=artist) | models.Q(artist_credits__artist=artist),
         )
+        .select_related("artist")
+        .prefetch_related("artist_credits__artist")
         .distinct()
         .order_by("-release_date", "title"),
     )
     all_albums_by_id = {}
-    for album in raw_albums:
-        canonical_album = canonicalize_album(album, user=request.user)
+    for canonical_album in canonicalize_albums(raw_albums, user=request.user):
         all_albums_by_id[canonical_album.id] = canonical_album
     all_albums = list(all_albums_by_id.values())
 
     user_music_entries = list(
         Music.objects.filter(
-            models.Q(album__artist=artist) | models.Q(album__artist_credits__artist=artist),
+            models.Q(album__artist=artist)
+            | models.Q(album__artist_credits__artist=artist),
             user=request.user,
         ).select_related("album", "item"),
     )
 
+    play_counts_by_music_id = _play_counts_by_music_id(user_music_entries)
     album_play_counts = {}
     total_plays = 0
     for music in user_music_entries:
         if music.album_id:
-            play_count = music.history.count()
+            play_count = play_counts_by_music_id.get(music.id, 0)
             album_play_counts[music.album_id] = (
                 album_play_counts.get(music.album_id, 0) + play_count
             )
@@ -391,11 +776,7 @@ def _render_music_artist_details(request, artist):
         album.score = album_scores.get(album.id)
 
     discography_groups = build_discography_groups(all_albums)
-    missing_cover_count = sum(
-        1
-        for album in all_albums
-        if not album.image
-    )
+    missing_cover_count = sum(1 for album in all_albums if not album.image)
 
     artist_tracker = ArtistTracker.objects.filter(
         user=request.user,
@@ -447,9 +828,7 @@ def _render_music_artist_details(request, artist):
                 updated_fields.append("country")
             if mb_data.get("genres"):
                 genre_names = [
-                    g.get("name")
-                    for g in mb_data.get("genres")
-                    if g.get("name")
+                    g.get("name") for g in mb_data.get("genres") if g.get("name")
                 ]
                 if genre_names != artist.genres:
                     artist.genres = genre_names
@@ -469,18 +848,25 @@ def _render_music_artist_details(request, artist):
         except Exception as exc:
             logger.debug("Failed to sync artist members from MusicBrainz: %s", exc)
 
-    band_members = list(
-        artist.members.select_related("member").order_by("-is_current", "member__name"),
+    band_members, member_of_bands, missing_relation_image_count = (
+        _build_artist_relations(
+            request.user,
+            artist,
+        )
     )
-    member_of_bands = list(
-        artist.bands.select_related("band").order_by("-is_current", "band__name"),
-    )
+    poll_for_relation_images = missing_relation_image_count > 0
+    if poll_for_relation_images:
+        _queue_artist_relation_image_prefetch(artist, band_members, member_of_bands)
 
     genre_chips = []
     if genres:
         genre_chips = [g["name"].title() for g in genres[:6]]
     elif tags:
         genre_chips = [t["name"].title() for t in tags[:6]]
+    else:
+        from app.providers import musicbrainz
+
+        genre_chips = musicbrainz._normalize_musicbrainz_genre_names(artist.genres)
 
     collection_stats = get_artist_collection_stats(request.user, artist)
     notes_entry = artist_tracker if artist_tracker and artist_tracker.notes else None
@@ -497,7 +883,9 @@ def _render_music_artist_details(request, artist):
         Sources.MUSICBRAINZ.value,
     )
     detail_primary_action = {
-        "label": artist_tracker.status_readable if artist_tracker else "Add to Library",
+        "label": artist_tracker.status_readable
+        if artist_tracker
+        else gettext_noop("Add to Library"),
         "modal_url": reverse("artist_track_modal", args=[artist.id]),
         "target_id": f"artist-track-modal-{artist.id}",
         "active": bool(artist_tracker),
@@ -538,6 +926,8 @@ def _render_music_artist_details(request, artist):
         "discography_groups": discography_groups,
         "band_members": band_members,
         "member_of_bands": member_of_bands,
+        "missing_relation_image_count": missing_relation_image_count,
+        "poll_for_relation_images": poll_for_relation_images,
         "collection_stats": collection_stats,
         "music_artist_metadata": artist_metadata,
         "music_artist_rating": {
@@ -628,9 +1018,8 @@ def _render_music_album_details(request, artist, album):
 
     has_mb_identity = album_has_musicbrainz_id(album)
     album_release_data = None
-    if (
-        album.musicbrainz_release_id
-        and sync_services.album_artist_credits_need_sync(album)
+    if album.musicbrainz_release_id and sync_services.album_artist_credits_need_sync(
+        album
     ):
         try:
             album_release_data = musicbrainz.get_release(album.musicbrainz_release_id)
@@ -673,10 +1062,14 @@ def _render_music_album_details(request, artist, album):
     elif album_metadata_updated:
         album.refresh_from_db(fields=["genres", "implied_genres"])
 
-    all_tracks = Track.objects.filter(album=album).order_by(
-        "disc_number",
-        "track_number",
-        "title",
+    all_tracks = (
+        Track.objects.filter(album=album)
+        .select_related("album", "album__artist")
+        .order_by(
+            "disc_number",
+            "track_number",
+            "title",
+        )
     )
     user_music_entries = list(
         Music.objects.filter(
@@ -718,10 +1111,15 @@ def _render_music_album_details(request, artist, album):
         if music_entry and music_entry.item_id:
             collection_entry = collection_entries_by_item_id.get(music_entry.item_id)
 
+        origin_url = _safe_origin_url(
+            getattr(music_entry, "origin_url", "") if music_entry else "",
+        )
         tracks_with_data.append(
             {
                 "track": track,
                 "music": music_entry,
+                "origin_url": origin_url,
+                "origin_label": _play_link_label(origin_url),
                 "history": (
                     list(music_entry.history.all().order_by("-end_date"))
                     if music_entry
@@ -745,10 +1143,23 @@ def _render_music_album_details(request, artist, album):
         album=album,
     ).first()
 
+    music_release_preference, selected_music_release = _selected_music_release(
+        request.user,
+        album,
+    )
+
+    album_display_image = album.image or settings.IMG_NONE
+    if (
+        selected_music_release
+        and selected_music_release.get("image")
+        and selected_music_release["image"] != settings.IMG_NONE
+    ):
+        album_display_image = selected_music_release["image"]
+
     total_runtime = None
     if total_duration_ms:
         total_minutes = total_duration_ms // 60000
-        if total_minutes >= 60:
+        if total_minutes >= MINUTES_PER_HOUR:
             hours = total_minutes // 60
             minutes = total_minutes % 60
             total_runtime = f"{hours}h {minutes}m"
@@ -787,13 +1198,16 @@ def _render_music_album_details(request, artist, album):
     detail_link_sections = view_barrel._build_detail_link_sections(
         {
             "source_url": album_details.get("musicbrainz_url", ""),
+            "external_links": _external_play_links(tracks_with_data),
         },
         MediaTypes.MUSIC.value,
         Sources.MUSICBRAINZ.value,
         Sources.MUSICBRAINZ.value,
     )
     detail_primary_action = {
-        "label": album_tracker.status_readable if album_tracker else "Add to Library",
+        "label": album_tracker.status_readable
+        if album_tracker
+        else gettext_noop("Add to Library"),
         "modal_url": reverse("album_track_modal", args=[album.id]),
         "target_id": f"album-track-modal-{album.id}",
         "active": bool(album_tracker),
@@ -808,12 +1222,14 @@ def _render_music_album_details(request, artist, album):
             or f"album-{album.id}"
         ),
     ).first()
+    album_genres = _album_display_genres(album)
     detail_tag_sections = _build_detail_tag_sections(
         {},
         detail_item,
         request.user,
-        fallback_genres=album.genres,
+        fallback_genres=album_genres,
         fallback_implied_genres=album.implied_genres,
+        genre_list_media_type=MediaTypes.MUSIC.value,
     )
 
     context = {
@@ -822,6 +1238,8 @@ def _render_music_album_details(request, artist, album):
         "media_type": MediaTypes.MUSIC.value,
         "artist": artist or album.artist,
         "album": album,
+        "album_genres": album_genres,
+        "album_display_image": album_display_image,
         "media": {
             "media_type": MediaTypes.MUSIC.value,
             "source": Sources.MUSICBRAINZ.value,
@@ -831,7 +1249,7 @@ def _render_music_album_details(request, artist, album):
                 or f"album-{album.id}"
             ),
             "title": album.title,
-            "image": album.image or settings.IMG_NONE,
+            "image": album_display_image,
             "synopsis": "",
             "details": {},
             "related": {},
@@ -843,6 +1261,15 @@ def _render_music_album_details(request, artist, album):
         "library_track_count": library_track_count,
         "total_runtime": total_runtime,
         "music_album_metadata": album_details,
+        "music_release_preference": music_release_preference,
+        "selected_music_release": selected_music_release,
+        "music_release_picker": {
+            "available": bool(album.musicbrainz_release_group_id),
+            "list_url": reverse(
+                "list_music_releases",
+                kwargs={"album_id": album.id},
+            ),
+        },
         "album_collection_metadata": collection_metadata,
         "album_collection_stats": None,
         "music_album_activity_subtitle": album_activity_subtitle,
@@ -862,7 +1289,9 @@ def _render_music_album_details(request, artist, album):
         "detail_link_sections": detail_link_sections,
         "detail_tag_sections": detail_tag_sections,
         "detail_tag_preview_genres_json": json.dumps(album.genres or []),
-        "detail_tag_preview_implied_genres_json": json.dumps(album.implied_genres or []),
+        "detail_tag_preview_implied_genres_json": json.dumps(
+            album.implied_genres or []
+        ),
         "notes_entry": notes_entry,
     }
     return render(request, "app/media_details.html", context)
@@ -881,7 +1310,9 @@ def music_album_details(request, artist_id, artist_slug, album_id, album_slug):
     from app.services.music import canonicalize_album
 
     album = get_object_or_404(
-        Album.objects.select_related("artist").prefetch_related("artist_credits__artist"),
+        Album.objects.select_related("artist").prefetch_related(
+            "artist_credits__artist"
+        ),
         id=album_id,
     )
     canonical_album = canonicalize_album(album, user=request.user)
@@ -894,34 +1325,149 @@ def music_album_details(request, artist_id, artist_slug, album_id, album_slug):
     return _render_music_album_details(request, artist, album)
 
 
+def _render_music_track_details(request, track):
+    """Render a music track through the shared media details template."""
+    album = track.album
+    artist = album.artist
+    music_entry = _music_entry_for_track(request.user, track)
+    track_genres = _track_page_genres(track)
+    recording_display = {"release_date": "", "runtime": "", "image": ""}
+    if music_entry is None:
+        recording = _lookup_unlistened_recording(track)
+        if recording and not track_genres:
+            track_genres = _recording_genre_names(recording)
+        recording_display = _recording_display(track, recording)
+    album_display_image = album.image or settings.IMG_NONE
+    if recording_display["image"] and album_display_image in ("", settings.IMG_NONE):
+        album_display_image = recording_display["image"]
+    context = {
+        "user": request.user,
+        "music_detail_kind": "track",
+        "media_type": MediaTypes.MUSIC.value,
+        "artist": artist,
+        "album": album,
+        "track": track,
+        "notes_entry": music_entry
+        if music_entry and music_entry.notes.strip()
+        else None,
+        "detail_notes_modal_url": reverse("music_track_notes", args=[track.id]),
+        "detail_notes_target_id": f"music-track-notes-{track.id}",
+        "detail_return_url": request.get_full_path(),
+        "album_display_image": album_display_image,
+        "track_genres": track_genres,
+        "recording_release_date": recording_display["release_date"],
+        "recording_runtime": recording_display["runtime"],
+        "track_history": _track_play_history(music_entry),
+        "media": {
+            "media_type": MediaTypes.MUSIC.value,
+            "source": Sources.MUSICBRAINZ.value,
+            "media_id": track.musicbrainz_recording_id or f"track-{track.id}",
+            "title": track.title,
+            "image": album_display_image,
+            "synopsis": "",
+            "details": {},
+            "related": {},
+        },
+    }
+    return render(request, "app/media_details.html", context)
+
+
+@require_http_methods(["GET", "POST"])
+def music_track_notes(request, track_id):
+    """Edit private track notes without recording a listen."""
+    from app import helpers
+
+    track = get_object_or_404(
+        Track.objects.select_related("album__artist"), id=track_id
+    )
+    music = _music_entry_for_track(request.user, track)
+    form = MusicTrackNotesForm(
+        request.POST if request.method == "POST" else None, instance=music
+    )
+    return_url = helpers.normalize_navigation_url(
+        request.POST.get("return_url") or request.GET.get("return_url"),
+    )
+    if request.method == "POST" and form.is_valid():
+        if music is not None or form.cleaned_data["notes"]:
+            music = form.save(commit=False)
+            if music.pk is None:
+                music.item, _ = Item.objects.get_or_create(
+                    source=Sources.MUSICBRAINZ.value,
+                    media_type=MediaTypes.MUSIC.value,
+                    media_id=track.musicbrainz_recording_id or f"track_{track.id}",
+                    defaults={
+                        "title": track.title,
+                        "image": track.album.image or settings.IMG_NONE,
+                    },
+                )
+                music.user = request.user
+                music.album = track.album
+                music.artist = track.album.artist
+                music.track = track
+                music.status = Status.PLANNING.value
+            # Music history rows are listens. A note edit must not add one.
+            music.save_without_historical_record(
+                update_fields=["notes"] if music.pk else None,
+            )
+        messages.success(request, gettext("Notes saved."))
+        if return_url and url_has_allowed_host_and_scheme(
+            return_url,
+            allowed_hosts={request.get_host()},
+            require_https=request.is_secure(),
+        ):
+            return redirect(return_url)
+        return redirect(_music_track_detail_url(track))
+    response = render(
+        request,
+        "app/components/music_track_notes.html",
+        {"form": form, "track": track, "return_url": return_url},
+    )
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+@require_GET
+def music_track_details(
+    request,
+    artist_id,
+    artist_slug,
+    album_id,
+    album_slug,
+    track_id,
+    track_slug,
+):
+    """Return the canonical shared music track detail page."""
+    track = get_object_or_404(
+        Track.objects.select_related("album__artist"),
+        id=track_id,
+    )
+    if track.album_id != album_id:
+        return redirect(_music_track_detail_url(track))
+    album = track.album
+    if album.artist_id and album.artist_id != artist_id:
+        return redirect(_music_track_detail_url(track))
+    return _render_music_track_details(request, track)
+
+
+@require_GET
+def track_detail(request, track_id):
+    """Redirect a short track URL to the canonical shared detail page."""
+    track = get_object_or_404(
+        Track.objects.select_related("album__artist"),
+        id=track_id,
+    )
+    return redirect(_music_track_detail_url(track))
+
+
 @require_GET
 def create_artist_from_search(request, musicbrainz_artist_id):
     """Create an Artist from MusicBrainz search and redirect to artist page."""
-    from app.providers import musicbrainz
-    from app.services.music import sync_artist_discography
+    # FORK: creation core shared with the REST API.
+    from app import fork_services_music
 
-    artist = Artist.objects.filter(musicbrainz_id=musicbrainz_artist_id).first()
-
-    if not artist:
-        artist_data = musicbrainz.get_artist(musicbrainz_artist_id)
-
-        artist = Artist.objects.create(
-            name=artist_data.get("name", "Unknown Artist"),
-            sort_name=artist_data.get("sort_name", ""),
-            musicbrainz_id=musicbrainz_artist_id,
-            country=artist_data.get("country", "") or "",
-            genres=[
-                g.get("name")
-                for g in artist_data.get("genres", [])
-                if g.get("name")
-            ]
-            if artist_data.get("genres")
-            else [],
-        )
-        logger.info("Created artist %s from MusicBrainz", artist.name)
-
-        sync_artist_discography(artist)
-
+    artist = fork_services_music.get_or_create_artist_from_musicbrainz(
+        musicbrainz_artist_id,
+    )
     return redirect(_music_artist_detail_url(artist))
 
 
@@ -937,13 +1483,13 @@ def create_album_from_search(request, musicbrainz_release_id):
     album = Album.objects.filter(
         musicbrainz_release_id=musicbrainz_release_id,
     ).first()
+    artist_credits = release_data.get("artist_credits", [])
 
     if not album:
         artist = None
         created_artists = []
         artist_id = release_data.get("artist_id")
         artist_name = release_data.get("artist_name")
-        artist_credits = release_data.get("artist_credits", [])
 
         if artist_credits:
             for position, credit in enumerate(artist_credits):
@@ -970,11 +1516,13 @@ def create_album_from_search(request, musicbrainz_release_id):
 
                 if artist is None:
                     artist = credit_artist
-                created_artists.append((
-                    credit_artist,
-                    position,
-                    credit.get("join_phrase", ""),
-                ))
+                created_artists.append(
+                    (
+                        credit_artist,
+                        position,
+                        credit.get("join_phrase", ""),
+                    )
+                )
         else:
             if artist_id:
                 artist = Artist.objects.filter(musicbrainz_id=artist_id).first()
@@ -1014,12 +1562,12 @@ def create_album_from_search(request, musicbrainz_release_id):
                 try:
                     from datetime import datetime
 
-                    if len(date_str) == 4:
-                        release_date = datetime.strptime(date_str, "%Y").date()
-                    elif len(date_str) == 7:
-                        release_date = datetime.strptime(date_str, "%Y-%m").date()
-                    elif len(date_str) >= 10:
-                        release_date = datetime.strptime(
+                    if len(date_str) == DATE_STR_LEN_YEAR_ONLY:
+                        release_date = datetime.strptime(date_str, "%Y").date()  # noqa: DTZ007  # date-only value; no timezone applies
+                    elif len(date_str) == DATE_STR_LEN_YEAR_MONTH:
+                        release_date = datetime.strptime(date_str, "%Y-%m").date()  # noqa: DTZ007  # date-only value; no timezone applies
+                    elif len(date_str) >= DATE_STR_LEN_FULL_DATE:
+                        release_date = datetime.strptime(  # noqa: DTZ007  # date-only value; no timezone applies
                             date_str[:10],
                             "%Y-%m-%d",
                         ).date()
@@ -1100,32 +1648,47 @@ def prefetch_artist_covers(request, artist_id):
             models.Q(artist=artist) | models.Q(artist_credits__artist=artist),
         )
         .distinct()
+        .select_related("artist")
+        .prefetch_related("artist_credits__artist")
         .order_by("-release_date", "title"),
     )
 
-    user_music_entries = Music.objects.filter(
-        user=request.user,
-    ).filter(
-        models.Q(album__artist=artist) | models.Q(album__artist_credits__artist=artist),
-    ).select_related("album")
+    user_music_entries = (
+        Music.objects.filter(
+            user=request.user,
+        )
+        .filter(
+            models.Q(album__artist=artist)
+            | models.Q(album__artist_credits__artist=artist),
+        )
+        .select_related("album")
+    )
 
+    play_counts_by_music_id = _play_counts_by_music_id(user_music_entries)
     album_play_counts = {}
     for music in user_music_entries:
         if music.album_id:
-            play_count = music.history.count()
+            play_count = play_counts_by_music_id.get(music.id, 0)
             album_play_counts[music.album_id] = (
                 album_play_counts.get(music.album_id, 0) + play_count
             )
 
+    album_trackers = AlbumTracker.objects.filter(
+        user=request.user,
+        album__in=all_albums,
+    ).select_related("album")
+    album_scores = {
+        tracker.album_id: tracker.score
+        for tracker in album_trackers
+        if tracker.score is not None
+    }
+
     for album in all_albums:
         album.play_count = album_play_counts.get(album.id, 0)
+        album.score = album_scores.get(album.id)
 
     discography_groups = build_discography_groups(all_albums)
-    missing_cover_count = sum(
-        1
-        for album in all_albums
-        if not album.image
-    )
+    missing_cover_count = sum(1 for album in all_albums if not album.image)
 
     poll_for_covers = missing_cover_count > 0
     if missing_cover_count:
@@ -1133,10 +1696,12 @@ def prefetch_artist_covers(request, artist_id):
         try:
             if cache.add(cache_key, True, 60 * 10):
                 try:
-                    prefetch_album_covers_batch.delay([artist.id], limit_per_artist=None)
-                except Exception as queue_exc:  # pragma: no cover - defensive
+                    prefetch_album_covers_batch.delay(
+                        [artist.id], limit_per_artist=None
+                    )
+                except Exception:  # pragma: no cover - defensive
                     cache.delete(cache_key)
-                    raise queue_exc
+                    raise
             poll_for_covers = bool(cache.get(cache_key))
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(
@@ -1145,6 +1710,7 @@ def prefetch_artist_covers(request, artist_id):
                 exception_summary(exc),
             )
 
+    attempt = _poll_attempt(request)
     return render(
         request,
         "app/components/artist_discography_container.html",
@@ -1152,7 +1718,52 @@ def prefetch_artist_covers(request, artist_id):
             "discography_groups": discography_groups,
             "artist": artist,
             "missing_cover_count": missing_cover_count,
-            "poll_for_covers": poll_for_covers,
+            # Covers the provider cannot find never arrive, so polling stops
+            # after a bounded number of tries rather than for the prefetch
+            # marker's full ten minutes.
+            "poll_for_covers": poll_for_covers
+            and attempt < ARTIST_IMAGE_POLL_MAX_ATTEMPTS,
+            "next_attempt": attempt + 1,
+            "user": request.user,
+        },
+    )
+
+
+@require_GET
+def prefetch_artist_relation_images(request, artist_id):
+    """HTMX endpoint to asynchronously fetch band-member/related-artist photos.
+
+    This runs after the artist page loads to avoid blocking the initial render.
+    Returns the updated members/also-in grid HTML.
+    """
+    artist = get_object_or_404(Artist, id=artist_id)
+
+    band_members, member_of_bands, missing_relation_image_count = (
+        _build_artist_relations(
+            request.user,
+            artist,
+        )
+    )
+
+    poll_for_relation_images = missing_relation_image_count > 0
+    if poll_for_relation_images:
+        _queue_artist_relation_image_prefetch(artist, band_members, member_of_bands)
+        poll_for_relation_images = bool(
+            cache.get(f"music:artist-image-prefetch:{artist.id}"),
+        )
+
+    attempt = _poll_attempt(request)
+    return render(
+        request,
+        "app/components/artist_relations_container.html",
+        {
+            "artist": artist,
+            "band_members": band_members,
+            "member_of_bands": member_of_bands,
+            "missing_relation_image_count": missing_relation_image_count,
+            "poll_for_relation_images": poll_for_relation_images
+            and attempt < ARTIST_IMAGE_POLL_MAX_ATTEMPTS,
+            "next_attempt": attempt + 1,
             "user": request.user,
         },
     )
@@ -1202,10 +1813,17 @@ def sync_artist_discography_view(request, artist_id):
     if cover_task_id:
         messages.success(
             request,
-            f"Synced {count} albums for {artist.name}. Cover art refresh queued.",
+            gettext(
+                "Synced %(value_1)s albums for %(value_2)s. Cover art refresh queued."
+            )
+            % {"value_1": count, "value_2": artist.name},
         )
     else:
-        messages.success(request, f"Synced {count} albums for {artist.name}")
+        messages.success(
+            request,
+            gettext("Synced %(value_1)s albums for %(value_2)s")
+            % {"value_1": count, "value_2": artist.name},
+        )
 
     response = HttpResponse(status=204)
     response["HX-Refresh"] = "true"
@@ -1263,8 +1881,10 @@ def artist_save(request):
         request,
         fallback_media_type=MediaTypes.MUSIC.value,
     )
+    home_row_id = request.GET.get("home_row_id") or request.POST.get("home_row_id", "")
 
     tracker = ArtistTracker.objects.filter(user=request.user, artist=artist).first()
+    old_status = getattr(tracker, "status", None)
 
     form = ArtistTrackerForm(request.POST, instance=tracker, user=request.user)
     if form.is_valid():
@@ -1272,12 +1892,36 @@ def artist_save(request):
         tracker.user = request.user
         tracker.artist = artist
         tracker.save()
-        messages.success(request, f"Saved {artist.name}")
+        messages.success(
+            request, gettext("Saved %(value_1)s") % {"value_1": artist.name}
+        )
+
+        if request.headers.get("HX-Request"):
+            htmx_trigger = {
+                "closeModal": {},
+                "showToast": {
+                    "message": f"Saved {artist.name}.",
+                    "type": "success",
+                },
+            }
+            if home_row_id and old_status != tracker.status:
+                htmx_trigger["refreshHomeRow"] = {"rowId": int(home_row_id)}
+            response = HttpResponse(status=204)
+            response["HX-Trigger"] = json.dumps(htmx_trigger)
+            return response
     else:
-        messages.error(request, f"Error saving {artist.name}: {form.errors}")
+        messages.error(
+            request,
+            gettext("Error saving %(value_1)s: %(value_2)s")
+            % {"value_1": artist.name, "value_2": form.errors},
+        )
 
     next_url = request.GET.get("next", "")
-    if next_url:
+    if next_url and url_has_allowed_host_and_scheme(
+        next_url,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
         return redirect(next_url)
     return redirect(_music_artist_detail_url(artist))
 
@@ -1297,9 +1941,16 @@ def artist_delete(request):
     tracker = ArtistTracker.objects.filter(user=request.user, artist=artist).first()
     if tracker:
         tracker.delete()
-        messages.success(request, f"Removed {artist.name} from your library")
+        messages.success(
+            request,
+            gettext("Removed %(value_1)s from your library") % {"value_1": artist.name},
+        )
 
     next_url = request.GET.get("next", "")
-    if next_url:
+    if next_url and url_has_allowed_host_and_scheme(
+        next_url,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
         return redirect(next_url)
     return redirect(_music_artist_detail_url(artist))

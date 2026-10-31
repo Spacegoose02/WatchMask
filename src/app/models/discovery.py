@@ -66,6 +66,28 @@ class CollectionEntry(models.Model):
         help_text="Audio bitrate in kbps (e.g., 128, 320, 1411)",
     )
 
+    # Purchase metadata
+    purchase_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Purchase price",
+    )
+    purchase_location = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Where the item was purchased or which service/retailer it's tied to",
+    )
+
+    # User-defined custom fields
+    custom_field_values = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Values for user-defined CollectionField entries, keyed by field id",
+    )
+
     # Plex rating key cache (for faster bulk imports)
     plex_rating_key = models.CharField(
         max_length=50,
@@ -87,6 +109,8 @@ class CollectionEntry(models.Model):
     )
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["-collected_at"]
         indexes = [
             models.Index(fields=["user", "-collected_at"]),
@@ -95,7 +119,211 @@ class CollectionEntry(models.Model):
         ]
 
     def __str__(self):
+        """Return a readable label for this record."""
         return f"{self.user.username} - {self.item.title}"
+
+
+class CollectionFieldGroup(models.Model):
+    """User-defined header grouping custom Collection fields."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="collection_field_groups",
+    )
+    name = models.CharField(max_length=100)
+    position = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        ordering = ["position", "id"]
+        indexes = [
+            models.Index(fields=["user", "position"]),
+        ]
+
+    def __str__(self):
+        """Return a readable label for this record."""
+        return f"{self.user.username} - {self.name}"
+
+
+class CollectionFieldType(models.TextChoices):
+    """Widget types available for a user-defined Collection field."""
+
+    TEXT = "text", "Text"
+    NUMBER = "number", "Number"
+    DATE = "date", "Date"
+    SELECT = "select", "Select"
+    CHECKBOX = "checkbox", "Checkbox"
+
+
+class CollectionField(models.Model):
+    """User-defined custom field belonging to a CollectionFieldGroup."""
+
+    group = models.ForeignKey(
+        CollectionFieldGroup,
+        on_delete=models.CASCADE,
+        related_name="fields",
+    )
+    label = models.CharField(max_length=100)
+    field_type = models.CharField(
+        max_length=20,
+        choices=CollectionFieldType,
+        default=CollectionFieldType.TEXT,
+    )
+    options = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Selectable choices, only used when field_type is 'select'",
+    )
+    media_types = models.JSONField(
+        default=list,
+        help_text="MediaTypes values this field applies to",
+    )
+    position = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        ordering = ["position", "id"]
+        indexes = [
+            models.Index(fields=["group", "position"]),
+        ]
+
+    def __str__(self):
+        """Return a readable label for this record."""
+        return f"{self.group.name} - {self.label}"
+
+
+class CollectionEntrySource(models.Model):
+    """Links an owned copy back to the source record that produced it.
+
+    Repeat imports reuse the copy behind the same source record instead of
+    duplicating it, and an overwrite run only touches copies it owns, so
+    manually created copies survive. ``occurrence`` distinguishes rows a
+    source cannot tell apart itself (identical duplicates in one export).
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="collection_entry_sources",
+    )
+    source = models.CharField(
+        max_length=32,
+        help_text="Importer that produced the copy, e.g. 'clz'",
+    )
+    source_record_id = models.CharField(
+        max_length=200,
+        help_text="Stable record id from the source, or a derived identity",
+    )
+    occurrence = models.PositiveIntegerField(
+        default=0,
+        help_text="Index among rows sharing a source_record_id in one export",
+    )
+    derived_identity = models.BooleanField(
+        default=False,
+        help_text="Whether source_record_id was derived rather than supplied",
+    )
+    entry = models.ForeignKey(
+        CollectionEntry,
+        on_delete=models.CASCADE,
+        related_name="source_records",
+    )
+    created_by_import_run = models.ForeignKey(
+        "integrations.ImportRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        constraints = [
+            UniqueConstraint(
+                fields=["user", "source", "source_record_id", "occurrence"],
+                name="app_collectionentrysource_unique_user_record",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "source"]),
+        ]
+
+    def __str__(self):
+        """Return a readable label for this record."""
+        return f"{self.source}:{self.source_record_id}#{self.occurrence}"
+
+
+class CollectionFieldSource(models.Model):
+    """Maps an import source's column key to the CollectionField it feeds.
+
+    The mapping is keyed by the *source* column, not by label, so renaming or
+    moving a field in the configuration UI leaves subsequent imports pointing
+    at the same row. It also records which import run first created a field.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="collection_field_sources",
+    )
+    source = models.CharField(
+        max_length=32,
+        help_text="Importer that produced the column, e.g. 'clz' or 'yamtrack'",
+    )
+    source_key = models.CharField(
+        max_length=200,
+        help_text="Normalized column key as it appears in the source export",
+    )
+    source_label = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="Original column label, preserved verbatim for provenance",
+    )
+    field = models.ForeignKey(
+        CollectionField,
+        on_delete=models.CASCADE,
+        related_name="source_mappings",
+    )
+    created_field = models.BooleanField(
+        default=False,
+        help_text="Whether this import created the field rather than reusing one",
+    )
+    created_by_import_run = models.ForeignKey(
+        "integrations.ImportRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        constraints = [
+            UniqueConstraint(
+                fields=["user", "source", "source_key"],
+                name="app_collectionfieldsource_unique_user_source_key",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "source"]),
+        ]
+
+    def __str__(self):
+        """Return a readable label for this record."""
+        return f"{self.source}:{self.source_key} -> {self.field_id}"
 
 
 class Tag(models.Model):
@@ -110,6 +338,8 @@ class Tag(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["name"]
         constraints = [
             UniqueConstraint(
@@ -123,9 +353,11 @@ class Tag(models.Model):
         ]
 
     def __str__(self):
+        """Return a readable label for this record."""
         return self.name
 
     def save(self, *args, **kwargs):
+        """Return the save."""
         self.name = " ".join(self.name.split())
         super().save(*args, **kwargs)
 
@@ -146,6 +378,8 @@ class ItemTag(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["-created_at"]
         constraints = [
             UniqueConstraint(
@@ -158,6 +392,7 @@ class ItemTag(models.Model):
         ]
 
     def __str__(self):
+        """Return a readable label for this record."""
         return f"{self.tag.name} -> {self.item.title}"
 
 
@@ -191,6 +426,8 @@ class DiscoverFeedback(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["user_id", "feedback_type", "-updated_at"]
         constraints = [
             UniqueConstraint(
@@ -204,6 +441,7 @@ class DiscoverFeedback(models.Model):
         ]
 
     def __str__(self):
+        """Return a readable label for this record."""
         return f"{self.user_id}:{self.item_id}:{self.feedback_type}"
 
 
@@ -218,6 +456,8 @@ class DiscoverApiCache(models.Model):
     expires_at = models.DateTimeField()
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["-fetched_at"]
         constraints = [
             UniqueConstraint(
@@ -231,6 +471,7 @@ class DiscoverApiCache(models.Model):
         ]
 
     def __str__(self):
+        """Return a readable label for this record."""
         return f"{self.provider}:{self.endpoint}"
 
 
@@ -291,6 +532,8 @@ class DiscoverTasteProfile(models.Model):
     expires_at = models.DateTimeField()
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["user_id", "media_type"]
         constraints = [
             UniqueConstraint(
@@ -304,6 +547,7 @@ class DiscoverTasteProfile(models.Model):
         ]
 
     def __str__(self):
+        """Return a readable label for this record."""
         return f"{self.user_id}:{self.media_type}"
 
 
@@ -322,6 +566,8 @@ class DiscoverRowCache(models.Model):
     expires_at = models.DateTimeField()
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["user_id", "media_type", "row_key"]
         constraints = [
             UniqueConstraint(
@@ -335,4 +581,5 @@ class DiscoverRowCache(models.Model):
         ]
 
     def __str__(self):
+        """Return a readable label for this record."""
         return f"{self.user_id}:{self.media_type}:{self.row_key}"

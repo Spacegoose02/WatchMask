@@ -9,6 +9,7 @@
       status: 'all',
       rating: 'all',
       collection: 'all',
+      group_by: 'item',
       progress: 'all',
       release: 'all',
     };
@@ -34,10 +35,60 @@
         return;
       }
 
-      params.set(field.name, value);
+      params.append(field.name, value);
     });
 
     return params;
+  }
+
+  // Every filter control routes its refresh through here.
+  //
+  // Two reasons this is a function call and not the buttons' own hx-get:
+  // option rows rendered by Alpine's x-for are created after htmx has scanned
+  // the DOM, so their hx-get never fires at all; and for the rows htmx did
+  // bind, it serializes the form during the click, before Alpine has flushed
+  // the state change, so the request carries the previous value and the
+  // results land one step behind.
+  //
+  // Callers invoke this from $nextTick, so the form is already up to date.
+  // Summary text for a relative "in the last N units" window, e.g. "Last 7 days".
+  // Returns '' when no window is set, so callers can fall through to the
+  // absolute range or "Any".
+  function relativeWindowLabel(amount, unit) {
+    const n = parseInt(amount, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      return '';
+    }
+    const singular = { days: 'day', weeks: 'week', months: 'month', years: 'year' };
+    const name = singular[unit] || 'day';
+    return `Last ${n} ${name}${n === 1 ? '' : 's'}`;
+  }
+
+  function applyFilterChange(endpoint, target, formId) {
+    if (!window.htmx || !endpoint || !target) {
+      return;
+    }
+    const form = document.getElementById(formId || 'filter-form');
+    // Grouping changes the list's structure, not just its rows, so filters in a
+    // grouped Games view take the full-page path instead of swapping items.
+    const groupBy = form && form.elements.group_by ? form.elements.group_by.value : '';
+    const currentGroupBy = new URLSearchParams(window.location.search).get('group_by');
+    if ((groupBy && groupBy !== 'item') || (currentGroupBy && currentGroupBy !== 'item')) {
+      const params = buildMediaListFilterParams(form);
+      if (!groupBy || groupBy === 'item') {
+        params.delete('group');
+      }
+      const query = params.toString();
+      window.location.href = query ? `${endpoint}?${query}` : endpoint;
+      return;
+    }
+    htmx.ajax('GET', endpoint, {
+      source: form || document.body,
+      target,
+      swap: 'innerHTML',
+      values: form ? htmx.values(form) : {},
+      indicator: '#loading-indicator',
+    });
   }
 
   function buildMediaListHref(listPath, form, overrides = {}) {
@@ -48,8 +99,10 @@
 </script>
 
 <script>
-  function mediaFilterMenu() {
-    const dataEl = document.getElementById('media-filter-data');
+  // Shared by the library toolbar and the smart-list rule builder; the caller
+  // names the json_script element holding its own filter options.
+  function mediaFilterMenu(dataElementId = 'media-filter-data') {
+    const dataEl = document.getElementById(dataElementId);
     const data = dataEl ? JSON.parse(dataEl.textContent) : {};
     return {
       open: false,
@@ -57,40 +110,57 @@
       genreSearch: '',
       impliedGenreSearch: '',
       yearSearch: '',
+      completedYearSearch: '',
       sourceSearch: '',
+      mediaStatusSearch: '',
       languageSearch: '',
       countrySearch: '',
       platformSearch: '',
       originSearch: '',
       formatSearch: '',
       authorSearch: '',
+      providerSearch: '',
+      moreProviderSearch: '',
       tagSearch: '',
       departmentSearch: '',
+      listSearch: '',
       genres: data.genres || [],
       impliedGenres: data.implied_genres || [],
       years: data.years || [],
       sources: data.sources || [],
+      mediaStatuses: data.media_statuses || [],
       languages: data.languages || [],
       countries: data.countries || [],
       platforms: data.platforms || [],
       origins: data.origins || [],
       formats: data.formats || [],
       authors: data.authors || [],
+      providers: data.providers || [],
+      allProviders: data.all_providers || [],
+      pinnedProviderNames: data.pinned_providers || [],
+      pinTogglePending: false,
       tags: data.tags || [],
+      tagCounts: data.tag_counts || {},
       departments: data.departments || [],
+      lists: data.lists || [],
       resetSearch() {
         this.genreSearch = '';
         this.impliedGenreSearch = '';
         this.yearSearch = '';
+        this.completedYearSearch = '';
         this.sourceSearch = '';
+        this.mediaStatusSearch = '';
         this.languageSearch = '';
         this.countrySearch = '';
         this.platformSearch = '';
         this.originSearch = '';
         this.formatSearch = '';
         this.authorSearch = '';
+        this.providerSearch = '';
+        this.moreProviderSearch = '';
         this.tagSearch = '';
         this.departmentSearch = '';
+        this.listSearch = '';
       },
       filteredGenres() {
         const term = this.genreSearch.toLowerCase();
@@ -113,12 +183,27 @@
         }
         return this.years.filter(option => option.label.toLowerCase().includes(term));
       },
+      filteredCompletedYears() {
+        const term = this.completedYearSearch.toLowerCase();
+        const options = this.years.filter(option => option.value !== 'unknown');
+        if (!term) {
+          return options;
+        }
+        return options.filter(option => option.label.toLowerCase().includes(term));
+      },
       filteredSources() {
         const term = this.sourceSearch.toLowerCase();
         if (!term) {
           return this.sources;
         }
         return this.sources.filter(option => option.label.toLowerCase().includes(term));
+      },
+      filteredMediaStatuses() {
+        const term = this.mediaStatusSearch.toLowerCase();
+        if (!term) {
+          return this.mediaStatuses;
+        }
+        return this.mediaStatuses.filter(option => option.label.toLowerCase().includes(term));
       },
       filteredLanguages() {
         const term = this.languageSearch.toLowerCase();
@@ -162,6 +247,42 @@
         }
         return this.authors.filter(option => option.label.toLowerCase().includes(term));
       },
+      filteredProviders() {
+        const term = this.providerSearch.toLowerCase();
+        if (!term) {
+          return this.providers;
+        }
+        return this.providers.filter(option => option.label.toLowerCase().includes(term));
+      },
+      filteredAllProviders() {
+        const term = this.moreProviderSearch.toLowerCase();
+        if (!term) {
+          return this.allProviders;
+        }
+        return this.allProviders.filter(option => option.label.toLowerCase().includes(term));
+      },
+      isProviderPinned(name) {
+        return this.pinnedProviderNames.includes(name);
+      },
+      togglePinnedProvider(name) {
+        if (this.pinTogglePending) {
+          return;
+        }
+        this.pinTogglePending = true;
+        fetch('{% url "toggle_pinned_provider" %}', {
+          method: 'POST',
+          headers: { 'X-CSRFToken': '{{ csrf_token }}' },
+          body: new URLSearchParams({ provider_name: name }),
+        })
+          .then((response) => {
+            if (response.ok) {
+              window.location.reload();
+            }
+          })
+          .finally(() => {
+            this.pinTogglePending = false;
+          });
+      },
       filteredTags() {
         const term = this.tagSearch.toLowerCase();
         if (!term) {
@@ -175,6 +296,13 @@
           return this.departments;
         }
         return this.departments.filter(d => d.toLowerCase().includes(term));
+      },
+      filteredLists() {
+        const term = this.listSearch.toLowerCase();
+        if (!term) {
+          return this.lists;
+        }
+        return this.lists.filter(option => option.label.toLowerCase().includes(term));
       },
     };
   }

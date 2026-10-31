@@ -32,11 +32,18 @@ class PodcastShow(models.Model):
     title = models.CharField(max_length=255)
     slug = models.CharField(max_length=255, blank=True, default="")
     author = models.CharField(max_length=255, blank=True, default="")
-    image = models.URLField(blank=True, default="")
-    description = models.TextField(blank=True, default="", help_text="Show description from Pocket Casts")
+    image = models.TextField(blank=True, default="")
+    description = models.TextField(
+        blank=True, default="", help_text="Show description from Pocket Casts"
+    )
     language = models.CharField(max_length=10, blank=True, default="")
     genres = models.JSONField(default=list, blank=True)
-    rss_feed_url = models.URLField(blank=True, default="", help_text="RSS feed URL for fetching full episode list")
+    rss_feed_url = models.URLField(
+        blank=True, default="", help_text="RSS feed URL for fetching full episode list"
+    )
+    website_url = models.URLField(
+        blank=True, default="", help_text="Podcast homepage URL from the RSS <link> element"
+    )
 
     class Meta:
         """Meta options for the model."""
@@ -74,6 +81,12 @@ class PodcastEpisode(models.Model):
         help_text="Duration in seconds",
     )
     audio_url = models.URLField(max_length=500, blank=True, default="")
+    website_url = models.URLField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="Episode webpage URL from the RSS <link> element",
+    )
     episode_number = models.PositiveIntegerField(null=True, blank=True)
     season_number = models.PositiveIntegerField(null=True, blank=True)
     file_type = models.CharField(max_length=50, blank=True, default="")
@@ -87,6 +100,15 @@ class PodcastEpisode(models.Model):
         verbose_name = "Podcast Episode"
         verbose_name_plural = "Podcast Episodes"
         unique_together = [("show", "episode_uuid")]
+        indexes = [
+            # The catalog sync looks an episode up by uuid alone, thousands of
+            # times a run. unique_together's index leads with show_id, so it
+            # cannot serve that lookup and every one of them was a table scan.
+            # Not unique: migration 0116 removed that constraint deliberately,
+            # because RSS-sourced rows key on the feed GUID and two shows can
+            # collide.
+            models.Index(fields=["episode_uuid"], name="podcast_ep_uuid_idx"),
+        ]
 
     def __str__(self):
         """Return the episode title."""
@@ -115,6 +137,8 @@ class Podcast(Media):
 
     tracker = FieldTracker()
 
+    LAST_SEEN_STATUS_IN_PROGRESS = 2  # playingStatus from API
+
     show = models.ForeignKey(
         PodcastShow,
         on_delete=models.SET_NULL,
@@ -139,6 +163,24 @@ class Podcast(Media):
         blank=True,
         help_text="Last seen playingStatus from API (2=in-progress, 3=completed)",
     )
+    position_updated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When played_up_to_seconds last changed. Media.progressed_at only "
+            "monitors 'progress', so the playback progress API needs its own "
+            "timestamp for ?updated_since= delta sync."
+        ),
+    )
+    is_end_date_inferred = models.BooleanField(
+        default=False,
+        help_text=(
+            "True when end_date is a synthetic estimate (e.g. derived from "
+            "publication time + duration, or distributed across the sync "
+            "window) rather than a timestamp backed by real provider "
+            "listening evidence."
+        ),
+    )
 
     @property
     def completed_play_count(self):
@@ -162,16 +204,49 @@ class Podcast(Media):
         Otherwise shows progress from the progress field.
         """
         is_in_progress = (
-            self.status == Status.IN_PROGRESS.value or
-            self.last_seen_status == 2  # 2 = in-progress from API
+            self.status == Status.IN_PROGRESS.value
+            or self.last_seen_status == self.LAST_SEEN_STATUS_IN_PROGRESS
         )
 
-        if is_in_progress and self.played_up_to_seconds and self.played_up_to_seconds > 0:
+        if (
+            is_in_progress
+            and self.played_up_to_seconds
+            and self.played_up_to_seconds > 0
+        ):
             minutes = self.played_up_to_seconds // 60
             return f"{minutes}m"
 
-        minutes = (self.progress or 0) // 60
-        return f"{minutes}m"
+        return f"{self.progress or 0}m"
+
+    @property
+    def progress_unit(self):
+        """Return the unit `progress` is measured in."""
+        return "minutes"
+
+    @property
+    def progress_percentage(self):
+        """Return percent listened through the current episode (0-100), or None.
+
+        Podcasts are tracked per episode, so this is the playback position within
+        a single episode relative to its runtime. Prefers the episode's precise
+        duration and falls back to the item runtime; returns None when the
+        position or a runtime is unavailable.
+        """
+        if not self.played_up_to_seconds:
+            return None
+
+        total_seconds = None
+        episode = self.episode
+        if episode and episode.duration:
+            total_seconds = episode.duration
+        elif self.item and self.item.runtime_minutes:
+            total_seconds = self.item.runtime_minutes * 60
+
+        if not total_seconds:
+            return None
+
+        percentage = round(self.played_up_to_seconds / total_seconds * 100)
+        return max(0, min(percentage, 100))
 
 
 class PodcastShowTracker(models.Model):

@@ -1,10 +1,11 @@
+{% load app_tags %}
+
 {% if media.artist.image and media.artist.image != IMG_NONE %}
-  <img alt="{{ media.artist.name }}"
-       class="lazyload min-w-10 w-10 h-10 object-cover rounded-md parent-hover-tap:hidden"
-       data-src="{{ media.artist.image }}"
-       src="{{ IMG_NONE }}">
+  <img data-media-artwork loading="lazy" decoding="sync" alt="{{ media.artist.name }}"
+       class="min-w-10 w-10 h-10 object-cover rounded-md parent-hover-tap:hidden"
+       src="{{ media.artist.image|image_url }}">
 {% else %}
-  <div class="min-w-10 w-10 h-10 bg-[#3e454d] rounded-md flex items-center justify-center parent-hover-tap:hidden">
+  <div class="min-w-10 w-10 h-10 bg-[var(--color-surface-alt)] rounded-md flex items-center justify-center parent-hover-tap:hidden">
     {% include "app/icons/person.svg" with classes="w-5 h-5 text-gray-600" %}
   </div>
 {% endif %}
@@ -19,10 +20,11 @@
 
 {# Track Modal #}
 <div x-show="trackOpen"
+     @mousedown.self="trackOpen = false"
+     x-cloak
      @keydown.escape.window="trackOpen = false"
      class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-  <div class="w-152 modal-max-height overflow-y-auto px-4 md:px-0 relative z-60"
-       @click.outside="trackOpen = false">
+  <div class="w-152 modal-max-height overflow-y-auto px-4 md:px-0 relative z-60">
     <div id="artist-track-modal-{{ media.artist.id }}"></div>
   </div>
 </div>

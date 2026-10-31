@@ -1,23 +1,30 @@
 import json
-from unittest.mock import patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import Client, TestCase
+from django.core.cache import cache
+from django.test import Client, TestCase, override_settings, tag
 from django.urls import reverse
+from django.utils import timezone
 
 from app import live_playback
 from app.models import (
     TV,
     Anime,
+    CollectionEntry,
     Episode,
     Item,
     ItemProviderLink,
     MediaTypes,
     Movie,
+    PlaybackProgress,
     Season,
     Sources,
     Status,
 )
+from app.services.grouped_anime import GroupedAnimeMatch
+from integrations.models import CollectionSourceState
 from integrations.webhooks.jellyfin import JellyfinWebhookProcessor
 
 
@@ -41,6 +48,7 @@ class JellyfinWebhookTests(TestCase):
         response = self.client.post(url, data={}, content_type="application/json")
         self.assertEqual(response.status_code, 401)
 
+    @tag("network")
     def test_tv_episode_mark_played(self):
         """Test webhook handles TV episode mark played event."""
         payload = {
@@ -87,6 +95,7 @@ class JellyfinWebhookTests(TestCase):
         )
         self.assertIsNotNone(episode.end_date)
 
+    @tag("network")
     def test_movie_mark_played(self):
         """Test webhook handles movie mark played event."""
         payload = {
@@ -116,6 +125,433 @@ class JellyfinWebhookTests(TestCase):
         self.assertEqual(movie.status, Status.COMPLETED.value)
         self.assertEqual(movie.progress, 1)
 
+    def test_user_data_saved_rating_creates_statusless_movie(self):
+        """A Jellyfin rating creates no watch state for an untracked movie."""
+        item = Item.objects.create(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+        )
+
+        JellyfinWebhookProcessor().process_payload(
+            {
+                "Event": "UserDataSaved",
+                "Item": {
+                    "Type": "Movie",
+                    "Name": "The Matrix",
+                    "ProviderIds": {"Tmdb": "603"},
+                    "UserData": {"Rating": 0},
+                },
+            },
+            self.user,
+        )
+
+        movie = Movie.objects.get(item=item, user=self.user)
+        self.assertEqual(movie.score, 0)
+        self.assertIsNone(movie.status)
+        self.assertEqual(movie.progress, 0)
+        self.assertFalse(movie.plays.exists())
+        self.assertFalse(
+            PlaybackProgress.objects.filter(user=self.user, item=item).exists()
+        )
+
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    def test_user_data_saved_rating_creates_statusless_tv(self, mock_get_media_metadata):
+        """A series rating creates a statusless TV row without watch state."""
+        mock_get_media_metadata.return_value = {
+            "media_id": "1668",
+            "title": "Friends",
+            "image": "",
+            "provider_external_ids": {},
+        }
+
+        JellyfinWebhookProcessor().process_payload(
+            {
+                "Event": "UserDataSaved",
+                "Item": {
+                    "Type": "Series",
+                    "Name": "Friends",
+                    "ProviderIds": {"Tmdb": "1668"},
+                    "UserData": {"Rating": 7.5},
+                },
+            },
+            self.user,
+        )
+
+        tv = TV.objects.get(item__media_id="1668", user=self.user)
+        self.assertEqual(tv.score, 7.5)
+        self.assertIsNone(tv.status)
+        self.assertEqual(tv.progress, 0)
+        self.assertFalse(Episode.objects.exists())
+        mock_get_media_metadata.assert_called_once_with(
+            MediaTypes.TV.value,
+            "1668",
+            Sources.TMDB.value,
+        )
+
+    def test_user_data_saved_rating_updates_movie_without_changing_watch_state(self):
+        """A rating update does not alter an existing movie's watch state."""
+        item = Item.objects.create(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+        )
+        movie = Movie.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=1,
+            score=4,
+        )
+
+        JellyfinWebhookProcessor().process_payload(
+            {
+                "Event": "UserDataSaved",
+                "Rating": 2.5,
+                "Item": {
+                    "Type": "Movie",
+                    "Name": "The Matrix",
+                    "ProviderIds": {"Tmdb": "603"},
+                },
+            },
+            self.user,
+        )
+
+        movie.refresh_from_db()
+        self.assertEqual(movie.score, 2.5)
+        self.assertEqual(movie.status, Status.IN_PROGRESS.value)
+        self.assertEqual(movie.progress, 1)
+
+    def _create_rated_show(self, *, with_episode_play):
+        """Track Friends S1 (optionally with a play of E1) and rate the show 6."""
+        item = Item.objects.create(
+            media_id="1668",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Friends",
+        )
+        ItemProviderLink.objects.create(
+            item=item,
+            provider=Sources.TVDB.value,
+            provider_media_id="76669",
+            provider_media_type=MediaTypes.TV.value,
+        )
+        tv = TV.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            score=6,
+        )
+        if not with_episode_play:
+            return tv, None
+        season = Season.objects.create(
+            item=Item.objects.create(
+                media_id="1668",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.SEASON.value,
+                title="Friends",
+                season_number=1,
+            ),
+            user=self.user,
+            related_tv=tv,
+            status=Status.IN_PROGRESS.value,
+        )
+        with patch(
+            "app.providers.services.get_media_metadata",
+            return_value={"season/1": {"episodes": [{}, {}]}},
+        ):
+            episode = Episode.objects.create(
+                item=Item.objects.create(
+                    media_id="1668",
+                    source=Sources.TMDB.value,
+                    media_type=MediaTypes.EPISODE.value,
+                    title="The One Where Monica Gets a Roommate",
+                    season_number=1,
+                    episode_number=1,
+                ),
+                related_season=season,
+                end_date=datetime(2026, 9, 1, 20, 0, tzinfo=UTC),
+            )
+        return tv, episode
+
+    def _episode_rating_payload(self, rating):
+        return {
+            "Event": "UserDataSaved",
+            "Item": {
+                "Type": "Episode",
+                "Name": "The One Where Monica Gets a Roommate",
+                "SeriesName": "Friends",
+                "ProviderIds": {"Tvdb": "76669"},
+                "ParentIndexNumber": 1,
+                "IndexNumber": 1,
+                "UserData": {"Rating": rating},
+            },
+        }
+
+    @patch("app.models.tv.TV._start_next_available_season")
+    def test_user_data_saved_episode_rating_rates_the_episode(
+        self,
+        _mock_start_next_available_season,
+    ):
+        """An episode rating lands on the episode and leaves the show's score."""
+        tv, episode = self._create_rated_show(with_episode_play=True)
+
+        JellyfinWebhookProcessor().process_payload(
+            self._episode_rating_payload(8.0),
+            self.user,
+        )
+
+        episode.refresh_from_db()
+        tv.refresh_from_db()
+        self.assertEqual(episode.score, 8)
+        self.assertEqual(tv.score, 6)
+        self.assertEqual(tv.status, Status.IN_PROGRESS.value)
+
+        # A second episode rating replaces the first instead of the show's.
+        JellyfinWebhookProcessor().process_payload(
+            self._episode_rating_payload(7.5),
+            self.user,
+        )
+        episode.refresh_from_db()
+        tv.refresh_from_db()
+        self.assertEqual(episode.score, 7.5)
+        self.assertEqual(tv.score, 6)
+
+    @patch("app.models.tv.TV._start_next_available_season")
+    def test_user_data_saved_rating_for_unwatched_episode_is_ignored(
+        self,
+        _mock_start_next_available_season,
+    ):
+        """Rating an episode with no play neither creates one nor rates the show."""
+        tv, _ = self._create_rated_show(with_episode_play=False)
+
+        JellyfinWebhookProcessor().process_payload(
+            self._episode_rating_payload(8.0),
+            self.user,
+        )
+
+        tv.refresh_from_db()
+        self.assertEqual(tv.score, 6)
+        self.assertFalse(Episode.objects.exists())
+
+    @patch("app.models.tv.TV._start_next_available_season")
+    def test_user_data_saved_series_rating_rates_the_show(
+        self,
+        _mock_start_next_available_season,
+    ):
+        """A series rating is still stored on the TV tracker."""
+        tv, _ = self._create_rated_show(with_episode_play=False)
+
+        JellyfinWebhookProcessor().process_payload(
+            {
+                "Event": "UserDataSaved",
+                "Item": {
+                    "Type": "Series",
+                    "Name": "Friends",
+                    "ProviderIds": {"Tvdb": "76669"},
+                    "UserData": {"Rating": 9.0},
+                },
+            },
+            self.user,
+        )
+
+        tv.refresh_from_db()
+        self.assertEqual(tv.score, 9.0)
+        self.assertEqual(tv.status, Status.IN_PROGRESS.value)
+        self.assertFalse(Episode.objects.exists())
+
+    def test_user_data_saved_rating_ignores_invalid_values(self):
+        """Missing and out-of-range ratings do not create tracker rows."""
+        item = Item.objects.create(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+        )
+        processor = JellyfinWebhookProcessor()
+
+        for rating in (None, True, "not-a-rating", -0.1, 10.1):
+            with self.subTest(rating=rating):
+                processor.process_payload(
+                    {
+                        "Event": "UserDataSaved",
+                        "Item": {
+                            "Type": "Movie",
+                            "ProviderIds": {"Tmdb": "603"},
+                            "UserData": {"Rating": rating},
+                        },
+                    },
+                    self.user,
+                )
+
+        self.assertFalse(Movie.objects.filter(item=item, user=self.user).exists())
+
+    @patch("app.providers.tmdb.movie")
+    @patch("app.models.Movie.process_status")
+    def test_movie_mark_played_uses_jellyfin_last_played_date(
+        self,
+        _mock_process_status,
+        mock_movie,
+    ):
+        """Completed Jellyfin plays retain Jellyfin's actual completion time."""
+        mock_movie.return_value = {
+            "title": "The Matrix",
+            "image": "",
+            "max_progress": 1,
+            "provider_external_ids": {},
+        }
+        payload = {
+            "Event": "Stop",
+            "Item": {
+                "Name": "The Matrix",
+                "ProductionYear": 1999,
+                "Type": "Movie",
+                "ProviderIds": {"Tmdb": "603"},
+                "UserData": {
+                    "Played": True,
+                    "LastPlayedDate": "2026-08-06T15:30:00.0000000Z",
+                },
+            },
+        }
+
+        JellyfinWebhookProcessor().process_payload(payload, self.user)
+
+        movie = Movie.objects.get(item__media_id="603", user=self.user)
+        self.assertEqual(
+            movie.end_date,
+            datetime(2026, 8, 6, 15, 30, tzinfo=UTC),
+        )
+
+    def _play_then_backdate(self, movie_payload, minutes_ago):
+        """Send Play, then move the Now Playing session start back in time."""
+        processor = JellyfinWebhookProcessor()
+        processor.process_payload({**movie_payload, "Event": "Play"}, self.user)
+        state = cache.get(live_playback._cache_key(self.user.id))
+        started = timezone.now().replace(second=0, microsecond=0) - timedelta(
+            minutes=minutes_ago,
+        )
+        state["started_at_ts"] = int(started.timestamp())
+        live_playback.set_user_playback_state(self.user.id, state)
+        return processor, started
+
+    @patch("app.providers.tmdb.movie")
+    def test_movie_stop_uses_play_time_as_start_date(self, mock_movie):
+        """A skim-then-stop row starts when Play arrived, not when Stop did (#1482)."""
+        mock_movie.return_value = {
+            "title": "Zombie",
+            "image": "",
+            "max_progress": 1,
+            "provider_external_ids": {},
+        }
+        payload = {
+            "PlaybackPositionTicks": "2382910000",
+            "Item": {
+                "Id": "jf-1",
+                "Name": "Zombie",
+                "Type": "Movie",
+                "ProviderIds": {"Tmdb": "7219"},
+                "UserData": {"Played": False},
+            },
+        }
+        processor, started = self._play_then_backdate(payload, 21)
+
+        processor.process_payload({**payload, "Event": "Stop"}, self.user)
+
+        movie = Movie.objects.get(item__media_id="7219", user=self.user)
+        self.assertEqual(movie.status, Status.IN_PROGRESS.value)
+        self.assertEqual(movie.start_date, started)
+
+    @patch("app.providers.tmdb.movie")
+    def test_movie_watched_in_one_sitting_has_start_and_end_date(self, mock_movie):
+        """A completed one-sitting watch keeps the Play time as its start (#1482)."""
+        mock_movie.return_value = {
+            "title": "Zombie",
+            "image": "",
+            "max_progress": 1,
+            "provider_external_ids": {},
+        }
+        payload = {
+            "PlaybackPositionTicks": "54000000000",
+            "Item": {
+                "Id": "jf-1",
+                "Name": "Zombie",
+                "Type": "Movie",
+                "RunTimeTicks": "54000000000",
+                "ProviderIds": {"Tmdb": "7219"},
+                "UserData": {"Played": True},
+            },
+        }
+        processor, started = self._play_then_backdate(payload, 90)
+
+        processor.process_payload({**payload, "Event": "Stop"}, self.user)
+
+        movie = Movie.objects.get(item__media_id="7219", user=self.user)
+        self.assertEqual(movie.status, Status.COMPLETED.value)
+        self.assertEqual(movie.start_date, started)
+        self.assertGreater(movie.end_date, movie.start_date)
+
+    @patch("app.providers.tmdb.find")
+    @patch("app.providers.tmdb.movie")
+    def test_imdb_only_movie_stop_still_finds_the_play_session(
+        self,
+        mock_movie,
+        mock_find,
+    ):
+        """The Play state has no TMDB id; the Jellyfin item id still matches it."""
+        mock_find.return_value = {"movie_results": [{"id": 7219}]}
+        mock_movie.return_value = {
+            "title": "Zombie",
+            "image": "",
+            "max_progress": 1,
+            "provider_external_ids": {},
+        }
+        payload = {
+            "PlaybackPositionTicks": "2382910000",
+            "Item": {
+                "Id": "jf-1",
+                "Name": "Zombie",
+                "Type": "Movie",
+                "ProviderIds": {"Imdb": "tt0080057"},
+                "UserData": {"Played": False},
+            },
+        }
+        processor, started = self._play_then_backdate(payload, 21)
+
+        processor.process_payload({**payload, "Event": "Stop"}, self.user)
+
+        movie = Movie.objects.get(item__media_id="7219", user=self.user)
+        self.assertEqual(movie.start_date, started)
+
+    @patch("app.providers.tmdb.movie")
+    def test_movie_stop_without_play_falls_back_to_stop_time(self, mock_movie):
+        """With no Now Playing session (e.g. a restart), behaviour is unchanged."""
+        mock_movie.return_value = {
+            "title": "Zombie",
+            "image": "",
+            "max_progress": 1,
+            "provider_external_ids": {},
+        }
+        payload = {
+            "Event": "Stop",
+            "PlaybackPositionTicks": "2382910000",
+            "Item": {
+                "Id": "jf-1",
+                "Name": "Zombie",
+                "Type": "Movie",
+                "ProviderIds": {"Tmdb": "7219"},
+                "UserData": {"Played": False},
+            },
+        }
+
+        JellyfinWebhookProcessor().process_payload(payload, self.user)
+
+        movie = Movie.objects.get(item__media_id="7219", user=self.user)
+        self.assertEqual(movie.status, Status.IN_PROGRESS.value)
+        self.assertIsNotNone(movie.start_date)
+
+    @tag("network")
     @patch("app.providers.mal.anime")
     @patch("app.providers.tmdb.find")
     def test_anime_movie_mark_played(self, mock_tmdb_find, mock_mal_anime):
@@ -156,8 +592,39 @@ class JellyfinWebhookTests(TestCase):
         self.assertEqual(movie.status, Status.COMPLETED.value)
         self.assertEqual(movie.progress, 1)
 
-    def test_anime_episode_mark_played(self):
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_anime_episode_mark_played(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_fetch_mapping_data,
+    ):
         """Test webhook handles anime episode mark played event."""
+        mock_find.return_value = {
+            "tv_episode_results": [
+                {"show_id": 209867, "season_number": 1, "episode_number": 1},
+            ],
+            "tv_results": [],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "209867",
+            "title": "Frieren: Beyond Journey's End",
+            "tvdb_id": 424536,
+            "season/1": {"episodes": [{"episode_number": 1}]},
+        }
+        mock_fetch_mapping_data.return_value = {
+            "tvdb_show:424536:s1": {"mal:52991": {"1-28": "1-28"}},
+        }
+        mock_mal_anime.return_value = {
+            "media_id": "52991",
+            "title": "Sousou no Frieren",
+            "image": "https://example.com/frieren.jpg",
+            "max_progress": 28,
+        }
         payload = {
             "Event": "Stop",
             "Item": {
@@ -190,7 +657,7 @@ class JellyfinWebhookTests(TestCase):
         self.assertEqual(anime.status, Status.IN_PROGRESS.value)
         self.assertEqual(anime.progress, 1)
 
-    @patch("integrations.webhooks.base.anime_mapping.load_mapping_data")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
     @patch("app.providers.mal.anime")
     @patch("app.providers.tmdb.tv_with_seasons")
     @patch("app.providers.tmdb.find")
@@ -218,20 +685,27 @@ class JellyfinWebhookTests(TestCase):
             "tvdb_id": "402474",
             "season/2": {"episodes": [{"episode_number": 11}]},
         }
+        # AniBridge v3 only carries the (wrong for this grouped show) TVDB
+        # season mapping; the correct TMDB-season mapping is a stored
+        # provider link, which the webhook must prefer.
         mock_load_mapping_data.return_value = {
-            "hells-paradise-tvdb": {
-                "tvdb_id": "402474",
-                "tvdb_season": 2,
-                "tvdb_epoffset": -13,
-                "mal_id": "46569",
-            },
-            "hells-paradise-tmdb": {
-                "tmdb_show_id": "12345",
-                "tmdb_season": 2,
-                "tmdb_epoffset": 0,
-                "mal_id": "60067",
-            },
+            "tvdb_show:402474:s2": {"mal:46569": {"1-12": "1-12"}},
         }
+        grouped_item = Item.objects.create(
+            media_id="60067",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Hell's Paradise 2nd Season",
+            image="https://example.com/hells-paradise-s2.jpg",
+        )
+        ItemProviderLink.objects.create(
+            item=grouped_item,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.TV.value,
+            provider_media_id="12345",
+            season_number=2,
+            episode_offset=0,
+        )
 
         def mal_side_effect(media_id):
             if str(media_id) == "60067":
@@ -284,7 +758,7 @@ class JellyfinWebhookTests(TestCase):
         )
 
     @patch("integrations.webhooks.base.BaseWebhookProcessor._handle_tv_episode")
-    @patch("integrations.webhooks.base.anime_mapping.load_mapping_data")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
     @patch("app.providers.mal.anime")
     @patch("app.providers.tmdb.tv_with_seasons")
     @patch("app.providers.tmdb.find")
@@ -313,13 +787,10 @@ class JellyfinWebhookTests(TestCase):
             "tvdb_id": "402474",
             "season/2": {"episodes": [{"episode_number": 11}]},
         }
+        # Season 2 mapping only covers episodes 14+, so episode 11 cannot be
+        # mapped to a valid MAL episode.
         mock_load_mapping_data.return_value = {
-            "hells-paradise-tvdb": {
-                "tvdb_id": "402474",
-                "tvdb_season": 2,
-                "tvdb_epoffset": -13,
-                "mal_id": "46569",
-            },
+            "tvdb_show:402474:s2": {"mal:46569": {"14-25": "1-12"}},
         }
         mock_mal_anime.return_value = {
             "media_id": "46569",
@@ -355,6 +826,986 @@ class JellyfinWebhookTests(TestCase):
         self.assertEqual(
             mock_handle_tv_episode.call_args.args[:3],
             (12345, 2, 11),
+        )
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_anime_episode_beyond_mal_cour_does_not_create_tv_row(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_load_mapping_data,
+    ):
+        """Episodes past the MAL cour must not spawn a second TV-library row.
+
+        Regression for discussion #967: an open-ended AniBridge range maps every
+        episode through, so episode 13 of a 12-episode MAL entry reaches
+        ``_handle_anime``, which refuses it. The refusal must not fall through
+        to a plain TV row, or the show accrues progress in both libraries.
+        """
+        # Jellyfin sends the episode's TVDB id, which TMDB resolves to its show.
+        mock_find.return_value = {
+            "tv_episode_results": [{"show_id": 12345}],
+            "tv_results": [],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Absolute Numbering Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/1": {
+                "episodes": [
+                    {"episode_number": 5},
+                    {"episode_number": 13},
+                ],
+            },
+        }
+        # Open-ended range: every episode maps straight through to MAL.
+        mock_load_mapping_data.return_value = {
+            "tvdb_show:402474:s1": {"mal:46569": {"1-": "1-"}},
+        }
+        mock_mal_anime.return_value = {
+            "media_id": "46569",
+            "title": "Absolute Numbering Show",
+            "image": "https://example.com/anime.jpg",
+            "max_progress": 12,
+        }
+
+        def _payload(episode_number):
+            return {
+                "Event": "Stop",
+                "Item": {
+                    "Type": "Episode",
+                    "Name": f"Episode {episode_number}",
+                    "ProviderIds": {"Tvdb": "402474"},
+                    "UserData": {"Played": True},
+                    "SeriesName": "Absolute Numbering Show",
+                    "ParentIndexNumber": 1,
+                    "IndexNumber": episode_number,
+                },
+            }
+
+        # Inside the cour: lands in the Anime library.
+        response = self.client.post(
+            self.url,
+            data=json.dumps(_payload(5)),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Anime.objects.filter(user=self.user).count(), 1)
+
+        # Past the cour: must stay in the Anime library, not open a TV row.
+        response = self.client.post(
+            self.url,
+            data=json.dumps(_payload(13)),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(Anime.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(
+            TV.objects.filter(user=self.user).count(),
+            0,
+            "episode past the MAL cour opened a duplicate TV-library row",
+        )
+        self.assertEqual(
+            Item.objects.filter(
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.TV.value,
+                media_id="12345",
+            ).count(),
+            0,
+        )
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_anime_episode_sticks_to_flat_mal_home_when_mapping_misses_season(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_load_mapping_data,
+    ):
+        """A season the mapping does not cover must not leak into TV Shows.
+
+        Regression for discussion #967: the user already tracks this show in
+        the Anime library as a flat MAL entry. A later season with no mapping
+        previously fell through and opened a second, TV-library row.
+        """
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Multi Cour Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/2": {"episodes": [{"episode_number": 3}]},
+        }
+        # Only season 1 is mapped; season 2 has no MAL entry available.
+        mock_load_mapping_data.return_value = {
+            "tvdb_show:402474:s1": {"mal:46569": {"1-12": "1-12"}},
+        }
+        mock_mal_anime.return_value = {
+            "media_id": "46569",
+            "title": "Multi Cour Show",
+            "image": "https://example.com/anime.jpg",
+            "max_progress": 12,
+        }
+
+        # The user's existing Anime-library home for this show.
+        anime_item = Item.objects.create(
+            media_id="46569",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Multi Cour Show",
+            image="https://example.com/anime.jpg",
+        )
+        ItemProviderLink.objects.create(
+            item=anime_item,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.TV.value,
+            provider_media_id="12345",
+            season_number=1,
+            episode_offset=0,
+        )
+        Anime.objects.create(
+            item=anime_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=12,
+        )
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(
+                {
+                    "Event": "Stop",
+                    "Item": {
+                        "Type": "Episode",
+                        "Name": "Episode 3",
+                        "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                        "UserData": {"Played": True},
+                        "SeriesName": "Multi Cour Show",
+                        "ParentIndexNumber": 2,
+                        "IndexNumber": 3,
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            TV.objects.filter(user=self.user).count(),
+            0,
+            "unmapped season leaked into the TV library",
+        )
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("app.services.grouped_anime.classify_tv_metadata")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_provider_switch_keeps_new_season_on_flat_mal_home(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_load_mapping_data,
+        mock_classify,
+    ):
+        """Changing the Anime Provider must not open a second home for a show.
+
+        The grouped fast path used to run before the existing-home lookup, so
+        a user who switched from MAL to TVDB saw the next season appear as a
+        new show with only that season's progress (#1698).
+        """
+        self.user.anime_enabled = True
+        self.user.anime_metadata_source_default = Sources.TVDB.value
+        self.user.save()
+
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Split Cour Show",
+            "image": "https://example.com/show.jpg",
+            "genres": ["Animation"],
+            "tvdb_id": "402474",
+            "season/2": {"episodes": [{"episode_number": 1}]},
+        }
+        mock_load_mapping_data.return_value = {
+            "tvdb_show:402474:s1": {"mal:46569": {"1-12": "1-12"}},
+            "tvdb_show:402474:s2": {"mal:46569": {"1-12": "13-24"}},
+        }
+        mock_mal_anime.return_value = {
+            "media_id": "46569",
+            "title": "Split Cour Show",
+            "image": "https://example.com/anime.jpg",
+            "max_progress": 24,
+        }
+        mock_classify.return_value = GroupedAnimeMatch(
+            decision="move",
+            reason="exact_external_id_and_animation_genre",
+            tmdb_id="12345",
+            tvdb_id="402474",
+            mal_ids=("46569",),
+        )
+
+        anime_item = Item.objects.create(
+            media_id="46569",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Split Cour Show",
+            image="https://example.com/anime.jpg",
+        )
+        ItemProviderLink.objects.create(
+            item=anime_item,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.TV.value,
+            provider_media_id="12345",
+            season_number=1,
+            episode_offset=0,
+        )
+        anime = Anime.objects.create(
+            item=anime_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=12,
+        )
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(
+                {
+                    "Event": "Stop",
+                    "Item": {
+                        "Type": "Episode",
+                        "Name": "Episode 1",
+                        "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                        "UserData": {"Played": True},
+                        "SeriesName": "Split Cour Show",
+                        "ParentIndexNumber": 2,
+                        "IndexNumber": 1,
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            TV.objects.filter(user=self.user).count(),
+            0,
+            "switching provider opened a second home for the same show",
+        )
+        anime.refresh_from_db()
+        self.assertEqual(anime.progress, 13)
+        self.assertEqual(
+            Anime.objects.filter(user=self.user).count(),
+            1,
+        )
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_tv_bucket_row_does_not_take_episodes_from_flat_mal_home(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_load_mapping_data,
+    ):
+        """A stray TV-library row must not capture a flat MAL anime's episodes.
+
+        A Plex show rating creates a TV row for a show the user tracks as flat
+        MAL anime; later watches went to that row, invisible to the anime
+        details page and to MAL sync.
+        """
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Flat Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/1": {"episodes": [{"episode_number": 9}]},
+        }
+        mock_load_mapping_data.return_value = {}
+        mock_mal_anime.return_value = {
+            "media_id": "35078",
+            "title": "Flat Show",
+            "image": "https://example.com/anime.jpg",
+            "max_progress": 12,
+        }
+
+        tv_item = Item.objects.create(
+            media_id="12345",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.TV.value,
+            title="Flat Show",
+        )
+        tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        anime_item = Item.objects.create(
+            media_id="35078",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Flat Show",
+            image="https://example.com/anime.jpg",
+        )
+        ItemProviderLink.objects.create(
+            item=anime_item,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.TV.value,
+            provider_media_id="12345",
+        )
+        anime = Anime.objects.create(
+            item=anime_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=8,
+        )
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(
+                {
+                    "Event": "Stop",
+                    "Item": {
+                        "Type": "Episode",
+                        "Name": "Episode 9",
+                        "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                        "UserData": {"Played": True},
+                        "SeriesName": "Flat Show",
+                        "ParentIndexNumber": 1,
+                        "IndexNumber": 9,
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        anime.refresh_from_db()
+        self.assertEqual(anime.progress, 9)
+        self.assertFalse(Season.objects.filter(related_tv=tv).exists())
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_tv_row_with_history_keeps_episodes_beside_a_flat_mal_entry(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_load_mapping_data,
+    ):
+        """A show really tracked in the TV library keeps its episodes.
+
+        Regression: a flat MAL entry linked to the same show (an OVA, one cour)
+        took every later scrobble away from the user's TV row.
+        """
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Flat Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/1": {"episodes": [{"episode_number": 9}]},
+        }
+        mock_load_mapping_data.return_value = {}
+        mock_mal_anime.return_value = {
+            "media_id": "35078",
+            "title": "Flat Show",
+            "image": "https://example.com/anime.jpg",
+            "max_progress": 12,
+        }
+
+        tv_item = Item.objects.create(
+            media_id="12345",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.TV.value,
+            title="Flat Show",
+        )
+        tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        season = Season.objects.create(
+            item=Item.objects.create(
+                media_id="12345", source=Sources.TMDB.value,
+                media_type=MediaTypes.SEASON.value, season_number=1,
+                library_media_type=MediaTypes.TV.value, title="Flat Show",
+            ),
+            user=self.user, related_tv=tv, status=Status.IN_PROGRESS.value,
+        )
+        Episode.objects.create(
+            item=Item.objects.create(
+                media_id="12345", source=Sources.TMDB.value,
+                media_type=MediaTypes.EPISODE.value, season_number=1, episode_number=8,
+                library_media_type=MediaTypes.TV.value, title="Episode 8",
+            ),
+            related_season=season,
+        )
+        anime_item = Item.objects.create(
+            media_id="35078",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Flat Show",
+            image="https://example.com/anime.jpg",
+        )
+        ItemProviderLink.objects.create(
+            item=anime_item,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.TV.value,
+            provider_media_id="12345",
+        )
+        anime = Anime.objects.create(
+            item=anime_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=8,
+        )
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(
+                {
+                    "Event": "Stop",
+                    "Item": {
+                        "Type": "Episode",
+                        "Name": "Episode 9",
+                        "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                        "UserData": {"Played": True},
+                        "SeriesName": "Flat Show",
+                        "ParentIndexNumber": 1,
+                        "IndexNumber": 9,
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        anime.refresh_from_db()
+        self.assertEqual(anime.progress, 8)
+        self.assertTrue(
+            Episode.objects.filter(related_season=season, item__episode_number=9).exists(),
+        )
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_tv_bucket_row_keeps_episodes_when_the_anime_home_is_grouped(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_load_mapping_data,
+    ):
+        """Only a flat MAL home takes the episode from a TV-bucket row.
+
+        Regression: any anime home dropped the TV row, so with a grouped home
+        the episode fell through to flat MAL mapping and started a flat entry.
+        """
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Flat Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/1": {"episodes": [{"episode_number": 9}]},
+        }
+        mock_load_mapping_data.return_value = {
+            "tvdb_show:402474:s1": {"mal:35078": {}},
+            "tmdb_show:12345:s1": {"mal:35078": {}},
+        }
+        mock_mal_anime.return_value = {
+            "media_id": "35078",
+            "title": "Flat Show",
+            "image": "https://example.com/anime.jpg",
+            "max_progress": 12,
+        }
+
+        tv_item = Item.objects.create(
+            media_id="12345",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.TV.value,
+            title="Flat Show",
+        )
+        tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        grouped_home = patch(
+            "integrations.webhooks.base.BaseWebhookProcessor._find_existing_anime_home",
+            return_value=("grouped", MagicMock()),
+        )
+        with grouped_home:
+            response = self.client.post(
+                self.url,
+                data=json.dumps(
+                    {
+                        "Event": "Stop",
+                        "Item": {
+                            "Type": "Episode",
+                            "Name": "Episode 9",
+                            "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                            "UserData": {"Played": True},
+                            "SeriesName": "Flat Show",
+                            "ParentIndexNumber": 1,
+                            "IndexNumber": 9,
+                        },
+                    },
+                ),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Anime.objects.filter(user=self.user).exists())
+        self.assertTrue(Season.objects.filter(related_tv=tv).exists())
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_anime_episode_sticks_to_grouped_anime_bucket_without_mapping(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_load_mapping_data,
+    ):
+        """Grouped anime keeps its bucket when no mapping or snapshot applies."""
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Grouped Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/1": {"episodes": [{"episode_number": 2}]},
+        }
+        mock_load_mapping_data.return_value = {}
+
+        grouped_item = Item.objects.create(
+            media_id="12345",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.ANIME.value,
+            title="Grouped Show",
+            image="https://example.com/show.jpg",
+        )
+        TV.objects.create(
+            item=grouped_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        # A competing default-bucket row for the same show: the scrobble must
+        # keep using the anime-bucket one the user actually tracks.
+        Item.objects.create(
+            media_id="12345",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type="",
+            title="Grouped Show",
+            image="https://example.com/show.jpg",
+        )
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(
+                {
+                    "Event": "Stop",
+                    "Item": {
+                        "Type": "Episode",
+                        "Name": "Episode 2",
+                        "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                        "UserData": {"Played": True},
+                        "SeriesName": "Grouped Show",
+                        "ParentIndexNumber": 1,
+                        "IndexNumber": 2,
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(TV.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(
+            TV.objects.get(user=self.user).item.library_media_type,
+            MediaTypes.ANIME.value,
+            "scrobble dropped the grouped-anime bucket",
+        )
+        self.assertEqual(
+            Item.objects.filter(
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.TV.value,
+                media_id="12345",
+            ).count(),
+            2,
+            "the scrobble created a third Item bucket for this show",
+        )
+
+    @override_settings(TVDB_API_KEY="")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_tv_episode_survives_anime_bucket_item_owned_by_another_user(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_load_mapping_data,
+    ):
+        """Another user's anime-bucket row must not break this user's scrobble.
+
+        Item uniqueness includes ``library_media_type``, so two buckets for one
+        show made the old ``get_or_create`` raise ``MultipleObjectsReturned``.
+        """
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Shared Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/1": {"episodes": [{"episode_number": 1}]},
+        }
+        mock_load_mapping_data.return_value = {}
+
+        other_user = get_user_model().objects.create_user(
+            username="otheruser",
+            password="other-password",
+        )
+        other_item = Item.objects.create(
+            media_id="12345",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.ANIME.value,
+            title="Shared Show",
+            image="https://example.com/show.jpg",
+        )
+        TV.objects.create(
+            item=other_item,
+            user=other_user,
+            status=Status.IN_PROGRESS.value,
+        )
+        # Second bucket for the same show. Item uniqueness includes
+        # `library_media_type`, so a lookup keyed only on
+        # (media_id, source, media_type) matches both rows and raises.
+        Item.objects.create(
+            media_id="12345",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.TV.value,
+            title="Shared Show",
+            image="https://example.com/show.jpg",
+        )
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(
+                {
+                    "Event": "Stop",
+                    "Item": {
+                        "Type": "Episode",
+                        "Name": "Episode 1",
+                        "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                        "UserData": {"Played": True},
+                        "SeriesName": "Shared Show",
+                        "ParentIndexNumber": 1,
+                        "IndexNumber": 1,
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(TV.objects.filter(user=self.user).count(), 1)
+
+    @patch("app.services.grouped_anime.classify_tv_metadata")
+    @patch("integrations.webhooks.anime_mappings.fetch_mapping_data")
+    @patch("app.providers.mal.anime")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    def test_new_anime_genesis_shape_follows_anime_provider_preference(
+        self,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_mal_anime,
+        mock_load_mapping_data,
+        mock_classify,
+    ):
+        """A brand-new anime is stored in the shape the user's provider implies.
+
+        Both routes are available here: a MAL mapping and a positive
+        grouped-anime verdict. Which one wins must be the user's Anime Provider,
+        not the order the branches happen to be written in.
+        """
+        mock_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [{"id": 12345}],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "12345",
+            "title": "Genesis Show",
+            "image": "https://example.com/show.jpg",
+            "tvdb_id": "402474",
+            "season/1": {"episodes": [{"episode_number": 1}]},
+        }
+        mock_load_mapping_data.return_value = {
+            "tvdb_show:402474:s1": {"mal:46569": {"1-12": "1-12"}},
+        }
+        mock_mal_anime.return_value = {
+            "media_id": "46569",
+            "title": "Genesis Show",
+            "image": "https://example.com/anime.jpg",
+            "max_progress": 12,
+        }
+        mock_classify.return_value = GroupedAnimeMatch(
+            decision="move",
+            reason="exact_external_id_match",
+            tmdb_id="12345",
+            tvdb_id="402474",
+            mal_ids=("46569",),
+        )
+
+        payload = {
+            "Event": "Stop",
+            "Item": {
+                "Type": "Episode",
+                "Name": "Episode 1",
+                "ProviderIds": {"Tmdb": "12345", "Tvdb": "402474"},
+                "UserData": {"Played": True},
+                "SeriesName": "Genesis Show",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 1,
+            },
+        }
+
+        # TVDB has no API key here, so it resolves back to TMDB - which is
+        # still a grouped provider, not a fallback to flat MAL.
+        cases = [
+            (Sources.MAL.value, "flat"),
+            (Sources.TMDB.value, "grouped"),
+            (Sources.TVDB.value, "grouped"),
+        ]
+        for provider, expected_shape in cases:
+            with self.subTest(provider=provider):
+                Episode.objects.all().delete()
+                Season.objects.all().delete()
+                TV.objects.all().delete()
+                Anime.objects.all().delete()
+                Item.objects.all().delete()
+
+                self.user.anime_metadata_source_default = provider
+                self.user.save(update_fields=["anime_metadata_source_default"])
+
+                with patch("app.providers.tvdb.enabled", return_value=False):
+                    response = self.client.post(
+                        self.url,
+                        data=json.dumps(payload),
+                        content_type="application/json",
+                    )
+
+                self.assertEqual(response.status_code, 200)
+
+                if expected_shape == "flat":
+                    self.assertEqual(Anime.objects.filter(user=self.user).count(), 1)
+                    self.assertEqual(TV.objects.filter(user=self.user).count(), 0)
+                else:
+                    self.assertEqual(Anime.objects.filter(user=self.user).count(), 0)
+                    tv = TV.objects.get(user=self.user)
+                    self.assertEqual(
+                        tv.item.library_media_type,
+                        MediaTypes.ANIME.value,
+                    )
+
+    @patch("app.services.grouped_anime.classify_tv_metadata")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    @patch.object(JellyfinWebhookProcessor, "_find_tv_media_id")
+    def test_stale_grouped_anime_match_does_not_corrupt_recovered_show(
+        self,
+        mock_find_tv_media_id,
+        mock_find,
+        mock_tv_with_seasons,
+        mock_classify,
+    ):
+        """A grouped-anime match computed pre-recovery must not survive it.
+
+        Regression for issue #1246: Jellyfin sent a TVDB episode ID that
+        `_find_tv_media_id` first resolved to an unrelated (but genuinely
+        animated) TMDB show. That wrong show's metadata falsely matched the
+        Anime-IDs mapping, but season recovery then correctly re-resolved the
+        real, already-tracked show. The stale match must not be applied to
+        that real item - doing so previously flipped it into the anime
+        bucket and stamped it with the wrong show's TMDB id.
+        """
+        wrong_show_metadata = {
+            "media_id": "42917",
+            "title": "Wrong Anime Show",
+            "image": "https://example.com/wrong.jpg",
+            "tvdb_id": "83315",
+            "genres": ["Animation"],
+        }
+        real_show_metadata = {
+            "media_id": "3968",
+            "title": "NewsRadio",
+            "image": "https://example.com/newsradio.jpg",
+            "tvdb_id": "75978",
+            "genres": ["Comedy"],
+            "season/2": {
+                "image": "https://example.com/season2.jpg",
+                # A second, unwatched episode keeps the season from being
+                # marked completed by this webhook, which would otherwise
+                # trigger an unrelated "next season" TMDB lookup.
+                "episodes": [{"episode_number": 2}, {"episode_number": 3}],
+            },
+        }
+
+        def tv_with_seasons_side_effect(media_id, _season_numbers, language=None):
+            if str(media_id) == "42917":
+                return wrong_show_metadata
+            if str(media_id) == "3968":
+                return real_show_metadata
+            raise AssertionError(f"unexpected tv_with_seasons media_id={media_id}")
+
+        mock_tv_with_seasons.side_effect = tv_with_seasons_side_effect
+        mock_find.return_value = {"tv_episode_results": [], "tv_results": []}
+        # Jellyfin's live-playback card resolution runs first and resolves
+        # cleanly; the second call (from `_process_tv`) resolves the incoming
+        # TVDB episode id to the wrong show; the third is
+        # `_recover_tv_metadata_for_missing_season`'s independent
+        # re-resolution, which finds the real show.
+        def find_tv_media_id_side_effect(_ids, *args, **kwargs):
+            # The live-playback fallback and `_process_tv`'s initial lookup
+            # both call this with identical args (series_title kwarg
+            # present) and both resolve to the wrong show here, exactly as
+            # the real bug did. Only the missing-season recovery's
+            # alt-ids-only call (no kwargs) resolves to the real show.
+            if kwargs.get("series_title"):
+                return ("42917", None, None)
+            return ("3968", None, None)
+
+        mock_find_tv_media_id.side_effect = find_tv_media_id_side_effect
+
+        def classify_side_effect(metadata, snapshot=None):
+            if metadata.get("media_id") == "42917":
+                return GroupedAnimeMatch(
+                    decision="move",
+                    reason="exact_external_id_and_animation_genre",
+                    tmdb_id="42917",
+                    tvdb_id="83315",
+                    mal_ids=("99999",),
+                )
+            return GroupedAnimeMatch(
+                decision="leave",
+                reason="no_exact_anime_ids_external_id_match",
+            )
+
+        mock_classify.side_effect = classify_side_effect
+
+        real_item = Item.objects.create(
+            media_id="3968",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type="",
+            title="NewsRadio",
+            image="https://example.com/newsradio.jpg",
+        )
+        TV.objects.create(
+            item=real_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+
+        payload = {
+            "Event": "Stop",
+            "Item": {
+                "Type": "Episode",
+                "Name": "Rat Funeral",
+                "ProviderIds": {"Tmdb": "", "Imdb": "tt0660219", "Tvdb": "83315"},
+                "UserData": {"Played": True},
+                "SeriesName": "NewsRadio",
+                "ParentIndexNumber": 2,
+                "IndexNumber": 2,
+            },
+        }
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        real_item.refresh_from_db()
+        self.assertNotEqual(
+            real_item.library_media_type,
+            MediaTypes.ANIME.value,
+            "the stale match promoted the real, already-tracked item into "
+            "the anime bucket",
+        )
+        self.assertNotEqual(
+            real_item.provider_external_ids.get("tmdb_id"),
+            "42917",
+            "the wrong show's TMDB id leaked onto the real item",
+        )
+        self.assertFalse(
+            ItemProviderLink.objects.filter(
+                provider=Sources.TMDB.value,
+                provider_media_id="42917",
+            ).exists(),
+            "a provider link for the wrong show was created",
+        )
+        self.assertTrue(
+            Episode.objects.filter(
+                item__media_id="3968",
+                item__season_number=2,
+                item__episode_number=2,
+            ).exists(),
         )
 
     def test_ignored_event_types(self):
@@ -397,6 +1848,397 @@ class JellyfinWebhookTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(Movie.objects.count(), 0)
 
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    def test_item_added_and_deleted_movie_syncs_jellyfin_collection(
+        self,
+        mock_get_media_metadata,
+    ):
+        """Movie library events should create and remove source-scoped ownership."""
+        mock_get_media_metadata.return_value = {
+            "media_id": "603",
+            "title": "The Matrix",
+            "image": "https://example.com/matrix.jpg",
+            "provider_external_ids": {"imdb_id": "tt0133093"},
+        }
+        payload = {
+            "Event": "ItemAdded",
+            "Item": {
+                "Type": "Movie",
+                "Name": "The Matrix",
+                "ProviderIds": {"Tmdb": "603", "Imdb": "tt0133093"},
+            },
+        }
+        processor = JellyfinWebhookProcessor()
+
+        processor.process_payload(payload, self.user)
+
+        item = Item.objects.get(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+        )
+        self.assertTrue(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=item,
+                source="jellyfin",
+            ).exists(),
+        )
+        self.assertTrue(
+            CollectionEntry.objects.filter(user=self.user, item=item).exists()
+        )
+        self.assertEqual(Movie.objects.filter(user=self.user, item=item).count(), 0)
+
+        processor.process_payload(
+            {**payload, "Event": "ItemDeleted"},
+            self.user,
+        )
+
+        self.assertFalse(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=item,
+                source="jellyfin",
+            ).exists(),
+        )
+        self.assertFalse(
+            CollectionEntry.objects.filter(user=self.user, item=item).exists()
+        )
+
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    def test_unofficial_plugin_item_removed_removes_jellyfin_collection(
+        self,
+        mock_get_media_metadata,
+    ):
+        """The unofficial Webhooks plugin sends ItemRemoved instead of ItemDeleted."""
+        mock_get_media_metadata.return_value = {
+            "media_id": "603",
+            "title": "The Matrix",
+            "image": "https://example.com/matrix.jpg",
+        }
+        payload = {
+            "Event": "ItemAdded",
+            "Item": {"Type": "Movie", "ProviderIds": {"Tmdb": "603"}},
+        }
+        processor = JellyfinWebhookProcessor()
+        processor.process_payload(payload, self.user)
+        item = Item.objects.get(media_id="603", media_type=MediaTypes.MOVIE.value)
+
+        processor.process_payload({**payload, "Event": "ItemRemoved"}, self.user)
+
+        self.assertFalse(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=item,
+                source="jellyfin",
+            ).exists(),
+        )
+        self.assertFalse(
+            CollectionEntry.objects.filter(user=self.user, item=item).exists()
+        )
+
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    @patch.object(
+        JellyfinWebhookProcessor, "_find_tv_media_id", return_value=("1668", None, None)
+    )
+    def test_item_added_and_deleted_episode_syncs_collection_without_tracking(
+        self,
+        _mock_find_tv_media_id,
+        mock_get_media_metadata,
+    ):
+        """Episode library events should preserve season/episode identity."""
+
+        def metadata(
+            media_type, media_id, source, season_numbers=None, episode_number=None
+        ):
+            if media_type == MediaTypes.TV.value:
+                return {
+                    "media_id": media_id,
+                    "title": "Friends",
+                    "image": "https://example.com/friends.jpg",
+                    "provider_external_ids": {"tvdb_id": "79175"},
+                }
+            return {
+                "episode_title": "The One Where It All Began",
+                "image": "https://example.com/episode.jpg",
+            }
+
+        mock_get_media_metadata.side_effect = metadata
+        payload = {
+            "Event": "ItemAdded",
+            "Item": {
+                "Type": "Episode",
+                "Name": "The One Where It All Began",
+                "SeriesName": "Friends",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 1,
+                "ProviderIds": {"Tvdb": "303821", "Imdb": "tt0583459"},
+            },
+        }
+        processor = JellyfinWebhookProcessor()
+
+        processor.process_payload(payload, self.user)
+
+        episode_item = Item.objects.get(
+            media_id="1668",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+        )
+        self.assertTrue(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=episode_item,
+                source="jellyfin",
+            ).exists(),
+        )
+        self.assertFalse(TV.objects.filter(user=self.user).exists())
+        self.assertFalse(Season.objects.filter(user=self.user).exists())
+        self.assertFalse(
+            Episode.objects.filter(related_season__user=self.user).exists()
+        )
+
+        processor.process_payload(
+            {**payload, "Event": "ItemDeleted"},
+            self.user,
+        )
+
+        self.assertFalse(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=episode_item,
+                source="jellyfin",
+            ).exists(),
+        )
+        self.assertFalse(
+            CollectionEntry.objects.filter(user=self.user, item=episode_item).exists()
+        )
+
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    def test_duplicate_item_added_is_idempotent_and_preserves_other_source_state(
+        self,
+        mock_get_media_metadata,
+    ):
+        """Repeated adds are safe and deleting Jellyfin leaves other ownership intact."""
+        mock_get_media_metadata.return_value = {
+            "media_id": "603",
+            "title": "The Matrix",
+            "image": "https://example.com/matrix.jpg",
+        }
+        payload = {
+            "Event": "ItemAdded",
+            "Item": {"Type": "Movie", "ProviderIds": {"Tmdb": "603"}},
+        }
+        processor = JellyfinWebhookProcessor()
+
+        processor.process_payload(payload, self.user)
+        processor.process_payload(payload, self.user)
+
+        item = Item.objects.get(media_id="603", media_type=MediaTypes.MOVIE.value)
+        CollectionSourceState.objects.create(
+            user=self.user,
+            item=item,
+            source="sonarr",
+        )
+        self.assertEqual(
+            CollectionEntry.objects.filter(user=self.user, item=item).count(),
+            1,
+        )
+        self.assertEqual(mock_get_media_metadata.call_count, 1)
+
+        processor.process_payload(
+            {**payload, "Event": "ItemDeleted"},
+            self.user,
+        )
+
+        self.assertFalse(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=item,
+                source="jellyfin",
+            ).exists(),
+        )
+        self.assertTrue(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=item,
+                source="sonarr",
+            ).exists(),
+        )
+        self.assertTrue(
+            CollectionEntry.objects.filter(user=self.user, item=item).exists()
+        )
+
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    def test_item_deleted_does_not_remove_manual_placeholder_without_jellyfin_state(
+        self,
+        mock_get_media_metadata,
+    ):
+        """An unrelated Jellyfin deletion must not remove manual ownership."""
+        item = Item.objects.create(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+        )
+        CollectionEntry.objects.create(user=self.user, item=item)
+
+        JellyfinWebhookProcessor().process_payload(
+            {
+                "Event": "ItemDeleted",
+                "Item": {"Type": "Movie", "ProviderIds": {"Tmdb": "603"}},
+            },
+            self.user,
+        )
+
+        self.assertTrue(
+            CollectionEntry.objects.filter(user=self.user, item=item).exists()
+        )
+        mock_get_media_metadata.assert_not_called()
+
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    def test_item_added_keeps_the_resolution_of_a_collected_title(
+        self,
+        mock_get_media_metadata,
+    ):
+        """Jellyfin sends no quality, so its ItemAdded must not blank one."""
+        item = Item.objects.create(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+        )
+        entry = CollectionEntry.objects.create(
+            user=self.user,
+            item=item,
+            media_type="digital",
+            resolution="4K",
+        )
+
+        JellyfinWebhookProcessor().process_payload(
+            {
+                "Event": "ItemAdded",
+                "Item": {"Type": "Movie", "ProviderIds": {"Tmdb": "603"}},
+            },
+            self.user,
+        )
+
+        entry.refresh_from_db()
+        self.assertEqual(entry.resolution, "4K")
+        self.assertTrue(
+            CollectionSourceState.objects.filter(
+                user=self.user,
+                item=item,
+                source="jellyfin",
+            ).exists(),
+        )
+        mock_get_media_metadata.assert_not_called()
+
+    @patch("integrations.webhooks.jellyfin.services.get_media_metadata")
+    def test_collection_events_ignore_invalid_or_unsupported_payloads(
+        self,
+        mock_get_media_metadata,
+    ):
+        """Invalid collection notifications should not create items or call providers."""
+        processor = JellyfinWebhookProcessor()
+
+        for item in (
+            {"Type": "Series", "ProviderIds": {"Tmdb": "1668"}},
+            {"Type": "Movie", "ProviderIds": {}},
+            {
+                "Type": "Episode",
+                "ParentIndexNumber": "not-a-number",
+                "IndexNumber": 1,
+                "ProviderIds": {"Tvdb": "303821"},
+            },
+            {
+                "Type": "Episode",
+                "ParentIndexNumber": -1,
+                "IndexNumber": 1,
+                "ProviderIds": {"Tvdb": "303821"},
+            },
+        ):
+            processor.process_payload(
+                {"Event": "ItemAdded", "Item": item},
+                self.user,
+            )
+
+        processor.process_payload(
+            {
+                "Event": "ItemDeleted",
+                "Item": {"Type": "Movie", "ProviderIds": {"Tmdb": "999999"}},
+            },
+            self.user,
+        )
+
+        self.assertEqual(Item.objects.count(), 0)
+        self.assertEqual(CollectionEntry.objects.count(), 0)
+        mock_get_media_metadata.assert_not_called()
+
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
+    @patch("app.providers.tvdb.series_tmdb_id")
+    @patch("app.providers.tvdb.episode_by_id")
+    @patch("integrations.webhooks.base.BaseWebhookProcessor._handle_tv_episode")
+    def test_tvdb_episode_id_resolves_to_series_tmdb_id(
+        self,
+        mock_handle_tv_episode,
+        mock_episode_by_id,
+        mock_series_tmdb_id,
+        mock_tmdb_find,
+        mock_tv_with_seasons,
+    ):
+        """Jellyfin episode TVDB IDs should resolve through their series."""
+        self.user.anime_enabled = False
+        self.user.save(update_fields=["anime_enabled"])
+        mock_tmdb_find.return_value = {
+            "tv_episode_results": [],
+            "tv_results": [],
+        }
+        mock_episode_by_id.return_value = {
+            "episode_id": "11821802",
+            "series_id": "407407",
+            "season_number": 1,
+            "episode_number": 3,
+        }
+        mock_series_tmdb_id.return_value = "124428"
+        mock_tv_with_seasons.return_value = {
+            "tvdb_id": "407407",
+            "title": "B&B Vol Liefde",
+            "season/1": {"episodes": []},
+        }
+        payload = {
+            "Event": "Stop",
+            "Item": {
+                "Type": "Episode",
+                "Name": "Episode 3",
+                "SeriesName": "B&B Vol Liefde",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 3,
+                "ProviderIds": {"Tvdb": "11821802"},
+                "UserData": {"Played": True},
+            },
+        }
+
+        processor = JellyfinWebhookProcessor()
+        ids = processor._extract_external_ids(payload)
+        processor._process_media(payload, self.user, ids)
+
+        mock_handle_tv_episode.assert_called_once_with(
+            "124428",
+            1,
+            3,
+            payload,
+            self.user,
+            # No Anime-IDs verdict was available, so the bucket stays undecided
+            # and remains eligible for later reclassification.
+            library_media_type=None,
+        )
+        mock_series_tmdb_id.assert_called_once_with("407407")
+
+    @tag("network")
     def test_mark_unplayed(self):
         """Test webhook handles not finished events."""
         payload = {
@@ -426,10 +2268,188 @@ class JellyfinWebhookTests(TestCase):
         self.assertEqual(movie.progress, 0)
         self.assertEqual(movie.status, Status.IN_PROGRESS.value)
 
+    def test_mark_played_event_ignored_when_disabled(self):
+        """Test MarkPlayed events are ignored unless opted in by the user."""
+        self.assertFalse(self.user.jellyfin_mark_played_enabled)
+        payload = {
+            "Event": "MarkPlayed",
+            "Item": {
+                "Name": "The Matrix",
+                "ProductionYear": 1999,
+                "Type": "Movie",
+                "ProviderIds": {"Tmdb": "603"},
+                "UserData": {"Played": True},
+            },
+        }
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Movie.objects.count(), 0)
+
+    @tag("network")
+    def test_mark_played_event_marks_movie_completed_when_enabled(self):
+        """Test MarkPlayed events mark a movie as completed once opted in."""
+        self.user.jellyfin_mark_played_enabled = True
+        self.user.save(update_fields=["jellyfin_mark_played_enabled"])
+
+        payload = {
+            "Event": "MarkPlayed",
+            "Item": {
+                "Name": "The Matrix",
+                "ProductionYear": 1999,
+                "Type": "Movie",
+                "ProviderIds": {"Tmdb": "603"},
+                "UserData": {"Played": False},
+            },
+        }
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        movie = Movie.objects.get(item__media_id="603", user=self.user)
+        self.assertEqual(movie.status, Status.COMPLETED.value)
+        self.assertEqual(movie.progress, 1)
+
+    @tag("network")
+    def test_mark_unplayed_event_ignored_when_disabled(self):
+        """Test MarkUnplayed events are ignored unless opted in by the user."""
+        self.assertFalse(self.user.jellyfin_mark_unplayed_enabled)
+
+        stop_payload = {
+            "Event": "Stop",
+            "Item": {
+                "Name": "The Matrix",
+                "ProductionYear": 1999,
+                "Type": "Movie",
+                "ProviderIds": {"Tmdb": "603"},
+                "UserData": {"Played": True},
+            },
+        }
+        self.client.post(
+            self.url,
+            data=json.dumps(stop_payload),
+            content_type="application/json",
+        )
+        self.assertEqual(Movie.objects.count(), 1)
+
+        mark_unplayed_payload = dict(stop_payload, Event="MarkUnplayed")
+        response = self.client.post(
+            self.url,
+            data=json.dumps(mark_unplayed_payload),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Movie.objects.count(), 1)
+
+    @tag("network")
+    def test_mark_unplayed_event_reverts_movie_when_enabled(self):
+        """MarkUnplayed reverts the movie's state and keeps its history.
+
+        This used to delete the tracking row outright, which took every
+        rewatch with it. Marking unwatched and deleting history are separate
+        operations, and only the first is what a media server is asking for.
+        """
+        self.user.jellyfin_mark_unplayed_enabled = True
+        self.user.save(update_fields=["jellyfin_mark_unplayed_enabled"])
+
+        stop_payload = {
+            "Event": "Stop",
+            "Item": {
+                "Name": "The Matrix",
+                "ProductionYear": 1999,
+                "Type": "Movie",
+                "ProviderIds": {"Tmdb": "603"},
+                "UserData": {"Played": True},
+            },
+        }
+        self.client.post(
+            self.url,
+            data=json.dumps(stop_payload),
+            content_type="application/json",
+        )
+        self.assertEqual(Movie.objects.count(), 1)
+
+        mark_unplayed_payload = dict(stop_payload, Event="MarkUnplayed")
+        response = self.client.post(
+            self.url,
+            data=json.dumps(mark_unplayed_payload),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Movie.objects.count(), 1, "the row must survive")
+        movie = Movie.objects.get()
+        self.assertNotEqual(movie.status, Status.COMPLETED.value)
+        self.assertIsNone(movie.end_date)
+
+    @tag("network")
+    def test_mark_unplayed_event_retracts_episode_when_enabled(self):
+        """MarkUnplayed retracts the latest episode play, not every play."""
+        self.user.jellyfin_mark_unplayed_enabled = True
+        self.user.save(update_fields=["jellyfin_mark_unplayed_enabled"])
+
+        stop_payload = {
+            "Event": "Stop",
+            "Item": {
+                "Type": "Episode",
+                "Name": "The One Where Monica Gets a Roommate",
+                "ProviderIds": {
+                    "Tvdb": "303821",
+                    "Imdb": "tt0583459",
+                },
+                "SeriesName": "Friends",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 1,
+                "UserData": {"Played": True},
+            },
+        }
+        self.client.post(
+            self.url,
+            data=json.dumps(stop_payload),
+            content_type="application/json",
+        )
+        episode = Episode.objects.get(
+            item__media_id="1668",
+            item__season_number=1,
+            item__episode_number=1,
+        )
+        self.assertIsNotNone(episode)
+
+        mark_unplayed_payload = dict(stop_payload, Event="MarkUnplayed")
+        response = self.client.post(
+            self.url,
+            data=json.dumps(mark_unplayed_payload),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        # One play existed, so retracting it leaves none -- but the retraction
+        # removed that single play rather than every row matching the title.
+        self.assertFalse(
+            Episode.objects.filter(
+                item__media_id="1668",
+                item__season_number=1,
+                item__episode_number=1,
+            ).exists(),
+        )
+
+    @tag("network")
     @patch("app.providers.tmdb.tv_with_seasons")
     @patch("app.providers.tmdb.find")
     def test_tv_episode_uses_existing_tvdb_tracked_item(
-        self, mock_find, mock_tv_with_seasons,
+        self,
+        mock_find,
+        mock_tv_with_seasons,
     ):
         """Webhook scrobble lands on an existing TVDB-tracked show rather than
         creating a duplicate TMDB-sourced item.
@@ -445,7 +2465,9 @@ class JellyfinWebhookTests(TestCase):
             title="Friends",
             image="https://example.com/friends.jpg",
         )
-        TV.objects.create(item=tvdb_item, user=self.user, status=Status.IN_PROGRESS.value)
+        TV.objects.create(
+            item=tvdb_item, user=self.user, status=Status.IN_PROGRESS.value
+        )
         ItemProviderLink.objects.create(
             item=tvdb_item,
             provider=Sources.TVDB.value,
@@ -471,7 +2493,16 @@ class JellyfinWebhookTests(TestCase):
                 "synopsis": "",
                 "image": "https://example.com/friends-s1.jpg",
                 "max_progress": 24,
-                "episodes": [{"episode_number": 1, "runtime": 22, "air_date": None, "still_path": None, "name": "The Pilot", "overview": ""}],
+                "episodes": [
+                    {
+                        "episode_number": 1,
+                        "runtime": 22,
+                        "air_date": None,
+                        "still_path": None,
+                        "name": "The Pilot",
+                        "overview": "",
+                    }
+                ],
                 "details": {"episodes": 24},
                 "providers": {},
             },
@@ -500,7 +2531,9 @@ class JellyfinWebhookTests(TestCase):
 
         # No new TMDB-sourced TV item should have been created
         self.assertFalse(
-            Item.objects.filter(source=Sources.TMDB.value, media_type=MediaTypes.TV.value).exists(),
+            Item.objects.filter(
+                source=Sources.TMDB.value, media_type=MediaTypes.TV.value
+            ).exists(),
         )
 
         # Season and episode items should be under the existing TVDB item
@@ -518,7 +2551,9 @@ class JellyfinWebhookTests(TestCase):
     @patch("app.providers.tmdb.tv_with_seasons")
     @patch("app.providers.tmdb.find")
     def test_tv_and_season_provider_links_ignore_episode_level_ids(
-        self, mock_find, mock_tv_with_seasons,
+        self,
+        mock_find,
+        mock_tv_with_seasons,
     ):
         """TV/Season provider links must use the validated show-level tvdb_id.
 
@@ -620,7 +2655,9 @@ class JellyfinWebhookTests(TestCase):
     @patch("app.providers.tmdb.tv_with_seasons")
     @patch("app.providers.tmdb.find")
     def test_second_episode_of_tracked_season_does_not_duplicate_season_item(
-        self, mock_find, mock_tv_with_seasons,
+        self,
+        mock_find,
+        mock_tv_with_seasons,
     ):
         """A second played episode of a tracked season must reuse that season.
 
@@ -630,7 +2667,7 @@ class JellyfinWebhookTests(TestCase):
         tmdb_show_id = "1668"
         show_level_tvdb_id = "76669"
 
-        def find_side_effect(ext_id, ext_type):  # noqa: ARG001
+        def find_side_effect(ext_id, ext_type):
             episode_number = 1 if ext_id == "303821" else 2
             return {
                 "tv_episode_results": [
@@ -737,7 +2774,9 @@ class JellyfinWebhookTests(TestCase):
     @patch("app.providers.tmdb.tv_with_seasons")
     @patch("app.providers.tmdb.find")
     def test_webhook_heals_preexisting_stray_season_item_and_avoids_conflict(
-        self, mock_find, mock_tv_with_seasons,
+        self,
+        mock_find,
+        mock_tv_with_seasons,
     ):
         """Reproduces the GitHub issue #326 follow-up report exactly.
 
@@ -858,6 +2897,7 @@ class JellyfinWebhookTests(TestCase):
         )
         self.assertIsNotNone(episode.end_date)
 
+    @tag("network")
     def test_repeated_watch(self):
         """Test webhook handles repeated watches."""
         payload = {
@@ -961,6 +3001,200 @@ class JellyfinWebhookTests(TestCase):
             msg = f"Expected {expected}, got {result}"
             raise AssertionError(msg)
 
+    @patch("app.providers.tmdb.movie")
+    def test_play_stop_play_with_stale_played_flag_stays_in_progress(
+        self,
+        mock_movie,
+    ):
+        """Playback events must not turn low-progress stale flags into watches."""
+        mock_movie.return_value = {
+            "title": "The Matrix",
+            "image": "https://example.com/matrix.jpg",
+            "max_progress": 1,
+            "provider_external_ids": {},
+        }
+        processor = JellyfinWebhookProcessor()
+
+        def payload(event, position):
+            return {
+                "Event": event,
+                "Item": {
+                    "Name": "The Matrix",
+                    "Type": "Movie",
+                    "Id": "jellyfin-movie-1",
+                    "ProviderIds": {"Tmdb": "603"},
+                    "RunTimeTicks": 1000 * 10_000_000,
+                    "UserData": {"Played": True},
+                },
+                "PlaybackPositionTicks": position * 10_000_000,
+            }
+
+        with patch("app.live_playback._attach_resolved_image"):
+            processor.process_payload(payload("Play", 100), self.user)
+            processor.process_payload(payload("Stop", 200), self.user)
+            processor.process_payload(payload("Play", 250), self.user)
+
+        movie = Movie.objects.get(item__media_id="603", user=self.user)
+        self.assertEqual(Movie.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(movie.status, Status.IN_PROGRESS.value)
+        self.assertIsNone(movie.end_date)
+        progress = PlaybackProgress.objects.get(user=self.user, item=movie.item)
+        self.assertEqual(progress.position_seconds, 200)
+        self.assertFalse(progress.completed)
+
+    @patch("app.providers.tmdb.movie")
+    def test_completed_jellyfin_stops_are_deduplicated_and_rewatches_survive(
+        self,
+        mock_movie,
+    ):
+        """The shared timestamp window suppresses repeats but permits rewatches."""
+        mock_movie.return_value = {
+            "title": "The Matrix",
+            "image": "https://example.com/matrix.jpg",
+            "max_progress": 1,
+            "provider_external_ids": {},
+        }
+        processor = JellyfinWebhookProcessor()
+
+        def payload(last_played_date):
+            return {
+                "Event": "Stop",
+                "Item": {
+                    "Name": "The Matrix",
+                    "Type": "Movie",
+                    "Id": "jellyfin-movie-2",
+                    "ProviderIds": {"Tmdb": "603"},
+                    "RunTimeTicks": 100 * 10_000_000,
+                    "UserData": {
+                        "Played": True,
+                        "LastPlayedDate": last_played_date,
+                    },
+                },
+                "PlaybackPositionTicks": 80 * 10_000_000,
+            }
+
+        processor.process_payload(payload("2026-08-06T15:30:00Z"), self.user)
+        processor.process_payload(payload("2026-08-06T15:30:00Z"), self.user)
+        processor.process_payload(payload("2026-08-06T20:30:00Z"), self.user)
+
+        self.assertEqual(Movie.objects.filter(item__media_id="603").count(), 2)
+        self.assertEqual(
+            PlaybackProgress.objects.get(
+                user=self.user,
+                item__media_id="603",
+            ).completed,
+            True,
+        )
+
+    def test_progress_qualified_false_stop_tracks_movie_and_ignores_old_timestamp(self):
+        """A completed stop from progress gets a fresh timestamp, not old history."""
+        processor = JellyfinWebhookProcessor()
+        payload = {
+            "Event": "Stop",
+            "Item": {
+                "Name": "The Matrix",
+                "Type": "Movie",
+                "Id": "jellyfin-movie-3",
+                "ProviderIds": {"Tmdb": "603"},
+                "RunTimeTicks": 100 * 10_000_000,
+                "UserData": {
+                    "Played": False,
+                    "LastPlayedDate": "2020-01-01T00:00:00Z",
+                },
+            },
+            "PlaybackPositionTicks": 80 * 10_000_000,
+        }
+
+        with (
+            patch("app.live_playback._attach_resolved_image"),
+            patch(
+                "app.providers.tmdb.movie",
+                return_value={
+                    "title": "The Matrix",
+                    "image": "https://example.com/matrix.jpg",
+                    "max_progress": 1,
+                    "provider_external_ids": {},
+                },
+            ),
+        ):
+            processor.process_payload(payload, self.user)
+
+        movie = Movie.objects.get(item__media_id="603", user=self.user)
+        self.assertEqual(movie.status, Status.COMPLETED.value)
+        self.assertGreater(movie.end_date, datetime(2020, 1, 1, tzinfo=UTC))
+        progress = PlaybackProgress.objects.get(user=self.user, item=movie.item)
+        self.assertTrue(progress.completed)
+
+    @patch.object(
+        JellyfinWebhookProcessor,
+        "_find_tv_media_id",
+        return_value=("1668", None, None),
+    )
+    @patch("app.providers.tmdb.get_tvdb_episode_image_map", return_value={})
+    @patch("app.providers.tmdb.tv_with_seasons")
+    def test_progress_qualified_false_stop_tracks_episode_and_progress(
+        self,
+        mock_tv_with_seasons,
+        _mock_episode_images,
+        _mock_find_tv_media_id,
+    ):
+        """Episode history and durable progress use the same completion result."""
+        self.user.anime_enabled = False
+        mock_tv_with_seasons.return_value = {
+            "media_id": "1668",
+            "title": "Friends",
+            "image": "https://example.com/friends.jpg",
+            "tvdb_id": "79175",
+            "provider_external_ids": {"tmdb_id": "1668", "tvdb_id": "79175"},
+            "season/1": {
+                "season_number": 1,
+                "image": "https://example.com/friends-s1.jpg",
+                "episodes": [
+                    {
+                        "episode_number": 1,
+                        "runtime": 22,
+                        "air_date": None,
+                        "still_path": None,
+                        "name": "The Pilot",
+                        "overview": "",
+                    },
+                    {"episode_number": 2},
+                ],
+            },
+        }
+        payload = {
+            "Event": "Stop",
+            "Item": {
+                "Type": "Episode",
+                "Name": "The Pilot",
+                "SeriesName": "Friends",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 1,
+                "ProviderIds": {"Tmdb": "1668"},
+                "RunTimeTicks": 100 * 10_000_000,
+                "UserData": {
+                    "Played": False,
+                    "LastPlayedDate": "2020-01-01T00:00:00Z",
+                },
+            },
+            "PlaybackPositionTicks": 80 * 10_000_000,
+        }
+
+        with patch("app.live_playback._attach_resolved_image"):
+            JellyfinWebhookProcessor().process_payload(payload, self.user)
+
+        episode = Episode.objects.get(
+            item__media_id="1668",
+            item__season_number=1,
+            item__episode_number=1,
+            related_season__user=self.user,
+        )
+        self.assertGreater(episode.end_date, datetime(2020, 1, 1, tzinfo=UTC))
+        progress = PlaybackProgress.objects.get(user=self.user, item=episode.item)
+        self.assertEqual(progress.position_seconds, 80)
+        self.assertEqual(progress.duration_seconds, 100)
+        self.assertTrue(progress.completed)
+
     @patch("app.providers.tmdb.find")
     def test_play_event_stores_live_playback_state(self, mock_find):
         """Play events should create live playback state for the home card."""
@@ -1011,6 +3245,42 @@ class JellyfinWebhookTests(TestCase):
         self.assertEqual(state["episode_number"], 1)
         self.assertEqual(state["duration_seconds"], 2666)
         self.assertEqual(state["view_offset_seconds"], 1447)
+
+    @patch("app.providers.tmdb.find")
+    def test_play_event_decodes_html_entities_in_titles(self, mock_find):
+        """The template HTML-escapes titles (#1387); live playback shows them decoded."""
+        mock_find.return_value = {
+            "tv_episode_results": [
+                {"show_id": 1668, "season_number": 1, "episode_number": 1},
+            ],
+            "tv_results": [],
+        }
+        payload = {
+            "Event": "Play",
+            "Item": {
+                "Type": "Episode",
+                "Name": "Caf&#233; de Paris &amp; &quot;Co&quot;",
+                "Id": "jf-episode-1",
+                "SeriesName": "Caf&#233; Society",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 1,
+                "RunTimeTicks": 26660000000,
+                "ProviderIds": {"Tvdb": "303821", "Imdb": "tt0583459"},
+                "UserData": {"Played": False},
+            },
+            "PlaybackPositionTicks": 14470000000,
+        }
+
+        response = self.client.post(
+            self.url,
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        state = live_playback.get_user_playback_state(self.user.id)
+        self.assertEqual(state["episode_title"], 'Café de Paris & "Co"')
+        self.assertEqual(state["series_title"], "Café Society")
 
     @patch("app.providers.tmdb.find")
     def test_pause_and_stop_events_update_live_playback_state(self, mock_find):
@@ -1098,7 +3368,8 @@ class JellyfinWebhookTests(TestCase):
         paused_state = live_playback.get_user_playback_state(self.user.id)
         self.assertIsNotNone(paused_state)
         self.assertEqual(
-            paused_state["status"], live_playback.PLAYBACK_STATUS_PAUSED,
+            paused_state["status"],
+            live_playback.PLAYBACK_STATUS_PAUSED,
         )
         self.assertEqual(paused_state["view_offset_seconds"], 721)
 
@@ -1116,3 +3387,294 @@ class JellyfinWebhookTests(TestCase):
             stopped_state["status"],
             live_playback.PLAYBACK_STATUS_STOPPED,
         )
+
+
+MATRIX_METADATA = {
+    "title": "The Matrix",
+    "image": "https://example.com/matrix.jpg",
+    "max_progress": 1,
+    "provider_external_ids": {},
+}
+
+FRIENDS_METADATA = {
+    "media_id": "1668",
+    "title": "Friends",
+    "image": "https://example.com/friends.jpg",
+    "tvdb_id": "79175",
+    "provider_external_ids": {"tmdb_id": "1668", "tvdb_id": "79175"},
+    "season/1": {
+        "season_number": 1,
+        "image": "https://example.com/friends-s1.jpg",
+        "episodes": [
+            {
+                "episode_number": 1,
+                "runtime": 22,
+                "air_date": None,
+                "still_path": None,
+                "name": "The Pilot",
+                "overview": "",
+            },
+            {"episode_number": 2},
+        ],
+    },
+}
+
+
+@patch("app.live_playback._attach_resolved_image")
+@patch("app.providers.tmdb.movie", return_value=MATRIX_METADATA)
+@patch.object(
+    JellyfinWebhookProcessor,
+    "_find_tv_media_id",
+    return_value=("1668", None, None),
+)
+@patch("app.providers.tmdb.get_tvdb_episode_image_map", return_value={})
+@patch("app.providers.tmdb.tv_with_seasons", return_value=FRIENDS_METADATA)
+class JellyfinWriteRulesTests(TestCase):
+    """Only Stop and the user's own watched toggle write tracking rows (#1250).
+
+    The Play/Stop gate is the shared rule in integrations/webhooks/
+    write_policy.py (contract tests in test_webhook_write_policy.py); these
+    check the real rows it leads to. UserDataSaved changes watch state only
+    when Jellyfin says the user toggled the checkmark, never for progress
+    saves, playback end, or our own watched-state push echoing back.
+    """
+
+    def setUp(self):
+        """Create a user without anime routing so episodes stay TV."""
+        self.user = get_user_model().objects.create_superuser(
+            username="rules-user",
+            token="rules-token",
+        )
+        self.user.anime_enabled = False
+        self.user.save(update_fields=["anime_enabled"])
+        self.processor = JellyfinWebhookProcessor()
+
+    def tearDown(self):
+        """Clear cached playback state created by webhook tests."""
+        live_playback.clear_user_playback_state(self.user.id)
+
+    def _enable(self, *, played=False, unplayed=False):
+        self.user.jellyfin_mark_played_enabled = played
+        self.user.jellyfin_mark_unplayed_enabled = unplayed
+        self.user.save(
+            update_fields=[
+                "jellyfin_mark_played_enabled",
+                "jellyfin_mark_unplayed_enabled",
+            ],
+        )
+
+    def _movie(self, event, *, position=None, played=False, **extra):
+        payload = {
+            "Event": event,
+            "Item": {
+                "Name": "The Matrix",
+                "Type": "Movie",
+                "Id": "jellyfin-movie-1",
+                "ProviderIds": {"Tmdb": "603"},
+                "RunTimeTicks": 1000 * 10_000_000,
+                "UserData": {
+                    "Played": played,
+                    "LastPlayedDate": "2026-09-20T20:00:00Z",
+                },
+            },
+            **extra,
+        }
+        if position is not None:
+            payload["PlaybackPositionTicks"] = position * 10_000_000
+        return payload
+
+    def _episode(self, event, *, played=False, **extra):
+        return {
+            "Event": event,
+            "Item": {
+                "Type": "Episode",
+                "Name": "The Pilot",
+                "SeriesName": "Friends",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 1,
+                "ProviderIds": {"Tmdb": "1668"},
+                "RunTimeTicks": 1000 * 10_000_000,
+                "UserData": {
+                    "Played": played,
+                    "LastPlayedDate": "2026-09-20T20:00:00Z",
+                },
+            },
+            **extra,
+        }
+
+    def _episode_plays(self):
+        return Episode.objects.filter(
+            item__media_id="1668",
+            item__season_number=1,
+            item__episode_number=1,
+            related_season__user=self.user,
+        )
+
+    # -- Play / Stop ------------------------------------------------------
+
+    def test_play_and_progress_events_never_write_rows(self, *_mocks):
+        """A Play-only client updates Now Playing and nothing else."""
+        for position in (0, 300, 900):
+            self.processor.process_payload(
+                self._movie("Play", position=position),
+                self.user,
+            )
+
+        self.assertFalse(Movie.objects.filter(user=self.user).exists())
+        self.assertFalse(PlaybackProgress.objects.filter(user=self.user).exists())
+        self.assertIsNotNone(live_playback.get_user_playback_state(self.user.id))
+
+    def test_unfinished_stop_after_a_minute_is_in_progress(self, *_mocks):
+        """Past a minute, an unfinished Stop records In Progress."""
+        self.processor.process_payload(
+            self._movie("Stop", position=60),
+            self.user,
+        )
+        movie = Movie.objects.get(user=self.user, item__media_id="603")
+        self.assertEqual(movie.status, Status.IN_PROGRESS.value)
+
+    def test_finished_stop_completes(self, *_mocks):
+        """80% or more on Stop still completes the movie."""
+        self.processor.process_payload(
+            self._movie("Stop", position=800),
+            self.user,
+        )
+        movie = Movie.objects.get(user=self.user, item__media_id="603")
+        self.assertEqual(movie.status, Status.COMPLETED.value)
+
+    # -- UserDataSaved watched toggle ------------------------------------
+
+    def test_toggle_played_marks_movie_watched_when_enabled(self, *_mocks):
+        """Clicking watched in Jellyfin completes the movie at LastPlayedDate."""
+        self._enable(played=True)
+        self.processor.process_payload(
+            self._movie("UserDataSaved", played=True, SaveReason="TogglePlayed"),
+            self.user,
+        )
+        movie = Movie.objects.get(user=self.user, item__media_id="603")
+        self.assertEqual(movie.status, Status.COMPLETED.value)
+        self.assertEqual(movie.end_date, datetime(2026, 9, 20, 20, 0, tzinfo=UTC))
+
+    def test_toggle_played_marks_episode_watched_when_enabled(self, *_mocks):
+        """Clicking watched on an episode records one play."""
+        self._enable(played=True)
+        self.processor.process_payload(
+            self._episode("UserDataSaved", played=True, SaveReason="TogglePlayed"),
+            self.user,
+        )
+        self.assertEqual(self._episode_plays().count(), 1)
+
+    def test_toggle_played_ignored_when_disabled(self, *_mocks):
+        """The checkmark only syncs once the user opts in."""
+        self.processor.process_payload(
+            self._movie("UserDataSaved", played=True, SaveReason="TogglePlayed"),
+            self.user,
+        )
+        self.processor.process_payload(
+            self._episode("UserDataSaved", played=True, SaveReason="TogglePlayed"),
+            self.user,
+        )
+        self.assertFalse(Movie.objects.filter(user=self.user).exists())
+        self.assertFalse(self._episode_plays().exists())
+
+    def test_other_save_reasons_never_change_watch_state(self, *_mocks):
+        """Progress saves, playback end and old templates are not a toggle."""
+        self._enable(played=True, unplayed=True)
+        for reason in ("PlaybackProgress", "PlaybackFinished", "UpdateUserRating"):
+            with self.subTest(reason=reason):
+                self.processor.process_payload(
+                    self._movie("UserDataSaved", played=True, SaveReason=reason),
+                    self.user,
+                )
+        # A template from before SaveReason existed.
+        self.processor.process_payload(
+            self._movie("UserDataSaved", played=True),
+            self.user,
+        )
+        self.assertFalse(Movie.objects.filter(user=self.user).exists())
+
+    def test_toggle_unplayed_retracts_only_when_enabled(self, *_mocks):
+        """Unchecking watched reverts state only with the unplayed opt-in."""
+        self._enable(played=True)
+        self.processor.process_payload(
+            self._episode("UserDataSaved", played=True, SaveReason="TogglePlayed"),
+            self.user,
+        )
+        unmark = self._episode(
+            "UserDataSaved",
+            played=False,
+            SaveReason="TogglePlayed",
+        )
+
+        self.processor.process_payload(unmark, self.user)
+        self.assertEqual(self._episode_plays().count(), 1)
+
+        self._enable(played=True, unplayed=True)
+        self.processor.process_payload(unmark, self.user)
+        self.assertEqual(self._episode_plays().count(), 0)
+
+    def test_rating_and_toggle_in_one_save_both_apply(self, *_mocks):
+        """A save carrying a rating and a toggle applies both."""
+        self._enable(played=True)
+        payload = self._movie(
+            "UserDataSaved",
+            played=True,
+            SaveReason="TogglePlayed",
+        )
+        payload["Item"]["UserData"]["Rating"] = 8
+        self.processor.process_payload(payload, self.user)
+
+        movie = Movie.objects.get(user=self.user, item__media_id="603")
+        self.assertEqual(movie.status, Status.COMPLETED.value)
+        self.assertEqual(movie.score, 8)
+
+    # -- Echo guard -----------------------------------------------------
+
+    def test_toggle_on_watched_movie_adds_no_play(self, *_mocks):
+        """Our push echoing back as a toggle is agreement, not a rewatch."""
+        self._enable(played=True)
+        self.processor.process_payload(
+            self._movie("Stop", position=900),
+            self.user,
+        )
+        echo = self._movie("UserDataSaved", played=True, SaveReason="TogglePlayed")
+        echo["Item"]["UserData"]["LastPlayedDate"] = "2026-09-25T09:00:00Z"
+        self.processor.process_payload(echo, self.user)
+
+        self.assertEqual(Movie.objects.filter(user=self.user).count(), 1)
+
+    def test_toggle_on_watched_episode_adds_no_play(self, *_mocks):
+        """An echo days later, outside the dedupe window, adds no play."""
+        self._enable(played=True)
+        self.processor.process_payload(
+            self._episode("UserDataSaved", played=True, SaveReason="TogglePlayed"),
+            self.user,
+        )
+        echo = self._episode("UserDataSaved", played=True, SaveReason="TogglePlayed")
+        echo["Item"]["UserData"]["LastPlayedDate"] = "2026-09-25T09:00:00Z"
+        self.processor.process_payload(echo, self.user)
+
+        self.assertEqual(self._episode_plays().count(), 1)
+
+    def test_unofficial_mark_played_on_watched_movie_adds_no_play(self, *_mocks):
+        """The same guard covers the unofficial plugin's MarkPlayed."""
+        self._enable(played=True)
+        self.processor.process_payload(
+            self._movie("Stop", position=900),
+            self.user,
+        )
+        mark = self._movie("MarkPlayed", played=True)
+        mark["Item"]["UserData"]["LastPlayedDate"] = "2026-09-25T09:00:00Z"
+        self.processor.process_payload(mark, self.user)
+
+        self.assertEqual(Movie.objects.filter(user=self.user).count(), 1)
+
+    def test_finished_stop_rewatch_still_counts(self, *_mocks):
+        """The guard is for manual marks only; a real second play still logs."""
+        first = self._movie("Stop", position=900)
+        self.processor.process_payload(first, self.user)
+        second = self._movie("Stop", position=900, played=True)
+        second["Item"]["UserData"]["LastPlayedDate"] = "2026-09-25T09:00:00Z"
+        self.processor.process_payload(second, self.user)
+
+        self.assertEqual(Movie.objects.filter(user=self.user).count(), 2)

@@ -1,10 +1,11 @@
 from unittest.mock import patch
 
+import requests
 from django.core.cache import cache
 from django.test import TestCase, override_settings
 
 from app.models import MediaTypes, Sources
-from app.providers import tvdb
+from app.providers import services, tvdb
 
 
 class TVDBProviderTests(TestCase):
@@ -86,6 +87,163 @@ class TVDBProviderTests(TestCase):
         self.assertIn("details", result["related"]["seasons"][0])
 
     @patch("app.providers.tvdb._request")
+    def test_tv_coerces_non_numeric_episode_count_to_none(self, mock_request):
+        """A non-numeric episodeCount from TVDB should normalize to None, not a string."""
+        mock_request.return_value = {
+            "data": {
+                "id": 81189,
+                "name": {"language": "eng", "name": "Breaking Bad"},
+                "originalName": {"language": "eng", "name": "Breaking Bad"},
+                "overview": "Chemistry teacher becomes kingpin.",
+                "firstAired": "2008-01-20",
+                "lastAired": "2013-09-29",
+                "numberOfEpisodes": 62,
+                "averageRuntime": 47,
+                "status": {"name": "Ended"},
+                "siteRating": "9.5",
+                "siteRatingCount": "1000",
+                "score": 859244,
+                "remoteIds": [],
+                "seasons": [
+                    {
+                        "id": 101,
+                        "number": 0,
+                        "name": "Specials",
+                        "type": {"name": "Aired Order"},
+                        "episodeCount": "TBA",
+                        "episodes": [],
+                    },
+                ],
+                "genres": [{"name": "Drama"}],
+                "characters": [],
+            },
+        }
+
+        result = tvdb.tv("81189")
+
+        season = result["related"]["seasons"][0]
+        self.assertIsNone(season["episode_count"])
+        self.assertIsNone(season["max_progress"])
+
+    @patch("app.providers.tvdb._request")
+    def test_tv_with_seasons_reuses_cached_series_extended_payload(
+        self,
+        mock_request,
+    ):
+        """Series extended metadata should be fetched once across TVDB lookups."""
+        mock_request.side_effect = [
+            {
+                "data": {
+                    "id": 81189,
+                    "name": "Breaking Bad",
+                    "seasons": [
+                        {
+                            "id": 102,
+                            "number": 1,
+                            "name": "Season 1",
+                            "type": {"name": "Aired Order"},
+                        },
+                    ],
+                    "characters": [],
+                },
+            },
+            {"data": {}},
+            {
+                "data": {
+                    "id": 102,
+                    "number": 1,
+                    "name": "Season 1",
+                    "type": {"name": "Aired Order"},
+                    "episodes": [],
+                },
+            },
+            {"data": {}},
+        ]
+
+        tvdb.tv("81189")
+        tvdb.tv_with_seasons("81189", [1])
+        tvdb.tv_with_seasons("81189", [1])
+
+        requested_paths = [call.args[0] for call in mock_request.call_args_list]
+        self.assertEqual(requested_paths.count("series/81189/extended"), 1)
+        self.assertEqual(requested_paths.count("seasons/102/extended"), 1)
+
+    @patch("app.providers.tvdb._request")
+    def test_tv_and_anime_routes_share_raw_series_extended_payload(self, mock_request):
+        """The raw series response should not be fetched once per route type."""
+        mock_request.side_effect = [
+            {
+                "data": {
+                    "id": 81189,
+                    "name": "Breaking Bad",
+                    "seasons": [],
+                    "characters": [],
+                },
+            },
+            {"data": {}},
+        ]
+
+        tvdb.tv("81189")
+        tvdb.tv("81189", routed_media_type=MediaTypes.ANIME.value)
+
+        requested_paths = [call.args[0] for call in mock_request.call_args_list]
+        self.assertEqual(requested_paths.count("series/81189/extended"), 1)
+
+    @patch("app.providers.tvdb._request")
+    def test_tv_keeps_series_cache_entries_separate_by_language(self, mock_request):
+        """Localized series payloads must not reuse another language's cache."""
+        series_payload = {
+            "data": {
+                "id": 81189,
+                "name": "Breaking Bad",
+                "seasons": [],
+                "characters": [],
+            },
+        }
+        mock_request.side_effect = [
+            series_payload,
+            {"data": {}},
+            series_payload,
+            {"data": {}},
+        ]
+
+        tvdb.tv("81189", language="en")
+        tvdb.tv("81189", language="es")
+
+        requested_paths = [call.args[0] for call in mock_request.call_args_list]
+        self.assertEqual(requested_paths.count("series/81189/extended"), 2)
+        self.assertNotEqual(
+            tvdb._series_extended_cache_key("81189", "en"),
+            tvdb._series_extended_cache_key("81189", "es"),
+        )
+
+    @patch("app.providers.tvdb._request")
+    def test_tv_uses_explicit_metadata_cache_timeout(self, mock_request):
+        """Normalized series metadata should use the long-lived TVDB TTL."""
+        mock_request.side_effect = [
+            {
+                "data": {
+                    "id": 81189,
+                    "name": "Breaking Bad",
+                    "seasons": [],
+                    "characters": [],
+                },
+            },
+            {"data": {}},
+        ]
+
+        tvdb.tv("81189")
+
+        self.assertGreaterEqual(
+            cache.ttl(
+                tvdb._cache_key(
+                    MediaTypes.TV.value, "81189", tvdb._preferred_language_code()
+                )
+            ),
+            tvdb.TVDB_METADATA_CACHE_TIMEOUT - 1,
+        )
+
+    @patch("app.providers.tvdb._request")
     def test_tv_prefers_english_translation_payload_for_titles_and_synopsis(
         self,
         mock_request,
@@ -96,7 +254,10 @@ class TVDBProviderTests(TestCase):
                 "data": {
                     "id": 259640,
                     "name": {"language": "jpn", "name": "ソードアート・オンライン"},
-                    "originalName": {"language": "jpn", "name": "ソードアート・オンライン"},
+                    "originalName": {
+                        "language": "jpn",
+                        "name": "ソードアート・オンライン",
+                    },
                     "overview": "日本語の概要",
                     "firstAired": "2012-07-08",
                     "status": {"name": "Ended"},
@@ -189,6 +350,7 @@ class TVDBProviderTests(TestCase):
                 },
             },
             {"data": {}},
+            {"data": {"episodes": []}, "links": {"next": None}},
         ]
 
         result = tvdb.tv_with_seasons("81189", [0])
@@ -203,6 +365,70 @@ class TVDBProviderTests(TestCase):
             result["season/0"]["episodes"][0]["image"],
             "https://example.com/special1.jpg",
         )
+
+    @patch("app.providers.tvdb.tv")
+    @patch("app.providers.tvdb._request")
+    def test_tv_with_seasons_coerces_non_numeric_episode_number(
+        self,
+        mock_request,
+        mock_tv,
+    ):
+        """A non-numeric episode number from TVDB should normalize to None, not a string."""
+        mock_tv.return_value = {
+            "media_id": "81189",
+            "source": Sources.TVDB.value,
+            "media_type": MediaTypes.TV.value,
+            "title": "Breaking Bad",
+            "original_title": "Breaking Bad",
+            "localized_title": "Breaking Bad",
+            "image": "https://example.com/show.jpg",
+            "synopsis": "Chemistry teacher becomes kingpin.",
+            "details": {"episodes": 62},
+            "related": {"seasons": [{"season_number": 5}]},
+            "external_links": {
+                "TVDB": "https://www.thetvdb.com/dereferrer/series/81189",
+            },
+        }
+        mock_request.side_effect = [
+            {
+                "data": {
+                    "id": 81189,
+                    "name": "Breaking Bad",
+                    "seasons": [
+                        {
+                            "id": 202,
+                            "number": 5,
+                            "name": "Season 5",
+                            "type": {"name": "Aired Order"},
+                        },
+                    ],
+                },
+            },
+            {"data": {}},
+            {
+                "data": {
+                    "id": 202,
+                    "number": 5,
+                    "name": "Season 5",
+                    "type": {"name": "Aired Order"},
+                    "episodes": [
+                        {
+                            "number": "TBA",
+                            "aired": None,
+                            "name": "Unannounced episode",
+                        },
+                    ],
+                },
+            },
+            {"data": {}},
+            {"data": {"episodes": []}, "links": {"next": None}},
+        ]
+
+        result = tvdb.tv_with_seasons("81189", [5])
+
+        episode = result["season/5"]["episodes"][0]
+        self.assertIsNone(episode["episode_number"])
+        self.assertIsNone(result["season/5"]["max_progress"])
 
     @patch("app.providers.tvdb.tv")
     @patch("app.providers.tvdb._request")
@@ -259,14 +485,274 @@ class TVDBProviderTests(TestCase):
                 },
             },
             {"data": {}},
-            {"data": {"name": "To You, in 2000 Years", "overview": "English episode overview."}},
+            {
+                "data": {
+                    "episodes": [
+                        {
+                            "id": 7001,
+                            "name": "To You, in 2000 Years",
+                            "overview": "English episode overview.",
+                        },
+                    ],
+                },
+                "links": {"next": None},
+            },
         ]
 
-        result = tvdb.tv_with_seasons("120089", [1], routed_media_type=MediaTypes.ANIME.value)
+        result = tvdb.tv_with_seasons(
+            "120089", [1], routed_media_type=MediaTypes.ANIME.value
+        )
 
         self.assertEqual(
             result["season/1"]["episodes"][0]["name"],
             "To You, in 2000 Years",
+        )
+
+    @patch("app.providers.tvdb.tv")
+    @patch("app.providers.tvdb._request")
+    def test_tv_with_seasons_batches_episode_translations_in_one_request(
+        self,
+        mock_request,
+        mock_tv,
+    ):
+        """Episode translations for a whole season should cost one HTTP call.
+
+        Previously, `_normalize_episode_rows` called `_with_preferred_translation`
+        per episode, which meant one uncached `episodes/{id}/translations/{lang}`
+        request per episode (an N+1). TVDB v4's `series/{id}/episodes/default/{lang}`
+        bulk endpoint returns every episode's translated name/overview in one
+        (paginated) request, so a season with any number of episodes should only
+        need a single extra request for translations, not one per episode.
+        """
+        mock_tv.return_value = {
+            "media_id": "330000",
+            "source": Sources.TVDB.value,
+            "media_type": MediaTypes.ANIME.value,
+            "title": "Some Show",
+            "original_title": "何かのショー",
+            "localized_title": "Some Show",
+            "image": "https://example.com/show.jpg",
+            "synopsis": "English synopsis",
+            "details": {"episodes": 3},
+            "related": {"seasons": [{"season_number": 1}]},
+            "external_links": {
+                "TVDB": "https://www.thetvdb.com/dereferrer/series/330000",
+            },
+        }
+        mock_request.side_effect = [
+            {
+                "data": {
+                    "id": 330000,
+                    "name": "何かのショー",
+                    "seasons": [
+                        {
+                            "id": 401,
+                            "number": 1,
+                            "name": "Season 1",
+                            "type": {"name": "Aired Order"},
+                        },
+                    ],
+                },
+            },
+            {"data": {}},
+            {
+                "data": {
+                    "id": 401,
+                    "seriesId": 330000,
+                    "number": 1,
+                    "name": "Season 1",
+                    "type": {"name": "Aired Order"},
+                    "episodes": [
+                        {"id": 9001, "number": 1, "name": "第一話"},
+                        {"id": 9002, "number": 2, "name": "第二話"},
+                        {"id": 9003, "number": 3, "name": "第三話"},
+                    ],
+                },
+            },
+            {"data": {}},
+            {
+                "data": {
+                    "episodes": [
+                        {
+                            "id": 9001,
+                            "name": "Episode One",
+                            "overview": "First overview.",
+                        },
+                        {
+                            "id": 9002,
+                            "name": "Episode Two",
+                            "overview": "Second overview.",
+                        },
+                        {
+                            "id": 9003,
+                            "name": "Episode Three",
+                            "overview": "Third overview.",
+                        },
+                    ],
+                },
+                "links": {"next": None},
+            },
+        ]
+
+        result = tvdb.tv_with_seasons(
+            "330000", [1], routed_media_type=MediaTypes.ANIME.value
+        )
+
+        episode_names = [episode["name"] for episode in result["season/1"]["episodes"]]
+        self.assertEqual(
+            episode_names,
+            ["Episode One", "Episode Two", "Episode Three"],
+        )
+
+        requested_paths = [call.args[0] for call in mock_request.call_args_list]
+        self.assertEqual(
+            requested_paths.count("series/330000/episodes/default/eng"),
+            1,
+        )
+        self.assertEqual(len(mock_request.call_args_list), 5)
+        self.assertFalse(
+            any(path.startswith("episodes/") for path in requested_paths),
+        )
+
+        warm_result = tvdb.tv_with_seasons(
+            "330000", [1], routed_media_type=MediaTypes.ANIME.value
+        )
+        self.assertEqual(
+            warm_result["season/1"]["episodes"],
+            result["season/1"]["episodes"],
+        )
+        self.assertEqual(len(mock_request.call_args_list), 5)
+
+    @patch("app.providers.tvdb._request")
+    def test_bulk_episode_translations_follow_pagination_and_cache(self, mock_request):
+        """Bulk episode translation pages should be followed once and then cached."""
+        mock_request.side_effect = [
+            {
+                "data": {"episodes": [{"id": 1, "name": "One"}]},
+                "links": {"next": 1},
+            },
+            {
+                "data": {"episodes": [{"id": 2, "name": "Two"}]},
+                "links": {"next": None},
+            },
+        ]
+
+        translations = tvdb._get_series_episode_translations("81189", "eng")
+        cached_translations = tvdb._get_series_episode_translations("81189", "eng")
+
+        self.assertEqual(set(translations), {"1", "2"})
+        self.assertEqual(cached_translations, translations)
+        self.assertEqual(mock_request.call_count, 2)
+        self.assertEqual(mock_request.call_args_list[0].kwargs["params"], {"page": 0})
+        self.assertEqual(mock_request.call_args_list[1].kwargs["params"], {"page": 1})
+
+    def test_missing_bulk_translation_uses_episode_fields_without_refetching(self):
+        """An absent bulk row should preserve the episode's provider fallback fields."""
+        season_data = {
+            "episodes": [
+                {
+                    "id": 1,
+                    "number": 1,
+                    "name": "Translated episode",
+                    "overview": "Translated overview",
+                },
+                {
+                    "id": 2,
+                    "number": 2,
+                    "name": "Original episode",
+                    "overview": "Original overview",
+                },
+            ],
+        }
+        with (
+            patch.object(
+                tvdb,
+                "_get_series_episode_translations",
+                return_value={
+                    "1": {
+                        "name": "Translated episode",
+                        "overview": "Translated overview",
+                        "language": "eng",
+                    },
+                },
+            ),
+            patch.object(tvdb, "_get_translation") as get_translation,
+        ):
+            result = tvdb._normalize_episode_rows(
+                season_data,
+                language="en",
+                series_id="81189",
+            )
+
+        self.assertEqual(result[1]["name"], "Original episode")
+        self.assertEqual(result[1]["overview"], "Original overview")
+        get_translation.assert_not_called()
+
+    def test_failed_bulk_translation_is_not_cached_as_partial_data(self):
+        """A failed page should use raw episode fields and avoid N+1 retries."""
+        provider_error = services.ProviderAPIError(
+            Sources.TVDB.value,
+            requests.exceptions.RequestException("translation service unavailable"),
+        )
+        with (
+            patch.object(
+                tvdb,
+                "_request",
+                side_effect=[
+                    {
+                        "data": {"episodes": [{"id": 1, "name": "Partial"}]},
+                        "links": {"next": 1},
+                    },
+                    provider_error,
+                ],
+            ) as request,
+            patch.object(tvdb, "_get_translation") as get_translation,
+        ):
+            first = tvdb._get_series_episode_translations("81189", "eng")
+            second = tvdb._get_series_episode_translations("81189", "eng")
+            normalized = tvdb._normalize_episode_rows(
+                {
+                    "episodes": [
+                        {
+                            "id": 1,
+                            "number": 1,
+                            "name": "Original episode",
+                            "overview": "Original overview",
+                        },
+                    ],
+                },
+                language="en",
+                series_id="81189",
+            )
+
+        self.assertEqual(first, {})
+        self.assertEqual(second, {})
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].kwargs["params"], {"page": 0})
+        self.assertEqual(request.call_args_list[1].kwargs["params"], {"page": 1})
+        self.assertEqual(normalized[0]["name"], "Original episode")
+        self.assertEqual(normalized[0]["overview"], "Original overview")
+        get_translation.assert_not_called()
+        self.assertEqual(
+            cache.get(tvdb._series_episode_translations_cache_key("81189", "eng")),
+            tvdb._EPISODE_TRANSLATIONS_UNAVAILABLE,
+        )
+
+    @patch("app.providers.tvdb._request")
+    def test_bulk_episode_translation_lookup_is_page_bounded(self, mock_request):
+        """A looping pagination link must not create unbounded provider calls."""
+        mock_request.return_value = {
+            "data": {"episodes": [{"id": 1, "name": "One"}]},
+            "links": {"next": 1},
+        }
+
+        translations = tvdb._get_series_episode_translations("81189", "eng")
+
+        self.assertEqual(mock_request.call_count, tvdb.EPISODE_TRANSLATIONS_MAX_PAGES)
+        self.assertEqual(translations, {})
+        self.assertEqual(
+            cache.get(tvdb._series_episode_translations_cache_key("81189", "eng")),
+            tvdb._EPISODE_TRANSLATIONS_UNAVAILABLE,
         )
 
     @override_settings(TVDB_API_KEY="test-tvdb-key")
@@ -321,6 +807,82 @@ class TVDBProviderTests(TestCase):
         self.assertEqual(result["results"][0]["title"], "Sword Art Online")
         self.assertEqual(result["results"][0]["localized_title"], "Sword Art Online")
 
+    @patch("app.providers.tvdb._with_preferred_translation", side_effect=lambda row, *args, **kwargs: row)
+    @patch("app.providers.tvdb._request")
+    def test_search_promotes_direct_title_matches(self, mock_request, _mock_translation):
+        """Direct title matches should outrank broad TVDB search matches."""
+        rows = [
+            {"id": index, "name": f"Unrelated Series {index}"}
+            for index in range(1, 20)
+        ]
+        rows[-1] = {
+            "id": 424536,
+            "name": "Frieren: Beyond Journey's End",
+        }
+        mock_request.return_value = {"data": rows}
+
+        result = tvdb.search(MediaTypes.TV.value, "Frieren", 1)
+
+        self.assertEqual(result["results"][0]["media_id"], "424536")
+
+    @override_settings(TMDB_LANG="ja")
+    @patch("app.providers.tvdb._request")
+    def test_search_prefers_configured_language_translation_rows(self, mock_request):
+        """Search results should prefer titles in the configured TMDB_LANG."""
+        mock_request.return_value = {
+            "data": [
+                {
+                    "id": 259640,
+                    "name": {"language": "eng", "name": "Sword Art Online"},
+                    "translations": {
+                        "name": [
+                            {"language": "eng", "name": "Sword Art Online"},
+                            {"language": "jpn", "name": "ソードアート・オンライン"},
+                        ],
+                    },
+                    "firstAired": "2012-07-08",
+                },
+            ],
+        }
+
+        result = tvdb.search(MediaTypes.ANIME.value, "sword art online", 1)
+
+        self.assertEqual(result["results"][0]["title"], "ソードアート・オンライン")
+        self.assertEqual(
+            result["results"][0]["localized_title"],
+            "ソードアート・オンライン",
+        )
+        self.assertEqual(
+            mock_request.call_args_list[0].kwargs["params"]["lang"], "jpn"
+        )
+
+    @patch("app.providers.tvdb._request")
+    def test_search_fetches_translation_when_row_has_none_embedded(
+        self, mock_request
+    ):
+        """Search rows without embedded translations should be localized via a
+        per-result translation fetch, matching the detail page's behavior.
+        """
+        mock_request.side_effect = [
+            {
+                "data": [
+                    {
+                        "id": "series-81797",
+                        "tvdb_id": 81797,
+                        "name": "ワンピース",
+                        "firstAired": "1999-10-20",
+                    },
+                ],
+            },
+            {"data": {"name": "One Piece"}},
+        ]
+
+        result = tvdb.search(MediaTypes.ANIME.value, "one piece", 1)
+
+        self.assertEqual(result["results"][0]["title"], "One Piece")
+        requested_paths = [call.args[0] for call in mock_request.call_args_list]
+        self.assertEqual(requested_paths[1], "series/81797/translations/eng")
+
     @patch("app.providers.tvdb.tv")
     @patch("app.providers.tvdb.tv_with_seasons")
     def test_episode_returns_tmdb_compatible_episode_payload(
@@ -357,6 +919,89 @@ class TVDBProviderTests(TestCase):
         self.assertEqual(result["episode_title"], "Pilot")
         self.assertEqual(result["image"], "https://example.com/pilot.jpg")
 
+    @patch("app.providers.tvdb.cache")
+    @patch("app.providers.tvdb._request")
+    def test_episode_by_id_returns_series_and_numbering(
+        self,
+        mock_request,
+        mock_cache,
+    ):
+        """Episode-level TVDB IDs should resolve to their series metadata."""
+        mock_cache.get.return_value = None
+        mock_request.return_value = {
+            "data": {
+                "id": 11821802,
+                "seriesId": 407407,
+                "seasonNumber": 1,
+                "number": 3,
+            },
+        }
+
+        result = tvdb.episode_by_id("11821802")
+
+        self.assertEqual(
+            result,
+            {
+                "episode_id": 11821802,
+                "series_id": 407407,
+                "season_number": 1,
+                "episode_number": 3,
+            },
+        )
+        mock_request.assert_called_once_with("episodes/11821802/extended")
+
+    @patch("app.providers.tvdb.cache")
+    @patch("app.providers.tvdb._request")
+    def test_series_tmdb_id_returns_remote_tmdb_id(
+        self,
+        mock_request,
+        mock_cache,
+    ):
+        """TVDB series metadata should expose its TMDB remote ID."""
+        mock_cache.get.return_value = None
+        mock_request.return_value = {
+            "data": {
+                "remoteIds": [
+                    {"sourceName": "TheMovieDB.com", "id": "124428"},
+                ],
+            },
+        }
+
+        result = tvdb.series_tmdb_id("407407")
+
+        self.assertEqual(result, "124428")
+        mock_request.assert_called_once_with("series/407407/extended")
+
+    @patch("app.providers.tvdb._request")
+    def test_series_tmdb_id_reuses_cached_series_extended_payload(
+        self,
+        mock_request,
+    ):
+        """series_tmdb_id should reuse _get_series_extended's cache, not refetch."""
+        series_payload = {
+            "data": {
+                "id": 81189,
+                "name": "Breaking Bad",
+                "seasons": [],
+                "characters": [],
+                "remoteIds": [
+                    {"sourceName": "TheMovieDB.com", "id": "1396"},
+                ],
+            },
+        }
+        mock_request.side_effect = [
+            series_payload,
+            {"data": {}},
+            series_payload,
+        ]
+
+        tvdb.tv("81189")
+        result = tvdb.series_tmdb_id("81189")
+
+        self.assertEqual(result, "1396")
+        requested_paths = [call.args[0] for call in mock_request.call_args_list]
+        self.assertEqual(requested_paths.count("series/81189/extended"), 1)
+
     @patch("app.providers.tvdb._request")
     def test_get_episode_airstamp_map_caches_precise_episode_times(self, mock_request):
         """Default-order episode maps should cache normalized airstamps."""
@@ -383,3 +1028,113 @@ class TVDBProviderTests(TestCase):
         self.assertEqual(first["1_1"], "2008-01-20T22:00:00+00:00")
         self.assertEqual(second, first)
         mock_request.assert_called_once()
+
+    @patch("app.providers.tvdb._request")
+    def test_person_normalizes_profile_and_filmography(self, mock_request):
+        """Person profiles should normalize bio fields and character credits."""
+        mock_request.return_value = {
+            "data": {
+                "id": 291115,
+                "name": "Bryan Cranston",
+                "image": "https://artworks.thetvdb.com/banners/person/291115.jpg",
+                "biographies": [
+                    {"language": "eng", "biography": "American actor."},
+                ],
+                "peopleType": "Actor",
+                "birth": "1956-03-07",
+                "death": None,
+                "birthPlace": "Hollywood, California, USA",
+                "characters": [
+                    {
+                        "seriesId": 81189,
+                        "type": "Actor",
+                        "name": "Walter White",
+                        "series": {
+                            "id": 81189,
+                            "name": "Breaking Bad",
+                            "image": "https://artworks.thetvdb.com/banners/series/81189.jpg",
+                            "firstAired": "2008-01-20",
+                        },
+                    },
+                ],
+            },
+        }
+
+        result = tvdb.person("291115")
+
+        self.assertEqual(result["person_id"], "291115")
+        self.assertEqual(result["source"], Sources.TVDB.value)
+        self.assertEqual(result["name"], "Bryan Cranston")
+        self.assertEqual(result["biography"], "American actor.")
+        self.assertEqual(result["birth_date"], "1956-03-07")
+        self.assertIsNone(result["death_date"])
+        self.assertEqual(result["place_of_birth"], "Hollywood, California, USA")
+
+        self.assertEqual(len(result["filmography"]), 1)
+        entry = result["filmography"][0]
+        self.assertEqual(entry["media_id"], "81189")
+        self.assertEqual(entry["media_type"], MediaTypes.TV.value)
+        self.assertEqual(entry["title"], "Breaking Bad")
+        self.assertEqual(entry["year"], 2008)
+        self.assertEqual(entry["credit_type"], "cast")
+        self.assertEqual(entry["role"], "Walter White")
+
+    @patch("app.providers.tvdb._request")
+    def test_person_caches_response(self, mock_request):
+        """Person profiles should be cached between calls."""
+        mock_request.return_value = {
+            "data": {"id": 291115, "name": "Bryan Cranston", "characters": []},
+        }
+
+        first = tvdb.person("291115")
+        second = tvdb.person("291115")
+
+        self.assertEqual(first, second)
+        mock_request.assert_called_once()
+
+    @patch("app.providers.tvdb._request")
+    def test_person_skips_characters_without_series_id(self, mock_request):
+        """Characters missing a seriesId shouldn't produce filmography entries."""
+        mock_request.return_value = {
+            "data": {
+                "id": 291115,
+                "name": "Bryan Cranston",
+                "characters": [{"type": "Actor", "name": "Unknown Role"}],
+            },
+        }
+
+        result = tvdb.person("291115")
+
+        self.assertEqual(result["filmography"], [])
+
+    @patch("app.providers.tvdb._request")
+    def test_person_prefers_english_biography_among_multiple_languages(
+        self, mock_request
+    ):
+        """Biography should be picked from the `biographies` array by language."""
+        mock_request.return_value = {
+            "data": {
+                "id": 291115,
+                "name": "Bryan Cranston",
+                "biographies": [
+                    {"language": "spa", "biography": "Actor estadounidense."},
+                    {"language": "eng", "biography": "American actor."},
+                ],
+                "characters": [],
+            },
+        }
+
+        result = tvdb.person("291115")
+
+        self.assertEqual(result["biography"], "American actor.")
+
+    @patch("app.providers.tvdb._request")
+    def test_person_falls_back_when_no_biographies_present(self, mock_request):
+        """Missing `biographies` shouldn't crash and should return an empty bio."""
+        mock_request.return_value = {
+            "data": {"id": 291115, "name": "Bryan Cranston", "characters": []},
+        }
+
+        result = tvdb.person("291115")
+
+        self.assertEqual(result["biography"], "")

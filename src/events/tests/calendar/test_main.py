@@ -52,16 +52,20 @@ class CalendarMainTests(CalendarFixturesMixin, TestCase):
                 datetime=timezone.now(),
             ),
         )
-        mock_process_anime_bulk.side_effect = lambda items, events_bulk: [
-            events_bulk.append(
-                Event(
-                    item=item,
-                    content_number=1,
-                    datetime=timezone.now(),
-                ),
-            )
-            for item in items
-        ]
+
+        def _process_anime_bulk(items, events_bulk):
+            for item in items:
+                events_bulk.append(
+                    Event(
+                        item=item,
+                        content_number=1,
+                        datetime=timezone.now(),
+                    ),
+                )
+            # process_anime_bulk reports the items it successfully checked.
+            return list(items)
+
+        mock_process_anime_bulk.side_effect = _process_anime_bulk
 
         result = fetch_releases(self.user.id)
 
@@ -241,3 +245,81 @@ class CalendarMainTests(CalendarFixturesMixin, TestCase):
 
         mock_process_other.assert_called_once()
         self.assertIn("No releases have been updated.", result)
+
+
+class CalendarCheckRecordingTests(CalendarFixturesMixin, TestCase):
+    """Test that only successfully checked items are stamped."""
+
+    @patch("events.calendar.main.process_other")
+    def test_successful_check_is_recorded(self, mock_process_other):
+        """A successful check is stamped so the staleness gate can skip it."""
+        mock_process_other.return_value = True
+
+        fetch_releases(items_to_process=[self.book_item])
+
+        self.book_item.refresh_from_db()
+        self.assertIsNotNone(self.book_item.calendar_checked_at)
+
+    @patch("events.calendar.main.process_other")
+    def test_failed_check_is_not_recorded(self, mock_process_other):
+        """A provider failure must stay retryable, not be suppressed for 12 hours."""
+        mock_process_other.return_value = False
+
+        fetch_releases(items_to_process=[self.book_item])
+
+        self.book_item.refresh_from_db()
+        self.assertIsNone(self.book_item.calendar_checked_at)
+
+    @patch("events.calendar.main.process_other")
+    def test_only_the_succeeding_item_is_recorded(self, mock_process_other):
+        """A failure for one item must not stamp the others in the same batch."""
+        mock_process_other.side_effect = lambda item, events_bulk: (
+            item.id != self.book_item.id
+        )
+
+        fetch_releases(items_to_process=[self.book_item, self.movie_item])
+
+        self.book_item.refresh_from_db()
+        self.movie_item.refresh_from_db()
+        self.assertIsNone(self.book_item.calendar_checked_at)
+        self.assertIsNotNone(self.movie_item.calendar_checked_at)
+
+
+class CalendarVideoTests(CalendarFixturesMixin, TestCase):
+    """A video lands on the Calendar on the day it was uploaded."""
+
+    def test_process_video_adds_an_event_on_the_upload_date(self):
+        """The event uses the stored date and no provider is called."""
+        from events.calendar.video import process_video
+
+        uploaded = timezone.now() - timezone.timedelta(days=30)
+        item = Item.objects.create(
+            media_id="vid1",
+            source=Sources.YOUTUBE.value,
+            media_type=MediaTypes.VIDEO.value,
+            title="A Video",
+            image="http://example.com/video.jpg",
+            release_datetime=uploaded,
+        )
+        events_bulk = []
+
+        self.assertTrue(process_video(item, events_bulk))
+
+        self.assertEqual(len(events_bulk), 1)
+        self.assertEqual(events_bulk[0].datetime, uploaded)
+
+    def test_process_video_without_an_upload_date_adds_nothing(self):
+        """No date reported means no event, and nothing to retry."""
+        from events.calendar.video import process_video
+
+        item = Item.objects.create(
+            media_id="vid2",
+            source=Sources.YOUTUBE.value,
+            media_type=MediaTypes.VIDEO.value,
+            title="Undated",
+            image="http://example.com/video.jpg",
+        )
+        events_bulk = []
+
+        self.assertTrue(process_video(item, events_bulk))
+        self.assertEqual(events_bulk, [])

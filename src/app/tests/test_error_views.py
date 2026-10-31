@@ -1,4 +1,8 @@
-from django.test import Client, TestCase, override_settings
+from django.contrib.auth import get_user_model
+from django.test import Client, RequestFactory, TestCase, override_settings
+from django.urls import reverse
+
+from app.error_views import csrf_failure
 
 
 @override_settings(
@@ -115,9 +119,68 @@ class ErrorPageTests(TestCase):
             html=False,
         )
 
-    def test_csrf_failure_page_includes_copyable_report(self):
-        """The CSRF failure page should expose a copyable diagnostic report."""
+    def test_igdb_not_configured_page_shows_setup_guidance(self):
+        """Missing IGDB credentials should show a config error, not a raw 500."""
+        response = self.client.get("/boom-igdb-not-configured/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assert_traceback_panel(response, "error-report-503")
+        self.assertContains(
+            response,
+            "Provider Not Configured",
+            status_code=503,
+            html=False,
+        )
+        self.assertContains(
+            response,
+            "IGDB is not configured",
+            status_code=503,
+            html=False,
+        )
+
+    def test_csrf_failure_redirects_anonymous_user_to_login(self):
+        """Anonymous CSRF failures should bounce to login, not a dead end."""
         response = self.csrf_client.post("/csrf-protected/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/accounts/login/", response.headers["Location"])
+
+    def test_csrf_failure_returns_authenticated_user_to_their_page(self):
+        """A logged-in user keeps their session and retries with a fresh token."""
+        get_user_model().objects.create_user(username="csrf-user", password="12345")
+        self.csrf_client.login(username="csrf-user", password="12345")
+
+        response = self.csrf_client.post("/csrf-protected/", HTTP_REFERER="/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("/accounts/login/", response.headers["Location"])
+
+    def test_csrf_failure_on_login_page_does_not_loop(self):
+        """A CSRF-rejected login POST must explain itself, not bounce to login.
+
+        Redirecting here sends the user back to the form they just submitted,
+        so they retry, fail CSRF again, and loop forever with no diagnostics
+        (#386).
+        """
+        with override_settings(ROOT_URLCONF="config.urls"):
+            login_url = reverse("account_login")
+            response = self.csrf_client.post(
+                login_url,
+                {"login": "someone", "password": "12345"},
+                HTTP_REFERER="http://testserver" + login_url,
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertContains(response, "USE_X_FORWARDED", status_code=403)
+
+    def test_csrf_failure_page_includes_copyable_report(self):
+        """The rendered CSRF page should expose a copyable diagnostic report.
+
+        Only reachable when the request has no user attached, since an
+        authenticated or anonymous user is redirected instead.
+        """
+        request = RequestFactory().post("/csrf-protected/")
+        response = csrf_failure(request, reason="CSRF token missing")
 
         self.assertEqual(response.status_code, 403)
         self.assert_traceback_panel(response, "error-report-403-csrf")
@@ -132,4 +195,18 @@ class ErrorPageTests(TestCase):
             "Traceback unavailable",
             status_code=403,
             html=False,
+        )
+
+    @override_settings(ROOT_URLCONF="config.urls")
+    def test_stale_startup_retry_returns_to_the_referring_page(self):
+        """A retry submitted after startup resumes should not become a 404."""
+        response = self.client.post(
+            "/retry",
+            HTTP_REFERER="http://testserver/track_modal/tmdb/tv/117648",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.headers["Location"],
+            "http://testserver/track_modal/tmdb/tv/117648",
         )

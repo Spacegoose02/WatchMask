@@ -1,23 +1,100 @@
+import json
 import logging
+from collections import defaultdict
 from datetime import UTC
 
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth.decorators import login_not_required
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils.translation import gettext, ngettext
 from django.views.decorators.http import require_GET, require_POST
 
 from app import helpers
 from app.discover import tab_cache as discover_tab_cache
-from app.log_safety import exception_summary
-from app.models import Item, MediaTypes, Sources, Status
+from app.models import Item, MediaTypes
+from app.templatetags import app_tags
 from app.track_modal_views import _DummyPodcastWrapper, _render_podcast_show_track_modal
 
 logger = logging.getLogger(__name__)
 
 
-@login_not_required
+def episode_items_by_uuid(show, episodes, *, source, media_type):
+    """Return ``{episode_uuid: Item}`` for ``episodes``, creating missing Items.
+
+    Episodes are Items only once someone looks at them, so a page creates the
+    ones it has not seen. The existing ones are read in a single query.
+    """
+    items = {
+        item.media_id: item
+        for item in Item.objects.filter(
+            media_id__in=[episode.episode_uuid for episode in episodes],
+            source=source,
+            media_type=media_type,
+        )
+    }
+    for episode in episodes:
+        item = items.get(episode.episode_uuid)
+        if item is None:
+            item, _ = Item.objects.get_or_create(
+                media_id=episode.episode_uuid,
+                source=source,
+                media_type=media_type,
+                defaults={
+                    "title": episode.title,
+                    "image": show.image or settings.IMG_NONE,
+                },
+            )
+            items[episode.episode_uuid] = item
+        if item.title != episode.title:
+            item.title = episode.title
+            item.save(update_fields=["title"])
+    return items
+
+
+def user_podcasts_by_episode(user, show, episodes):
+    """Return ``{episode_id: [Podcast, ...]}``, latest ``end_date`` first."""
+    from app.models import Podcast
+
+    by_episode = defaultdict(list)
+    for podcast in Podcast.objects.filter(
+        user=user,
+        show=show,
+        episode__in=episodes,
+    ).order_by("-end_date"):
+        by_episode[podcast.episode_id].append(podcast)
+    return by_episode
+
+
+def completed_plays_by_podcast_id(podcast_ids, limit=None):
+    """Return ``{podcast_id: [history record, ...]}``, newest completed play first.
+
+    ``limit`` keeps only that many records per podcast, in SQL, for callers
+    that display a few plays of an entry with a long history.
+    """
+    from django.db.models import F, Window
+    from django.db.models.functions import RowNumber
+
+    from app.models import Podcast
+
+    by_podcast = defaultdict(list)
+    if not podcast_ids:
+        return by_podcast
+    records = Podcast.history.filter(id__in=podcast_ids, end_date__isnull=False)
+    if limit is not None:
+        records = records.annotate(
+            play_rank=Window(
+                RowNumber(),
+                partition_by=F("id"),
+                order_by=F("end_date").desc(),
+            ),
+        ).filter(play_rank__lte=limit)
+    # history_user is read per record when the play list is rendered.
+    for record in records.select_related("history_user").order_by("-end_date"):
+        by_podcast[record.id].append(record)
+    return by_podcast
+
+
 @require_GET
 def podcast_show_detail(request, show_id):
     """Return the detail page for a podcast show."""
@@ -32,18 +109,23 @@ def podcast_show_detail(request, show_id):
 
     tracker = PodcastShowTracker.objects.filter(user=request.user, show=show).first()
 
-    episodes = PodcastEpisode.objects.filter(show=show).annotate(
-        published_or_old=Coalesce(
-            "published",
-            Value(datetime(1970, 1, 1, tzinfo=UTC),
-                  output_field=DateTimeField()),
-        ),
-    ).order_by("-published_or_old", "-episode_number")
+    episodes = (
+        PodcastEpisode.objects.filter(show=show)
+        .annotate(
+            published_or_old=Coalesce(
+                "published",
+                Value(datetime(1970, 1, 1, tzinfo=UTC), output_field=DateTimeField()),
+            ),
+        )
+        .order_by("-published_or_old", "-episode_number")
+    )
 
-    user_podcasts = list(Podcast.objects.filter(
-        user=request.user,
-        show=show,
-    ).select_related("episode", "item"))
+    user_podcasts = list(
+        Podcast.objects.filter(
+            user=request.user,
+            show=show,
+        ).select_related("episode", "item")
+    )
 
     total_episodes = episodes.count()
     total_listened = len(user_podcasts)
@@ -73,7 +155,7 @@ def podcast_show_track_modal(request, show_id):
 
 @require_GET
 def podcast_episodes_api(request, show_id):
-    """API endpoint for paginated podcast episodes.
+    """Return a page of podcast episodes.
 
     Returns HTML fragments for infinite scroll if format=html, otherwise JSON.
     """
@@ -94,51 +176,56 @@ def podcast_episodes_api(request, show_id):
         page = 1
         page_size = 20
 
-    episodes_qs = PodcastEpisode.objects.filter(show=show).annotate(
-        published_or_old=Coalesce(
-            "published",
-            Value(datetime(1970, 1, 1, tzinfo=UTC),
-                  output_field=DateTimeField()),
-        ),
-    ).order_by("-published_or_old", "-episode_number")
+    episodes_qs = (
+        PodcastEpisode.objects.filter(show=show)
+        .annotate(
+            published_or_old=Coalesce(
+                "published",
+                Value(datetime(1970, 1, 1, tzinfo=UTC), output_field=DateTimeField()),
+            ),
+        )
+        .order_by("-published_or_old", "-episode_number")
+    )
     total_count = episodes_qs.count()
 
     start = (page - 1) * page_size
     end = start + page_size
     episodes = episodes_qs[start:end]
 
-    user_podcasts = list(Podcast.objects.filter(
-        user=request.user,
-        show=show,
-    ).select_related("episode", "item").order_by("episode_id", "-created_at"))
+    episodes = list(episodes)
+    user_podcasts = list(
+        Podcast.objects.filter(
+            user=request.user,
+            show=show,
+            episode__in=episodes,
+        )
+        .select_related("episode", "item")
+        .order_by("episode_id", "-created_at")
+    )
 
     episode_podcast_map = {}
     for podcast in user_podcasts:
-        if podcast.episode_id:
-            if podcast.episode_id not in episode_podcast_map:
-                episode_podcast_map[podcast.episode_id] = podcast
+        if podcast.episode_id and podcast.episode_id not in episode_podcast_map:
+            episode_podcast_map[podcast.episode_id] = podcast
+    completed_plays = completed_plays_by_podcast_id(
+        {podcast.id for podcast in episode_podcast_map.values()},
+        limit=10,
+    )
 
-    episode_items_data = []
-    episode_items_map = {}
-    for episode in episodes:
-        item, _ = Item.objects.get_or_create(
-            media_id=episode.episode_uuid,
-            source=show.source,
-            media_type=MediaTypes.PODCAST.value,
-            defaults={
-                "title": episode.title,
-                "image": show.image or settings.IMG_NONE,
-            },
-        )
-        if item.title != episode.title:
-            item.title = episode.title
-            item.save(update_fields=["title"])
-        episode_items_data.append({
+    episode_items_map = episode_items_by_uuid(
+        show,
+        episodes,
+        source=show.source,
+        media_type=MediaTypes.PODCAST.value,
+    )
+    episode_items_data = [
+        {
             "media_id": episode.episode_uuid,
             "source": show.source,
             "media_type": MediaTypes.PODCAST.value,
-        })
-        episode_items_map[episode.episode_uuid] = item
+        }
+        for episode in episodes
+    ]
 
     enriched_episodes_raw = helpers.enrich_items_with_user_data(
         request,
@@ -160,14 +247,7 @@ def podcast_episodes_api(request, show_id):
                     enriched = e
                     break
 
-            duration_str = ""
-            if episode_obj.duration:
-                hours = episode_obj.duration // 3600
-                minutes = (episode_obj.duration % 3600) // 60
-                if hours > 0:
-                    duration_str = f"{hours}h {minutes}m"
-                else:
-                    duration_str = f"{minutes}m"
+            duration_str = helpers.seconds_to_hm(episode_obj.duration)
 
             user_podcast = episode_podcast_map.get(episode_obj.id)
 
@@ -175,7 +255,11 @@ def podcast_episodes_api(request, show_id):
                 def __init__(self, episode):
                     self.title = episode.title
                     self.track_number = episode.episode_number
-                    self.duration_formatted = self._format_duration(episode.duration) if episode.duration else None
+                    self.duration_formatted = (
+                        self._format_duration(episode.duration)
+                        if episode.duration
+                        else None
+                    )
                     self.musicbrainz_recording_id = None
                     self.id = episode.id
                     self.published = episode.published
@@ -197,14 +281,16 @@ def podcast_episodes_api(request, show_id):
 
             all_history = []
             if user_podcast:
-                all_history = list(user_podcast.history.filter(end_date__isnull=False).order_by("-end_date")[:10])
+                all_history = completed_plays.get(user_podcast.id, [])
 
                 class PodcastHistoryWrapper:
                     def __init__(self, podcast, item, history_list):
                         self.item = item
                         self.id = podcast.id
                         self._history_list = history_list
-                        self.in_progress_instance_id = podcast.id if not podcast.end_date else None
+                        self.in_progress_instance_id = (
+                            podcast.id if not podcast.end_date else None
+                        )
 
                     @property
                     def completed_play_count(self):
@@ -229,28 +315,35 @@ def podcast_episodes_api(request, show_id):
                         return HistoryProxy(self._history_list)
 
                 item = episode_items_map.get(episode_obj.episode_uuid)
-                podcast_wrapper = PodcastHistoryWrapper(user_podcast, enriched["item"] if enriched else item, all_history)
+                podcast_wrapper = PodcastHistoryWrapper(
+                    user_podcast, enriched["item"] if enriched else item, all_history
+                )
             else:
                 item = episode_items_map.get(episode_obj.episode_uuid)
-                podcast_wrapper = _DummyPodcastWrapper(enriched["item"] if enriched else item)
+                podcast_wrapper = _DummyPodcastWrapper(
+                    enriched["item"] if enriched else item
+                )
 
-            episode_list.append({
-                "title": episode_obj.title,
-                "episode_number": episode_obj.episode_number or 0,
-                "image": show.image or settings.IMG_NONE,
-                "air_date": episode_obj.published,
-                "runtime": duration_str,
-                "overview": "",
-                "history": all_history,
-                "media": enriched["media"] if enriched else None,
-                "item": enriched["item"] if enriched else item,
-                "media_id": episode_obj.episode_uuid,
-                "source": show.source,
-                "media_type": MediaTypes.PODCAST.value,
-                "track_adapter": PodcastEpisodeAdapter(episode_obj),
-                "album_adapter": PodcastShowAdapter(show),
-                "music_wrapper": podcast_wrapper,
-            })
+            episode_list.append(
+                {
+                    "title": episode_obj.title,
+                    "episode_number": episode_obj.episode_number or 0,
+                    "image": show.image or settings.IMG_NONE,
+                    "air_date": episode_obj.published,
+                    "runtime": duration_str,
+                    "overview": "",
+                    "website_url": episode_obj.website_url,
+                    "history": all_history,
+                    "media": enriched["media"] if enriched else None,
+                    "item": enriched["item"] if enriched else item,
+                    "media_id": episode_obj.episode_uuid,
+                    "source": show.source,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "track_adapter": PodcastEpisodeAdapter(episode_obj),
+                    "album_adapter": PodcastShowAdapter(show),
+                    "music_wrapper": podcast_wrapper,
+                }
+            )
 
         html = render_to_string(
             "app/components/podcast_episode_list.html",
@@ -281,14 +374,7 @@ def podcast_episodes_api(request, show_id):
                 enriched = e
                 break
 
-        duration_str = ""
-        if episode_obj.duration:
-            hours = episode_obj.duration // 3600
-            minutes = (episode_obj.duration % 3600) // 60
-            if hours > 0:
-                duration_str = f"{hours}h {minutes}m"
-            else:
-                duration_str = f"{minutes}m"
+        duration_str = helpers.seconds_to_hm(episode_obj.duration)
 
         user_podcast = episode_podcast_map.get(episode_obj.id)
         status = user_podcast.status if user_podcast else None
@@ -296,10 +382,13 @@ def podcast_episodes_api(request, show_id):
         episode_data = {
             "id": episode_obj.id,
             "title": episode_obj.title,
-            "published": episode_obj.published.isoformat() if episode_obj.published else None,
+            "published": episode_obj.published.isoformat()
+            if episode_obj.published
+            else None,
             "duration": duration_str,
             "duration_seconds": episode_obj.duration,
             "episode_number": episode_obj.episode_number,
+            "website_url": episode_obj.website_url,
             "status": status,
             "has_history": enriched and enriched.get("media") is not None,
         }
@@ -307,23 +396,25 @@ def podcast_episodes_api(request, show_id):
 
     total_pages = (total_count + page_size - 1) // page_size
 
-    return JsonResponse({
-        "episodes": episode_list,
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total_count": total_count,
-            "total_pages": total_pages,
-            "has_more": has_more,
-        },
-    })
+    return JsonResponse(
+        {
+            "episodes": episode_list,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_more": has_more,
+            },
+        }
+    )
 
 
 @require_POST
 def podcast_show_save(request):
     """Save a podcast show tracker - mirrors artist_save."""
     from app.forms import PodcastShowTrackerForm
-    from app.models import PodcastShow, PodcastShowTracker
+    from app.models import Podcast, PodcastShow, PodcastShowTracker
 
     show_id = request.POST.get("show_id")
     show = get_object_or_404(PodcastShow, id=show_id)
@@ -331,8 +422,10 @@ def podcast_show_save(request):
         request,
         fallback_media_type=MediaTypes.PODCAST.value,
     )
+    home_row_id = request.GET.get("home_row_id") or request.POST.get("home_row_id", "")
 
     tracker = PodcastShowTracker.objects.filter(user=request.user, show=show).first()
+    old_status = getattr(tracker, "status", None)
 
     form = PodcastShowTrackerForm(request.POST, instance=tracker, user=request.user)
     if form.is_valid():
@@ -340,11 +433,43 @@ def podcast_show_save(request):
         tracker.user = request.user
         tracker.show = show
         tracker.save()
-        messages.success(request, f"Saved {show.title}")
-    else:
-        messages.error(request, f"Error saving {show.title}: {form.errors}")
+        messages.success(
+            request, gettext("Saved %(value_1)s") % {"value_1": show.title}
+        )
 
-    next_url = request.GET.get("next", "")
+        if old_status != tracker.status:
+            # Home/medialist read episode-level Podcast.status, not the
+            # show tracker, so keep existing listens in sync with it.
+            updated = Podcast.objects.filter(user=request.user, show=show).update(
+                status=tracker.status,
+            )
+            if updated:
+                from app import cache_utils
+
+                cache_utils.clear_media_list_cache_for_user(request.user.id)
+                cache_utils.clear_home_row_cache_for_user(request.user.id)
+
+        if request.headers.get("HX-Request"):
+            htmx_trigger = {
+                "closeModal": {},
+                "showToast": {
+                    "message": f"Saved {show.title}.",
+                    "type": "success",
+                },
+            }
+            if home_row_id and old_status != tracker.status:
+                htmx_trigger["refreshHomeRow"] = {"rowId": int(home_row_id)}
+            response = HttpResponse(status=204)
+            response["HX-Trigger"] = json.dumps(htmx_trigger)
+            return response
+    else:
+        messages.error(
+            request,
+            gettext("Error saving %(value_1)s: %(value_2)s")
+            % {"value_1": show.title, "value_2": form.errors},
+        )
+
+    next_url = helpers.safe_return_url(request, request.GET.get("next", ""), "")
     if next_url:
         redirect_response = redirect(next_url)
     else:
@@ -369,9 +494,12 @@ def podcast_show_delete(request):
     tracker = PodcastShowTracker.objects.filter(user=request.user, show=show).first()
     if tracker:
         tracker.delete()
-        messages.success(request, f"Removed {show.title} from your library")
+        messages.success(
+            request,
+            gettext("Removed %(value_1)s from your library") % {"value_1": show.title},
+        )
 
-    next_url = request.GET.get("next", "")
+    next_url = helpers.safe_return_url(request, request.GET.get("next", ""), "")
     if next_url:
         redirect_response = redirect(next_url)
     else:
@@ -388,156 +516,47 @@ def podcast_mark_all_played(request, show_id):
     Episodes not yet imported from Pocket Casts are not included — run a Pocket Casts
     import first to fetch the full episode list.
     """
-    import hashlib
-
-    from django.utils import timezone
-
-    import events
-    from app.mixins import disable_fetch_releases
-    from app.models import Podcast, PodcastEpisode, PodcastShow, PodcastShowTracker
-    from integrations import podcast_rss
+    from app.models import PodcastShow
 
     show = get_object_or_404(PodcastShow, id=show_id)
 
-    tracker, _ = PodcastShowTracker.objects.get_or_create(
-        user=request.user,
-        show=show,
-        defaults={"status": Status.IN_PROGRESS.value},
+    # FORK: mark-all-played core shared with the REST API.
+    from app import fork_services_podcast
+
+    created_count = fork_services_podcast.mark_all_episodes_played(
+        request.user,
+        show,
     )
 
-    if show.rss_feed_url:
-        try:
-            episodes_data = podcast_rss.fetch_episodes_from_rss(show.rss_feed_url, limit=None)
-
-            seen_uuids = set(
-                PodcastEpisode.objects.filter(show=show).values_list("episode_uuid", flat=True)
+    if created_count == 0:
+        messages.info(
+            request,
+            gettext("All episodes of %(value_1)s are already marked as played")
+            % {"value_1": show.title},
+        )
+    else:
+        messages.success(
+            request,
+            ngettext(
+                "Marked %(count)s episode of %(title)s as played",
+                "Marked %(count)s episodes of %(title)s as played",
+                created_count,
             )
-            for episode_data in episodes_data:
-                episode_uuid = episode_data.get("guid")
-                if not episode_uuid:
-                    uuid_str = f"{episode_data.get('title', '')}{episode_data.get('published', '')}"
-                    episode_uuid = hashlib.md5(uuid_str.encode()).hexdigest()[:36]
-
-                if episode_uuid in seen_uuids:
-                    continue
-
-                exists = False
-                if episode_data.get("title") and episode_data.get("published"):
-                    exists = PodcastEpisode.objects.filter(
-                        show=show,
-                        title__iexact=episode_data["title"].strip(),
-                        published__date=episode_data["published"].date(),
-                    ).exists()
-
-                if not exists:
-                    try:
-                        PodcastEpisode.objects.create(
-                            show=show,
-                            episode_uuid=episode_uuid,
-                            title=episode_data.get("title", "Unknown Episode"),
-                            published=episode_data.get("published"),
-                            duration=episode_data.get("duration"),
-                            audio_url=episode_data.get("audio_url", ""),
-                            episode_number=episode_data.get("episode_number"),
-                            season_number=episode_data.get("season_number"),
-                        )
-                        seen_uuids.add(episode_uuid)
-                    except Exception:
-                        logger.debug("Skipping duplicate episode UUID %s for show %s", episode_uuid, show.title)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch full episode list from RSS feed for %s: %s",
-                show.title,
-                exception_summary(e),
-            )
-
-    all_episodes = PodcastEpisode.objects.filter(show=show)
-
-    completed_episodes = set(
-        Podcast.objects.filter(
-            user=request.user,
-            show=show,
-            episode__isnull=False,
-            end_date__isnull=False,
-        ).values_list("episode_id", flat=True),
-    )
-
-    unplayed_episodes = all_episodes.exclude(id__in=completed_episodes)
-
-    if not unplayed_episodes.exists():
-        messages.info(request, f"All episodes of {show.title} are already marked as played")
-        return redirect("media_details", source=show.source, media_type=MediaTypes.PODCAST.value, media_id=show.podcast_uuid, title=show.slug or show.title)
-
-    created_count = 0
-    items_created = []
-
-    with disable_fetch_releases():
-        for episode in unplayed_episodes:
-            runtime_minutes = episode.duration // 60 if episode.duration else None
-            item_defaults = {
-                "title": episode.title,
-                "image": show.image or settings.IMG_NONE,
-            }
-            if runtime_minutes:
-                item_defaults["runtime_minutes"] = runtime_minutes
-            if episode.published:
-                item_defaults["release_datetime"] = episode.published
-
-            item, item_created = Item.objects.get_or_create(
-                media_id=episode.episode_uuid,
-                source=show.source,
-                media_type=MediaTypes.PODCAST.value,
-                defaults=item_defaults,
-            )
-
-            if not item_created:
-                update_fields = []
-                if runtime_minutes and item.runtime_minutes != runtime_minutes:
-                    item.runtime_minutes = runtime_minutes
-                    update_fields.append("runtime_minutes")
-                if episode.published and item.release_datetime != episode.published:
-                    item.release_datetime = episode.published
-                    update_fields.append("release_datetime")
-                if update_fields:
-                    item.save(update_fields=update_fields)
-
-            if item_created:
-                items_created.append(item)
-
-            end_date = episode.published if episode.published else timezone.now()
-
-            Podcast.objects.create(
-                item=item,
-                user=request.user,
-                show=show,
-                episode=episode,
-                status=Status.COMPLETED.value,
-                end_date=end_date,
-                progress=runtime_minutes if runtime_minutes else 0,
-            )
-            created_count += 1
-
-    if items_created:
-        events.tasks.reload_calendar.apply_async(
-            kwargs={"item_ids": [item.id for item in items_created]},
-            countdown=3,
+            % {"count": created_count, "title": show.title},
         )
 
-    episode_word = "episodes" if created_count != 1 else "episode"
-    messages.success(
-        request,
-        f"Marked {created_count} {episode_word} of {show.title} as played",
+    return redirect(
+        "media_details",
+        source=show.source,
+        media_type=MediaTypes.PODCAST.value,
+        media_id=show.podcast_uuid,
+        title=show.slug or show.title,
     )
-
-    return redirect("media_details", source=show.source, media_type=MediaTypes.PODCAST.value, media_id=show.podcast_uuid, title=show.slug or show.title)
 
 
 @require_POST
 def podcast_save(request):
     """Handle adding a play for a podcast episode - mirrors song_save for music."""
-    from django.utils import timezone
-    from django.utils.dateparse import parse_date, parse_datetime
-
     from app.models import Podcast, PodcastEpisode, PodcastShow
 
     episode_uuid = request.POST.get("episode_uuid")
@@ -549,87 +568,65 @@ def podcast_save(request):
         fallback_media_type=MediaTypes.PODCAST.value,
     )
 
-    end_date = None
-    if end_date_str:
-        end_date = parse_datetime(end_date_str)
-        if end_date:
-            if timezone.is_naive(end_date):
-                end_date = timezone.make_aware(end_date)
-        else:
-            parsed_date = parse_date(end_date_str)
-            if parsed_date:
-                end_date = timezone.make_aware(
-                    timezone.datetime.combine(parsed_date, timezone.datetime.min.time()),
-                )
-
     show = get_object_or_404(PodcastShow, id=show_id)
     episode = get_object_or_404(PodcastEpisode, id=episode_id) if episode_id else None
 
-    runtime_minutes = None
-    if episode and episode.duration:
-        runtime_minutes = episode.duration // 60
+    # A blank date means "now" and is resolved in the service. A date that was
+    # supplied but cannot be read is a different case: recording it as "now"
+    # would store a time the user did not choose and never tell them.
+    end_date = None
+    if end_date_str:
+        try:
+            end_date = helpers.parse_completion_datetime(end_date_str)
+        except (TypeError, ValueError):
+            message = gettext(
+                'Watchmask cannot read the date "%(value_1)s". Enter the date as YYYY-MM-DD. To record this play at the current time, keep the date empty.'
+            ) % {"value_1": end_date_str}
+            if request.headers.get("HX-Request"):
+                # Do not swap and do not close the modal. The date the user
+                # typed stays on screen for them to correct. Closing it would
+                # make them find the episode and type everything again.
+                response = HttpResponse(status=200)
+                response["HX-Reswap"] = "none"
+                response["HX-Trigger"] = json.dumps(
+                    {"showToast": {"message": message, "type": "error"}},
+                )
+                return response
+            messages.error(request, message)
+            return redirect(
+                "media_details",
+                source=show.source,
+                media_type=MediaTypes.PODCAST.value,
+                media_id=show.podcast_uuid,
+                title=show.slug or app_tags.slug(show.title or "") or "podcast",
+            )
 
-    item_defaults = {
-        "title": episode.title if episode else "Unknown Episode",
-        "image": show.image or settings.IMG_NONE,
-    }
-    if runtime_minutes:
-        item_defaults["runtime_minutes"] = runtime_minutes
-    if episode and episode.published:
-        item_defaults["release_datetime"] = episode.published
+    # FORK: play-recording core shared with the REST API.
+    from app import fork_services_podcast
 
-    item, created = Item.objects.get_or_create(
-        media_id=episode_uuid,
-        source=show.source,
-        media_type=MediaTypes.PODCAST.value,
-        defaults=item_defaults,
+    recorded_podcast, duplicate = fork_services_podcast.record_podcast_play(
+        request.user,
+        show,
+        episode=episode,
+        episode_uuid=episode_uuid,
+        end_date=end_date,
     )
-    if not created:
-        update_fields = []
-        if runtime_minutes and item.runtime_minutes != runtime_minutes:
-            item.runtime_minutes = runtime_minutes
-            update_fields.append("runtime_minutes")
-        if episode and episode.published and item.release_datetime != episode.published:
-            item.release_datetime = episode.published
-            update_fields.append("release_datetime")
-        if update_fields:
-            item.save(update_fields=update_fields)
-
-    existing_podcast = Podcast.objects.filter(
-        user=request.user,
-        item=item,
-    ).first()
-
-    if existing_podcast:
-        latest_history = existing_podcast.history.filter(end_date__isnull=False).order_by("-end_date").first()
-        if latest_history and latest_history.end_date and end_date:
-            time_diff = abs((end_date - latest_history.end_date).total_seconds())
-            if time_diff < 300:
-                logger.debug("Skipping duplicate podcast history entry (time difference: %d seconds)", time_diff)
-                messages.info(request, f"Play already recorded for {episode.title if episode else 'episode'}")
-            else:
-                existing_podcast.end_date = end_date
-                if runtime_minutes and existing_podcast.progress != runtime_minutes:
-                    existing_podcast.progress = runtime_minutes
-                existing_podcast.save()
-                messages.success(request, f"Added play for {episode.title if episode else 'episode'}")
-        else:
-            existing_podcast.end_date = end_date
-            if runtime_minutes and existing_podcast.progress != runtime_minutes:
-                existing_podcast.progress = runtime_minutes
-            existing_podcast.save()
-            messages.success(request, f"Added play for {episode.title if episode else 'episode'}")
-    else:
-        Podcast.objects.create(
-            item=item,
-            user=request.user,
-            show=show,
-            episode=episode,
-            status=Status.COMPLETED.value,
-            end_date=end_date,
-            progress=runtime_minutes if runtime_minutes else 0,
+    item = recorded_podcast.item
+    episode_title = episode.title if episode else "episode"
+    if duplicate:
+        # Say that nothing was added. A plain "already recorded" reads as
+        # success, and the user then finds the play count unchanged.
+        messages.info(
+            request,
+            gettext(
+                "Watchmask recorded a play for %(value_1)s less than five minutes ago. Watchmask did not add a second play."
+            )
+            % {"value_1": episode_title},
         )
-        messages.success(request, f"Added play for {episode.title if episode else 'episode'}")
+    else:
+        messages.success(
+            request, gettext("Added play for %(value_1)s") % {"value_1": episode_title}
+        )
 
     if request.headers.get("HX-Request"):
         from django.template.loader import render_to_string
@@ -638,43 +635,52 @@ def podcast_save(request):
         if not episode_obj:
             return HttpResponse("Episode not found", status=404)
 
-        user_podcast = Podcast.objects.filter(
-            user=request.user,
-            show=show,
-            episode=episode_obj,
-        ).order_by("-created_at").first()
+        user_podcast = (
+            Podcast.objects.filter(
+                user=request.user,
+                show=show,
+                episode=episode_obj,
+            )
+            .order_by("-created_at")
+            .first()
+        )
 
-        episode_items_data = [{
-            "media_id": episode_obj.episode_uuid,
-            "source": show.source,
-            "media_type": MediaTypes.PODCAST.value,
-        }]
+        episode_items_data = [
+            {
+                "media_id": episode_obj.episode_uuid,
+                "source": show.source,
+                "media_type": MediaTypes.PODCAST.value,
+            }
+        ]
         enriched_episodes_raw = helpers.enrich_items_with_user_data(
             request,
             episode_items_data,
             user=request.user,
         )
-        enriched = enriched_episodes_raw[0] if enriched_episodes_raw else {"item": {"media_id": episode_obj.episode_uuid}, "media": None}
+        enriched = (
+            enriched_episodes_raw[0]
+            if enriched_episodes_raw
+            else {"item": {"media_id": episode_obj.episode_uuid}, "media": None}
+        )
 
-        duration_str = ""
-        if episode_obj.duration:
-            hours = episode_obj.duration // 3600
-            minutes = (episode_obj.duration % 3600) // 60
-            if hours > 0:
-                duration_str = f"{hours}h {minutes}m"
-            else:
-                duration_str = f"{minutes}m"
+        duration_str = helpers.seconds_to_hm(episode_obj.duration)
 
         all_history = []
         if user_podcast:
-            all_history = list(user_podcast.history.filter(end_date__isnull=False).order_by("-end_date")[:10])
+            all_history = list(
+                user_podcast.history.filter(end_date__isnull=False).order_by(
+                    "-end_date"
+                )[:10]
+            )
 
             class PodcastHistoryWrapper:
                 def __init__(self, podcast, item, history_list):
                     self.item = item
                     self.id = podcast.id
                     self._history_list = history_list
-                    self.in_progress_instance_id = podcast.id if not podcast.end_date else None
+                    self.in_progress_instance_id = (
+                        podcast.id if not podcast.end_date else None
+                    )
 
                 @property
                 def completed_play_count(self):
@@ -706,7 +712,11 @@ def podcast_save(request):
             def __init__(self, episode):
                 self.title = episode.title
                 self.track_number = episode.episode_number
-                self.duration_formatted = self._format_duration(episode.duration) if episode.duration else None
+                self.duration_formatted = (
+                    self._format_duration(episode.duration)
+                    if episode.duration
+                    else None
+                )
                 self.musicbrainz_recording_id = None
                 self.id = episode.id
                 self.published = episode.published
@@ -732,6 +742,7 @@ def podcast_save(request):
             "air_date": episode_obj.published,
             "runtime": duration_str,
             "overview": "",
+            "website_url": episode_obj.website_url,
             "history": all_history,
             "media": enriched["media"] if enriched else None,
             "item": item,
@@ -760,12 +771,10 @@ def podcast_save(request):
         response["HX-Trigger"] = "closeModal"
         return response
 
-    from django.utils.text import slugify
-
     return redirect(
         "media_details",
         source=show.source,
         media_type=MediaTypes.PODCAST.value,
         media_id=show.podcast_uuid,
-        title=show.slug or slugify(show.title),
+        title=show.slug or app_tags.slug(show.title or "") or "podcast",
     )

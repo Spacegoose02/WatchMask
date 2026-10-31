@@ -1,4 +1,8 @@
-from app import custom_metadata, models
+from django.conf import settings
+from django.core.cache import cache
+
+from app import custom_metadata, helpers, models
+from app.helpers import MODEL_MAP
 from app.models import MediaTypes, Sources
 
 
@@ -223,7 +227,7 @@ def episode(media_id, season_number, episode_number):
     return None
 
 
-def process_episodes(season_metadata, episodes_in_db):
+def process_episodes(season_metadata, episodes_in_db, season=None):
     """Process the episodes for the selected season."""
     tracked_episodes = {}
     for ep in episodes_in_db:
@@ -236,6 +240,10 @@ def process_episodes(season_metadata, episodes_in_db):
 
     for episode_payload in season_metadata["episodes"]:
         episode_number = episode_payload["episode_number"]
+        pass_plays, all_plays = helpers.split_pass_history(
+            tracked_episodes.get(episode_number, []),
+            season,
+        )
         episode_data = {
             "source": Sources.MANUAL.value,
             "media_id": episode_payload["media_id"],
@@ -250,7 +258,8 @@ def process_episodes(season_metadata, episodes_in_db):
                 or episode_payload.get("synopsis")
                 or "No synopsis available."
             ),
-            "history": tracked_episodes.get(episode_number, []),
+            "history": pass_plays,
+            "all_history": all_plays,
         }
         if episode_payload.get("runtime"):
             episode_data["runtime"] = episode_payload["runtime"]
@@ -278,3 +287,65 @@ def build_episodes_response(season_episodes):
             },
         )
     return episodes
+
+
+def search(media_type, query, page=1, *, limit=None, offset=None, user=None):
+    """Search tracked manual media for the authenticated user."""
+    normalized_query = (query or "").strip()
+
+    if user is None or media_type not in MODEL_MAP:
+        per_page = limit or settings.PER_PAGE
+        current_page = (
+            page if limit is None or offset is None else offset // per_page + 1
+        )
+        return helpers.format_search_response(current_page, per_page, 0, [])
+
+    per_page = limit or settings.PER_PAGE
+    current_offset = offset if offset is not None else (page - 1) * per_page
+    current_page = current_offset // per_page + 1
+
+    cache_key = (
+        "manual_search_"
+        f"{media_type}_{normalized_query.lower()}_{user.id}_{current_page}"
+    )
+    data = cache.get(cache_key)
+    if data is not None:
+        return data
+
+    model_class = MODEL_MAP[media_type]
+    tracked_item_ids = model_class.objects.filter(user=user).values_list(
+        "item_id",
+        flat=True,
+    )
+
+    item_queryset = models.Item.objects.filter(
+        id__in=tracked_item_ids,
+        source=Sources.MANUAL.value,
+        media_type=media_type,
+        title__icontains=normalized_query,
+    ).order_by("title", "id")
+
+    total_results = item_queryset.count()
+    page_items = item_queryset[current_offset : current_offset + per_page]
+
+    results = [
+        {
+            "media_id": item.media_id,
+            "source": item.source,
+            "media_type": item.media_type,
+            "title": item.title,
+            "image": item.image,
+        }
+        for item in page_items
+    ]
+
+    data = helpers.format_search_response(
+        current_page,
+        per_page,
+        total_results,
+        results,
+    )
+
+    cache.set(cache_key, data)
+
+    return data

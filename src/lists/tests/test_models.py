@@ -2,22 +2,30 @@ import datetime
 from datetime import timedelta
 from unittest.mock import patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import IntegrityError
+from django.core.cache import cache
+from django.db import IntegrityError, transaction
+from django.db.models import Prefetch
 from django.test import TestCase
 from django.utils import timezone
 
 from app.models import (
     TV,
     CollectionEntry,
+    Episode,
     Game,
     Item,
+    ItemTag,
     MediaTypes,
     Movie,
     Music,
+    Season,
     Sources,
     Status,
+    Tag,
 )
+from app.services import tracking_hydration
 from lists import smart_rules
 from lists.models import CustomList, CustomListItem
 
@@ -108,6 +116,55 @@ class CustomListModelTest(TestCase):
                 custom_list=self.custom_list,
             )
 
+    def _add_two_items(self):
+        """Add a first- and second-added item, returning (first, second)."""
+        first_item = Item.objects.create(
+            title="First Added",
+            media_id="first",
+            media_type=MediaTypes.TV.value,
+            source=Sources.MANUAL.value,
+            image="http://example.com/first.jpg",
+        )
+        second_item = Item.objects.create(
+            title="Second Added",
+            media_id="second",
+            media_type=MediaTypes.TV.value,
+            source=Sources.MANUAL.value,
+            image="http://example.com/second.jpg",
+        )
+        CustomListItem.objects.create(
+            item=first_item,
+            custom_list=self.custom_list,
+        )
+        CustomListItem.objects.create(
+            item=second_item,
+            custom_list=self.custom_list,
+        )
+        return first_item, second_item
+
+    def test_image_uses_first_added_item(self):
+        """CustomList.image should use the first-added item (no prefetch)."""
+        first_item, _second_item = self._add_two_items()
+
+        self.assertEqual(self.custom_list.image, first_item.image)
+
+    def test_image_uses_first_added_item_when_prefetched(self):
+        """CustomList.image should use the first-added item, matching the
+        prefetch ordering used by the lists grid and cover image views.
+        """
+        first_item, _second_item = self._add_two_items()
+
+        prefetched_list = CustomList.objects.prefetch_related(
+            Prefetch(
+                "customlistitem_set",
+                queryset=CustomListItem.objects.select_related(
+                    "item",
+                ).order_by("date_added"),
+            ),
+        ).get(id=self.custom_list.id)
+
+        self.assertEqual(prefetched_list.image, first_item.image)
+
 
 class CustomListManagerTest(TestCase):
     """Test case for the CustomListManager."""
@@ -139,7 +196,6 @@ class CustomListManagerTest(TestCase):
 
         self.assertEqual(resolved, self.list1)
 
-
     def test_smart_list_sync_items(self):
         """Smart list should sync matching items from saved filters."""
         item = Item.objects.create(
@@ -163,7 +219,7 @@ class CustomListManagerTest(TestCase):
         self.assertTrue(smart_list.items.filter(id=item.id).exists())
 
     def test_collect_matching_item_ids_fast_paths_simple_status_rules(self):
-        """Status-only smart rules should not build extra collection/rating scans."""
+        """Status-only smart rules are answered in SQL, without scanning items."""
         completed_item = Item.objects.create(
             title="Completed Movie",
             media_id="4567",
@@ -198,18 +254,210 @@ class CustomListManagerTest(TestCase):
         )
 
         with patch(
-            "lists.smart_rules._collection_filter_context",
-            side_effect=AssertionError("collection context should not be built"),
-        ), patch(
-            "lists.smart_rules._filter_item_ids_by_rating",
-            side_effect=AssertionError("rating filter scan should not run"),
-        ), patch(
-            "lists.smart_rules._matches_item_filters",
+            "app.library_query.executor.LibraryQueryExecutor._scan",
             side_effect=AssertionError("simple status rules should not scan items"),
         ):
-            matched_ids = smart_rules.collect_matching_item_ids(self.user, normalized_rules)
+            matched_ids = smart_rules.collect_matching_item_ids(
+                self.user, normalized_rules
+            )
 
         self.assertEqual(matched_ids, {completed_item.id})
+
+    def test_smart_rules_support_multi_status_and_tag_modes(self):
+        """Smart-list matching combines statuses with OR and tags by mode."""
+        both_item = Item.objects.create(
+            title="Action Comedy Movie",
+            media_id="multi-1",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+        )
+        action_item = Item.objects.create(
+            title="Action Movie",
+            media_id="multi-2",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+        )
+        comedy_item = Item.objects.create(
+            title="Comedy Movie",
+            media_id="multi-3",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+        )
+        plain_item = Item.objects.create(
+            title="Plain Movie",
+            media_id="multi-4",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+        )
+        Movie.objects.create(
+            item=both_item, user=self.user, status=Status.COMPLETED.value
+        )
+        Movie.objects.create(
+            item=action_item, user=self.user, status=Status.DROPPED.value
+        )
+        Movie.objects.create(
+            item=comedy_item, user=self.user, status=Status.PLANNING.value
+        )
+        Movie.objects.create(
+            item=plain_item, user=self.user, status=Status.PAUSED.value
+        )
+        action_tag = Tag.objects.create(user=self.user, name="Action")
+        comedy_tag = Tag.objects.create(user=self.user, name="Comedy")
+        ItemTag.objects.create(item=both_item, tag=action_tag)
+        ItemTag.objects.create(item=both_item, tag=comedy_tag)
+        ItemTag.objects.create(item=action_item, tag=action_tag)
+        ItemTag.objects.create(item=comedy_item, tag=comedy_tag)
+
+        status_rules = smart_rules.normalize_rule_payload(
+            {
+                "media_types": [MediaTypes.MOVIE.value],
+                "status": [Status.COMPLETED.value, Status.DROPPED.value],
+            },
+            self.user,
+        )
+        self.assertEqual(
+            smart_rules.collect_matching_item_ids(self.user, status_rules),
+            {both_item.id, action_item.id},
+        )
+
+        for mode, expected_ids in {
+            "and": {both_item.id},
+            "or": {both_item.id, action_item.id, comedy_item.id},
+            "not": {plain_item.id},
+        }.items():
+            rules = smart_rules.normalize_rule_payload(
+                {
+                    "media_types": [MediaTypes.MOVIE.value],
+                    "tag": ["Action", "Comedy"],
+                    "tag_mode": mode,
+                },
+                self.user,
+            )
+            self.assertEqual(
+                smart_rules.collect_matching_item_ids(self.user, rules),
+                expected_ids,
+            )
+            self.assertEqual(
+                {
+                    item.id
+                    for item in (both_item, action_item, comedy_item, plain_item)
+                    if smart_rules.item_matches_rules(self.user, item, rules)
+                },
+                expected_ids,
+            )
+
+    def test_normalize_rule_payload_restricts_list_filter_to_accessible_manual_lists(
+        self,
+    ):
+        """The list filter should only accept non-smart lists owner can access."""
+        inaccessible_list = CustomList.objects.create(
+            name="Not Mine",
+            owner=self.other_user,
+        )
+        smart_target = CustomList.objects.create(
+            name="Smart Target",
+            owner=self.user,
+            is_smart=True,
+        )
+
+        rules = smart_rules.normalize_rule_payload(
+            {
+                "list": [
+                    self.list1.id,
+                    self.list2.id,
+                    inaccessible_list.id,
+                    smart_target.id,
+                ],
+            },
+            self.user,
+        )
+
+        self.assertCountEqual(rules["list"], [self.list1.id, self.list2.id])
+
+    def test_collect_matching_item_ids_unions_linked_list_contents(self):
+        """List filter should include linked lists' items even if other filters fail."""
+        linked_item = Item.objects.create(
+            title="Untracked Linked Game",
+            media_id="link-1",
+            media_type=MediaTypes.GAME.value,
+            source=Sources.IGDB.value,
+        )
+        CustomListItem.objects.create(
+            custom_list=self.list1,
+            item=linked_item,
+            added_by=self.user,
+        )
+        other_item = Item.objects.create(
+            title="Unrelated Movie",
+            media_id="link-2",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+        )
+        Movie.objects.create(
+            item=other_item, user=self.user, status=Status.COMPLETED.value
+        )
+
+        rules = smart_rules.normalize_rule_payload(
+            {
+                "media_types": [MediaTypes.MOVIE.value],
+                "genre": "Nonexistent Genre",
+                "list": [self.list1.id],
+            },
+            self.user,
+        )
+
+        matched_ids = smart_rules.collect_matching_item_ids(self.user, rules)
+
+        self.assertIn(linked_item.id, matched_ids)
+        self.assertNotIn(other_item.id, matched_ids)
+
+    def test_item_matches_rules_short_circuits_for_linked_list_membership(self):
+        """A linked list's item should match regardless of other active filters."""
+        linked_item = Item.objects.create(
+            title="Linked Game",
+            media_id="link-3",
+            media_type=MediaTypes.GAME.value,
+            source=Sources.IGDB.value,
+        )
+        CustomListItem.objects.create(
+            custom_list=self.list1,
+            item=linked_item,
+            added_by=self.user,
+        )
+
+        rules = smart_rules.normalize_rule_payload(
+            {"genre": "Nonexistent Genre", "list": [self.list1.id]},
+            self.user,
+        )
+
+        self.assertTrue(smart_rules.item_matches_rules(self.user, linked_item, rules))
+
+    def test_manual_list_membership_change_syncs_referencing_smart_lists(self):
+        """Adding/removing an item on a linked manual list should resync smart lists."""
+        linked_item = Item.objects.create(
+            title="Freshly Linked Game",
+            media_id="link-4",
+            media_type=MediaTypes.GAME.value,
+            source=Sources.IGDB.value,
+        )
+        smart_list = CustomList.objects.create(
+            name="All Owned Games",
+            owner=self.user,
+            is_smart=True,
+            smart_filters={"list": [self.list1.id]},
+        )
+
+        membership = CustomListItem.objects.create(
+            custom_list=self.list1,
+            item=linked_item,
+            added_by=self.user,
+        )
+
+        self.assertTrue(smart_list.items.filter(id=linked_item.id).exists())
+
+        membership.delete()
+
+        self.assertFalse(smart_list.items.filter(id=linked_item.id).exists())
 
     def test_smart_list_collection_filter_uses_episode_collection_for_tv(self):
         """Collected TV rules should match when related episodes are collected."""
@@ -244,6 +492,83 @@ class CustomListManagerTest(TestCase):
         smart_list.sync_smart_items()
         self.assertTrue(smart_list.items.filter(id=tv_item.id).exists())
 
+    def test_collect_matching_item_ids_excludes_collected_episode_items_for_tv(self):
+        """Collection-only fallback shouldn't surface bare episode items for a TV row.
+
+        Episodes carrying `library_media_type="tv"` (normal per-episode TV tracking)
+        match the "tv" media type via `library_media_type`, but the Episode model has
+        no `user` field, so returning their raw item ids crashes any downstream code
+        that resolves them with `Episode.objects.filter(user=...)` (issue #397).
+        """
+        tv_item = Item.objects.create(
+            title="Collected Show",
+            media_id="778",
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.TV.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/tv.jpg",
+        )
+        TV.objects.create(item=tv_item, user=self.user, status=Status.IN_PROGRESS.value)
+
+        untracked_episode_item = Item.objects.create(
+            title="Untracked Episode",
+            media_id="779",
+            media_type=MediaTypes.EPISODE.value,
+            library_media_type=MediaTypes.TV.value,
+            source=Sources.TMDB.value,
+            season_number=1,
+            episode_number=1,
+            image="https://example.com/episode.jpg",
+        )
+        CollectionEntry.objects.create(user=self.user, item=untracked_episode_item)
+
+        normalized_rules = smart_rules.normalize_rule_payload(
+            {"media_types": [MediaTypes.TV.value], "status": "all"},
+            self.user,
+        )
+        matched_ids = smart_rules.collect_matching_item_ids(
+            self.user,
+            normalized_rules,
+            include_collection_only_untracked=True,
+        )
+
+        self.assertIn(tv_item.id, matched_ids)
+        self.assertNotIn(untracked_episode_item.id, matched_ids)
+
+    def test_collection_filter_batches_large_id_sets(self):
+        """Collection lookups shouldn't blow SQLite's bound-parameter limit (#500 error).
+
+        Forcing a tiny `_id_batch_size` simulates a user with a collection large
+        enough to exceed `connection.features.max_query_params` without creating
+        thousands of rows.
+        """
+        movie_items = []
+        for index in range(5):
+            item = Item.objects.create(
+                title=f"Collected Movie {index}",
+                media_id=str(1000 + index),
+                media_type=MediaTypes.MOVIE.value,
+                source=Sources.TMDB.value,
+                image=f"https://example.com/movie{index}.jpg",
+            )
+            CollectionEntry.objects.create(user=self.user, item=item)
+            movie_items.append(item)
+
+        normalized_rules = smart_rules.normalize_rule_payload(
+            {"media_types": [MediaTypes.MOVIE.value], "status": "all"},
+            self.user,
+        )
+
+        with patch("lists.smart_rules._id_batch_size", return_value=2):
+            matched_ids = smart_rules.collect_matching_item_ids(
+                self.user,
+                normalized_rules,
+                include_collection_only_untracked=True,
+            )
+
+        for item in movie_items:
+            self.assertIn(item.id, matched_ids)
+
     def test_smart_list_language_filter(self):
         """Language filter should match item language metadata."""
         item = Item.objects.create(
@@ -265,6 +590,109 @@ class CustomListManagerTest(TestCase):
         )
         smart_list.sync_smart_items()
         self.assertTrue(smart_list.items.filter(id=item.id).exists())
+
+    def test_smart_list_completed_date_filter_differs_from_release_year(self):
+        """Completed-date filter matches end_date, not the item's release year."""
+        item = Item.objects.create(
+            title="Old Release, Recently Finished",
+            media_id="901",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/movie.jpg",
+            release_datetime=datetime.date(1999, 1, 1),
+        )
+        Movie.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            end_date=datetime.datetime(2025, 6, 15, tzinfo=datetime.UTC),
+        )
+
+        smart_list = CustomList.objects.create(
+            name="Completed in June 2025",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.MOVIE.value],
+            smart_filters={
+                "completed_date_from": "2025-06-01",
+                "completed_date_to": "2025-06-30",
+            },
+        )
+        smart_list.sync_smart_items()
+        self.assertTrue(smart_list.items.filter(id=item.id).exists())
+
+        # The item's release year (1999) doesn't overlap the completed range,
+        # confirming this isn't accidentally matching on year/release_datetime.
+        year_filtered = smart_rules.normalize_rule_payload(
+            {
+                "media_types": [MediaTypes.MOVIE.value],
+                "year": "2025",
+            },
+            self.user,
+        )
+        self.assertNotIn(
+            item.id,
+            smart_rules.collect_matching_item_ids(self.user, year_filtered),
+        )
+
+        outside_range = CustomList.objects.create(
+            name="Completed in 1999",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.MOVIE.value],
+            smart_filters={
+                "completed_date_from": "1999-01-01",
+                "completed_date_to": "1999-12-31",
+            },
+        )
+        outside_range.sync_smart_items()
+        self.assertFalse(outside_range.items.filter(id=item.id).exists())
+
+    def test_smart_list_completed_date_filter_uses_episode_dates_for_tv(self):
+        """TV/Season have no persisted end_date; filter matches via episodes."""
+        season_item = Item.objects.create(
+            title="Friends",
+            media_id="1668",
+            media_type=MediaTypes.SEASON.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/friends.jpg",
+            season_number=1,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        tv = TV.objects.get(user=self.user, item__media_id="1668")
+
+        episode_item = Item.objects.create(
+            title="Friends S1E1",
+            media_id="1668",
+            media_type=MediaTypes.EPISODE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/friends.jpg",
+            season_number=1,
+            episode_number=1,
+        )
+        Episode.objects.create(
+            item=episode_item,
+            related_season=season,
+            end_date=datetime.datetime(2023, 6, 2, tzinfo=datetime.UTC),
+        )
+
+        smart_list = CustomList.objects.create(
+            name="Completed early June 2023",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.SEASON.value, MediaTypes.TV.value],
+            smart_filters={
+                "completed_date_from": "2023-06-01",
+                "completed_date_to": "2023-06-03",
+            },
+        )
+        smart_list.sync_smart_items()
+        self.assertTrue(smart_list.items.filter(id=season_item.id).exists())
+        self.assertTrue(smart_list.items.filter(id=tv.item_id).exists())
 
     def test_smart_list_implied_genre_filter_matches_item_implied_genres(self):
         """Implied genre rules should match only the implied_genres field."""
@@ -333,6 +761,252 @@ class CustomListManagerTest(TestCase):
         )
         smart_list.sync_smart_items()
         self.assertTrue(smart_list.items.filter(id=item.id).exists())
+
+    def test_smart_list_provider_filter_matches_when_region_configured(self):
+        """Provider filter should match items available on that service in the user's region."""
+        item = Item.objects.create(
+            title="Streaming Movie",
+            media_id="1300",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/movie.jpg",
+            watch_providers={
+                "US": {
+                    "flatrate": [
+                        {"provider_id": 8, "provider_name": "Netflix"},
+                    ],
+                },
+            },
+        )
+        Movie.objects.create(item=item, user=self.user, status=Status.COMPLETED.value)
+        self.user.watch_provider_region = "US"
+        self.user.save(update_fields=["watch_provider_region"])
+
+        smart_list = CustomList.objects.create(
+            name="Netflix Movies",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.MOVIE.value],
+            smart_filters={"provider": "Netflix"},
+        )
+        smart_list.sync_smart_items()
+        self.assertTrue(smart_list.items.filter(id=item.id).exists())
+
+    def test_smart_list_provider_filter_no_match_without_region_configured(self):
+        """Provider filter should exclude items when the owner has no region set."""
+        item = Item.objects.create(
+            title="Unfiltered Movie",
+            media_id="1301",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/movie2.jpg",
+            watch_providers={
+                "US": {
+                    "flatrate": [
+                        {"provider_id": 8, "provider_name": "Netflix"},
+                    ],
+                },
+            },
+        )
+        Movie.objects.create(item=item, user=self.user, status=Status.COMPLETED.value)
+
+        smart_list = CustomList.objects.create(
+            name="Netflix Movies No Region",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.MOVIE.value],
+            smart_filters={"provider": "Netflix"},
+        )
+        smart_list.sync_smart_items()
+        self.assertFalse(smart_list.items.filter(id=item.id).exists())
+
+    def test_smart_list_provider_filter_matches_on_incremental_sync(self):
+        """Incremental sync should use the owner's watch_provider_region."""
+        self.user.watch_provider_region = "US"
+        self.user.save(update_fields=["watch_provider_region"])
+
+        smart_list = CustomList.objects.create(
+            name="Netflix Incremental",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.MOVIE.value],
+            smart_filters={"provider": "Netflix"},
+        )
+
+        item = Item.objects.create(
+            title="Incremental Netflix Movie",
+            media_id="1303",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/incremental-netflix.jpg",
+            watch_providers={
+                "US": {
+                    "flatrate": [
+                        {"provider_id": 8, "provider_name": "Netflix"},
+                    ],
+                },
+            },
+        )
+        Movie.objects.create(item=item, user=self.user, status=Status.COMPLETED.value)
+
+        rules = smart_rules.normalize_list_rules(smart_list)
+        self.assertTrue(smart_rules.item_matches_rules(self.user, item, rules))
+        self.assertTrue(smart_list.items.filter(id=item.id).exists())
+
+    def test_smart_list_provider_filter_excludes_on_incremental_sync(self):
+        """Incremental sync should exclude items whose providers do not match."""
+        self.user.watch_provider_region = "US"
+        self.user.save(update_fields=["watch_provider_region"])
+
+        smart_list = CustomList.objects.create(
+            name="Netflix Incremental Exclude",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.MOVIE.value],
+            smart_filters={"provider": "Netflix"},
+        )
+
+        item = Item.objects.create(
+            title="Incremental Disney Movie",
+            media_id="1304",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/incremental-disney.jpg",
+            watch_providers={
+                "US": {
+                    "flatrate": [
+                        {"provider_id": 337, "provider_name": "Disney Plus"},
+                    ],
+                },
+            },
+        )
+        Movie.objects.create(item=item, user=self.user, status=Status.COMPLETED.value)
+
+        rules = smart_rules.normalize_list_rules(smart_list)
+        self.assertFalse(smart_rules.item_matches_rules(self.user, item, rules))
+        self.assertFalse(smart_list.items.filter(id=item.id).exists())
+
+    def test_smart_list_provider_filter_matches_when_providers_backfilled(self):
+        """Provider backfill on an already-tracked item should update Smart Lists."""
+        self.user.watch_provider_region = "US"
+        self.user.save(update_fields=["watch_provider_region"])
+
+        smart_list = CustomList.objects.create(
+            name="Netflix After Backfill",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.MOVIE.value],
+            smart_filters={"provider": "Netflix"},
+        )
+
+        item = Item.objects.create(
+            title="Backfill Netflix Movie",
+            media_id="1305",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/backfill-netflix.jpg",
+            watch_providers={},
+        )
+        Movie.objects.create(item=item, user=self.user, status=Status.COMPLETED.value)
+        self.assertFalse(smart_list.items.filter(id=item.id).exists())
+
+        item.watch_providers = {
+            "US": {
+                "flatrate": [
+                    {"provider_id": 8, "provider_name": "Netflix"},
+                ],
+            },
+        }
+        item.save(update_fields=["watch_providers"])
+
+        rules = smart_rules.normalize_list_rules(smart_list)
+        self.assertTrue(smart_rules.item_matches_rules(self.user, item, rules))
+        self.assertTrue(smart_list.items.filter(id=item.id).exists())
+
+    def test_smart_list_provider_filter_matches_immediately_on_track(self):
+        """Tracking a show should persist providers so Smart Lists match immediately."""
+        self.user.watch_provider_region = "US"
+        self.user.save(update_fields=["watch_provider_region"])
+
+        smart_list = CustomList.objects.create(
+            name="Apple TV Planning",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[MediaTypes.TV.value],
+            smart_filters={"provider": "Apple TV"},
+        )
+
+        hydrated = tracking_hydration.ensure_item_metadata(
+            self.user,
+            MediaTypes.TV.value,
+            "1306",
+            Sources.TMDB.value,
+            prefetched_metadata={
+                "media_id": "1306",
+                "source": Sources.TMDB.value,
+                "media_type": MediaTypes.TV.value,
+                "title": "Cape Fear",
+                "image": "https://example.com/cape-fear.jpg",
+                "details": {},
+                "related": {},
+                "providers": {
+                    "US": {
+                        "flatrate": [
+                            {"provider_id": 350, "provider_name": "Apple TV"},
+                        ],
+                    },
+                },
+            },
+        )
+        TV.objects.create(
+            item=hydrated.item,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+
+        self.assertEqual(
+            hydrated.item.watch_providers["US"]["flatrate"][0]["provider_name"],
+            "Apple TV",
+        )
+        self.assertTrue(smart_list.items.filter(id=hydrated.item.id).exists())
+        self.assertTrue(
+            smart_rules.item_matches_rules(
+                self.user,
+                hydrated.item,
+                smart_rules.normalize_list_rules(smart_list),
+            )
+        )
+
+    def test_build_rule_filter_data_includes_providers_when_region_configured(self):
+        item = Item.objects.create(
+            title="Provider Data Movie",
+            media_id="1302",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/movie3.jpg",
+            watch_providers={
+                "US": {
+                    "flatrate": [
+                        {"provider_id": 384, "provider_name": "HBO Max"},
+                    ],
+                },
+            },
+        )
+        Movie.objects.create(item=item, user=self.user, status=Status.COMPLETED.value)
+        self.user.watch_provider_region = "US"
+        self.user.save(update_fields=["watch_provider_region"])
+
+        filter_data = smart_rules.build_rule_filter_data(
+            self.user,
+            [MediaTypes.MOVIE.value],
+            "all",
+            "",
+        )
+
+        self.assertTrue(filter_data["show_providers"])
+        self.assertIn(
+            {"value": "HBO Max", "label": "HBO Max"}, filter_data["providers"]
+        )
 
     def test_smart_list_not_rated_excludes_rated_replays_on_full_sync(self):
         """Full smart-list rebuilds should treat any scored replay as rated."""
@@ -482,8 +1156,12 @@ class CustomListManagerTest(TestCase):
             image="https://example.com/twothousands.jpg",
             release_datetime=timezone.make_aware(datetime.datetime(2005, 6, 1, 12, 0)),
         )
-        Movie.objects.create(item=older_item, user=self.user, status=Status.COMPLETED.value)
-        Movie.objects.create(item=newer_item, user=self.user, status=Status.COMPLETED.value)
+        Movie.objects.create(
+            item=older_item, user=self.user, status=Status.COMPLETED.value
+        )
+        Movie.objects.create(
+            item=newer_item, user=self.user, status=Status.COMPLETED.value
+        )
 
         smart_list = CustomList.objects.create(
             name="2000s Movies",
@@ -538,7 +1216,9 @@ class CustomListManagerTest(TestCase):
             is_smart=True,
             smart_media_types=[MediaTypes.MOVIE.value],
             smart_filters={
-                "date_added_from": (timezone.localdate() - timedelta(days=7)).isoformat(),
+                "date_added_from": (
+                    timezone.localdate() - timedelta(days=7)
+                ).isoformat(),
                 "date_added_to": timezone.localdate().isoformat(),
             },
         )
@@ -621,3 +1301,398 @@ class CustomListManagerTest(TestCase):
 
         entry.delete()
         self.assertFalse(smart_list.items.filter(id=tv_item.id).exists())
+
+
+class CustomListItemDeleteRenumberTest(TestCase):
+    """CustomListItem.delete() must safely renumber later list positions."""
+
+    def setUp(self):
+        """Create a user, a list, and enough items to force multi-row renumbering."""
+        self.user = get_user_model().objects.create_user(
+            username="test",
+            password="12345",
+        )
+        self.custom_list = CustomList.objects.create(name="Big List", owner=self.user)
+        self.items = []
+        for index in range(50):
+            item = Item.objects.create(
+                title=f"Item {index}",
+                media_id=str(1000 + index),
+                media_type=MediaTypes.MOVIE.value,
+                source=Sources.TMDB.value,
+            )
+            self.items.append(item)
+            CustomListItem.objects.create(custom_list=self.custom_list, item=item)
+
+    def test_deleting_from_the_middle_renumbers_without_error(self):
+        """Deleting an early item must cleanly renumber ~49 trailing rows."""
+        target = CustomListItem.objects.get(
+            custom_list=self.custom_list,
+            item=self.items[5],
+        )
+
+        target.delete()
+
+        remaining = list(
+            CustomListItem.objects.filter(custom_list=self.custom_list).order_by(
+                "list_item_id",
+            ),
+        )
+        self.assertEqual(len(remaining), 49)
+        # Sequential with no gap left where the deleted row was.
+        self.assertEqual(
+            [entry.list_item_id for entry in remaining],
+            list(range(len(remaining))),
+        )
+        self.assertFalse(any(entry.list_item_id is None for entry in remaining))
+
+    def test_deleting_every_item_one_at_a_time_never_collides(self):
+        """Repeated single deletes from the front must never raise IntegrityError."""
+        for _ in range(len(self.items)):
+            first = (
+                CustomListItem.objects.filter(custom_list=self.custom_list)
+                .order_by("list_item_id")
+                .first()
+            )
+            try:
+                first.delete()
+            except IntegrityError as exc:  # pragma: no cover - the bug this guards
+                self.fail(f"delete() raised IntegrityError: {exc}")
+
+        self.assertEqual(
+            CustomListItem.objects.filter(custom_list=self.custom_list).count(),
+            0,
+        )
+
+    def test_delete_refreshes_a_stale_position_after_locking_the_list(self):
+        """A delete must not close the gap using a pre-lock position snapshot."""
+        stale_target = CustomListItem.objects.get(
+            custom_list=self.custom_list,
+            item=self.items[3],
+        )
+        CustomListItem.objects.get(
+            custom_list=self.custom_list,
+            item=self.items[0],
+        ).delete()
+
+        # The first delete renumbered this row in the database, while the
+        # already-loaded instance still carries its original position.
+        stale_target.delete()
+
+        positions = list(
+            CustomListItem.objects.filter(custom_list=self.custom_list)
+            .order_by("list_item_id")
+            .values_list("list_item_id", flat=True),
+        )
+        self.assertEqual(positions, list(range(len(positions))))
+
+    def test_list_item_id_uniqueness_remains_enforced(self):
+        """Every supported database must reject duplicate list positions."""
+        first = CustomListItem.objects.get(
+            custom_list=self.custom_list,
+            item=self.items[0],
+        )
+        duplicate = CustomListItem(
+            custom_list=self.custom_list,
+            item=Item.objects.create(
+                title="Duplicate position",
+                media_id="duplicate-position",
+                media_type=MediaTypes.MOVIE.value,
+                source=Sources.TMDB.value,
+            ),
+            list_item_id=first.list_item_id,
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            duplicate.save(force_insert=True)
+
+
+class TmdbBackdropTest(TestCase):
+    """Backdrop lookups must actually reach TMDB."""
+
+    def setUp(self):
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+        super().tearDown()
+
+    @patch("app.providers.services.api_request")
+    def test_cached_backdrop_and_cached_absence_skip_provider(self, mock_request):
+        for cached in (
+            "https://image.tmdb.org/t/p/w1280/cached.jpg",
+            settings.IMG_NONE,
+        ):
+            with self.subTest(cached=cached):
+                cache.set("tmdb_backdrop_movie_603", cached, 60)
+                self.assertEqual(
+                    CustomList()._get_tmdb_backdrop(MediaTypes.MOVIE.value, "603"),
+                    cached,
+                )
+        mock_request.assert_not_called()
+
+    @patch("app.providers.services.api_request")
+    def test_tv_backdrop_is_cached_for_seven_days(self, mock_request):
+        mock_request.return_value = {"backdrop_path": "/tv.jpg"}
+        with patch("app.backdrops.cache.set", wraps=cache.set) as mock_cache_set:
+            backdrop = CustomList()._get_tmdb_backdrop(MediaTypes.TV.value, "1396")
+
+        self.assertTrue(mock_request.call_args.args[2].endswith("/tv/1396"))
+        mock_cache_set.assert_any_call(
+            "tmdb_backdrop_tv_1396", backdrop, 60 * 60 * 24 * 7
+        )
+        self.assertEqual(cache.get("tmdb_backdrop_tv_1396"), backdrop)
+
+    @patch("app.providers.services.api_request", side_effect=RuntimeError("offline"))
+    def test_provider_error_caches_absence_for_one_day(self, mock_request):
+        with patch("app.backdrops.cache.set", wraps=cache.set) as mock_cache_set:
+            backdrop = CustomList()._get_tmdb_backdrop(MediaTypes.MOVIE.value, "603")
+
+        self.assertEqual(backdrop, settings.IMG_NONE)
+        mock_cache_set.assert_any_call(
+            "tmdb_backdrop_movie_603", settings.IMG_NONE, 60 * 60 * 24
+        )
+        self.assertEqual(cache.get("tmdb_backdrop_movie_603"), settings.IMG_NONE)
+
+    @patch("app.providers.services.api_request")
+    def test_backdrop_url_is_built_from_the_response(self, mock_request):
+        """A successful lookup returns the full image URL."""
+        mock_request.return_value = {"backdrop_path": "/abc.jpg"}
+
+        backdrop = CustomList()._get_tmdb_backdrop(MediaTypes.MOVIE.value, "603")
+
+        self.assertEqual(backdrop, "https://image.tmdb.org/t/p/w1280/abc.jpg")
+        params = mock_request.call_args.kwargs["params"]
+        self.assertIn("api_key", params)
+        self.assertIn("language", params)
+
+    @patch("app.providers.services.api_request")
+    def test_missing_backdrop_falls_back_to_placeholder(self, mock_request):
+        """A title without a backdrop yields the placeholder."""
+        mock_request.return_value = {}
+
+        backdrop = CustomList()._get_tmdb_backdrop(MediaTypes.MOVIE.value, "603")
+
+        self.assertEqual(backdrop, settings.IMG_NONE)
+
+
+class SmartRuleGranularMediaTypesTest(TestCase):
+    """Season and episode participate in smart rules on their own terms."""
+
+    def setUp(self):
+        """Create a user with TV enabled but Seasons hidden from the sidebar."""
+        self.user = get_user_model().objects.create_user(
+            username="granular",
+            password="12345",
+        )
+        self.user.season_enabled = False
+        self.user.save(update_fields=["season_enabled"])
+
+        self.season_item = Item.objects.create(
+            title="Friends",
+            media_id="1668",
+            media_type=MediaTypes.SEASON.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/friends.jpg",
+            season_number=1,
+        )
+        self.season = Season.objects.create(
+            item=self.season_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        self.episode_item = Item.objects.create(
+            title="Friends S1E1",
+            media_id="1668",
+            media_type=MediaTypes.EPISODE.value,
+            source=Sources.TMDB.value,
+            image="https://example.com/friends.jpg",
+            season_number=1,
+            episode_number=1,
+        )
+        self.episode = Episode.objects.create(
+            item=self.episode_item,
+            related_season=self.season,
+            score=8,
+            end_date=datetime.datetime(2023, 6, 2, tzinfo=datetime.UTC),
+        )
+
+    def test_available_media_types_ignore_the_sidebar_season_preference(self):
+        """Hiding Seasons in the sidebar must not remove them from smart rules."""
+        self.assertNotIn(MediaTypes.SEASON.value, self.user.get_enabled_media_types())
+
+        available = smart_rules.get_available_media_types(self.user)
+
+        self.assertIn(MediaTypes.SEASON.value, available)
+        self.assertIn(MediaTypes.EPISODE.value, available)
+
+    def test_granular_types_stay_out_of_an_implicit_all_types_rule(self):
+        """A list naming no media types must not materialise every episode."""
+        targets = smart_rules._target_media_types(self.user, [])
+
+        self.assertNotIn(MediaTypes.SEASON.value, targets)
+        self.assertNotIn(MediaTypes.EPISODE.value, targets)
+
+        smart_list = CustomList.objects.create(
+            name="Everything",
+            owner=self.user,
+            is_smart=True,
+            smart_media_types=[],
+        )
+        smart_list.sync_smart_items()
+
+        self.assertFalse(smart_list.items.filter(id=self.episode_item.id).exists())
+
+    def test_episode_rules_match_when_named_explicitly(self):
+        """Episodes participate once the rule asks for them."""
+        rules = smart_rules.normalize_rule_payload(
+            {"media_types": [MediaTypes.EPISODE.value]},
+            self.user,
+        )
+
+        self.assertEqual(rules["media_types"], [MediaTypes.EPISODE.value])
+        self.assertIn(
+            self.episode_item.id,
+            smart_rules.collect_matching_item_ids(self.user, rules),
+        )
+
+    def test_episode_rating_filter_uses_the_season_owner(self):
+        """Episode hangs off its season, so `user=` would raise a FieldError."""
+        rules = smart_rules.normalize_rule_payload(
+            {"media_types": [MediaTypes.EPISODE.value], "rating_min": "7"},
+            self.user,
+        )
+
+        self.assertIn(
+            self.episode_item.id,
+            smart_rules.collect_matching_item_ids(self.user, rules),
+        )
+
+        unrated = smart_rules.normalize_rule_payload(
+            {"media_types": [MediaTypes.EPISODE.value], "rating": "not_rated"},
+            self.user,
+        )
+
+        self.assertNotIn(
+            self.episode_item.id,
+            smart_rules.collect_matching_item_ids(self.user, unrated),
+        )
+
+
+class SmartRuleRelativeDateWindowTest(TestCase):
+    """ "In the last N units" stays relative and resolves at evaluation time."""
+
+    def setUp(self):
+        """Create a user with movies completed at known dates."""
+        self.user = get_user_model().objects.create_user(
+            username="relative",
+            password="12345",
+        )
+        self.today = timezone.localdate()
+        self.recent_item = Item.objects.create(
+            title="Recent Movie",
+            media_id="rel-1",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.MANUAL.value,
+            image="https://example.com/recent.jpg",
+        )
+        Movie.objects.create(
+            item=self.recent_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            end_date=timezone.now() - timedelta(days=3),
+        )
+        self.old_item = Item.objects.create(
+            title="Old Movie",
+            media_id="rel-2",
+            media_type=MediaTypes.MOVIE.value,
+            source=Sources.MANUAL.value,
+            image="https://example.com/old.jpg",
+        )
+        Movie.objects.create(
+            item=self.old_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            end_date=timezone.now() - timedelta(days=200),
+        )
+
+    def _rules(self, **extra):
+        return smart_rules.normalize_rule_payload(
+            {"media_types": [MediaTypes.MOVIE.value], **extra},
+            self.user,
+        )
+
+    def test_window_is_stored_relative_not_snapshotted(self):
+        """The saved rule keeps the amount and unit, not resolved dates."""
+        rules = self._rules(
+            completed_date_within="7",
+            completed_date_within_unit="days",
+        )
+
+        self.assertEqual(rules["completed_date_within"], "7")
+        self.assertEqual(rules["completed_date_within_unit"], "days")
+        self.assertEqual(rules["completed_date_from"], "")
+        self.assertEqual(rules["completed_date_to"], "")
+
+    def test_window_matches_only_items_inside_it(self):
+        """A 7-day window keeps the recent item and drops the old one."""
+        matched = smart_rules.collect_matching_item_ids(
+            self.user,
+            self._rules(completed_date_within="7", completed_date_within_unit="days"),
+        )
+
+        self.assertIn(self.recent_item.id, matched)
+        self.assertNotIn(self.old_item.id, matched)
+
+    def test_wider_window_picks_up_the_older_item(self):
+        """A one-year window covers both."""
+        matched = smart_rules.collect_matching_item_ids(
+            self.user,
+            self._rules(completed_date_within="1", completed_date_within_unit="years"),
+        )
+
+        self.assertIn(self.recent_item.id, matched)
+        self.assertIn(self.old_item.id, matched)
+
+    def test_window_moves_with_the_clock(self):
+        """The same stored rule resolves to a different range on a later day."""
+        rules = self._rules(
+            completed_date_within="7",
+            completed_date_within_unit="days",
+        )
+
+        early = smart_rules.resolve_relative_date_windows(
+            rules,
+            datetime.date(2026, 1, 10),
+        )
+        later = smart_rules.resolve_relative_date_windows(
+            rules,
+            datetime.date(2026, 6, 10),
+        )
+
+        self.assertEqual(early["completed_date_from"], "2026-01-03")
+        self.assertEqual(later["completed_date_from"], "2026-06-03")
+
+    def test_window_clears_a_conflicting_absolute_range(self):
+        """A payload carrying both keeps only the relative window."""
+        rules = self._rules(
+            completed_date_within="30",
+            completed_date_within_unit="days",
+            completed_date_from="2020-01-01",
+            completed_date_to="2020-12-31",
+        )
+
+        self.assertEqual(rules["completed_date_from"], "")
+        self.assertEqual(rules["completed_date_to"], "")
+
+    def test_invalid_windows_are_dropped(self):
+        """Junk amounts and units fall back to no window / days."""
+        for bad in ("", "0", "-3", "abc", "1000"):
+            rules = self._rules(completed_date_within=bad)
+            self.assertEqual(rules["completed_date_within"], "", bad)
+
+        rules = self._rules(
+            completed_date_within="5",
+            completed_date_within_unit="fortnights",
+        )
+        self.assertEqual(rules["completed_date_within_unit"], "days")

@@ -1,35 +1,90 @@
 {% extends "base.html" %}
+{% load i18n %}
+
 {% load static %}
 {% load app_tags %}
 {% load user_tags %}
 
 {% block title %}
-  Statistics - Watchmask
+  {% translate "Statistics - Watchmask" %}
 {% endblock title %}
 
 {% block content %}
   <style>
+    .hm { aspect-ratio: 1; width: 100%; border-radius: 0.125rem; transition: background-color 0.2s; }
+    :where(.hm) { background: var(--color-surface-muted); }
+    .hm:not(.hm-f):hover { box-shadow: 0 0 0 2px #fff; }
+    .hm-f { cursor: default; }
     /* Custom scrollbar styling for statistics cards */
     .statistics-card-scroll::-webkit-scrollbar {
       width: 6px;
     }
     .statistics-card-scroll::-webkit-scrollbar-track {
-      background: #2a2f35;
+      background: var(--color-surface);
       border-radius: 3px;
     }
     .statistics-card-scroll::-webkit-scrollbar-thumb {
-      background: #4b5563;
+      background: var(--color-text-muted);
       border-radius: 3px;
     }
     .statistics-card-scroll::-webkit-scrollbar-thumb:hover {
-      background: #6b7280;
+      background: var(--color-text-secondary);
     }
     /* Firefox */
     .statistics-card-scroll {
       scrollbar-width: thin;
-      scrollbar-color: #4b5563 #2a2f35;
+      scrollbar-color: var(--color-text-muted) var(--color-surface);
     }
 
+    .statistics-page { container: statistics / inline-size; }
+    #featured-repeat-player { container: featured-player / inline-size; }
+    .stats-average-rating { container: stats-rating / inline-size; }
+    @container stats-rating (max-width: 280px) {
+      .stats-average-rating-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 2.5rem;
+        gap: 0.375rem;
+      }
+      .stats-average-rating-row > div:first-child {
+        grid-column: 1 / -1;
+      }
+    }
+    @container featured-player (min-width: 451px) {
+      .featured-player-layout {
+        grid-template-columns: 8rem minmax(0, 1fr) 8rem;
+        align-items: center;
+      }
+    }
+    @container featured-player (max-width: 450px) {
+      .featured-player-layout {
+        grid-template-columns: 6rem minmax(0, 1fr) 6rem;
+        align-items: center;
+      }
+      .featured-player-layout > div:first-child > img,
+      .featured-player-layout > div:first-child > div,
+      .featured-player-layout > div:last-child > .relative {
+        width: 6rem !important;
+        height: 6rem !important;
+        max-width: none;
+      }
+      .featured-player-layout > div:nth-child(2) {
+        height: auto;
+        gap: 0.75rem;
+        text-align: left;
+      }
+      .featured-player-layout h3 {
+        white-space: normal;
+      }
+    }
+    @container featured-player (max-width: 360px) {
+      .featured-player-layout {
+        grid-template-columns: 6rem minmax(0, 1fr);
+      }
+      .featured-player-layout > div:last-child {
+        grid-column: 1 / -1;
+        justify-content: center;
+      }
+    }
     .stats-hero-title { font-size: 1.875rem; }
     @media (min-width: 1024px) {
       .stats-hero-row     { grid-template-columns: repeat(5, 1fr); }
@@ -45,6 +100,34 @@
       }
     }
 
+    /* The summary cards sit next to the sidebar and shrink to ~130-180px between
+       1024px and 1535px, and to ~150px on small phones. Let their text shrink and
+       wrap instead of spilling out, and compact them where space is tightest. */
+    .stats-summary-row > div > div:last-child {
+      min-width: 0;
+      overflow-wrap: break-word;
+    }
+    @media (max-width: 399px), (min-width: 1024px) and (max-width: 1535px) {
+      .stats-summary-row > div {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
+        padding: 0.75rem;
+      }
+      .stats-summary-row > div > div:first-child {
+        margin-right: 0;
+      }
+      .stats-summary-row > div > div:last-child {
+        width: 100%;
+      }
+    }
+    @media (min-width: 1024px) and (max-width: 1535px) {
+      .stats-summary-row > div p.font-bold,
+      .stats-summary-row > div div.font-bold {
+        font-size: 1rem;
+      }
+    }
+
     /* Mobile-only highlight carousel */
     .stats-highlight-dots {
       display: flex;
@@ -55,7 +138,7 @@
       width: 0.5rem;
       height: 0.5rem;
       border-radius: 9999px;
-      background: #4b5563;
+      background: var(--color-text-muted);
       transition: background-color 150ms ease;
     }
     .stats-highlight-dot.is-active {
@@ -72,19 +155,19 @@
     .stats-button-title {
       flex: 0 0 auto;
       font-weight: 600;
-      color: #f9fafb;
+      color: var(--color-text);
       white-space: nowrap;
     }
     .stats-button-divider {
       width: 1px;
       height: 1.25rem;
       align-self: center;
-      background: #374151;
+      background: var(--color-border);
       flex: 0 0 auto;
     }
     .stats-button-summary {
       min-width: 0;
-      color: #9ca3af;
+      color: var(--color-text-muted);
       font-size: 0.95rem;
       white-space: nowrap;
       overflow: hidden;
@@ -100,7 +183,7 @@
     }
     .stats-compare-prefix {
       flex: 0 0 auto;
-      color: #9ca3af;
+      color: var(--color-text-muted);
       font-size: 0.95rem;
       white-space: nowrap;
     }
@@ -108,18 +191,21 @@
       min-width: 0;
       flex: 1 1 auto;
       font-weight: 600;
-      color: #f9fafb;
+      color: var(--color-text);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       text-align: left;
     }
     .stats-dropdown-panel {
-      background: #2a2f35;
-      border: 1px solid #374151;
+      background: var(--color-surface-strong);
+      border: 1px solid var(--color-border);
       border-radius: 0.5rem;
       box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
-      overflow: hidden;
+      overflow-x: hidden;
+      overflow-y: auto;
+      /* Fallback only: date-range.js caps each open menu to the room left below it. */
+      max-height: calc(100dvh - 12rem);
     }
     .stats-range-panel {
       width: min(90vw, 420px);
@@ -138,12 +224,12 @@
       padding: 0.75rem;
       border-radius: 0.375rem;
       text-align: left;
-      color: #e5e7eb;
+      color: var(--color-text);
       transition: background-color 150ms ease, color 150ms ease;
       cursor: pointer;
     }
     .stats-option-row:hover {
-      background: #39404b;
+      background: var(--color-surface-hover);
     }
     .stats-option-row.is-selected {
       background: #4f46e5;
@@ -170,7 +256,7 @@
     .stats-option-summary {
       min-width: 0;
       font-size: 0.85rem;
-      color: #94a3b8;
+      color: var(--color-text-muted);
       line-height: 1.35;
       white-space: nowrap;
       overflow: hidden;
@@ -183,7 +269,7 @@
     .stats-compare-label {
       font-size: 0.95rem;
       font-weight: 500;
-      color: #94a3b8;
+      color: var(--color-text-muted);
       white-space: nowrap;
     }
     .stats-range-wrapper {
@@ -240,7 +326,7 @@
       min-width: 0;
       font-size: 0.75rem;
       line-height: 1;
-      color: #94a3b8;
+      color: var(--color-text-muted);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -266,7 +352,7 @@
       color: #fb7185;
     }
     .stats-media-card-mobile-badge-neutral {
-      color: #cbd5e1;
+      color: var(--color-text-secondary);
     }
     .stats-media-card-mobile-badge-icon {
       width: 0.75rem;
@@ -275,7 +361,7 @@
       stroke-width: 2.25;
     }
     .stats-media-card-tooltip-trigger {
-      color: #6b7280;
+      color: var(--color-text-muted);
       transition: color 150ms ease;
       flex: 0 0 auto;
       align-self: baseline;
@@ -287,15 +373,15 @@
       transform: translateY(3px);
     }
     .stats-media-card-tooltip-trigger:hover {
-      color: #9ca3af;
+      color: var(--color-text-secondary);
     }
     .stats-tooltip {
-      background: #1f2937;
-      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: var(--color-surface-strong);
+      border: 1px solid var(--color-border);
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
     }
     .stats-tooltip-arrow {
-      border-top-color: #1f2937;
+      border-top-color: var(--color-surface-strong);
     }
     .stats-tooltip-lines {
       display: grid;
@@ -308,10 +394,10 @@
       gap: 0.75rem;
     }
     .stats-tooltip-label {
-      color: #d1d5db;
+      color: var(--color-text-secondary);
     }
     .stats-tooltip-value {
-      color: #f9fafb;
+      color: var(--color-text);
       font-weight: 600;
       white-space: nowrap;
     }
@@ -507,156 +593,246 @@
         flex: 0 0 2.75rem;
       }
     }
+    /* Duo displays have room for compact desktop rows at the same width in
+       either orientation; a shorter viewport should not enlarge the cards. */
+    @media (min-width: 600px) and (max-width: 1023.98px) {
+      .stats-range-row > div {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.4fr) 2.75rem;
+        width: 100%;
+        align-items: stretch;
+      }
+      .stats-range-button,
+      .stats-mediatype-button,
+      .stats-compare-button {
+        width: 100%;
+        height: 2.75rem;
+        padding: 0.5rem 0.75rem;
+        font-size: 0.875rem;
+      }
+      .stats-range-panel {
+        width: min(420px, calc(100vw - 4rem));
+      }
+      .stats-compare-panel {
+        width: min(360px, calc(100vw - 4rem));
+      }
+      .stats-dropdown-panel {
+        max-height: calc(100dvh - 11rem - var(--header-safe-top) - var(--safe-bottom));
+        overflow-y: auto;
+      }
+      .stats-refresh-button {
+        grid-column: -2 / -1;
+      }
+      .stats-highlight-track {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        overflow: visible;
+        scroll-snap-type: none;
+      }
+      .stats-highlight-card {
+        min-width: 0;
+      }
+      .stats-highlight-dots {
+        display: none;
+      }
+      .stats-hero-cards {
+        margin-bottom: 1rem;
+      }
+      .stats-summary-row {
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+      }
+      .stats-summary-row > div {
+        grid-column: span 2;
+      }
+      .stats-summary-row > div:nth-last-child(-n+2) {
+        grid-column: span 3;
+      }
+      .consumption-row {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .stats-summary-row > div,
+      .consumption-row > div {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
+        padding: 0.75rem;
+      }
+      .stats-summary-row > div > div:first-child,
+      .consumption-row > div > div:first-child {
+        padding: 0.375rem;
+        margin-right: 0;
+      }
+      .stats-summary-row > div > div:first-child svg,
+      .consumption-row > div > div:first-child svg {
+        width: 1.25rem;
+        height: 1.25rem;
+      }
+    }
+    @media (min-width: 900px) and (max-width: 1023.98px) {
+      .stats-summary-row {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+      }
+      .stats-summary-row > div,
+      .stats-summary-row > div:nth-last-child(-n+2) {
+        grid-column: auto;
+      }
+      .stats-chart-pair,
+      .stats-hour-charts {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .stats-hour-charts > div:last-child {
+        grid-column: 1 / -1;
+      }
+      #timeWorldsContainer,
+      #statusCompositionContainer {
+        flex-direction: column;
+        height: auto !important;
+      }
+      #timeWorldsContainer > .relative,
+      #statusCompositionContainer > .relative {
+        align-self: center;
+      }
+      #statusCompositionLegend {
+        width: 100%;
+        flex: auto;
+      }
+      #timeWorldsLegend {
+        width: 100%;
+        flex: auto;
+        height: 9.375rem;
+      }
+    }
+    @media (min-width: 1024px) {
+      @container statistics (max-width: 1250px) {
+        .stats-summary-row > div,
+        .consumption-row > div {
+          padding: 0.75rem;
+        }
+        .stats-summary-row > div > div:first-child,
+        .consumption-row > div > div:first-child {
+          padding: 0.25rem;
+          margin-right: 0.5rem;
+        }
+        .stats-summary-row > div > div:first-child svg,
+        .consumption-row > div > div:first-child svg {
+          width: 1.25rem;
+          height: 1.25rem;
+        }
+        .stats-summary-row > div > div:last-child,
+        .consumption-row > div > div:last-child {
+          min-width: 0;
+        }
+        .stats-summary-row p,
+        .consumption-row p {
+          white-space: nowrap;
+        }
+      }
+      @container statistics (max-width: 1099px) {
+        .stats-summary-row {
+          grid-template-columns: repeat(6, minmax(0, 1fr));
+        }
+        .stats-summary-row > div {
+          grid-column: span 2;
+        }
+        .stats-summary-row > div:nth-last-child(-n+2) {
+          grid-column: span 3;
+        }
+        .consumption-row {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+        #timeWorldsContainer,
+        #statusCompositionContainer {
+          flex-direction: column;
+          height: auto !important;
+        }
+        #timeWorldsContainer > .relative,
+        #statusCompositionContainer > .relative {
+          align-self: center;
+        }
+        #timeWorldsLegend,
+        #statusCompositionLegend {
+          width: 100%;
+          flex: auto;
+        }
+      }
+    }
   </style>
   
-  <div x-data="{
+  {# Statistics are kept warm in the background, so the page never polls on its #}
+  {# own. It waits only after a manual Refresh, or the one time a range has #}
+  {# never been built (see docs/architecture/statistics-sync.md). #}
+  <div class="statistics-page" x-data="{
     cacheRefreshing: false,
-    metadataRefreshing: false,
+    buildingFirstTime: {{ statistics_building|yesno:"true,false" }},
     cacheUpdater: null,
     rebuildListener: null,
-    selectedRangeName: '{{ selected_range_name|default:"" }}',
+    selectedRangeName: '{{ selected_range_name|default:""|escapejs }}',
     init() {
-      // Initialize cache updater immediately if we have a range name
       if (this.selectedRangeName && window.CacheUpdater) {
         this.cacheUpdater = CacheUpdater.init('statistics', {
           rangeName: this.selectedRangeName,
-          onRefreshComplete: (success, reason) => {
-            console.log('Statistics page: Refresh complete callback', success, reason);
+          onRefreshComplete: () => {
             this.cacheRefreshing = false;
-            this.metadataRefreshing = false;
           },
           onUpdate: () => {
-            console.log('Statistics page: Update callback called, reloading page');
-            // Reload the page to show fresh data
             setTimeout(() => {
               window.location.reload();
             }, 300);
           }
         });
       }
-      
-      // When the refresh button triggers a rebuild, hand reload control to
-      // CacheUpdater (which guards on data.exists before reloading).
+
       this.rebuildListener = () => {
-        console.log('Statistics page: rebuild started event received, starting CacheUpdater');
         this.cacheRefreshing = true;
-        if (this.cacheUpdater && !this.cacheUpdater.isPolling) {
-          this.cacheUpdater.wasRefreshing = true;
-          this.cacheUpdater.lastBuiltAt = null;
-          this.cacheUpdater.start();
-        }
+        this.startWaiting();
       };
       window.addEventListener('stats-cache-rebuild-started', this.rebuildListener);
 
-      // Check initial cache status after a short delay to ensure Alpine.js is ready
-      requestAnimationFrame(() => {
-        setTimeout(() => {
-          this.checkCacheStatus();
-        }, 200);
-      });
+      if (this.buildingFirstTime) {
+        this.startWaiting();
+      }
+    },
+    startWaiting() {
+      if (this.cacheUpdater && !this.cacheUpdater.isPolling) {
+        this.cacheUpdater.wasRefreshing = true;
+        this.cacheUpdater.lastBuiltAt = null;
+        this.cacheUpdater.start();
+      }
     },
     destroy() {
-      // Stop polling and drop listeners when the page is swapped away
       if (this.cacheUpdater) {
         this.cacheUpdater.stop();
       }
       if (this.rebuildListener) {
         window.removeEventListener('stats-cache-rebuild-started', this.rebuildListener);
       }
-    },
-    async checkCacheStatus() {
-      if (!this.selectedRangeName) {
-        console.log('Statistics page: No range name, skipping cache status check');
-        return;
-      }
-      try {
-        const params = new URLSearchParams({
-          cache_type: 'statistics',
-          range_name: this.selectedRangeName
-        });
-        const response = await fetch(`/api/cache-status/?${params.toString()}`);
-        if (response.ok) {
-          const data = await response.json();
-          console.log('Statistics page: Initial cache status', data);
-          // Show notification and start polling only when a refresh is actually running
-          // (or when this specific range is missing/stale while a broader refresh wave is active),
-          // to avoid polling/reload loops from unrelated range rebuilds.
-          this.metadataRefreshing = data.metadata_refreshing || false;
-          const currentRangeNeedsRefresh =
-            data.is_refreshing ||
-            data.refresh_scheduled ||
-            this.metadataRefreshing ||
-            !data.exists ||
-            data.is_stale;
-          const waitingOnCurrentRange =
-            data.is_refreshing ||
-            data.refresh_scheduled ||
-            this.metadataRefreshing ||
-            ((!data.exists || data.is_stale) && data.any_range_refreshing);
-          if (waitingOnCurrentRange) {
-            console.log('Statistics page: Showing notification and starting polling', {
-              is_stale: data.is_stale,
-              is_refreshing: data.is_refreshing,
-              exists: data.exists,
-              any_range_refreshing: data.any_range_refreshing,
-              recently_built: data.recently_built,
-              refresh_scheduled: data.refresh_scheduled,
-              metadata_refreshing: data.metadata_refreshing
-            });
-            this.cacheRefreshing = true;
-            if (this.cacheUpdater) {
-              // Mark that we were refreshing so we can detect completion
-              // Set this BEFORE calling start() so it's preserved
-              this.cacheUpdater.wasRefreshing = currentRangeNeedsRefresh;
-              this.cacheUpdater.lastBuiltAt = data.built_at || null;
-              this.cacheUpdater.start();
-            }
-          } else {
-            this.metadataRefreshing = false;
-            console.log('Statistics page: Cache is fresh, no notification needed', {
-              is_stale: data.is_stale,
-              is_refreshing: data.is_refreshing,
-              recently_built: data.recently_built
-            });
-          }
-        }
-      } catch (error) {
-        console.error('Error checking cache status:', error);
-      }
     }
   }">
-  
-  {# Cache refresh notification banner #}
+
+  {# Manual refresh / first-build notice #}
   <div class="fixed top-24 right-0 left-0 {% block messages_sidebar_offset %}lg:left-64{% endblock messages_sidebar_offset %} z-50 flex justify-center pointer-events-none mb-4">
     <div class="w-full max-w-xl px-4 pointer-events-auto">
-      <div x-show="cacheRefreshing && !metadataRefreshing"
+      <div x-show="cacheRefreshing || buildingFirstTime"
            x-cloak
            x-transition
-           class="flex items-center gap-2 rounded-md border px-3 py-2 shadow-lg text-white toast-info opacity-0"
+           class="flex items-center gap-2 rounded-md border px-3 py-2 shadow-lg toast-info opacity-0"
            x-init="setTimeout(() => $el.classList.add('opacity-100', 'transform-none'), 10); $el.classList.add('transition-all', 'duration-300', 'ease-out', 'transform', 'translate-y-[-1rem]')">
         {% include "app/icons/info.svg" with classes="w-4 h-4 text-indigo-300 shrink-0 animate-pulse" %}
-        <p class="text-sm font-medium flex-1">Refreshing statistics in background...</p>
+        {% translate "Building your statistics for the first time..." as building_label %}
+        {% translate "Refreshing statistics in background..." as refreshing_label %}
+        <p class="text-sm font-medium flex-1"
+           x-text="buildingFirstTime ? '{{ building_label|escapejs }}' : '{{ refreshing_label|escapejs }}'">
+          {% if statistics_building %}{{ building_label }}{% else %}{{ refreshing_label }}{% endif %}
+        </p>
         <button class="text-current opacity-70 hover:opacity-100 transition-opacity cursor-pointer"
-                @click="cacheRefreshing = false; cacheUpdater?.stop();">
-          {% include "app/icons/x.svg" with classes="w-4 h-4" %}
-        </button>
-      </div>
-      <div x-show="metadataRefreshing"
-           x-cloak
-           x-transition
-           class="flex items-center gap-2 rounded-md border px-3 py-2 shadow-lg text-white toast-info opacity-0"
-           x-init="setTimeout(() => $el.classList.add('opacity-100', 'transform-none'), 10); $el.classList.add('transition-all', 'duration-300', 'ease-out', 'transform', 'translate-y-[-1rem]')">
-        {% include "app/icons/info.svg" with classes="w-4 h-4 text-indigo-300 shrink-0 animate-pulse" %}
-        <p class="text-sm font-medium flex-1">Updating metadata in background...</p>
-        <button class="text-current opacity-70 hover:opacity-100 transition-opacity cursor-pointer"
-                @click="metadataRefreshing = false; cacheUpdater?.stop();">
+                @click="cacheRefreshing = false; buildingFirstTime = false; cacheUpdater?.stop();">
           {% include "app/icons/x.svg" with classes="w-4 h-4" %}
         </button>
       </div>
     </div>
   </div>
-  
-  <div x-data="dateRangePicker({
+
+  {% translate "Anime" as media_i18n_22 %}{% translate "Manga" as media_i18n_26 %}{% translate "Music" as media_i18n_24 %}<div x-data="dateRangePicker({
     initialRangeName: '{{ selected_range_name|default:""|escapejs }}',
     initialStartDate: '{{ start_date_str|default:""|escapejs }}',
     initialEndDate: '{{ end_date_str|default:""|escapejs }}',
@@ -669,21 +845,32 @@
       {value: 'all', label: 'All media'},
       {value: 'tv', label: 'TV Shows'},
       {value: 'movie', label: 'Movies'},
-      {value: 'anime', label: 'Anime'},
+      {value: 'anime', label: '{{ media_i18n_22|escapejs }}'},
+      {% if user.manga_enabled %}{value: 'manga', label: '{{ media_i18n_26|escapejs }}'},{% endif %}
       {value: 'game', label: 'Games'},
       {% if user.boardgame_enabled %}{value: 'boardgame', label: 'Board Games'},{% endif %}
-      {% if user.music_enabled %}{value: 'music', label: 'Music'},{% endif %}
+      {% if user.music_enabled %}{value: 'music', label: '{{ media_i18n_24|escapejs }}'},{% endif %}
       {% if user.podcast_enabled %}{value: 'podcast', label: 'Podcasts'},{% endif %}
+      {% if user.video_enabled %}{value: 'video', label: 'Videos'},{% endif %}
       {% if user.book_enabled %}{value: 'book', label: 'Books'},{% endif %}
       {% if user.comic_enabled %}{value: 'comic', label: 'Comics'},{% endif %}
-      {% if user.manga_enabled %}{value: 'manga', label: 'Manga'},{% endif %}
     ]
-  })" x-init="init()">
+  })"
+       data-date-format="{{ user_django_date_format }}"
+       x-init="init()">
+    {% if statistics_built_at %}
+      <div class="flex justify-end mb-1">
+        <span class="hidden sm:inline text-xs text-[var(--color-text-muted)] whitespace-nowrap"
+              title="{{ statistics_built_at|date:"DATETIME_FORMAT" }}">
+          {% blocktranslate with ago=statistics_built_at|timesince %}Updated {{ ago }} ago{% endblocktranslate %}
+        </span>
+      </div>
+    {% endif %}
     <div class="stats-range-row flex flex-wrap items-center justify-end gap-2 mb-4 sm:mb-6">
       <div class="flex flex-wrap items-center gap-2">
       <div class="stats-range-wrapper relative min-w-0">
         <button @click="toggleRangeDropdown()"
-                class="stats-range-button flex items-center gap-2 px-4 py-2.5 bg-[#2a2f35] hover:bg-[#343a40] rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer">
+                class="stats-range-button flex items-center gap-2 px-4 py-2.5 bg-[var(--color-surface)] hover:bg-[var(--color-surface-muted)] rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer">
           <svg xmlns="http://www.w3.org/2000/svg"
                width="24"
                height="24"
@@ -693,7 +880,7 @@
                stroke-width="2"
                stroke-linecap="round"
                stroke-linejoin="round"
-               class="w-5 h-5 text-indigo-400 shrink-0">
+               class="w-5 h-5 text-[var(--color-link)] shrink-0">
             <path d="M8 2v4"></path>
             <path d="M16 2v4"></path>
             <rect width="18" height="18" x="3" y="4" rx="2"></rect>
@@ -711,7 +898,7 @@
                stroke-width="2"
                stroke-linecap="round"
                stroke-linejoin="round"
-               class="w-4 h-4 text-gray-400 transition-transform duration-200 shrink-0"
+               class="w-4 h-4 text-[var(--color-text-muted)] transition-transform duration-200 shrink-0"
                :class="{'rotate-180': isRangeOpen}">
             <path d="m6 9 6 6 6-6"></path>
           </svg>
@@ -724,14 +911,14 @@
              class="absolute left-0 z-20 mt-2 stats-dropdown-panel stats-range-panel">
           <div class="flex border-b border-gray-700">
             <button @click="activeTab = 'predefined'"
-                    :class="{'text-white border-b-2 border-indigo-500': activeTab === 'predefined', 'text-gray-400 hover:text-gray-200': activeTab !== 'predefined'}"
+                    :class="{'text-[var(--color-text)] border-b-2 border-indigo-500': activeTab === 'predefined', 'text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)]': activeTab !== 'predefined'}"
                     class="flex-1 py-3 text-sm font-medium transition-colors cursor-pointer">
-              Predefined Ranges
+              {% translate "Predefined Ranges" %}
             </button>
             <button @click="activeTab = 'custom'"
-                    :class="{'text-white border-b-2 border-indigo-500': activeTab === 'custom', 'text-gray-400 hover:text-gray-200': activeTab !== 'custom'}"
+                    :class="{'text-[var(--color-text)] border-b-2 border-indigo-500': activeTab === 'custom', 'text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)]': activeTab !== 'custom'}"
                     class="flex-1 py-3 text-sm font-medium transition-colors cursor-pointer">
-              Custom Range
+              {% translate "Custom Range" %}
             </button>
           </div>
 
@@ -755,7 +942,7 @@
                        stroke-width="2"
                        stroke-linecap="round"
                        stroke-linejoin="round"
-                       class="w-4 h-4 shrink-0 text-white">
+                       class="w-4 h-4 shrink-0 text-[var(--color-text)]">
                     <path d="M20 6 9 17l-5-5"></path>
                   </svg>
                 </button>
@@ -767,25 +954,25 @@
             <div class="space-y-4">
               <div class="grid grid-cols-2 gap-4">
                 <div>
-                  <label class="block text-sm font-medium mb-2 text-gray-300">Start Date</label>
+                  <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Start Date" %}</label>
                   <input x-model="startDate"
                          @change="updateDateRange()"
-                         class="w-full p-2.5 bg-[#39404b] rounded-md text-white border border-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-sm [color-scheme:dark] scheme-dark"
+                         class="w-full p-2.5 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-sm"
                          type="date">
                 </div>
                 <div>
-                  <label class="block text-sm font-medium mb-2 text-gray-300">End Date</label>
+                  <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "End Date" %}</label>
                   <input x-model="endDate"
                          @change="updateDateRange()"
-                         class="w-full p-2.5 bg-[#39404b] rounded-md text-white border border-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-sm [color-scheme:dark] scheme-dark"
+                         class="w-full p-2.5 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-sm"
                          type="date">
                 </div>
               </div>
 
 <div class="flex justify-end gap-2 pt-2">
                 <button @click="isRangeOpen = false"
-                        class="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 text-sm rounded-md transition-colors cursor-pointer">
-                  Cancel
+                        class="px-4 py-2 bg-[var(--color-surface-strong)] hover:bg-[var(--color-surface-hover)] text-[var(--color-text-secondary)] text-sm rounded-md transition-colors cursor-pointer">
+                  {% translate "Cancel" %}
                 </button>
                 <button @click="applyCustomRange()"
                         class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-md transition-colors cursor-pointer flex items-center gap-2">
@@ -801,7 +988,7 @@
                        class="w-4 h-4">
                     <path d="M20 6 9 17l-5-5"></path>
                   </svg>
-                  Apply Range
+                  {% translate "Apply Range" %}
                 </button>
               </div>
             </div>
@@ -811,7 +998,7 @@
 
       <div class="stats-mediatype-wrapper relative min-w-0">
         <button @click="toggleMediaTypeDropdown()"
-                class="stats-mediatype-button flex items-center gap-2 px-4 py-2.5 bg-[#2a2f35] hover:bg-[#343a40] rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer">
+                class="stats-mediatype-button flex items-center gap-2 px-4 py-2.5 bg-[var(--color-surface)] hover:bg-[var(--color-surface-muted)] rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer">
           <svg xmlns="http://www.w3.org/2000/svg"
                width="20"
                height="20"
@@ -821,7 +1008,7 @@
                stroke-width="2"
                stroke-linecap="round"
                stroke-linejoin="round"
-               class="w-5 h-5 text-indigo-400 shrink-0">
+               class="w-5 h-5 text-[var(--color-link)] shrink-0">
             <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
           </svg>
           <span class="stats-button-title" x-text="mediaTypeTriggerLabel()"></span>
@@ -834,7 +1021,7 @@
                stroke-width="2"
                stroke-linecap="round"
                stroke-linejoin="round"
-               class="w-4 h-4 text-gray-400 transition-transform duration-200 shrink-0"
+               class="w-4 h-4 text-[var(--color-text-muted)] transition-transform duration-200 shrink-0"
                :class="{'rotate-180': isMediaTypeOpen}">
             <path d="m6 9 6 6 6-6"></path>
           </svg>
@@ -850,9 +1037,9 @@
             <template x-for="opt in mediaTypeOptions" :key="opt.value">
               <button @click="selectMediaType(opt.value)"
                       class="stats-option-row"
-                      :class="{'is-selected': selectedMediaType === opt.value}">
+                      :class="{'is-selected': isMediaTypeSelected(opt.value)}">
                 <span class="stats-option-title" x-text="opt.label"></span>
-                <svg x-show="selectedMediaType === opt.value"
+                <svg x-show="isMediaTypeSelected(opt.value)"
                      xmlns="http://www.w3.org/2000/svg"
                      width="24"
                      height="24"
@@ -862,7 +1049,7 @@
                      stroke-width="2"
                      stroke-linecap="round"
                      stroke-linejoin="round"
-                     class="w-4 h-4 shrink-0 text-white">
+                     class="w-4 h-4 shrink-0 text-[var(--color-text)]">
                   <path d="M20 6 9 17l-5-5"></path>
                 </svg>
               </button>
@@ -873,9 +1060,9 @@
 
       <div class="stats-compare-wrapper relative min-w-0" x-show="hasFiniteRange()" x-cloak>
         <button @click="toggleCompareDropdown()"
-                class="stats-compare-button flex items-center gap-2 w-full px-4 py-2.5 bg-[#2a2f35] hover:bg-[#343a40] rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer">
+                class="stats-compare-button flex items-center gap-2 w-full px-4 py-2.5 bg-[var(--color-surface)] hover:bg-[var(--color-surface-muted)] rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer">
           <div class="stats-compare-copy">
-            <span class="stats-compare-prefix">Compare to:</span>
+            <span class="stats-compare-prefix">{% translate "Compare to:" %}</span>
             <span class="stats-compare-value"
                   x-text="comparisonTriggerLabel()"></span>
           </div>
@@ -888,7 +1075,7 @@
                stroke-width="2"
                stroke-linecap="round"
                stroke-linejoin="round"
-               class="w-4 h-4 text-gray-400 transition-transform duration-200 shrink-0"
+               class="w-4 h-4 text-[var(--color-text-muted)] transition-transform duration-200 shrink-0"
                :class="{'rotate-180': isCompareOpen}">
             <path d="m6 9 6 6 6-6"></path>
           </svg>
@@ -924,7 +1111,7 @@
                      stroke-width="2"
                      stroke-linecap="round"
                      stroke-linejoin="round"
-                     class="w-4 h-4 shrink-0 text-white">
+                     class="w-4 h-4 shrink-0 text-[var(--color-text)]">
                   <path d="M20 6 9 17l-5-5"></path>
                 </svg>
               </button>
@@ -935,8 +1122,8 @@
 
       <button @click="refreshStatistics()"
               :disabled="refreshing"
-              class="stats-refresh-button flex items-center justify-center px-3 py-2.5 bg-[#2a2f35] hover:bg-[#343a40] disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer"
-              title="Refresh statistics">
+              class="stats-refresh-button flex items-center justify-center px-3 py-2.5 bg-[var(--color-surface)] hover:bg-[var(--color-surface-muted)] disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-all duration-200 border border-gray-700 shadow-sm cursor-pointer"
+              title="{% translate "Refresh statistics" %}">
         <svg xmlns="http://www.w3.org/2000/svg"
              width="24"
              height="24"
@@ -946,7 +1133,7 @@
              stroke-width="2"
              stroke-linecap="round"
              stroke-linejoin="round"
-             class="w-5 h-5 text-indigo-400 transition-transform duration-300"
+             class="w-5 h-5 text-[var(--color-link)] transition-transform duration-300"
              :class="{'animate-spin': refreshing}">
           <path d="M21.5 2v6h-6"></path>
           <path d="M21.34 15.57a10 10 0 1 1-.57-8.38"></path>
@@ -962,27 +1149,27 @@
       <!-- Hero + Highlight Cards -->
       <div class="stats-hero-row grid grid-cols-1 gap-x-3 sm:gap-x-4 items-start">
         <div class="flex flex-col justify-center stats-hero-text">
-          <p class="stats-hero-title font-bold text-white leading-snug">
-            You've spent <span class="text-indigo-400 tabular-nums" x-text="(currentTypeSummary.total_hours || 0).toLocaleString()"></span> hours
+          <p class="stats-hero-title font-bold text-[var(--color-text)] leading-snug">
+            {% translate "You've spent" %} <span class="text-[var(--color-link)] tabular-nums" x-text="(currentTypeSummary.total_hours || 0).toLocaleString()"></span> {% translate "hours" %}
           </p>
-          <p class="stats-hero-title font-bold text-white leading-snug">
-            with <span class="text-indigo-400 tabular-nums" x-text="(currentTypeSummary.total || 0).toLocaleString()"></span> <span x-text="currentTypeLabel + '.'"></span>
+          <p class="stats-hero-title font-bold text-[var(--color-text)] leading-snug">
+            {% translate "with" %} <span class="text-[var(--color-link)] tabular-nums" x-text="(currentTypeSummary.total || 0).toLocaleString()"></span> <span x-text="currentTypeLabel + '.'"></span>
           </p>
-          <div class="flex items-center gap-2 mt-4 pb-3 text-sm text-gray-400">
-            <div class="w-7 h-7 rounded-full bg-[#2a2f35] flex items-center justify-center text-indigo-400 shrink-0">
+          <div class="flex items-center gap-2 mt-4 pb-3 text-sm text-[var(--color-text-muted)]">
+            <div class="w-7 h-7 rounded-full bg-[var(--color-surface)] flex items-center justify-center text-[var(--color-link)] shrink-0">
               <svg viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5"><path d="M10 2l1.8 5.4L17 10l-5.2 2.6L10 18l-1.8-5.4L3 10l5.2-2.6z"/></svg>
             </div>
-            <span>That's <span x-text="(currentTypeSummary.total_days || 0).toLocaleString()"></span> days of <span x-text="currentTypeFlavor"></span>. Keep exploring.</span>
+            <span>{% translate "That's" %} <span x-text="(currentTypeSummary.total_days || 0).toLocaleString()"></span> {% translate "days of" %} <span x-text="currentTypeFlavor"></span>{% translate ". Keep exploring." %}</span>
           </div>
         </div>
         <div class="min-w-0 stats-hero-cards">
-          <div x-show="selectedMediaType === 'all'" x-cloak>
+          <div x-show="isHighlightSetVisible('all')" x-cloak>
             {% with highlights=history_highlights %}
               {% include "app/components/statistics/highlight_set.html" %}
             {% endwith %}
           </div>
           {% for mt, type_highlights in history_highlights_by_type.items %}
-          <div x-show="selectedMediaType === '{{ mt }}'" x-cloak>
+          <div x-show="isHighlightSetVisible('{{ mt }}')" x-cloak>
             {% with highlights=type_highlights %}
               {% include "app/components/statistics/highlight_set.html" %}
             {% endwith %}
@@ -993,7 +1180,7 @@
 
       <!-- Statistics Cards -->
       <div class="stats-summary-row grid grid-cols-2 gap-3 sm:gap-4 mb-2 sm:mb-4">
-        <div class="bg-[#2a2f35] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
+        <div class="bg-[var(--color-surface)] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
           <div class="bg-indigo-600/20 p-2 sm:p-3 rounded-full mr-3 shrink-0">
             <svg xmlns="http://www.w3.org/2000/svg"
                  width="24"
@@ -1004,21 +1191,21 @@
                  stroke-width="2"
                  stroke-linecap="round"
                  stroke-linejoin="round"
-                 class="w-4 h-4 sm:w-6 sm:h-6 text-indigo-400">
+                 class="w-4 h-4 sm:w-6 sm:h-6 text-[var(--color-link)]">
               <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
               <path d="m9 11 3 3L22 4"></path>
             </svg>
           </div>
           <div>
-            <h3 class="text-xs sm:text-sm font-medium text-gray-400">Completed Items</h3>
+            <h3 class="text-xs sm:text-sm font-medium text-[var(--color-text-muted)]">{% translate "Completed Items" %}</h3>
             <p x-show="currentTypeSummary.total" class="text-xl sm:text-2xl font-bold" style="display:none">
               <span x-text="currentTypeSummary.completed"></span>
-              <span class="text-gray-500 text-sm sm:text-lg">/ <span x-text="currentTypeSummary.total"></span></span>
+              <span class="text-[var(--color-text-muted)] text-sm sm:text-lg">/ <span x-text="currentTypeSummary.total"></span></span>
             </p>
-            <p x-show="!currentTypeSummary.total" class="text-xl sm:text-2xl font-bold text-gray-500" style="display:none">--</p>
+            <p x-show="!currentTypeSummary.total" class="text-xl sm:text-2xl font-bold text-[var(--color-text-muted)]" style="display:none">--</p>
           </div>
         </div>
-        <div class="bg-[#2a2f35] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
+        <div class="bg-[var(--color-surface)] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
           <div class="bg-yellow-600/20 p-2 sm:p-3 rounded-full mr-3 shrink-0">
             <svg xmlns="http://www.w3.org/2000/svg"
                  width="24"
@@ -1036,15 +1223,15 @@
             </svg>
           </div>
           <div>
-            <h3 class="text-xs sm:text-sm font-medium text-gray-400">Average Rating</h3>
+            <h3 class="text-xs sm:text-sm font-medium text-[var(--color-text-muted)]">{% translate "Average Rating" %}</h3>
             <p x-show="currentTypeSummary.has_score" class="text-xl sm:text-2xl font-bold" style="display:none">
               <span x-text="currentTypeSummary.average_score"></span>
-              <span class="text-gray-500 text-sm sm:text-lg">/ {{ user|rating_scale_max }}</span>
+              <span class="text-[var(--color-text-muted)] text-sm sm:text-lg">/ {{ user|rating_scale_max }}</span>
             </p>
-            <p x-show="!currentTypeSummary.has_score" class="text-xl sm:text-2xl font-bold text-gray-500" style="display:none">--</p>
+            <p x-show="!currentTypeSummary.has_score" class="text-xl sm:text-2xl font-bold text-[var(--color-text-muted)]" style="display:none">--</p>
           </div>
         </div>
-        <div class="bg-[#2a2f35] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
+        <div class="bg-[var(--color-surface)] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
           <div class="bg-emerald-600/20 p-2 sm:p-3 rounded-full mr-3 shrink-0">
             <svg xmlns="http://www.w3.org/2000/svg"
                  width="24"
@@ -1063,13 +1250,13 @@
             </svg>
           </div>
           <div>
-            <h3 class="text-xs sm:text-sm font-medium text-gray-400">Most Active Day</h3>
-            <p x-show="currentTypeSummary.most_active_day" class="text-xl sm:text-2xl font-bold" x-text="currentTypeSummary.most_active_day" style="display:none"></p>
-            <p x-show="currentTypeSummary.most_active_day" class="text-xs sm:text-sm text-gray-500" x-text="currentTypeSummary.most_active_day_percentage + '% of activity'" style="display:none"></p>
-            <p x-show="!currentTypeSummary.most_active_day" class="text-xl sm:text-2xl font-bold text-gray-500" style="display:none">--</p>
+            <h3 class="text-xs sm:text-sm font-medium text-[var(--color-text-muted)]">{% translate "Most Active Day" %}</h3>
+            <p x-show="currentTypeSummary.most_active_day" class="text-xl sm:text-2xl font-bold" x-text="currentTypeSummary.most_active_day_label" style="display:none"></p>
+            <p x-show="currentTypeSummary.most_active_day" class="text-xs sm:text-sm text-[var(--color-text-muted)]" x-text="interpolate(gettext('%(percent)s of activity'), {percent: currentTypeSummary.most_active_day_percentage + '%'}, true)" style="display:none"></p>
+            <p x-show="!currentTypeSummary.most_active_day" class="text-xl sm:text-2xl font-bold text-[var(--color-text-muted)]" style="display:none">--</p>
           </div>
         </div>
-        <div class="bg-[#2a2f35] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
+        <div class="bg-[var(--color-surface)] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
           <div class="bg-red-600/20 p-2 sm:p-3 rounded-full mr-3 shrink-0">
             <svg xmlns="http://www.w3.org/2000/svg"
                  width="24"
@@ -1086,13 +1273,13 @@
             </svg>
           </div>
           <div>
-            <h3 class="text-xs sm:text-sm font-medium text-gray-400">Current Streak</h3>
+            <h3 class="text-xs sm:text-sm font-medium text-[var(--color-text-muted)]">{% translate "Current Streak" %}</h3>
             <div x-show="currentTypeSummary.most_active_day" style="display:none">
-              <div class="text-xl sm:text-2xl font-bold" x-text="currentTypeSummary.current_streak + ' day' + (currentTypeSummary.current_streak === 1 ? '' : 's')"></div>
-              <div class="flex items-center gap-1 text-xs sm:text-sm text-gray-500">
-                <span x-text="'Longest: ' + currentTypeSummary.longest_streak + ' day' + (currentTypeSummary.longest_streak === 1 ? '' : 's')"></span>
+              {% translate " day" as media_i18n_13 %}<div class="text-xl sm:text-2xl font-bold" x-text="currentTypeSummary.current_streak + '{{ media_i18n_13|escapejs }}' + (currentTypeSummary.current_streak === 1 ? '' : 's')"></div>
+              <div class="flex items-center gap-1 text-xs sm:text-sm text-[var(--color-text-muted)]">
+                {% translate "Longest: " as media_i18n_14 %}{% translate " day" as media_i18n_13 %}<span x-text="'{{ media_i18n_14|escapejs }}' + currentTypeSummary.longest_streak + '{{ media_i18n_13|escapejs }}' + (currentTypeSummary.longest_streak === 1 ? '' : 's')"></span>
                 <div x-show="currentTypeSummary.longest_streak_start" class="relative" x-data="{ tooltipOpen: false }">
-                  <button @mouseenter="tooltipOpen = true" @mouseleave="tooltipOpen = false" @click="tooltipOpen = !tooltipOpen" @click.outside="tooltipOpen = false" class="text-gray-500 hover:text-gray-400 transition-colors cursor-pointer inline-flex items-center" type="button" aria-label="Show information" style="transform: translateY(1px);">
+                  <button @mouseenter="tooltipOpen = true" @mouseleave="tooltipOpen = false" @click="tooltipOpen = !tooltipOpen" @click.outside="tooltipOpen = false" class="text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors cursor-pointer inline-flex items-center" type="button" aria-label="{% translate "Show information" %}" style="transform: translateY(1px);">
                     {% include "app/icons/info.svg" with classes="w-3.5 h-3.5" %}
                   </button>
                   <div x-show="tooltipOpen"
@@ -1102,7 +1289,7 @@
                        x-transition:leave="transition ease-in duration-150"
                        x-transition:leave-start="opacity-100 scale-100"
                        x-transition:leave-end="opacity-0 scale-95"
-                       class="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-64 max-w-[calc(100vw-2rem)] p-3 text-white text-xs rounded-lg z-10 stats-tooltip"
+                       class="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-64 max-w-[calc(100vw-2rem)] p-3 text-[var(--color-text)] text-xs rounded-lg z-10 stats-tooltip"
                        style="display: none;">
                     <p x-text="currentTypeSummary.longest_streak_dates_display"></p>
                     <div class="absolute left-1/2 -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent stats-tooltip-arrow"></div>
@@ -1110,30 +1297,30 @@
                 </div>
               </div>
             </div>
-            <p x-show="!currentTypeSummary.most_active_day" class="text-xl sm:text-2xl font-bold text-gray-500" style="display:none">--</p>
+            <p x-show="!currentTypeSummary.most_active_day" class="text-xl sm:text-2xl font-bold text-[var(--color-text-muted)]" style="display:none">--</p>
           </div>
         </div>
-        <div class="bg-[#2a2f35] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
+        <div class="bg-[var(--color-surface)] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
           <div class="{% if total_activity_comparison.badge_state == 'up' %}bg-green-600/20{% elif total_activity_comparison.badge_state == 'down' %}bg-red-600/20{% else %}bg-gray-600/20{% endif %} p-2 sm:p-3 rounded-full mr-3 shrink-0">
             {% if total_activity_comparison.badge_state == 'up' %}
               {% include "app/icons/bars-increasing.svg" with classes="w-4 h-4 sm:w-6 sm:h-6 text-green-400" %}
             {% elif total_activity_comparison.badge_state == 'down' %}
               {% include "app/icons/bars-increasing.svg" with classes="w-4 h-4 sm:w-6 sm:h-6 text-red-400" %}
             {% else %}
-              {% include "app/icons/bars-increasing.svg" with classes="w-4 h-4 sm:w-6 sm:h-6 text-gray-400" %}
+              {% include "app/icons/bars-increasing.svg" with classes="w-4 h-4 sm:w-6 sm:h-6 text-[var(--color-text-muted)]" %}
             {% endif %}
           </div>
           <div class="min-w-0">
-            <h3 class="text-xs sm:text-sm font-medium text-gray-400">Activity</h3>
-            <p class="text-xl sm:text-2xl font-bold {% if total_activity_comparison.badge_state == 'up' %}text-green-400{% elif total_activity_comparison.badge_state == 'down' %}text-red-400{% else %}text-gray-500{% endif %}">
-              {% if total_activity_comparison.badge %}{{ total_activity_comparison.badge }}{% else %}--{% endif %}
+            <h3 class="text-xs sm:text-sm font-medium text-[var(--color-text-muted)]">{% translate "Activity" %}</h3>
+            <p class="text-xl sm:text-2xl font-bold {% if total_activity_comparison.badge_state == 'up' %}text-green-400{% elif total_activity_comparison.badge_state == 'down' %}text-red-400{% else %}text-[var(--color-text-muted)]{% endif %}">
+              {% if total_activity_comparison.badge %}{{ total_activity_comparison.badge|translate_activity_text }}{% else %}--{% endif %}
             </p>
             {% if total_activity_comparison.badge %}
-              <div class="flex items-center gap-1 text-xs sm:text-sm text-gray-500">
-                <span>vs {{ activity_comparison_period_label }}</span>
+              <div class="flex items-center gap-1 text-xs sm:text-sm text-[var(--color-text-muted)]">
+                <span>{% blocktranslate trimmed with value_1=activity_comparison_period_label|translate_detail_value %}vs {{ value_1 }}{% endblocktranslate %}</span>
                 {% if total_activity_comparison.tooltip %}
                   <div class="relative" x-data="{ tooltipOpen: false }">
-                    <button @mouseenter="tooltipOpen = true" @mouseleave="tooltipOpen = false" @click="tooltipOpen = !tooltipOpen" @click.outside="tooltipOpen = false" class="text-gray-500 hover:text-gray-400 transition-colors cursor-pointer inline-flex items-center" type="button" aria-label="Show comparison totals" style="transform: translateY(1px);">
+                    <button @mouseenter="tooltipOpen = true" @mouseleave="tooltipOpen = false" @click="tooltipOpen = !tooltipOpen" @click.outside="tooltipOpen = false" class="text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors cursor-pointer inline-flex items-center" type="button" aria-label="{% translate "Show comparison totals" %}" style="transform: translateY(1px);">
                       {% include "app/icons/info.svg" with classes="w-3.5 h-3.5" %}
                     </button>
                     <div x-show="tooltipOpen"
@@ -1143,7 +1330,7 @@
                          x-transition:leave="transition ease-in duration-150"
                          x-transition:leave-start="opacity-100 scale-100"
                          x-transition:leave-end="opacity-0 scale-95"
-                         class="absolute right-0 bottom-full mb-2 w-56 max-w-[calc(100vw-2rem)] p-3 text-white text-xs rounded-lg z-10 stats-tooltip"
+                         class="absolute right-0 bottom-full mb-2 w-56 max-w-[calc(100vw-2rem)] p-3 text-[var(--color-text)] text-xs rounded-lg z-10 stats-tooltip"
                          style="display: none;">
                       <div class="stats-tooltip-lines">
                         <div class="stats-tooltip-line">
@@ -1165,22 +1352,41 @@
         </div>
       </div>
       <!-- Activity Rhythm + Time Across Your Worlds -->
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
+      <div class="stats-chart-pair grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
     <!-- Activity Rhythm -->
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6">
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6">
       <div class="flex items-center justify-between mb-3">
         <div>
-          <h2 class="text-base font-semibold text-white mb-0.5">Activity Rhythm</h2>
-          <p class="text-xs text-gray-400">Each cell is one day. Brighter means more.</p>
+          <h2 class="text-base font-semibold text-[var(--color-text)] mb-0.5">{% translate "Activity Rhythm" %}</h2>
+          <p class="text-xs text-[var(--color-text-muted)]">{% translate "Each cell is one day. Brighter means more." %}</p>
         </div>
         <div id="activityRhythmLegend" class="flex-shrink-0 flex items-center gap-1.5 ml-3"></div>
       </div>
       <div id="activityRhythmContainer" class="w-full"></div>
     </div>
     <!-- Time Across Your Worlds -->
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6">
-      <h2 class="text-base font-semibold text-white mb-0.5" id="timeWorldsTitle">Hours by Media Type</h2>
-      <p class="text-xs text-gray-400 mb-3" id="timeWorldsSubtitle">Where your hours go.</p>
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-0.5" id="timeWorldsTitle">{% translate "Hours by Media Type" %}</h2>
+      <div class="text-xs text-[var(--color-text-muted)] mb-3 flex items-center gap-1">
+        <span id="timeWorldsSubtitle">{% translate "Where your hours go." %}</span>
+        <div id="timeWorldsInfo" class="relative hidden" x-data="{ tooltipOpen: false }">
+          <button @mouseenter="tooltipOpen = true" @mouseleave="tooltipOpen = false" @click="tooltipOpen = !tooltipOpen" @click.outside="tooltipOpen = false" class="text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors cursor-pointer inline-flex items-center" type="button" aria-label="{% translate "Show information" %}">
+            {% include "app/icons/info.svg" with classes="w-3.5 h-3.5" %}
+          </button>
+          <div x-show="tooltipOpen"
+               x-transition:enter="transition ease-out duration-200"
+               x-transition:enter-start="opacity-0 scale-95"
+               x-transition:enter-end="opacity-100 scale-100"
+               x-transition:leave="transition ease-in duration-150"
+               x-transition:leave-start="opacity-100 scale-100"
+               x-transition:leave-end="opacity-0 scale-95"
+               class="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-64 max-w-[calc(100vw-2rem)] p-3 text-[var(--color-text)] text-xs rounded-lg z-10 stats-tooltip"
+               style="display: none;">
+            {% translate "Shows can belong to multiple genres, so genre hours overlap and can add up to more than the total shown in the middle, which reflects your actual watch time." %}
+            <div class="absolute left-1/2 -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent stats-tooltip-arrow"></div>
+          </div>
+        </div>
+      </div>
       <div id="timeWorldsContainer" class="flex items-center gap-4 sm:gap-6" style="height:150px;">
         <div class="relative shrink-0" style="width:150px;height:150px;">
           <div id="timeWorldsCenter" class="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-center"></div>
@@ -1194,56 +1400,56 @@
 
   <!-- Activity History Section -->
   {% if user.activity_history_view != 'stacked' %}
-  <div id="activityHistory" class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 w-full overflow-hidden mb-4">
+  {# Translated tooltip templates for the media-type filter; the script swaps in the date and count. #}
+  <div id="activityHistory" class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 w-full overflow-hidden mb-4"
+       data-title-0="{% blocktranslate with date='__DATE__' count count=0 %}{{ date }}: {{ count }} activity{% plural %}{{ date }}: {{ count }} activities{% endblocktranslate %}"
+       data-title-1="{% blocktranslate with date='__DATE__' count count=1 %}{{ date }}: {{ count }} activity{% plural %}{{ date }}: {{ count }} activities{% endblocktranslate %}"
+       data-title-2="{% blocktranslate with date='__DATE__' count count=2 %}{{ date }}: {{ count }} activity{% plural %}{{ date }}: {{ count }} activities{% endblocktranslate %}">
         <div class="flex items-center justify-between mb-3">
           <div>
-            <h2 class="text-base font-semibold text-white mb-0.5">Activity History</h2>
-            <p class="text-xs text-gray-400">Each cell is one day. Brighter means more activity.</p>
+            <h2 class="text-base font-semibold text-[var(--color-text)] mb-0.5">{% translate "Activity History" %}</h2>
+            <p class="text-xs text-[var(--color-text-muted)]">{% translate "Each cell is one day. Brighter means more activity." %}</p>
           </div>
-          <div class="flex-shrink-0 flex items-center gap-2 text-xs text-gray-400">
-            <span>Less</span>
-            <div class="w-3 h-3 rounded-sm bg-[#2f353e]"></div>
+          <div class="flex-shrink-0 flex items-center gap-2 text-xs text-[var(--color-text-muted)]">
+            <span>{% translate "Less" %}</span>
+            <div class="w-3 h-3 rounded-sm bg-[var(--color-surface-muted)]"></div>
             <div class="w-3 h-3 rounded-sm bg-indigo-700"></div>
             <div class="w-3 h-3 rounded-sm bg-indigo-600"></div>
             <div class="w-3 h-3 rounded-sm bg-indigo-500"></div>
             <div class="w-3 h-3 rounded-sm bg-indigo-400"></div>
-            <span>More</span>
+            <span>{% translate "More" %}</span>
           </div>
         </div>
         <div class="w-full overflow-x-auto overflow-y-hidden scrollbar-hidden">
 
           <div class="w-full" x-ref="graphContainer">
-            <!-- Months row: proportional flex to track responsive column widths -->
-            <div class="flex mb-2 pl-[37px] gap-1">
+            <!-- Months row: same grid tracks as the weeks grid below, so each label sits on its first week column -->
+            <div class="grid gap-1 mb-2 pl-[37px]"
+                 style="grid-template-columns: repeat({{ activity_data.calendar_weeks|length }}, minmax(1rem, 20px))">
               {% for month, week_count in activity_data.months %}
-                <div class="text-xs text-gray-400 min-w-0 overflow-hidden"
-                     style="flex: {{ week_count }} {{ week_count }} 0; min-width: calc({{ week_count }} * 1rem)">{{ month }}</div>
+                <div class="text-xs text-[var(--color-text-muted)] min-w-0 whitespace-nowrap {% if not forloop.first %}border-l{% endif %}"
+                     style="grid-column: span {{ week_count }}{% if not forloop.first %}; border-color: var(--color-border); padding-left: 0.25rem{% endif %}">{{ month|month_abbreviation }}</div>
               {% endfor %}
             </div>
 
             <!-- Graph wrapper -->
             <div class="flex">
               <!-- Weekday labels: gap-1 + flex-1 items tracks responsive cell height -->
-              <div class="flex flex-col gap-1 pr-2 text-sm text-gray-400 flex-shrink-0" style="width:37px">
+              <div class="flex flex-col gap-1 pr-2 text-sm text-[var(--color-text-muted)] flex-shrink-0" style="width:37px">
                 {% for label in activity_data.weekday_labels %}
                   {% if forloop.counter|divisibleby:2 %}
                     <div class="flex-1"></div>
                   {% else %}
-                    <div class="flex-1 flex items-center justify-end">{{ label }}</div>
+                    <div class="flex-1 flex items-center justify-end">{% translate label %}</div>
                   {% endif %}
                 {% endfor %}
               </div>
 
-              <!-- Weeks grid: flex-1 columns grow to fill width, capped at 20px -->
-              <div class="flex gap-1 flex-1 min-w-0">
-                {% for week in activity_data.calendar_weeks %}
-                  <div class="flex flex-col gap-1 flex-1 min-w-4" style="max-width:20px">
-                    {% for day in week %}
-                      <div class="aspect-square w-full rounded-sm transition-colors duration-200 {% if day.future %}bg-[#2f353e] cursor-default{% else %}hover:ring-2 hover:ring-white {% if day.level == 0 %}bg-[#2f353e]{% elif day.level == 1 %}bg-indigo-700{% elif day.level == 2 %}bg-indigo-600{% elif day.level == 3 %}bg-indigo-500{% elif day.level == 4 %}bg-indigo-400{% endif %}{% endif %}"
-                           title="{% if day.future %}{{ day.date }}{% else %}{{ day.date }}: {{ day.count }} activit{{ day.count|pluralize:"y,ies" }}{% endif %}"></div>
-                    {% endfor %}
-                  </div>
-                {% endfor %}
+              <!-- Weeks grid: columns grow to fill width, capped at 20px -->
+              <div class="grid gap-1 flex-1 min-w-0" data-heatmap-grid data-heatmap-start="{{ activity_data.calendar_weeks.0.0.date }}"
+                   style="grid-template-columns: repeat({{ activity_data.calendar_weeks|length }}, minmax(1rem, 20px))">
+                {% comment %}Compact on purpose: all-time history can be thousands of weeks. Dates and titles are derived from the cell's position on hover (statistics-charts.js).{% endcomment %}
+                {% for week in activity_data.calendar_weeks %}<div class="flex flex-col gap-1 min-w-4">{% for day in week %}<div class="hm{% if day.future %} hm-f{% elif day.level == 1 %} bg-indigo-700{% elif day.level == 2 %} bg-indigo-600{% elif day.level == 3 %} bg-indigo-500{% elif day.level == 4 %} bg-indigo-400{% endif %}"{% if not day.future and day.by_type %} data-heatmap-counts="{% for media_type, n in day.by_type.items %}{{ media_type }}:{{ n }}{% if not forloop.last %},{% endif %}{% endfor %}"{% endif %}></div>{% endfor %}</div>{% endfor %}
               </div>
             </div>
           </div>
@@ -1253,21 +1459,21 @@
   {% endif %}
 
   <!-- Combined Hours charts -->
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4" style="margin-bottom:1rem">
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6">
-      <h2 class="text-base font-semibold text-white mb-3">Hours by Month</h2>
+  <div class="stats-hour-charts grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4" style="margin-bottom:1rem">
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-3">{% translate "Hours by Month" %}</h2>
       <div id="combinedPlaysByMonthContainer" class="h-64">
         <canvas id="combinedPlaysByMonthChart"></canvas>
       </div>
     </div>
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6">
-      <h2 class="text-base font-semibold text-white mb-3">Hours by Day of Week</h2>
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-3">{% translate "Hours by Day of Week" %}</h2>
       <div id="combinedPlaysByWeekdayContainer" class="h-64">
         <canvas id="combinedPlaysByWeekdayChart"></canvas>
       </div>
     </div>
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6">
-      <h2 class="text-base font-semibold text-white mb-3">Hours by Time of Day</h2>
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-3">{% translate "Hours by Time of Day" %}</h2>
       <div id="combinedPlaysByTimeContainer" class="h-64">
         <canvas id="combinedPlaysByTimeChart"></canvas>
       </div>
@@ -1277,7 +1483,7 @@
   <!-- Consumption -->
   <div class="consumption-row grid grid-cols-2 gap-3 sm:gap-4" style="margin-bottom:1rem; --consumption-cols: 3" :style="'margin-bottom:1rem; --consumption-cols: ' + consumptionTiles().length" x-show="currentConsumption.has_data">
     <template x-for="tile in consumptionTiles()" :key="tile.key">
-      <div class="bg-[#2a2f35] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
+      <div class="bg-[var(--color-surface)] rounded-lg p-3 sm:p-5 flex items-center min-w-0">
         <div class="p-2 sm:p-3 rounded-full mr-3 shrink-0" :class="tile.bg">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -1285,30 +1491,30 @@
                x-html="consumptionIconPath(tile)"></svg>
         </div>
         <div class="min-w-0">
-          <h3 class="text-xs sm:text-sm font-medium text-gray-400" x-text="tile.label"></h3>
+          <h3 class="text-xs sm:text-sm font-medium text-[var(--color-text-muted)]" x-text="tile.label"></h3>
           <p class="text-xl sm:text-2xl font-bold" x-text="tile.value"></p>
-          <p class="text-xs text-gray-500" x-text="tile.caption"></p>
+          <p class="text-xs text-[var(--color-text-muted)]" x-text="tile.caption"></p>
         </div>
       </div>
     </template>
   </div>
 
   <!-- Status Composition + Rating Distribution -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4" style="margin-bottom:1rem">
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 flex flex-col h-full">
-      <h2 class="text-base font-semibold text-white mb-0.5" id="statusCompositionTitle">Status Composition</h2>
-      <p class="text-xs text-gray-400 mb-3" id="statusCompositionSubtitle">What portion of your library is in each state.</p>
-      <div id="statusCompositionContainer" class="flex-1 flex items-center gap-4 sm:gap-6">
+  <div class="stats-chart-pair grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4" style="margin-bottom:1rem">
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 flex flex-col h-full">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-0.5" id="statusCompositionTitle">{% translate "Status Composition" %}</h2>
+      <p class="text-xs text-[var(--color-text-muted)] mb-3" id="statusCompositionSubtitle">{% translate "What portion of your library is in each state." %}</p>
+      <div id="statusCompositionContainer" class="flex-1 min-w-0 flex items-center gap-4 sm:gap-6">
         <div class="relative shrink-0" style="width:150px;height:150px;">
           <div id="statusCompositionCenter" class="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-center"></div>
           <canvas id="statusCompositionChart" style="position:relative;z-index:1"></canvas>
         </div>
-        <div id="statusCompositionLegend" class="flex-1 min-w-0 space-y-2"></div>
+        <div id="statusCompositionLegend" class="flex-1 min-w-0 overflow-x-auto overflow-y-hidden scrollbar-hidden space-y-2"></div>
       </div>
     </div>
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6">
-      <h2 class="text-base font-semibold text-white mb-0.5" id="ratingDistributionTitle">Rating Distribution</h2>
-      <p class="text-xs text-gray-400 mb-3" id="ratingDistributionSubtitle">How your rated items are distributed.</p>
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-0.5" id="ratingDistributionTitle">{% translate "Rating Distribution" %}</h2>
+      <p class="text-xs text-[var(--color-text-muted)] mb-3" id="ratingDistributionSubtitle">{% translate "How your rated items are distributed." %}</p>
       <div id="ratingDistributionContainer" class="h-[174px]">
         <canvas id="ratingDistributionChart"></canvas>
       </div>
@@ -1317,17 +1523,17 @@
 
   <!-- Status Breakdown + Average Rating -->
   <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4" style="margin-bottom:1rem">
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 lg:col-span-2">
-      <h2 class="text-base font-semibold text-white mb-0.5" id="statusBreakdownTitle">Status Breakdown</h2>
+    <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 lg:col-span-2">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-0.5" id="statusBreakdownTitle">{% translate "Status Breakdown" %}</h2>
       <div id="statusBreakdownContainer"></div>
     </div>
-    <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 lg:col-span-1">
-      <h2 class="text-base font-semibold text-white mb-0.5">Average Rating</h2>
-      <p class="text-xs text-gray-400 pb-2 mb-1 border-b border-gray-700">Your average score by type.</p>
+    <div class="stats-average-rating bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 lg:col-span-1">
+      <h2 class="text-base font-semibold text-[var(--color-text)] mb-0.5">{% translate "Average Rating" %}</h2>
+      <p class="text-xs text-[var(--color-text-muted)] pb-2 mb-1 border-b border-gray-700">{% translate "Your average score by type." %}</p>
       <div>
         <template x-for="row in averageRatingRows()" :key="row.value">
-          <div class="flex items-center gap-3 py-2 border-b border-gray-700/50 last:border-0">
-            <div class="flex items-center gap-2 flex-1 min-w-0" style="min-width:110px">
+          <div class="stats-average-rating-row flex flex-wrap items-center gap-x-3 gap-y-1 py-2 border-b border-gray-700/50 last:border-0">
+            <div class="flex items-center gap-2 flex-1 min-w-0">
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24" height="24" viewBox="0 0 24 24"
                    fill="none" stroke="currentColor" stroke-width="2"
@@ -1335,7 +1541,7 @@
                    class="w-4 h-4 shrink-0"
                    :style="'color:' + row.color"
                    x-html="row.icon"></svg>
-              <span class="text-sm text-gray-300 truncate" x-text="row.label"></span>
+              <span class="text-sm text-[var(--color-text-secondary)] truncate" x-text="row.label"></span>
             </div>
             <div class="relative shrink-0" style="width:96px;height:16px;">
               <div class="absolute inset-0 flex gap-1 text-gray-600">
@@ -1353,18 +1559,18 @@
                 <svg style="flex-shrink:0" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
               </div>
             </div>
-            <span class="text-sm font-semibold text-white w-10 text-center shrink-0" x-text="row.average_score_display"></span>
+            <span class="text-sm font-semibold text-[var(--color-text)] w-10 text-center shrink-0" x-text="row.average_score_display"></span>
           </div>
         </template>
-        <p x-show="averageRatingRows().length === 0" class="text-sm text-gray-500 text-center py-6" style="display:none">No ratings yet.</p>
+        <p x-show="averageRatingRows().length === 0" class="text-sm text-[var(--color-text-muted)] text-center py-6" style="display:none">{% translate "No ratings yet." %}</p>
       </div>
     </div>
   </div>
 
     <!-- Copied: Score Distribution by Media Type (placed under Activity History) -->
     {% if user.activity_history_view != 'heatmap' %}
-    <div id="scoreCopyWrapper" class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 stat-scroll-safe mt-0">
-      <h2 class="text-xl font-semibold mb-3 sm:mb-4 text-center">Played Hours by Media Type</h2>
+    <div id="scoreCopyWrapper" class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 stat-scroll-safe mt-0">
+      <h2 class="text-xl font-semibold mb-3 sm:mb-4 text-center">{% translate "Played Hours by Media Type" %}</h2>
 
         {% if daily_hours_by_media_type.labels and daily_hours_by_media_type.datasets %}
           <div class="flex justify-center items-stretch min-h-[320px] sm:min-h-[380px]" id="scoreCopyCanvasWrapper">
@@ -1372,7 +1578,7 @@
           </div>
         {% else %}
           <div class="flex flex-col items-center justify-center py-16">
-            <div class="bg-[#39404b] rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+            <div class="bg-[var(--color-surface-strong)] rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
                    height="24"
@@ -1382,14 +1588,14 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-8 h-8 text-gray-400">
+                   class="w-8 h-8 text-[var(--color-text-muted)]">
                 <path d="m15.477 12.89 1.515 8.526a.5.5 0 0 1-.81.47l-3.58-2.687a1 1 0 0 0-1.197 0l-3.586 2.686a.5.5 0 0 1-.81-.469l1.514-8.526">
                 </path>
                 <circle cx="12" cy="8" r="6"></circle>
               </svg>
             </div>
-            <h3 class="text-lg font-medium mb-2">No content logged</h3>
-            <p class="text-gray-400 text-center max-w-md">No media items were logged during the selected time period.</p>
+            <h3 class="text-lg font-medium mb-2">{% translate "No content logged" %}</h3>
+            <p class="text-[var(--color-text-muted)] text-center max-w-md">{% translate "No media items were logged during the selected time period." %}</p>
           </div>
         {% endif %}
       </div>
@@ -1406,13 +1612,13 @@
            hx-swap="outerHTML"
            class="mb-4 sm:mb-8 space-y-4 sm:space-y-4"
            style="margin-top: 1rem;"
-           x-show="['all','tv','movie','anime','game'].includes(selectedMediaType)">
+           x-show="isTalentVisible()">
         <div class="grid grid-cols-1 lg:grid-cols-5 gap-3 sm:gap-4 items-start">
-          <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 lg:col-span-2 overflow-hidden animate-pulse">
+          <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 lg:col-span-2 overflow-hidden animate-pulse">
             <div class="h-6 w-48 bg-gray-700 rounded mb-4"></div>
             <div class="h-40 bg-gray-700/60 rounded"></div>
           </div>
-          <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 lg:col-span-3 overflow-hidden animate-pulse">
+          <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 lg:col-span-3 overflow-hidden animate-pulse">
             <div class="h-6 w-40 bg-gray-700 rounded mb-4"></div>
             <div class="h-40 bg-gray-700/60 rounded"></div>
           </div>
@@ -1431,6 +1637,12 @@
         </div>
       {% endif %}
 
+      {% if user.manga_enabled and manga_consumption.has_data %}
+        <div x-show="isMediaTypeVisible('manga')">
+          {% include "app/components/reading_consumption_section.html" with media_name=_("Manga") consumption=manga_consumption media_type_slug='manga' chart_prefix='manga' top_rated_list=top_rated_manga %}
+        </div>
+      {% endif %}
+
       {% if movie_consumption.has_data %}
         <div x-show="isMediaTypeVisible('movie')">
           {% include "app/components/statistics/movie_activity_overview.html" %}
@@ -1445,19 +1657,13 @@
 
       {% if user.book_enabled and book_consumption.has_data %}
         <div x-show="isMediaTypeVisible('book')">
-          {% include "app/components/reading_consumption_section.html" with media_name="Books" consumption=book_consumption media_type_slug='book' chart_prefix='book' top_rated_list=top_rated_book show_top_authors=True %}
+          {% include "app/components/reading_consumption_section.html" with media_name=_("Books") consumption=book_consumption media_type_slug='book' chart_prefix='book' top_rated_list=top_rated_book show_top_authors=True %}
         </div>
       {% endif %}
 
       {% if user.comic_enabled and comic_consumption.has_data %}
         <div x-show="isMediaTypeVisible('comic')">
-          {% include "app/components/reading_consumption_section.html" with media_name="Comics" consumption=comic_consumption media_type_slug='comic' chart_prefix='comic' top_rated_list=top_rated_comic %}
-        </div>
-      {% endif %}
-
-      {% if user.manga_enabled and manga_consumption.has_data %}
-        <div x-show="isMediaTypeVisible('manga')">
-          {% include "app/components/reading_consumption_section.html" with media_name="Manga" consumption=manga_consumption media_type_slug='manga' chart_prefix='manga' top_rated_list=top_rated_manga %}
+          {% include "app/components/reading_consumption_section.html" with media_name=_("Comics") consumption=comic_consumption media_type_slug='comic' chart_prefix='comic' top_rated_list=top_rated_comic %}
         </div>
       {% endif %}
 
@@ -1467,6 +1673,11 @@
         </div>
       {% endif %}
 
+      {% if user.video_enabled and video_consumption.has_data %}
+        <div x-show="isMediaTypeVisible('video')">
+          {% include "app/components/statistics/video_activity_overview.html" %}
+        </div>
+      {% endif %}
       {% if user.podcast_enabled and podcast_consumption.has_data %}
         <div x-show="isMediaTypeVisible('podcast')">
           {% include "app/components/statistics/podcast_activity_overview.html" %}
@@ -1480,27 +1691,26 @@
       Location: After "Movie Plays by Time of Day" chart
       To restore: Uncomment this entire section
       {% if top_played.movie %}
-        <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 mobile-tight-section stat-scroll-safe mb-4 sm:mb-6">
+        <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 mobile-tight-section stat-scroll-safe mb-4 sm:mb-6">
           <div class="flex flex-col space-y-1 mb-3 sm:mb-4">
-            <span class="text-sm uppercase tracking-widest text-gray-400">Movies</span>
+            <span class="text-sm uppercase tracking-widest text-[var(--color-text-muted)]">Movies</span>
             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
               <div>
-                <h2 class="text-2xl font-semibold text-white">Most Played</h2>
-                <span class="text-sm text-gray-500" x-text="selectedRange"></span>
+                <h2 class="text-2xl font-semibold text-[var(--color-text)]">Most Played</h2>
+                <span class="text-sm text-[var(--color-text-muted)]" x-text="selectedRange"></span>
               </div>
-              <a href="{% url 'medialist' 'movie' %}" class="text-sm text-indigo-400 hover:text-indigo-300 transition-colors">
+              <a href="{% url 'medialist' 'movie' %}" class="text-sm text-[var(--color-link)] hover:text-[var(--color-link-hover)] transition-colors">
                 See all your top movies →
               </a>
             </div>
           </div>
           <div class="media-grid">
             {% for item in top_played.movie %}
-              <div class="{% if secondary_color %}bg-[#39404b]{% else %}bg-[#2a2f35]{% endif %} rounded-lg overflow-hidden shadow-lg relative">
+              <div class="{% if secondary_color %}bg-[var(--color-surface-strong)]{% else %}bg-[var(--color-surface)]{% endif %} rounded-lg overflow-hidden shadow-lg relative">
                 <div class="relative">
                   <img alt="{{ item.media.item }}"
-                       class="lazyload w-full aspect-[2/3] bg-[#3e454d] {% if item.media.item.image != IMG_NONE %}object-cover{% endif %}"
-                       data-src="{{ item.media.item.image }}"
-                       src="{{ IMG_NONE }}">
+                       class="w-full aspect-[2/3] bg-[var(--color-surface-alt)] {% if item.media.item.image != IMG_NONE %}object-cover{% endif %}"
+                       src="{{ item.media.item.image|image_url }}">
                   
                   {% if item.media.status %}
                     <div class="media-status-chip absolute top-2 left-2 bg-gray-900/90 text-white text-xs px-2 py-1 rounded-md flex items-center shadow-md"
@@ -1521,9 +1731,9 @@
                         </svg>
                       {% endif %}
                       {% if item.media.end_date is not None %}
-                        <span class="text-sm text-white">{{ item.media.end_date|user_date_format:user }}</span>
+                        <span class="text-sm text-[var(--color-text)]">{{ item.media.end_date|user_date_format:user }}</span>
                       {% elif item.media.start_date is not None %}
-                        <span class="text-sm text-white">{{ item.media.start_date|user_date_format:user }}</span>
+                        <span class="text-sm text-[var(--color-text)]">{{ item.media.start_date|user_date_format:user }}</span>
                       {% endif %}
                     </div>
                   {% endif %}
@@ -1542,19 +1752,19 @@
                            class="w-4 h-4 text-yellow-400 mr-1">
                         <path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
                       </svg>
-                      <span class="text-sm text-white">{{ item.media.score|score_display:user }}</span>
+                      <span class="text-sm text-[var(--color-text)]">{{ item.media.score|score_display:user }}</span>
                     </div>
                   {% endif %}
                 </div>
                 
                 <div class="p-3">
                   <a href="{{ item.media.item|media_url }}"
-                     class="text-sm font-semibold text-white hover:text-indigo-400 transition duration-300 line-clamp-1"
+                     class="text-sm font-semibold text-[var(--color-text)] hover:text-[var(--color-link)] transition duration-300 line-clamp-1"
                      title="{{ item.media.item }}">{{ item.media.item }}</a>
-                  <p class="text-xs text-gray-400 mt-1">
+                  <p class="text-xs text-[var(--color-text-muted)] mt-1">
                     {{ item.play_count }} play{{ item.play_count|pluralize }}
                   </p>
-                  <p class="text-xs text-indigo-400 mt-1">{{ item.formatted_duration }}</p>
+                  <p class="text-xs text-[var(--color-link)] mt-1">{{ item.formatted_duration }}</p>
                 </div>
               </div>
             {% endfor %}
@@ -1570,27 +1780,26 @@
       Location: After "Episode Plays by Time of Day" chart
       To restore: Uncomment this entire section
       {% if top_played.tv %}
-        <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 mobile-tight-section stat-scroll-safe mb-4 sm:mb-6">
+        <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 mobile-tight-section stat-scroll-safe mb-4 sm:mb-6">
           <div class="flex flex-col space-y-1 mb-3 sm:mb-4">
-            <span class="text-sm uppercase tracking-widest text-gray-400">TV Shows</span>
+            <span class="text-sm uppercase tracking-widest text-[var(--color-text-muted)]">TV Shows</span>
             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
               <div>
-                <h2 class="text-2xl font-semibold text-white">Most Played</h2>
-                <span class="text-sm text-gray-500" x-text="selectedRange"></span>
+                <h2 class="text-2xl font-semibold text-[var(--color-text)]">Most Played</h2>
+                <span class="text-sm text-[var(--color-text-muted)]" x-text="selectedRange"></span>
               </div>
-              <a href="{% url 'medialist' 'tv' %}" class="text-sm text-indigo-400 hover:text-indigo-300 transition-colors">
+              <a href="{% url 'medialist' 'tv' %}" class="text-sm text-[var(--color-link)] hover:text-[var(--color-link-hover)] transition-colors">
                 See all your top TV shows →
               </a>
             </div>
           </div>
           <div class="media-grid">
             {% for item in top_played.tv %}
-              <div class="{% if secondary_color %}bg-[#39404b]{% else %}bg-[#2a2f35]{% endif %} rounded-lg overflow-hidden shadow-lg relative">
+              <div class="{% if secondary_color %}bg-[var(--color-surface-strong)]{% else %}bg-[var(--color-surface)]{% endif %} rounded-lg overflow-hidden shadow-lg relative">
                 <div class="relative">
                   <img alt="{{ item.media.item }}"
-                       class="lazyload w-full aspect-[2/3] bg-[#3e454d] {% if item.media.item.image != IMG_NONE %}object-cover{% endif %}"
-                       data-src="{{ item.media.item.image }}"
-                       src="{{ IMG_NONE }}">
+                       class="w-full aspect-[2/3] bg-[var(--color-surface-alt)] {% if item.media.item.image != IMG_NONE %}object-cover{% endif %}"
+                       src="{{ item.media.item.image|image_url }}">
                   
                   {% if item.media.status %}
                     <div class="media-status-chip absolute top-2 left-2 bg-gray-900/90 text-white text-xs px-2 py-1 rounded-md flex items-center shadow-md"
@@ -1611,9 +1820,9 @@
                         </svg>
                       {% endif %}
                       {% if item.media.end_date is not None %}
-                        <span class="text-sm text-white">{{ item.media.end_date|user_date_format:user }}</span>
+                        <span class="text-sm text-[var(--color-text)]">{{ item.media.end_date|user_date_format:user }}</span>
                       {% elif item.media.start_date is not None %}
-                        <span class="text-sm text-white">{{ item.media.start_date|user_date_format:user }}</span>
+                        <span class="text-sm text-[var(--color-text)]">{{ item.media.start_date|user_date_format:user }}</span>
                       {% endif %}
                     </div>
                   {% endif %}
@@ -1632,17 +1841,17 @@
                            class="w-4 h-4 text-yellow-400 mr-1">
                         <path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
                       </svg>
-                      <span class="text-sm text-white">{{ item.media.score|score_display:user }}</span>
+                      <span class="text-sm text-[var(--color-text)]">{{ item.media.score|score_display:user }}</span>
                     </div>
                   {% endif %}
                 </div>
                 
                 <div class="p-3">
                   <a href="{{ item.media.item|media_url }}"
-                     class="text-sm font-semibold text-white hover:text-indigo-400 transition duration-300 line-clamp-1"
+                     class="text-sm font-semibold text-[var(--color-text)] hover:text-[var(--color-link)] transition duration-300 line-clamp-1"
                      title="{{ item.media.item }}">{{ item.media.item }}</a>
-                  <p class="text-xs text-gray-400 mt-1">{{ item.episode_count }} episodes</p>
-                  <p class="text-xs text-indigo-400 mt-1">{{ item.formatted_duration }}</p>
+                  <p class="text-xs text-[var(--color-text-muted)] mt-1">{{ item.episode_count }} episodes</p>
+                  <p class="text-xs text-[var(--color-link)] mt-1">{{ item.formatted_duration }}</p>
                 </div>
               </div>
             {% endfor %}
@@ -1653,27 +1862,26 @@
 
       <!-- Top Board Games Section -->
       {% if top_played.boardgame %}
-        <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 mobile-tight-section stat-scroll-safe mb-4 sm:mb-6">
+        <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 mobile-tight-section stat-scroll-safe mb-4 sm:mb-6">
           <div class="flex flex-col space-y-1 mb-3 sm:mb-4">
-            <span class="text-sm uppercase tracking-widest text-gray-400">Board Games</span>
+            <span class="text-sm uppercase tracking-widest text-[var(--color-text-muted)]">{% translate "Board Games" %}</span>
             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
               <div>
-                <h2 class="text-2xl font-semibold text-white">Most Played</h2>
-                <span class="text-sm text-gray-500" x-text="selectedRange"></span>
+                <h2 class="text-2xl font-semibold text-[var(--color-text)]">{% translate "Most Played" %}</h2>
+                <span class="text-sm text-[var(--color-text-muted)]" x-text="selectedRange"></span>
               </div>
-              <a href="{% url 'medialist' 'boardgame' %}" class="text-sm text-indigo-400 hover:text-indigo-300 transition-colors">
-                See all your top board games →
+              <a href="{% url 'medialist' 'boardgame' %}" class="text-sm text-[var(--color-link)] hover:text-[var(--color-link-hover)] transition-colors">
+                {% translate "See all your top board games →" %}
               </a>
             </div>
           </div>
           <div class="media-grid">
             {% for item in top_played.boardgame %}
-              <div class="{% if secondary_color %}bg-[#39404b]{% else %}bg-[#2a2f35]{% endif %} rounded-lg overflow-hidden shadow-lg relative">
+              <div class="{% if secondary_color %}bg-[var(--color-surface-strong)]{% else %}bg-[var(--color-surface)]{% endif %} rounded-lg overflow-hidden shadow-lg relative">
                 <div class="relative">
                   <img alt="{{ item.media.item }}"
-                       class="lazyload w-full aspect-[2/3] bg-[#3e454d] {% if item.media.item.image != IMG_NONE %}object-cover{% endif %}"
-                       data-src="{{ item.media.item.image }}"
-                       src="{{ IMG_NONE }}">
+                       class="w-full aspect-[2/3] bg-[var(--color-surface-alt)] {% if item.media.item.image != IMG_NONE %}object-cover{% endif %}"
+                       src="{{ item.media.item.image|image_url }}">
                   
                   {% if item.media.status %}
                     <div class="media-status-chip absolute top-2 left-2 bg-gray-900/90 text-white text-xs px-2 py-1 rounded-md flex items-center shadow-md"
@@ -1694,9 +1902,9 @@
                         </svg>
                       {% endif %}
                       {% if item.media.end_date is not None %}
-                        <span class="text-sm text-white">{{ item.media.end_date|user_date_format:user }}</span>
+                        <span class="text-sm text-[var(--color-text)]">{{ item.media.end_date|user_date_format:user }}</span>
                       {% elif item.media.start_date is not None %}
-                        <span class="text-sm text-white">{{ item.media.start_date|user_date_format:user }}</span>
+                        <span class="text-sm text-[var(--color-text)]">{{ item.media.start_date|user_date_format:user }}</span>
                       {% endif %}
                     </div>
                   {% endif %}
@@ -1715,16 +1923,16 @@
                            class="w-4 h-4 text-yellow-400 mr-1">
                         <path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
                       </svg>
-                      <span class="text-sm text-white">{{ item.media.score|score_display:user }}</span>
+                      <span class="text-sm text-[var(--color-text)]">{{ item.media.score|score_display:user }}</span>
                     </div>
                   {% endif %}
                 </div>
                 
                 <div class="p-3">
                   <a href="{{ item.media.item|media_url }}"
-                     class="text-sm font-semibold text-white hover:text-indigo-400 transition duration-300 line-clamp-1"
+                     class="text-sm font-semibold text-[var(--color-text)] hover:text-[var(--color-link)] transition duration-300 line-clamp-1"
                      title="{{ item.media.item }}">{{ item.media.item }}</a>
-                  <p class="text-xs text-indigo-400 mt-1">{{ item.formatted_duration }}</p>
+                  <p class="text-xs text-[var(--color-link)] mt-1">{{ item.formatted_duration }}</p>
                 </div>
               </div>
             {% endfor %}
@@ -1734,10 +1942,10 @@
 
       <!-- Empty State for Top Played -->
       {% if not top_played.movie and not top_played.tv and not top_played.boardgame and not top_played.anime %}
-        <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 stat-scroll-safe mb-4 sm:mb-6">
-          <h2 class="text-xl font-semibold mb-3 sm:mb-4">Top Played</h2>
+        <div class="bg-[var(--color-surface)] rounded-lg p-4 sm:p-6 stat-scroll-safe mb-4 sm:mb-6">
+          <h2 class="text-xl font-semibold mb-3 sm:mb-4">{% translate "Top Played" %}</h2>
           <div class="flex flex-col items-center justify-center py-12 sm:py-16">
-            <div class="bg-[#39404b] rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+            <div class="bg-[var(--color-surface-strong)] rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
               <svg xmlns="http://www.w3.org/2000/svg"
                    width="24"
                    height="24"
@@ -1747,59 +1955,16 @@
                    stroke-width="2"
                    stroke-linecap="round"
                    stroke-linejoin="round"
-                   class="w-8 h-8 text-gray-400">
+                   class="w-8 h-8 text-[var(--color-text-muted)]">
                 <path d="M3 3v18h18"></path>
                 <path d="M18.7 8l-5.1 5.1-2.8-2.7L7 14.3"></path>
               </svg>
             </div>
-            <h3 class="text-lg font-medium mb-2">No activity yet</h3>
-            <p class="text-gray-400 text-center max-w-md">Start tracking your media to see your top played items.</p>
+            <h3 class="text-lg font-medium mb-2">{% translate "No activity yet" %}</h3>
+            <p class="text-[var(--color-text-muted)] text-center max-w-md">{% translate "Start tracking your media to see your top played items." %}</p>
           </div>
         </div>
       {% endif %}
-
-      <!-- Top Rated Media Section -->
-      {% comment %}
-      COMMENTED OUT: Old "ALL MEDIA - Top Rated Media" section
-      REPLACED BY: New 3-card rows in Movies and TV Shows Activity Overview sections (Top Rated cards)
-      Location: After "Movie Plays by Time of Day" chart (Movies) and "Episode Plays by Time of Day" chart (TV Shows)
-      To restore: Uncomment this entire section
-      <div class="bg-[#2a2f35] rounded-lg p-4 sm:p-6 mobile-tight-section stat-scroll-safe mb-4 sm:mb-6">
-        <div class="flex flex-col space-y-1 mb-3 sm:mb-4">
-          <span class="text-sm uppercase tracking-widest text-gray-400">All Media</span>
-          <h2 class="text-2xl font-semibold text-white">Top Rated Media</h2>
-        </div>
-
-        {% if top_rated %}
-          <div class="media-grid">
-            {% for media in top_rated %}
-              {% include "app/components/media_card.html" with media=media item=media.item title=media.item from_grid=True secondary_color=True user=user current_sort='progress' %}
-            {% endfor %}
-          </div>
-        {% else %}
-          <div class="flex flex-col items-center justify-center py-16">
-            <div class="bg-[#39404b] rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-              <svg xmlns="http://www.w3.org/2000/svg"
-                   width="24"
-                   height="24"
-                   viewBox="0 0 24 24"
-                   fill="none"
-                   stroke="currentColor"
-                   stroke-width="2"
-                   stroke-linecap="round"
-                   stroke-linejoin="round"
-                   class="w-8 h-8 text-gray-400">
-                <path d="m15.477 12.89 1.515 8.526a.5.5 0 0 1-.81.47l-3.58-2.687a1 1 0 0 0-1.197 0l-3.586 2.686a.5.5 0 0 1-.81-.469l1.514-8.526">
-                </path>
-                <circle cx="12" cy="8" r="6"></circle>
-              </svg>
-            </div>
-            <h3 class="text-lg font-medium mb-2">No ratings yet</h3>
-            <p class="text-gray-400 text-center max-w-md">Rate your media items to see score distribution statistics.</p>
-          </div>
-        {% endif %}
-      </div>
-      {% endcomment %}
 
     </div>
   </div>
@@ -1830,7 +1995,7 @@
       return this.weekStartDay === 'monday' ? 'Monday' : 'Sunday';
     },
     ratingScaleLabel() {
-      return this.ratingScale === '5' ? '1-5 stars' : '1-10 stars';
+      return { '5': '1-5 stars', '0': 'Disabled' }[this.ratingScale] || '1-10 stars';
     },
     {% if not user.anime_enabled and tvdb_enabled %}
     statsAnimeGenreLabel() {
@@ -1857,9 +2022,9 @@
   }">
     {# FAB button #}
     <button @click="open = true"
-            class="fixed bottom-6 right-6 z-40 w-14 h-14 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg flex items-center justify-center cursor-pointer transition-colors"
-            title="Statistics preferences"
-            aria-label="Statistics preferences">
+            class="fixed bottom-6 right-[max(1.5rem,var(--safe-right))] z-40 w-14 h-14 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg flex items-center justify-center cursor-pointer transition-colors"
+            title="{% translate "Statistics preferences" %}"
+            aria-label="{% translate "Statistics preferences" %}">
       {% include "app/icons/vertical-sliders.svg" with classes="w-5 h-5" %}
     </button>
 
@@ -1867,15 +2032,15 @@
     <div x-show="open"
          x-cloak
          @keydown.escape.window="open = false"
-         class="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50">
-      <div class="w-full sm:w-[420px] relative z-60"
-           @click.outside="open = false">
-        <div class="bg-[#2a2f35] rounded-t-2xl sm:rounded-xl p-6 overflow-visible modal-max-height">
+         class="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50"
+         @mousedown.self="open = false">
+      <div class="w-full sm:w-[420px] relative z-60">
+        <div class="bg-[var(--color-surface)] rounded-t-2xl sm:rounded-xl p-6 overflow-visible modal-max-height">
           {# Header #}
           <div class="flex items-center justify-between mb-5">
-            <h2 class="text-lg font-semibold text-white">Statistics Preferences</h2>
+            <h2 class="text-lg font-semibold text-[var(--color-text)]">{% translate "Statistics Preferences" %}</h2>
             <button @click="open = false"
-                    class="text-gray-400 hover:text-white transition-colors cursor-pointer">
+                    class="text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors cursor-pointer">
               {% include "app/icons/x.svg" with classes="w-5 h-5" %}
             </button>
           </div>
@@ -1883,13 +2048,13 @@
           <div class="space-y-4">
             {# Activity History View #}
             <div>
-              <label class="block text-sm font-medium text-gray-300 mb-1">Activity History View</label>
+              <label class="block text-sm font-medium text-[var(--color-text-secondary)] mb-1">{% translate "Activity History View" %}</label>
               <div class="relative" @click.outside="activityHistoryViewOpen = false">
                 <button type="button"
                         @click="activityHistoryViewOpen = !activityHistoryViewOpen"
-                        class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                        class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
                   <span x-text="activityHistoryViewLabel()"></span>
-                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-gray-400"><path d="m6 9 6 6 6-6"></path></svg>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-[var(--color-text-muted)]"><path d="m6 9 6 6 6-6"></path></svg>
                 </button>
                 <div x-show="activityHistoryViewOpen"
                      x-transition:enter="transition ease-out duration-100"
@@ -1898,18 +2063,18 @@
                      x-transition:leave="transition ease-in duration-75"
                      x-transition:leave-start="transform opacity-100 scale-100"
                      x-transition:leave-end="transform opacity-0 scale-95"
-                     class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                     class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
                   <button type="button"
                           @click="activityHistoryView = 'heatmap'; activityHistoryViewOpen = false"
-                          :class="activityHistoryView === 'heatmap' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="activityHistoryView === 'heatmap' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Activity Heatmap
+                    {% translate "Activity Heatmap" %}
                   </button>
                   <button type="button"
                           @click="activityHistoryView = 'stacked'; activityHistoryViewOpen = false"
-                          :class="activityHistoryView === 'stacked' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="activityHistoryView === 'stacked' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Stacked Bar Chart
+                    {% translate "Stacked Bar Chart" %}
                   </button>
                 </div>
               </div>
@@ -1917,13 +2082,13 @@
 
             {# Duration Format #}
             <div>
-              <label class="block text-sm font-medium text-gray-300 mb-1">Duration Format</label>
+              <label class="block text-sm font-medium text-[var(--color-text-secondary)] mb-1">{% translate "Duration Format" %}</label>
               <div class="relative" @click.outside="durationFormatOpen = false">
                 <button type="button"
                         @click="durationFormatOpen = !durationFormatOpen"
-                        class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                        class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
                   <span x-text="durationFormatLabel()"></span>
-                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-gray-400"><path d="m6 9 6 6 6-6"></path></svg>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-[var(--color-text-muted)]"><path d="m6 9 6 6 6-6"></path></svg>
                 </button>
                 <div x-show="durationFormatOpen"
                      x-transition:enter="transition ease-out duration-100"
@@ -1932,18 +2097,18 @@
                      x-transition:leave="transition ease-in duration-75"
                      x-transition:leave-start="transform opacity-100 scale-100"
                      x-transition:leave-end="transform opacity-0 scale-95"
-                     class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                     class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
                   <button type="button"
                           @click="durationFormat = 'hours_minutes'; durationFormatOpen = false"
-                          :class="durationFormat === 'hours_minutes' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="durationFormat === 'hours_minutes' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Hours and minutes (500h 30min)
+                    {% translate "Hours and minutes (500h 30min)" %}
                   </button>
                   <button type="button"
                           @click="durationFormat = 'long_units'; durationFormatOpen = false"
-                          :class="durationFormat === 'long_units' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="durationFormat === 'long_units' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Days and hours (20d 20h 30min)
+                    {% translate "Days and hours (20d 20h 30min)" %}
                   </button>
                 </div>
               </div>
@@ -1951,13 +2116,13 @@
 
             {# Week Start Day #}
             <div>
-              <label class="block text-sm font-medium text-gray-300 mb-1">Week Start Day</label>
+              <label class="block text-sm font-medium text-[var(--color-text-secondary)] mb-1">{% translate "Week Start Day" %}</label>
               <div class="relative" @click.outside="weekStartDayOpen = false">
                 <button type="button"
                         @click="weekStartDayOpen = !weekStartDayOpen"
-                        class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                        class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
                   <span x-text="weekStartDayLabel()"></span>
-                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-gray-400"><path d="m6 9 6 6 6-6"></path></svg>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-[var(--color-text-muted)]"><path d="m6 9 6 6 6-6"></path></svg>
                 </button>
                 <div x-show="weekStartDayOpen"
                      x-transition:enter="transition ease-out duration-100"
@@ -1966,18 +2131,18 @@
                      x-transition:leave="transition ease-in duration-75"
                      x-transition:leave-start="transform opacity-100 scale-100"
                      x-transition:leave-end="transform opacity-0 scale-95"
-                     class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                     class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
                   <button type="button"
                           @click="weekStartDay = 'monday'; weekStartDayOpen = false"
-                          :class="weekStartDay === 'monday' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="weekStartDay === 'monday' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Monday
+                    {% translate "Monday" %}
                   </button>
                   <button type="button"
                           @click="weekStartDay = 'sunday'; weekStartDayOpen = false"
-                          :class="weekStartDay === 'sunday' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="weekStartDay === 'sunday' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Sunday
+                    {% translate "Sunday" %}
                   </button>
                 </div>
               </div>
@@ -1985,13 +2150,13 @@
 
             {# Rating Scale #}
             <div>
-              <label class="block text-sm font-medium text-gray-300 mb-1">Rating Scale</label>
+              <label class="block text-sm font-medium text-[var(--color-text-secondary)] mb-1">{% translate "Rating Scale" %}</label>
               <div class="relative" @click.outside="ratingScaleOpen = false">
                 <button type="button"
                         @click="ratingScaleOpen = !ratingScaleOpen"
-                        class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                        class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
                   <span x-text="ratingScaleLabel()"></span>
-                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-gray-400"><path d="m6 9 6 6 6-6"></path></svg>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-[var(--color-text-muted)]"><path d="m6 9 6 6 6-6"></path></svg>
                 </button>
                 <div x-show="ratingScaleOpen"
                      x-transition:enter="transition ease-out duration-100"
@@ -2000,18 +2165,24 @@
                      x-transition:leave="transition ease-in duration-75"
                      x-transition:leave-start="transform opacity-100 scale-100"
                      x-transition:leave-end="transform opacity-0 scale-95"
-                     class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                     class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
                   <button type="button"
                           @click="ratingScale = '10'; ratingScaleOpen = false"
-                          :class="ratingScale === '10' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="ratingScale === '10' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    1-10 stars
+                    {% translate "1-10 stars" %}
                   </button>
                   <button type="button"
                           @click="ratingScale = '5'; ratingScaleOpen = false"
-                          :class="ratingScale === '5' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="ratingScale === '5' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    1-5 stars
+                    {% translate "1-5 stars" %}
+                  </button>
+                  <button type="button"
+                          @click="ratingScale = '0'; ratingScaleOpen = false"
+                          :class="ratingScale === '0' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
+                          class="block w-full px-3 py-2 text-left text-sm transition-colors">
+                    {% translate "Disabled" %}
                   </button>
                 </div>
               </div>
@@ -2019,14 +2190,14 @@
 
             {% if not user.anime_enabled and tvdb_enabled %}
             <div>
-              <label class="block text-sm font-medium text-gray-300 mb-1">Anime Statistics</label>
-              <p class="text-xs text-gray-400 mb-2">Choose how TV shows tagged as Anime via TVDB appear.</p>
+              <label class="block text-sm font-medium text-[var(--color-text-secondary)] mb-1">{% translate "Anime Statistics" %}</label>
+              <p class="text-xs text-[var(--color-text-muted)] mb-2">{% translate "Choose how TV shows tagged as Anime via TVDB appear." %}</p>
               <div class="relative" @click.outside="statsAnimeGenreOpen = false">
                 <button type="button"
                         @click="statsAnimeGenreOpen = !statsAnimeGenreOpen"
-                        class="flex items-center justify-between w-full px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                        class="flex items-center justify-between w-full px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
                   <span x-text="statsAnimeGenreLabel()"></span>
-                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-gray-400"><path d="m6 9 6 6 6-6"></path></svg>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 text-[var(--color-text-muted)]"><path d="m6 9 6 6 6-6"></path></svg>
                 </button>
                 <div x-show="statsAnimeGenreOpen"
                      x-transition:enter="transition ease-out duration-100"
@@ -2035,18 +2206,18 @@
                      x-transition:leave="transition ease-in duration-75"
                      x-transition:leave-start="transform opacity-100 scale-100"
                      x-transition:leave-end="transform opacity-0 scale-95"
-                     class="absolute left-0 right-0 mt-2 py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
+                     class="absolute left-0 right-0 mt-2 py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden z-10 border border-gray-600">
                   <button type="button"
                           @click="statsAnimeGenre = 'false'; statsAnimeGenreOpen = false"
-                          :class="statsAnimeGenre === 'false' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="statsAnimeGenre === 'false' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Display in TV Shows
+                    {% translate "Display in TV Shows" %}
                   </button>
                   <button type="button"
                           @click="statsAnimeGenre = 'true'; statsAnimeGenreOpen = false"
-                          :class="statsAnimeGenre === 'true' ? 'text-white bg-[#39404b]' : 'text-gray-300 hover:bg-[#39404b] hover:text-white'"
+                          :class="statsAnimeGenre === 'true' ? 'text-[var(--color-text)] bg-[var(--color-surface-strong)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                           class="block w-full px-3 py-2 text-left text-sm transition-colors">
-                    Display as Anime
+                    {% translate "Display as Anime" %}
                   </button>
                 </div>
               </div>
@@ -2058,27 +2229,25 @@
           <div class="flex gap-3 mt-6">
             <button type="button"
                     @click="open = false"
-                    class="flex-1 px-4 py-2 bg-[#39404b] text-gray-200 rounded-md text-sm font-medium hover:bg-[#434b57] transition-colors cursor-pointer">
-              Cancel
+                    class="flex-1 px-4 py-2 bg-[var(--color-surface-strong)] text-[var(--color-text-secondary)] rounded-md text-sm font-medium hover:bg-[var(--color-surface-border)] transition-colors cursor-pointer">
+              {% translate "Cancel" %}
             </button>
             <button type="button"
                     @click="save()"
                     :disabled="saving"
                     class="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-md text-sm font-medium hover:bg-indigo-500 transition-colors cursor-pointer disabled:opacity-50">
-              <span x-show="!saving">Save</span>
-              <span x-show="saving" x-cloak>Saving…</span>
+              <span x-show="!saving">{% translate "Save" %}</span>
+              <span x-show="saving" x-cloak>{% translate "Saving…" %}</span>
             </button>
           </div>
         </div>
       </div>
     </div>
   </div>
+  </div>
 {% endblock content %}
 
 {% block js %}
-  <script src="{% static 'js/date-range.js' %}{% get_static_file_mtime 'js/date-range.js' %}"
-          data-date-format="{{ user_django_date_format }}"></script>
-
   <script>
     function highlightCarousel() {
       return {
@@ -2173,8 +2342,8 @@
       });
     }
 
-    if (!window.__yamtrackStatsCardFitBound) {
-      window.__yamtrackStatsCardFitBound = true;
+    if (!window.__floppyStatsCardFitBound) {
+      window.__floppyStatsCardFitBound = true;
       window.addEventListener("resize", () => scheduleStatisticsMediaCardFit(), { passive: true });
       window.addEventListener("load", () => scheduleStatisticsMediaCardFit());
     }
@@ -2250,6 +2419,11 @@
   {% if user.podcast_enabled and podcast_consumption.has_data %}
     {% if show_year_charts %}
       {{ podcast_consumption.charts.by_year|json_script:"podcast_plays_by_year" }}
+    {% endif %}
+  {% endif %}
+  {% if user.video_enabled and video_consumption.has_data %}
+    {% if show_year_charts %}
+      {{ video_consumption.charts.by_year|json_script:"video_plays_by_year" }}
     {% endif %}
   {% endif %}
 

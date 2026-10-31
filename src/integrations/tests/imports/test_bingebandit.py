@@ -102,8 +102,9 @@ class BingeBanditViewTests(TestCase):
             webhook_usernames="alice",
         )
 
+    @patch("integrations.tasks.sync_bingebandit_library.delay")
     @patch("integrations.bingebandit.BingeBanditClient.get_me", return_value={"username": "alice"})
-    def test_connect_stores_encrypted_key_and_filters_webhooks_to_user(self, _mock_me):
+    def test_connect_stores_encrypted_key_and_filters_webhooks_to_user(self, _mock_me, _mock_sync):
         response = self.client.post(
             reverse("bingebandit_connect"),
             {"base_url": "http://bb.local/", "api_key": "bb_key"},

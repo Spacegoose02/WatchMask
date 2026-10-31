@@ -6,24 +6,73 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from celery import states
 from celery.result import AsyncResult
 from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.models import UserManager as DjangoUserManager
 from django.db import models
 from django.db.models import Q
+from django.urls import reverse
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 from django_celery_beat.models import PeriodicTask
 from django_celery_results.models import TaskResult
 
 from app.models import Item, MediaTypes, Sources, Status
-from users import helpers
+from integrations import import_progress
+from users import currency, helpers
+
+# Longest playback webhook secret accepted on input. The column itself is
+# unbounded because it holds ciphertext, so the cap has to be enforced where
+# the plaintext arrives — the settings form and the preferences API.
+PLAYBACK_WEBHOOK_SECRET_MAX_LENGTH = 128
 
 EXCLUDED_SEARCH_TYPES = [MediaTypes.SEASON.value, MediaTypes.EPISODE.value]
+HOME_ALL_MEDIA_TYPE = "all"
+
+# Search-bar option that searches every enabled type in the user's own library
+# (tracked, collected or tagged items) instead of one provider (#1160).
+ALL_SEARCH_TYPE = "all"
 
 VALID_SEARCH_TYPES = [
     value for value in MediaTypes.values if value not in EXCLUDED_SEARCH_TYPES
-]
+] + [ALL_SEARCH_TYPE]
 
 VALID_HOME_SCREEN_MEDIA_TYPES = [
-    value for value in MediaTypes.values if value != MediaTypes.EPISODE.value
+    HOME_ALL_MEDIA_TYPE,
+    *[value for value in MediaTypes.values if value != MediaTypes.EPISODE.value],
 ]
+
+MULTI_STATUS_PREFERENCE_FIELDS = {
+    "tv_status",
+    "season_status",
+    "movie_status",
+    "anime_status",
+    "manga_status",
+    "game_status",
+    "boardgame_status",
+    "book_status",
+    "comic_status",
+    "music_status",
+    "podcast_status",
+    "video_status",
+    "list_detail_status",
+}
+# Score-scaling constants: a user's display scale is either 1-5 or the
+# internal storage scale of 0-10 (see RatingScaleChoices).
+FIVE_POINT_RATING_SCALE = 5
+MAX_INTERNAL_RATING_SCORE = 10
+
+
+def season_enabled_default():
+    """Watchmask hides the standalone TV seasons section for new users."""
+    from django.conf import settings
+
+    return MediaTypes.SEASON.value not in settings.WATCHMASK_HIDDEN_MEDIA_TYPES
+
+
+def boardgame_enabled_default():
+    """Watchmask hides board games for new users."""
+    from django.conf import settings
+
+    return MediaTypes.BOARDGAME.value not in settings.WATCHMASK_HIDDEN_MEDIA_TYPES
 
 
 def generate_token():
@@ -31,46 +80,88 @@ def generate_token():
     return secrets.token_urlsafe(24)
 
 
+class FloppyUserManager(DjangoUserManager):
+    """User manager with an explicit helper for disposable test accounts."""
+
+    def create_test_user(self, username, email=None, password=None, **extra_fields):
+        """Create a user that is excluded from normal user pickers."""
+        extra_fields["is_test_account"] = True
+        return self.create_user(
+            username=username,
+            email=email,
+            password=password,
+            **extra_fields,
+        )
+
+
 class HomeSortChoices(models.TextChoices):
     """Choices for home page sort options."""
 
-    UPCOMING = "upcoming", "Upcoming"
-    RECENT = "recent", "Recent"
-    COMPLETION = "completion", "Completion"
-    EPISODES_LEFT = "episodes_left", "Episodes Left"
-    TITLE = "title", "Title"
+    UPCOMING = "upcoming", _("Upcoming")
+    RECENT = "recent", _("Recent")
+    COMPLETION = "completion", _("Completion")
+    EPISODES_LEFT = "episodes_left", _("Episodes Left")
+    TITLE = "title", _("Title")
+    RANDOM = "random", _("Random")
 
 
 class MediaSortChoices(models.TextChoices):
     """Choices for media list sort options."""
 
-    SCORE = "score", "Rating"
-    CRITIC_RATING = "critic_rating", "Critic Rating"
-    TITLE = "title", "Title"
-    AUTHOR = "author", "Author"
-    POPULARITY = "popularity", "Popularity"
-    PROGRESS = "progress", "Progress"
-    RUNTIME = "runtime", "Runtime"
-    TIME_TO_BEAT = "time_to_beat", "Time to Beat"
-    PLAYS = "plays", "Plays"
-    TIME_WATCHED = "time_watched", "Time Watched"
-    RELEASE_DATE = "release_date", "Release Date"
-    DATE_ADDED = "date_added", "Date Added"
-    START_DATE = "start_date", "Start Date"
-    END_DATE = "end_date", "Last Watched"
-    NEXT_EPISODE_AIR_DATE = "next_episode_air_date", "Episode Air Date"
-    TIME_LEFT = "time_left", "Time Left"
+    SCORE = "score", _("Rating")
+    CRITIC_RATING = "critic_rating", _("Critic Rating")
+    TITLE = "title", _("Title")
+    AUTHOR = "author", _("Author")
+    POPULARITY = "popularity", _("Popularity")
+    PROGRESS = "progress", _("Progress")
+    RUNTIME = "runtime", _("Runtime")
+    TIME_TO_BEAT = "time_to_beat", _("Time to Beat")
+    PLATFORM = "platform", _("Platform")
+    PLAYS = "plays", _("Plays")
+    TIME_WATCHED = "time_watched", _("Time Watched")
+    RELEASE_DATE = "release_date", _("Release Date")
+    DATE_ADDED = "date_added", _("Date Added")
+    START_DATE = "start_date", _("Start Date")
+    END_DATE = "end_date", _("Last Watched")
+    NEXT_EPISODE_AIR_DATE = "next_episode_air_date", _("Episode Air Date")
+    TIME_LEFT = "time_left", _("Time Left")
 
 
 GAME_LIKE_MEDIA_TYPES = {MediaTypes.GAME.value, MediaTypes.BOARDGAME.value}
+READING_MEDIA_TYPES = {
+    MediaTypes.BOOK.value,
+    MediaTypes.COMIC.value,
+    MediaTypes.MANGA.value,
+}
+LISTENING_MEDIA_TYPES = {MediaTypes.MUSIC.value, MediaTypes.PODCAST.value}
 
 
 def relabel_end_date_sort_choice(media_type, choices):
-    """Swap the END_DATE sort choice label to 'Last Played' for game-like media types."""
-    if media_type not in GAME_LIKE_MEDIA_TYPES:
+    """Use media-type-appropriate wording for the END_DATE sort choice."""
+    end_date_label = None
+    if media_type in GAME_LIKE_MEDIA_TYPES:
+        end_date_label = _("Last Played")
+    elif media_type in READING_MEDIA_TYPES:
+        end_date_label = _("Last Read")
+    elif media_type in LISTENING_MEDIA_TYPES:
+        end_date_label = _("Last Listened")
+
+    if end_date_label is None:
         return choices
     return [
-        (value, "Last Played") if value == MediaSortChoices.END_DATE else (value, label)
+        (value, end_date_label)
+        if value == MediaSortChoices.END_DATE
+        else (value, label)
+        for value, label in choices
+    ]
+
+
+def relabel_author_sort_choice(media_type, choices):
+    """Call a video's author sort Channel, since its channel is stored as the author."""
+    if media_type != MediaTypes.VIDEO.value:
+        return choices
+    return [
+        (value, _("Channel")) if value == MediaSortChoices.AUTHOR else (value, label)
         for value, label in choices
     ]
 
@@ -78,230 +169,325 @@ def relabel_end_date_sort_choice(media_type, choices):
 class MediaStatusChoices(models.TextChoices):
     """Choices for media list status options."""
 
-    ALL = "All", "All"
-    COMPLETED = Status.COMPLETED.value, Status.COMPLETED.label
-    IN_PROGRESS = Status.IN_PROGRESS.value, Status.IN_PROGRESS.label
-    PLANNING = Status.PLANNING.value, Status.PLANNING.label
-    PAUSED = Status.PAUSED.value, Status.PAUSED.label
-    DROPPED = Status.DROPPED.value, Status.DROPPED.label
+    ALL = "All", _("All")
+    COMPLETED = Status.COMPLETED.value, _("Completed")
+    IN_PROGRESS = Status.IN_PROGRESS.value, _("In Progress")
+    PLANNING = Status.PLANNING.value, _("Planning")
+    PAUSED = Status.PAUSED.value, _("Paused")
+    DROPPED = Status.DROPPED.value, _("Dropped")
 
 
 class DirectionChoices(models.TextChoices):
     """Choices for sort direction options."""
 
-    ASC = "asc", "Ascending"
-    DESC = "desc", "Descending"
+    ASC = "asc", _("Ascending")
+    DESC = "desc", _("Descending")
 
 
 class LayoutChoices(models.TextChoices):
     """Choices for media list layout options."""
 
-    GRID = "grid", "Grid"
-    TABLE = "table", "Table"
+    GRID = "grid", _("Grid")
+    TABLE = "table", _("Table")
+
+
+class ListDetailLayoutChoices(models.TextChoices):
+    """Choices for the list page layout: the media list layouts plus Tiers."""
+
+    GRID = "grid", _("Grid")
+    TABLE = "table", _("Table")
+    TIERS = "tiers", _("Tiers")
 
 
 class CalendarLayoutChoices(models.TextChoices):
     """Choices for calendar layout options."""
 
-    GRID = "grid", "Grid"
-    LIST = "list", "List"
+    GRID = "grid", _("Grid")
+    LIST = "list", _("List")
 
 
 class ListSortChoices(models.TextChoices):
     """Choices for list sort options."""
 
-    LAST_ITEM_ADDED = "last_item_added", "Last Item Added"
-    LAST_WATCHED = "last_watched", "Last Watched"
-    NAME = "name", "Name"
-    ITEMS_COUNT = "items_count", "Items Count"
-    NEWEST_FIRST = "newest_first", "Newest First"
+    LAST_ITEM_ADDED = "last_item_added", _("Last Item Added")
+    LAST_WATCHED = "last_watched", _("Last Watched")
+    NAME = "name", _("Name")
+    ITEMS_COUNT = "items_count", _("Items Count")
+    NEWEST_FIRST = "newest_first", _("Newest First")
 
 
 class ListDetailSortChoices(models.TextChoices):
     """Choices for list detail sort options."""
 
-    DATE_ADDED = "date_added", "Date Added"
-    CUSTOM = "custom", "Custom"
-    TITLE = "title", "Title"
-    MEDIA_TYPE = "media_type", "Media Type"
-    RATING = "rating", "Rating"
-    PROGRESS = "progress", "Progress"
-    RELEASE_DATE = "release_date", "Release Date"
-    START_DATE = "start_date", "Start Date"
-    END_DATE = "end_date", "End Date"
+    DATE_ADDED = "date_added", _("Date Added")
+    CUSTOM = "custom", _("Custom")
+    TITLE = "title", _("Title")
+    MEDIA_TYPE = "media_type", _("Media Type")
+    RATING = "rating", _("Rating")
+    PROGRESS = "progress", _("Progress")
+    STATUS = "status", _("Status")
+    RELEASE_DATE = "release_date", _("Release Date")
+    START_DATE = "start_date", _("Start Date")
+    END_DATE = "end_date", _("End Date")
+    PLATFORM = "platform", _("Platform")
+    TIER = "tier", _("Tier")
 
 
 class DateFormatChoices(models.TextChoices):
     """Choices for date format preferences."""
 
-    SYSTEM_DEFAULT = "system_default", "System default (locale)"
-    ISO_8601 = "iso_8601", "ISO 8601"
-    MONTH_D_YYYY = "month_d_yyyy", "Month D, YYYY"
-    D_MON_YYYY = "d_mon_yyyy", "D Mon YYYY"
-    M_D_YYYY = "m_d_yyyy", "M/D/YYYY"
-    D_M_YYYY = "d_m_yyyy", "D/M/YYYY"
-    DD_MM_YYYY = "dd_mm_yyyy", "DD.MM.YYYY"
-    YYYY_MM_DD = "yyyy_mm_dd", "YYYY/MM/DD"
-    LONG_EU = "long_eu", "18 Jan, 2026"
+    SYSTEM_DEFAULT = "system_default", _("System default")
+    ISO_8601 = "iso_8601", _("ISO 8601")
+    MONTH_D_YYYY = "month_d_yyyy", _("Month D, YYYY")
+    D_MON_YYYY = "d_mon_yyyy", _("D Mon YYYY")
+    M_D_YYYY = "m_d_yyyy", _("M/D/YYYY")
+    D_M_YYYY = "d_m_yyyy", _("D/M/YYYY")
+    DD_MM_YYYY = "dd_mm_yyyy", _("DD.MM.YYYY")
+    YYYY_MM_DD = "yyyy_mm_dd", _("YYYY/MM/DD")
+    LONG_EU = "long_eu", _("18 Jan, 2026")
+
+
+class ThemeChoices(models.TextChoices):
+    """Choices for UI theme preference."""
+
+    SYSTEM = "system", _("System default")
+    LIGHT = "light", _("Light")
+    DARK = "dark", _("Dark")
+    CATPPUCCIN_MOCHA = "catppuccin_mocha", _("Catppuccin Mocha")
+    DRACULA = "dracula", _("Dracula")
+    NORD = "nord", _("Nord")
+    GRUVBOX = "gruvbox", _("Gruvbox")
+    OLED = "oled", _("OLED")
+    GLASS = "glass", _("Glass cinema")
+    PLEX = "plex", _("Plex inspired")
+    PROJECTOR = "projector", _("Projector")
+    VIDEO_STORE = "video_store", _("Video store")
+    CUSTOM = "custom", _("Custom palette")
+
+
+class UiLanguageChoices(models.TextChoices):
+    """Choices for UI display language preference."""
+
+    AUTO = "auto", _("Auto (browser language)")
+    EN = "en", "English"
+    DE = "de", "Deutsch"
+    ES = "es", "Español"
+    FR = "fr", "Français"
+    IT = "it", "Italiano"
+
+
+class LogoStyleChoices(models.TextChoices):
+    """Choices for the Floppy logo style preference."""
+
+    COLORFUL = "colorful", _("Original color")
+    MONOCHROME = "monochrome", _("Monochrome")
+    TEXT = "text", _("Text")
+    CUSTOM = "custom", _("Custom image")
+    HIDDEN = "hidden", _("Hidden")
+
+
+class LogoTextFontChoices(models.TextChoices):
+    """Safe local font stacks available to text wordmarks."""
+
+    DISPLAY = "display", _("Watchmask display")
+    SANS = "sans", _("Clean sans")
+    SERIF = "serif", _("Editorial serif")
+    MONO = "mono", _("Technical mono")
+
+
+class LogoTextWeightChoices(models.IntegerChoices):
+    """Font weights available to text wordmarks."""
+
+    REGULAR = 400, _("Regular")
+    MEDIUM = 500, _("Medium")
+    SEMIBOLD = 600, _("Semibold")
+    BOLD = 700, _("Bold")
+    EXTRABOLD = 800, _("Extra bold")
+    BLACK = 900, _("Black")
+
+
+LOGO_TEXT_SIZES = tuple(range(16, 41))
+LOGO_TEXT_SPACINGS = tuple(range(-2, 7))
 
 
 class TimeFormatChoices(models.TextChoices):
     """Choices for time format preferences."""
 
-    SYSTEM_DEFAULT = "system_default", "System default (locale)"
-    H_MM_AMPM = "h_mm_ampm", "12-hour (h:mm AM/PM)"
-    HH_MM_AMPM = "hh_mm_ampm", "12-hour, leading zero (hh:mm AM/PM)"
-    HH_MM = "hh_mm", "24-hour (HH:mm)"
-    HH_MM_SS = "hh_mm_ss", "24-hour with seconds (HH:mm:ss)"
+    SYSTEM_DEFAULT = "system_default", _("System default")
+    H_MM_AMPM = "h_mm_ampm", _("12-hour (h:mm AM/PM)")
+    HH_MM_AMPM = "hh_mm_ampm", _("12-hour, leading zero (hh:mm AM/PM)")
+    HH_MM = "hh_mm", _("24-hour (HH:mm)")
+    HH_MM_SS = "hh_mm_ss", _("24-hour with seconds (HH:mm:ss)")
 
 
 class WeekStartDayChoices(models.TextChoices):
     """Choices for week start day preference."""
 
-    MONDAY = "monday", "Monday"
-    SUNDAY = "sunday", "Sunday"
+    MONDAY = "monday", _("Monday")
+    SUNDAY = "sunday", _("Sunday")
 
 
 class RatingScaleChoices(models.TextChoices):
     """Choices for rating scale preferences."""
 
-    TEN = "10", "1-10 stars"
-    FIVE = "5", "1-5 stars"
+    TEN = "10", _("1-10 stars")
+    FIVE = "5", _("1-5 stars")
+    DISABLED = "0", _("Disabled")
 
 
 class ActivityHistoryViewChoices(models.TextChoices):
     """Choices for which activity history view to show on the statistics page."""
 
-    HEATMAP = "heatmap", "Activity Heatmap"
-    STACKED = "stacked", "Stacked Bar Chart"
+    HEATMAP = "heatmap", _("Activity Heatmap")
+    STACKED = "stacked", _("Stacked Bar Chart")
 
 
 class DurationFormatChoices(models.TextChoices):
     """Choices for how long durations are displayed."""
 
-    HOURS_MINUTES = "hours_minutes", "Hours and minutes (500h 30min)"
-    LONG_UNITS = "long_units", "Days and hours (20d 20h 30min)"
+    HOURS_MINUTES = "hours_minutes", _("Hours and minutes (500h 30min)")
+    LONG_UNITS = "long_units", _("Days and hours (20d 20h 30min)")
 
 
 class StatisticsRangeChoices(models.TextChoices):
     """Choices for predefined statistics date ranges."""
 
-    TODAY = "Today", "Today"
-    YESTERDAY = "Yesterday", "Yesterday"
-    THIS_WEEK = "This Week", "This Week"
-    LAST_7_DAYS = "Last 7 Days", "Last 7 Days"
-    THIS_MONTH = "This Month", "This Month"
-    LAST_30_DAYS = "Last 30 Days", "Last 30 Days"
-    LAST_90_DAYS = "Last 90 Days", "Last 90 Days"
-    THIS_YEAR = "This Year", "This Year"
-    LAST_6_MONTHS = "Last 6 Months", "Last 6 Months"
-    LAST_12_MONTHS = "Last 12 Months", "Last 12 Months"
-    ALL_TIME = "All Time", "All Time"
+    TODAY = "Today", _("Today")
+    YESTERDAY = "Yesterday", _("Yesterday")
+    THIS_WEEK = "This Week", _("This Week")
+    LAST_7_DAYS = "Last 7 Days", _("Last 7 Days")
+    THIS_MONTH = "This Month", _("This Month")
+    LAST_30_DAYS = "Last 30 Days", _("Last 30 Days")
+    LAST_90_DAYS = "Last 90 Days", _("Last 90 Days")
+    THIS_YEAR = "This Year", _("This Year")
+    LAST_6_MONTHS = "Last 6 Months", _("Last 6 Months")
+    LAST_12_MONTHS = "Last 12 Months", _("Last 12 Months")
+    ALL_TIME = "All Time", _("All Time")
 
 
 class ImportFrequencyChoices(models.TextChoices):
-    ONCE     = "once",  "One Time Import"
-    DAILY    = "daily", "Every Day"
-    TWO_DAYS = "2days", "Every 2 Days"
+    """Import frequency choices."""
+
+    ONCE = "once", _("One Time Import")
+    DAILY = "daily", _("Every Day")
+    TWO_DAYS = "2days", _("Every 2 Days")
 
 
 class ImportModeChoices(models.TextChoices):
-    NEW               = "new",               "Only Sync New Items"
-    OVERWRITE         = "overwrite",         "Sync New Items and Overwrite Existing"
-    WATCHLIST         = "watchlist",         "Import Watchlist Data Only"
-    UPDATE_COLLECTION = "update_collection", "Update Collection Metadata Only"
+    """Import mode choices."""
+
+    NEW = "new", _("Only Sync New Items")
+    OVERWRITE = "overwrite", _("Sync New Items and Overwrite Existing")
+    WATCHLIST = "watchlist", _("Import Watchlist Data Only")
+    UPDATE_COLLECTION = "update_collection", _("Update Collection Metadata Only")
+
+
+class OnboardingStatusChoices(models.TextChoices):
+    """Progress state for the first-run setup wizard."""
+
+    NOT_STARTED = "not_started", _("Not Started")
+    IN_PROGRESS = "in_progress", _("In Progress")
+    COMPLETED = "completed", _("Completed")
+
+
+class OnboardingStepChoices(models.TextChoices):
+    """Step to resume the first-run setup wizard on."""
+
+    MEDIA_TYPES = "media_types", _("Choose Media Types")
+    METADATA = "metadata", _("Add Metadata Keys")
+    SERVICES = "services", _("Choose Services")
+    SERVICES_SUMMARY = "services_summary", _("Review Services")
+    SERVICE_SETUP = "service_setup", _("Connect Services")
+    IMPORT_STATUS = "import_status", _("Import Status")
+    INTEGRATION_SETUP = "integration_setup", _("Set Up Scrobbling")
+    DONE = "done", _("Done")
 
 
 class TopTalentSortChoices(models.TextChoices):
     """Choices for sorting top cast/crew/studio cards on statistics."""
 
-    PLAYS = "plays", "Plays"
-    TIME = "time", "Time"
-    TITLES = "titles", "Titles"
+    PLAYS = "plays", _("Plays")
+    TIME = "time", _("Time")
+    TITLES = "titles", _("Titles")
 
 
 class GenreSortChoices(models.TextChoices):
     """Choices for sorting the Taste Signals Top Genres panel on statistics."""
 
-    TIME = "time", "Time"
-    PLAYS = "plays", "Plays"
+    TIME = "time", _("Time")
+    PLAYS = "plays", _("Plays")
 
 
 class StatisticsCompareChoices(models.TextChoices):
     """Choices for the default comparison mode on the statistics page."""
 
-    PREVIOUS_PERIOD = "previous_period", "Previous period"
-    LAST_YEAR = "last_year", "Last year"
-    NONE = "none", "No comparison"
+    PREVIOUS_PERIOD = "previous_period", _("Previous period")
+    LAST_YEAR = "last_year", _("Last year")
+    NONE = "none", _("No comparison")
 
 
 class GameLoggingStyleChoices(models.TextChoices):
     """Choices for how game history entries are displayed."""
 
-    SESSIONS = "sessions", "Sessions"
-    REPEATS = "repeats", "Repeats"
+    SESSIONS = "sessions", _("Sessions")
+    REPEATS = "repeats", _("Repeats")
 
 
 class MobileGridLayoutChoices(models.TextChoices):
     """Choices for mobile grid layout preference."""
 
-    COMFORTABLE = "comfortable", "Comfortable (2 columns)"
-    COMPACT = "compact", "Compact (3 columns)"
+    COMFORTABLE = "comfortable", _("Comfortable (2 columns)")
+    COMPACT = "compact", _("Compact (3 columns)")
 
 
 class QuickSeasonUpdateChoices(models.TextChoices):
     """Controls quick season update buttons and the next-episode pill on home cards."""
 
-    NONE = "none", "None"
-    SEASON_UPDATE = "season_update", "Quick Season Update buttons only"
-    NEXT_EPISODE = "next_episode", "Next Episode button only"
-    BOTH = "both", "Both"
-
-
-class MediaCardSubtitleDisplayChoices(models.TextChoices):
-    """Choices for media card subtitle visibility."""
-
-    HOVER = "hover", "On hover"
-    ALWAYS = "always", "Always visible"
+    NONE = "none", _("None")
+    SEASON_UPDATE = "season_update", _("Quick Season Update buttons only")
+    NEXT_EPISODE = "next_episode", _("Next Episode button only")
+    BOTH = "both", _("Both")
 
 
 class TitleDisplayPreferenceChoices(models.TextChoices):
     """Choices for how item titles are displayed across the app."""
 
-    LOCALIZED = "localized", "Show Localized Titles"
-    ORIGINAL = "original", "Show Original Titles"
-    AUTO = "auto", "Auto (if available)"
+    LOCALIZED = "localized", _("Show Localized Titles")
+    ORIGINAL = "original", _("Show Original Titles")
+    AUTO = "auto", _("Auto (if available)")
 
 
 class PlannedHomeDisplayChoices(models.TextChoices):
     """Choices for how planned items are displayed on home page."""
 
-    DISABLED = "disabled", "Disabled"
-    COMBINED = "combined", "Combined"
-    SEPARATED = "separated", "Separated"
+    DISABLED = "disabled", _("Disabled")
+    COMBINED = "combined", _("Combined")
+    SEPARATED = "separated", _("Separated")
 
 
 class HomeScreenRowTypeChoices(models.TextChoices):
     """Supported row sources for the configurable home screen."""
 
-    LIBRARY_QUERY = "library_query", "Library Row"
-    CUSTOM_LIST = "custom_list", "List / Smart List"
-    RECENTLY_UNRATED = "recently_unrated", "Recently Played - Not Rated"
+    UP_NEXT = "up_next", _("Up Next")
+    LIBRARY_QUERY = "library_query", _("Library Row")
+    CUSTOM_LIST = "custom_list", _("List / Smart List")
+    RECENTLY_UNRATED = "recently_unrated", _("Recently Played - Not Rated")
 
 
+# kept: unrenamed model field/class names and help_text below (avoids a migration; see plan)
 class JellyseerrDefaultAddedStatusChoices(models.TextChoices):
     """Choices for status applied to media added via Jellyseerr webhook."""
 
-    PLANNING = Status.PLANNING.value, Status.PLANNING.label
-    IN_PROGRESS = Status.IN_PROGRESS.value, Status.IN_PROGRESS.label
+    PLANNING = Status.PLANNING.value, _("Planning")
+    IN_PROGRESS = Status.IN_PROGRESS.value, _("In Progress")
 
 
 class QuickWatchDateChoices(models.TextChoices):
     """Choices for quick watch date behavior when bulk-marking media as completed."""
 
-    CURRENT_DATE = "current_date", "Current Date"
-    RELEASE_DATE = "release_date", "Release Date"
-    NO_DATE = "no_date", "No Date"
+    CURRENT_DATE = "current_date", _("Current Date")
+    RELEASE_DATE = "release_date", _("Release Date")
+    NO_DATE = "no_date", _("No Date")
 
 
 class MetadataSourceDefaultChoices(models.TextChoices):
@@ -310,35 +496,47 @@ class MetadataSourceDefaultChoices(models.TextChoices):
     TMDB = Sources.TMDB.value, Sources.TMDB.label
     TVDB = Sources.TVDB.value, Sources.TVDB.label
     MAL = Sources.MAL.value, Sources.MAL.label
+    HARDCOVER = Sources.HARDCOVER.value, Sources.HARDCOVER.label
+    OPENLIBRARY = Sources.OPENLIBRARY.value, Sources.OPENLIBRARY.label
+    GOOGLEBOOKS = Sources.GOOGLEBOOKS.value, Sources.GOOGLEBOOKS.label
+    COMICVINE = Sources.COMICVINE.value, Sources.COMICVINE.label
+    GCD = Sources.GCD.value, Sources.GCD.label
 
 
 class AnimeLibraryModeChoices(models.TextChoices):
     """Choices for where grouped anime should surface in the UI."""
 
-    ANIME = MediaTypes.ANIME.value, "Anime Library"
-    TV = MediaTypes.TV.value, "TV Library"
-    BOTH = "both", "Both Libraries"
+    ANIME = MediaTypes.ANIME.value, _("Anime Library")
+    TV = MediaTypes.TV.value, _("TV Library")
+    BOTH = "both", _("Both Libraries")
 
 
 class SessionDurationChoices(models.IntegerChoices):
     """Choices for how long a login session persists."""
 
-    ONE_DAY = 86400, "1 day"
-    ONE_WEEK = 604800, "1 week"
-    TWO_WEEKS = 1209600, "2 weeks"
-    ONE_MONTH = 2592000, "30 days"
-    THREE_MONTHS = 7776000, "90 days"
+    ONE_DAY = 86400, _("1 day")
+    ONE_WEEK = 604800, _("1 week")
+    TWO_WEEKS = 1209600, _("2 weeks")
+    ONE_MONTH = 2592000, _("30 days")
+    THREE_MONTHS = 7776000, _("90 days")
 
 
 class User(AbstractUser):
     """Custom user model."""
 
     is_demo = models.BooleanField(default=False)
+    is_test_account = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Exclude this account from normal user pickers and sharing controls.",
+    )
+
+    objects = FloppyUserManager()
 
     last_search_type = models.CharField(
         max_length=10,
         default=MediaTypes.TV.value,
-        choices=MediaTypes.choices,
+        choices=[*MediaTypes.choices, (ALL_SEARCH_TYPE, "All")],
     )
 
     last_discover_type = models.CharField(
@@ -371,13 +569,13 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     tv_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
     )
 
     # Media type preferences: TV Seasons
-    season_enabled = models.BooleanField(default=True)
+    season_enabled = models.BooleanField(default=season_enabled_default)
     season_layout = models.CharField(
         max_length=20,
         default=LayoutChoices.GRID,
@@ -394,7 +592,7 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     season_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
     )
@@ -417,9 +615,13 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     movie_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
+    )
+    movie_show_each_play = models.BooleanField(
+        default=False,
+        help_text="Show each play/entry as its own row instead of aggregating duplicates",
     )
 
     # Media type preferences: Anime
@@ -440,9 +642,13 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     anime_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
+    )
+    anime_show_each_play = models.BooleanField(
+        default=False,
+        help_text="Show each play/entry as its own row instead of aggregating duplicates",
     )
 
     # Media type preferences: Manga
@@ -463,9 +669,13 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     manga_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
+    )
+    manga_show_each_play = models.BooleanField(
+        default=False,
+        help_text="Show each play/entry as its own row instead of aggregating duplicates",
     )
 
     # Media type preferences: Games
@@ -486,13 +696,17 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     game_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
     )
+    game_show_each_play = models.BooleanField(
+        default=False,
+        help_text="Show each play/entry as its own row instead of aggregating duplicates",
+    )
 
     # Media type preferences: Board Games
-    boardgame_enabled = models.BooleanField(default=True)
+    boardgame_enabled = models.BooleanField(default=boardgame_enabled_default)
     boardgame_layout = models.CharField(
         max_length=20,
         default=LayoutChoices.GRID,
@@ -509,7 +723,7 @@ class User(AbstractUser):
         choices=MediaSortChoices.choices,
     )
     boardgame_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices.choices,
     )
@@ -532,9 +746,13 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     book_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
+    )
+    book_show_each_play = models.BooleanField(
+        default=False,
+        help_text="Show each play/entry as its own row instead of aggregating duplicates",
     )
 
     # Media type preferences: Comics
@@ -555,7 +773,7 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     comic_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
     )
@@ -578,7 +796,7 @@ class User(AbstractUser):
         choices=MediaSortChoices,
     )
     music_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices.choices,
     )
@@ -601,7 +819,30 @@ class User(AbstractUser):
         choices=MediaSortChoices.choices,
     )
     podcast_status = models.CharField(
+        max_length=128,
+        default=MediaStatusChoices.ALL,
+        choices=MediaStatusChoices,
+    )
+
+    # Video preferences
+    video_enabled = models.BooleanField(default=True)
+    video_layout = models.CharField(
         max_length=20,
+        default=LayoutChoices.GRID,
+        choices=LayoutChoices.choices,
+    )
+    video_direction = models.CharField(
+        max_length=4,
+        default=DirectionChoices.DESC,
+        choices=DirectionChoices.choices,
+    )
+    video_sort = models.CharField(
+        max_length=32,
+        default=MediaSortChoices.TITLE,
+        choices=MediaSortChoices.choices,
+    )
+    video_status = models.CharField(
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
     )
@@ -610,12 +851,6 @@ class User(AbstractUser):
     clickable_media_cards = models.BooleanField(
         default=False,
         help_text="Hide hover overlay on touch devices",
-    )
-    media_card_subtitle_display = models.CharField(
-        max_length=20,
-        default=MediaCardSubtitleDisplayChoices.HOVER,
-        choices=MediaCardSubtitleDisplayChoices.choices,
-        help_text="Control when media card subtitles are visible",
     )
     title_display_preference = models.CharField(
         max_length=20,
@@ -639,17 +874,17 @@ class User(AbstractUser):
     )
 
     # Progress visibility preferences
-    progress_bar = models.BooleanField(
-        default=True,
-        help_text="Show progress bar",
-    )
     hide_completed_recommendations = models.BooleanField(
         default=False,
         help_text="Hide completed media in recommendations",
     )
-    hide_zero_rating = models.BooleanField(
-        default=False,
-        help_text="Hide zero ratings from media cards",
+    show_recommendations = models.BooleanField(
+        default=True,
+        help_text="Show recommendations on media detail pages",
+    )
+    show_discover = models.BooleanField(
+        default=True,
+        help_text="Show the Discover page and keep its caches warm",
     )
     obfuscate_episodes = models.BooleanField(
         default=False,
@@ -662,22 +897,54 @@ class User(AbstractUser):
         default="UNSET",
         help_text="Region to show watch providers for",
     )
+    metadata_language = models.CharField(
+        max_length=10,
+        default="",
+        blank=True,
+        help_text=(
+            "Preferred language for TV/movie metadata and cover art. "
+            "Falls back to the server default when unset."
+        ),
+    )
     tv_metadata_source_default = models.CharField(
         max_length=20,
         default=MetadataSourceDefaultChoices.TMDB,
         choices=[
-            (MetadataSourceDefaultChoices.TMDB, MetadataSourceDefaultChoices.TMDB.label),
-            (MetadataSourceDefaultChoices.TVDB, MetadataSourceDefaultChoices.TVDB.label),
+            (
+                MetadataSourceDefaultChoices.TMDB,
+                MetadataSourceDefaultChoices.TMDB.label,
+            ),
+            (
+                MetadataSourceDefaultChoices.TVDB,
+                MetadataSourceDefaultChoices.TVDB.label,
+            ),
         ],
         help_text="Default metadata provider for TV details and search tabs.",
     )
+    tv_auto_move_to_default_provider = models.BooleanField(
+        default=True,
+        help_text=(
+            "Let the nightly job move TV shows tracked on the other provider to "
+            "the default provider. Turned off when the user chooses to leave "
+            "their library as it is after switching providers."
+        ),
+    )
     anime_metadata_source_default = models.CharField(
         max_length=20,
-        default=MetadataSourceDefaultChoices.MAL,
+        # TMDB by default so the Anime library gets real season/episode trees,
+        # matching how TV Shows behaves. MAL stays available for users who
+        # prefer its per-cour entries. Existing users keep their stored value.
+        default=MetadataSourceDefaultChoices.TMDB,
         choices=[
             (MetadataSourceDefaultChoices.MAL, MetadataSourceDefaultChoices.MAL.label),
-            (MetadataSourceDefaultChoices.TMDB, MetadataSourceDefaultChoices.TMDB.label),
-            (MetadataSourceDefaultChoices.TVDB, MetadataSourceDefaultChoices.TVDB.label),
+            (
+                MetadataSourceDefaultChoices.TMDB,
+                MetadataSourceDefaultChoices.TMDB.label,
+            ),
+            (
+                MetadataSourceDefaultChoices.TVDB,
+                MetadataSourceDefaultChoices.TVDB.label,
+            ),
         ],
         help_text="Default metadata provider for Anime details and search tabs.",
     )
@@ -686,6 +953,40 @@ class User(AbstractUser):
         default=AnimeLibraryModeChoices.ANIME,
         choices=AnimeLibraryModeChoices.choices,
         help_text="Where grouped anime entries should surface in the UI.",
+    )
+    book_metadata_source_default = models.CharField(
+        max_length=20,
+        default=MetadataSourceDefaultChoices.HARDCOVER,
+        choices=[
+            (
+                MetadataSourceDefaultChoices.HARDCOVER,
+                MetadataSourceDefaultChoices.HARDCOVER.label,
+            ),
+            (
+                MetadataSourceDefaultChoices.OPENLIBRARY,
+                MetadataSourceDefaultChoices.OPENLIBRARY.label,
+            ),
+            (
+                MetadataSourceDefaultChoices.GOOGLEBOOKS,
+                MetadataSourceDefaultChoices.GOOGLEBOOKS.label,
+            ),
+        ],
+        help_text="Default metadata provider for Book details and search tabs.",
+    )
+    comic_metadata_source_default = models.CharField(
+        max_length=20,
+        default=MetadataSourceDefaultChoices.COMICVINE,
+        choices=[
+            (
+                MetadataSourceDefaultChoices.COMICVINE,
+                MetadataSourceDefaultChoices.COMICVINE.label,
+            ),
+            (
+                MetadataSourceDefaultChoices.GCD,
+                MetadataSourceDefaultChoices.GCD.label,
+            ),
+        ],
+        help_text="Default metadata provider for Comic details and search tabs.",
     )
     stats_split_tv_anime = models.BooleanField(
         default=False,
@@ -716,9 +1017,14 @@ class User(AbstractUser):
         choices=ListDetailSortChoices,
     )
     list_detail_status = models.CharField(
-        max_length=20,
+        max_length=128,
         default=MediaStatusChoices.ALL,
         choices=MediaStatusChoices,
+    )
+    list_detail_layout = models.CharField(
+        max_length=20,
+        default=ListDetailLayoutChoices.GRID,
+        choices=ListDetailLayoutChoices,
     )
 
     # Notification settings
@@ -739,6 +1045,10 @@ class User(AbstractUser):
     daily_digest_enabled = models.BooleanField(
         default=True,
         help_text="Receive a daily digest of upcoming releases",
+    )
+    premiere_notifications_enabled = models.BooleanField(
+        default=True,
+        help_text="Receive a weekly digest of new show and season premieres",
     )
 
     # Account recovery and authenticator settings
@@ -798,6 +1108,45 @@ class User(AbstractUser):
         null=True,
         help_text="When the API token was regenerated (update webhook URLs)",
     )
+    playback_webhook_url = models.URLField(
+        blank=True,
+        default="",
+        max_length=500,
+        help_text=(
+            "Outgoing webhook POSTed the live playback state whenever it "
+            "changes. Blank disables it, which is the default."
+        ),
+    )
+    # Stored as Fernet ciphertext, the same way every other credential this
+    # app keeps reaches the database (`tmdb_proxy_url`, provider credentials,
+    # the Trakt refresh token). Never read this attribute directly — go through
+    # `get_playback_webhook_secret` / `set_playback_webhook_secret`. TextField
+    # rather than a bounded CharField because the ciphertext is roughly twice
+    # the plaintext; the input length cap lives with the form and the API.
+    playback_webhook_secret = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "Encrypted shared secret for the playback webhook. When set, each "
+            "request carries an X-Floppy-Signature header holding the "
+            "HMAC-SHA256 of the exact body sent."
+        ),
+    )
+    jellyfin_mark_played_enabled = models.BooleanField(
+        default=False,
+        help_text="Process Jellyfin MarkPlayed webhook events",
+    )
+    jellyfin_mark_unplayed_enabled = models.BooleanField(
+        default=False,
+        help_text="Process Jellyfin MarkUnplayed webhook events",
+    )
+    group_scrobbled_anime = models.BooleanField(
+        default=False,
+        help_text=(
+            "Convert a flat MAL anime entry to per-episode tracking when a "
+            "media server reports one of its episodes"
+        ),
+    )
 
     jellyseerr_enabled = models.BooleanField(
         default=False,
@@ -823,17 +1172,125 @@ class User(AbstractUser):
         default=Status.PLANNING.value,
         help_text="Status to set when adding media via Jellyseerr webhook",
     )
-
+    seerr_url = models.URLField(
+        blank=True,
+        help_text="Seerr server URL, used to request movies and shows from Watchmask",
+    )
+    seerr_api_key = models.TextField(
+        blank=True,
+        default="",
+        help_text="Encrypted Seerr API key",
+    )
+    seerr_username = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Seerr login (username or email) the requests are made as",
+    )
+    seerr_user_id = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Seerr user id resolved from seerr_username when settings are saved",
+    )
+    tmdb_proxy_url = models.TextField(
+        blank=True,
+        help_text=(
+            "Encrypted outbound proxy URL for TMDB requests "
+            "(e.g. socks5://user:pass@host:port)"
+        ),
+    )
     date_format = models.CharField(
         max_length=20,
         default=DateFormatChoices.SYSTEM_DEFAULT,
         choices=DateFormatChoices.choices,
     )
 
+    theme = models.CharField(
+        max_length=20,
+        default=ThemeChoices.SYSTEM,
+        choices=ThemeChoices.choices,
+    )
+
+    custom_theme = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Validated custom application color palette",
+    )
+
+    detail_page_layouts = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Visible and ordered sections for each detail page family",
+    )
+
+    card_metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Per-media-type subtitle fields shown under a card title",
+    )
+
+    ui_language = models.CharField(
+        max_length=10,
+        default=UiLanguageChoices.AUTO,
+        choices=UiLanguageChoices.choices,
+        help_text="Preferred UI display language",
+    )
+
+    logo_style = models.CharField(
+        max_length=12,
+        default=LogoStyleChoices.COLORFUL,
+        choices=LogoStyleChoices.choices,
+        help_text="Preferred Watchmask logo style",
+    )
+
+    logo_text = models.CharField(
+        max_length=32,
+        default="Watchmask",
+        help_text="Short navigation wordmark",
+    )
+
+    logo_text_font = models.CharField(
+        max_length=12,
+        default=LogoTextFontChoices.DISPLAY,
+        choices=LogoTextFontChoices.choices,
+        help_text="Font family used by the navigation wordmark",
+    )
+
+    logo_text_size = models.PositiveSmallIntegerField(
+        default=23,
+        choices=[(value, f"{value}px") for value in LOGO_TEXT_SIZES],
+        help_text="Font size used by the navigation wordmark",
+    )
+
+    logo_text_weight = models.PositiveSmallIntegerField(
+        default=LogoTextWeightChoices.EXTRABOLD,
+        choices=LogoTextWeightChoices.choices,
+        help_text="Font weight used by the navigation wordmark",
+    )
+
+    logo_text_spacing = models.SmallIntegerField(
+        default=-1,
+        choices=[(value, f"{value}px") for value in LOGO_TEXT_SPACINGS],
+        help_text="Letter spacing used by the navigation wordmark",
+    )
+
+    custom_logo_data = models.TextField(
+        blank=True,
+        default="",
+        help_text="Normalized custom navigation logo",
+    )
+
     time_format = models.CharField(
         max_length=20,
         default=TimeFormatChoices.SYSTEM_DEFAULT,
         choices=TimeFormatChoices.choices,
+    )
+
+    currency = models.CharField(
+        max_length=4,
+        default=currency.AUTO,
+        choices=[(currency.AUTO, _("Auto (browser region)")), *currency.choices()],
+        help_text="Currency shown next to collection prices; auto follows the browser",
     )
 
     week_start_day = models.CharField(
@@ -855,6 +1312,42 @@ class User(AbstractUser):
         max_length=20,
         default=ImportModeChoices.NEW,
         choices=ImportModeChoices.choices,
+    )
+
+    onboarding_status = models.CharField(
+        max_length=20,
+        default=OnboardingStatusChoices.NOT_STARTED,
+        choices=OnboardingStatusChoices.choices,
+        help_text="Progress state for the first-run setup wizard.",
+    )
+    onboarding_step = models.CharField(
+        max_length=20,
+        default=OnboardingStepChoices.MEDIA_TYPES,
+        choices=OnboardingStepChoices.choices,
+        help_text="Step to resume the first-run setup wizard on.",
+    )
+    onboarding_selected_sources = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Source slugs chosen to connect during the setup wizard.",
+    )
+    onboarding_skipped_sources = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Source slugs explicitly skipped during the setup wizard.",
+    )
+    onboarding_connected_sources = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Source slugs successfully connected during the setup wizard.",
+    )
+    onboarding_skipped_integrations = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Source slugs whose realtime integration (e.g. a webhook) was "
+            "explicitly skipped during the setup wizard."
+        ),
     )
 
     game_logging_style = models.CharField(
@@ -929,10 +1422,34 @@ class User(AbstractUser):
         default=False,
         help_text="Show a media-type header (icon + name) above each group of home screen rows",
     )
+    home_media_type_chips_enabled = models.BooleanField(
+        default=True,
+        help_text="Show media-type labels on mixed in-progress and finished Home rows",
+    )
+    home_media_type_chip_style = models.CharField(
+        max_length=12,
+        default="soft",
+        choices=[
+            ("solid", "Solid"),
+            ("soft", "Soft"),
+            ("outline", "Outline"),
+        ],
+        help_text="Appearance of media-type labels on mixed Home rows",
+    )
+    home_media_type_chip_colors = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Custom hexadecimal label colors keyed by media type",
+    )
     home_screen_media_type_order = models.JSONField(
         default=list,
         blank=True,
         help_text="User's preferred order of media-type sections on the Home screen",
+    )
+    sidebar_media_type_order = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="User's preferred order of media types in the sidebar",
     )
     auto_pause_in_progress_enabled = models.BooleanField(
         default=False,
@@ -947,6 +1464,11 @@ class User(AbstractUser):
         default=dict,
         blank=True,
         help_text="Per-library table column order and hidden keys",
+    )
+    pinned_watch_providers = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Watch-provider names pinned/favorited by the user, promoted out of 'More'",
     )
     book_comic_manga_progress_percentage = models.BooleanField(
         default=False,
@@ -1060,10 +1582,6 @@ class User(AbstractUser):
                 condition=models.Q(boardgame_direction__in=DirectionChoices.values),
             ),
             models.CheckConstraint(
-                name="boardgame_status_valid",
-                condition=models.Q(boardgame_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
                 name="book_sort_valid",
                 condition=models.Q(book_sort__in=MediaSortChoices.values),
             ),
@@ -1100,7 +1618,28 @@ class User(AbstractUser):
             ),
             models.CheckConstraint(
                 name="anime_library_mode_valid",
-                condition=models.Q(anime_library_mode__in=AnimeLibraryModeChoices.values),
+                condition=models.Q(
+                    anime_library_mode__in=AnimeLibraryModeChoices.values
+                ),
+            ),
+            models.CheckConstraint(
+                name="book_metadata_source_default_valid",
+                condition=models.Q(
+                    book_metadata_source_default__in=[
+                        MetadataSourceDefaultChoices.HARDCOVER,
+                        MetadataSourceDefaultChoices.OPENLIBRARY,
+                        MetadataSourceDefaultChoices.GOOGLEBOOKS,
+                    ],
+                ),
+            ),
+            models.CheckConstraint(
+                name="comic_metadata_source_default_valid",
+                condition=models.Q(
+                    comic_metadata_source_default__in=[
+                        MetadataSourceDefaultChoices.COMICVINE,
+                        MetadataSourceDefaultChoices.GCD,
+                    ],
+                ),
             ),
             models.CheckConstraint(
                 name="lists_sort_valid",
@@ -1112,27 +1651,31 @@ class User(AbstractUser):
             ),
             models.CheckConstraint(
                 name="activity_history_view_valid",
-                condition=models.Q(activity_history_view__in=ActivityHistoryViewChoices.values),
+                condition=models.Q(
+                    activity_history_view__in=ActivityHistoryViewChoices.values
+                ),
             ),
             models.CheckConstraint(
                 name="duration_format_valid",
                 condition=models.Q(duration_format__in=DurationFormatChoices.values),
             ),
             models.CheckConstraint(
-                name="media_card_subtitle_display_valid",
-                condition=models.Q(media_card_subtitle_display__in=MediaCardSubtitleDisplayChoices.values),
-            ),
-            models.CheckConstraint(
                 name="title_display_preference_valid",
-                condition=models.Q(title_display_preference__in=TitleDisplayPreferenceChoices.values),
+                condition=models.Q(
+                    title_display_preference__in=TitleDisplayPreferenceChoices.values
+                ),
             ),
             models.CheckConstraint(
                 name="statistics_default_range_valid",
-                condition=models.Q(statistics_default_range__in=StatisticsRangeChoices.values),
+                condition=models.Q(
+                    statistics_default_range__in=StatisticsRangeChoices.values
+                ),
             ),
             models.CheckConstraint(
                 name="statistics_compare_mode_valid",
-                condition=models.Q(statistics_compare_mode__in=StatisticsCompareChoices.values),
+                condition=models.Q(
+                    statistics_compare_mode__in=StatisticsCompareChoices.values
+                ),
             ),
             models.CheckConstraint(
                 name="top_talent_sort_by_valid",
@@ -1151,36 +1694,10 @@ class User(AbstractUser):
                 condition=models.Q(list_detail_sort__in=ListDetailSortChoices.values),
             ),
             models.CheckConstraint(
-                name="list_detail_status_valid",
-                condition=models.Q(list_detail_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
-                name="tv_status_valid",
-                condition=models.Q(tv_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
-                name="season_status_valid",
-                condition=models.Q(season_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
-                name="movie_status_valid",
-                condition=models.Q(movie_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
-                name="anime_status_valid",
-                condition=models.Q(anime_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
-                name="manga_status_valid",
-                condition=models.Q(manga_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
-                name="game_status_valid",
-                condition=models.Q(game_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
-                name="book_status_valid",
-                condition=models.Q(book_status__in=MediaStatusChoices.values),
+                name="list_detail_layout_valid",
+                condition=models.Q(
+                    list_detail_layout__in=ListDetailLayoutChoices.values
+                ),
             ),
             models.CheckConstraint(
                 name="music_layout_valid",
@@ -1195,10 +1712,6 @@ class User(AbstractUser):
                 condition=models.Q(music_direction__in=DirectionChoices.values),
             ),
             models.CheckConstraint(
-                name="music_status_valid",
-                condition=models.Q(music_status__in=MediaStatusChoices.values),
-            ),
-            models.CheckConstraint(
                 name="podcast_layout_valid",
                 condition=models.Q(podcast_layout__in=LayoutChoices.values),
             ),
@@ -1211,8 +1724,16 @@ class User(AbstractUser):
                 condition=models.Q(podcast_direction__in=DirectionChoices.values),
             ),
             models.CheckConstraint(
-                name="podcast_status_valid",
-                condition=models.Q(podcast_status__in=MediaStatusChoices.values),
+                name="video_layout_valid",
+                condition=models.Q(video_layout__in=LayoutChoices.values),
+            ),
+            models.CheckConstraint(
+                name="video_sort_valid",
+                condition=models.Q(video_sort__in=MediaSortChoices.values),
+            ),
+            models.CheckConstraint(
+                name="video_direction_valid",
+                condition=models.Q(video_direction__in=DirectionChoices.values),
             ),
             models.CheckConstraint(
                 name="quick_watch_date_valid",
@@ -1246,6 +1767,19 @@ class User(AbstractUser):
         # Special case for last_search_type
         if field_name == "last_search_type" and new_value not in VALID_SEARCH_TYPES:
             return getattr(self, field_name)
+
+        # Media-type status preferences hold a comma-joined list of statuses
+        # (multi-select filter), so each token is validated individually
+        # instead of the field's own single-choice `choices`.
+        if field_name in MULTI_STATUS_PREFERENCE_FIELDS:
+            tokens = [token for token in str(new_value or "").split(",") if token]
+            if any(token not in MediaStatusChoices.values for token in tokens):
+                return getattr(self, field_name)
+            current_value = getattr(self, field_name)
+            if new_value != current_value:
+                setattr(self, field_name, new_value)
+                self.save(update_fields=[field_name])
+            return new_value
 
         field = self._meta.get_field(field_name)
         # Check if the field has choices
@@ -1293,7 +1827,9 @@ class User(AbstractUser):
                     "hidden": list(hidden),
                 }
         else:
-            if isinstance(existing, dict) and ("order" in existing or "hidden" in existing):
+            if isinstance(existing, dict) and (
+                "order" in existing or "hidden" in existing
+            ):
                 scoped_prefs = {
                     key: value
                     for key, value in existing.items()
@@ -1320,13 +1856,34 @@ class User(AbstractUser):
 
         return prefs[media_type]
 
+    def toggle_pinned_provider(self, provider_name):
+        """Pin or unpin a watch-provider name, returning the updated pinned list."""
+        pinned = list(self.pinned_watch_providers or [])
+        if provider_name in pinned:
+            pinned.remove(provider_name)
+        else:
+            pinned.append(provider_name)
+
+        self.pinned_watch_providers = pinned
+        self.save(update_fields=["pinned_watch_providers"])
+
+        return pinned
+
     @property
     def rating_scale_max(self):
-        """Return the max rating value for the user's configured scale."""
+        """Return the max rating value for the user's configured scale.
+
+        Disabled ratings keep the 10-point maths so stored scores still convert.
+        """
         try:
-            return int(self.rating_scale)
+            return int(self.rating_scale) or 10
         except (TypeError, ValueError):
             return 10
+
+    @property
+    def ratings_enabled(self):
+        """Return whether the user's own rating controls should be shown."""
+        return self.rating_scale != RatingScaleChoices.DISABLED
 
     def _coerce_score_decimal(self, score):
         """Coerce a score into a Decimal, returning None on failure."""
@@ -1344,7 +1901,7 @@ class User(AbstractUser):
         score_decimal = self._coerce_score_decimal(score)
         if score_decimal is None:
             return None
-        if self.rating_scale_max == 5:
+        if self.rating_scale_max == FIVE_POINT_RATING_SCALE:
             score_decimal = score_decimal / Decimal(2)
         return score_decimal.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
 
@@ -1353,12 +1910,12 @@ class User(AbstractUser):
         score_decimal = self._coerce_score_decimal(score)
         if score_decimal is None:
             return None
-        if self.rating_scale_max == 5:
+        if self.rating_scale_max == FIVE_POINT_RATING_SCALE:
             score_decimal = score_decimal * Decimal(2)
         score_decimal = score_decimal.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
         if score_decimal < 0:
             return Decimal(0)
-        if score_decimal > 10:
+        if score_decimal > MAX_INTERNAL_RATING_SCORE:
             return Decimal(10)
         return score_decimal
 
@@ -1405,6 +1962,21 @@ class User(AbstractUser):
 
         return enabled_types
 
+    def get_sidebar_media_types(self):
+        """Return enabled media types in the user's preferred sidebar order."""
+        enabled_types = [
+            media_type
+            for media_type in self.get_enabled_media_types()
+            if media_type != MediaTypes.COMIC_ISSUE.value
+        ]
+        preferred_order = self.sidebar_media_type_order or []
+        ordered = [
+            media_type for media_type in preferred_order if media_type in enabled_types
+        ]
+        return ordered + [
+            media_type for media_type in enabled_types if media_type not in ordered
+        ]
+
     def get_active_media_types(self):
         """Return a list of active media type values based on user preferences."""
         enabled_types = self.get_enabled_media_types()
@@ -1440,43 +2012,101 @@ class User(AbstractUser):
 
         return None
 
+    def task_result_filter(self):
+        """Match TaskResult rows whose kwargs carry this user's id."""
+        return (
+            Q(task_kwargs__contains=f"'user_id': {self.id},")
+            | Q(task_kwargs__contains=f"'user_id': {self.id}" + "}")
+            | Q(task_kwargs__contains=f'"user_id": {self.id},')
+            | Q(task_kwargs__contains=f'"user_id": {self.id}' + "}")
+        )
+
     def get_import_tasks(self):
         """Return import tasks history and schedules for the user."""
         result_task_names = {
-            "trakt": ["Import from Trakt"],
+            "trakt": [
+                "Import from Trakt",
+                "Import Trakt data export",
+                "Import Trakt collection CSV",
+            ],
             "simkl": ["Import from SIMKL"],
             "myanimelist": ["Import from MyAnimeList"],
             "anilist": ["Import from AniList"],
             "kitsu": ["Import from Kitsu"],
+            "mangabaka": ["Import from MangaBaka"],
             "yamtrack": ["Import from Yamtrack"],
             "hltb": ["Import from HowLongToBeat"],
+            "grouvee": ["Import from Grouvee"],
             "steam": ["Import from Steam"],
+            "xbox": ["Import from Xbox", "Import from Xbox (Recurring)"],
+            "psn": ["Import from PSN", "Import from PSN (Recurring)"],
             "imdb": ["Import from IMDB"],
             "goodreads": [
                 "Import from Goodreads",
                 "Import from GoodReads",
                 "integrations.tasks.import_goodreads",
             ],
-            "plex": ["Import from Plex", "Sync Plex Watchlist"],
+            "mdblist": ["Import from MDBList", "Import MDBList Lists"],
+            "plex": [
+                "Import from Plex",
+                "Sync Plex Watchlist",
+                "Sync Plex Watched Marks",
+            ],
+            "jellyfin_playback_reporting": [
+                "Import from Jellyfin Playback Reporting",
+            ],
             "bingebandit": ["Import from BingeBandit"],
             "radarr": ["Import from Radarr", "Import from Radarr (Recurring)"],
             "sonarr": ["Import from Sonarr", "Import from Sonarr (Recurring)"],
-            "audiobookshelf": ["Import from Audiobookshelf", "Import from Audiobookshelf (Recurring)"],
-            "storyteller": ["Import from Storyteller", "Import from Storyteller (Recurring)"],
-            "pocketcasts": ["Import from Pocket Casts", "Import from Pocket Casts (Recurring)"],
+            "mylar": ["Import from Mylar3", "Import from Mylar3 (Recurring)"],
+            "kapowarr": ["Import from Kapowarr", "Import from Kapowarr (Recurring)"],
+            "audiobookshelf": [
+                "Import from Audiobookshelf",
+                "Import from Audiobookshelf (Recurring)",
+            ],
+            "kavita": ["Import from Kavita", "Import from Kavita (Recurring)"],
+            "komga": ["Import from Komga", "Import from Komga (Recurring)"],
+            "storyteller": [
+                "Import from Storyteller",
+                "Import from Storyteller (Recurring)",
+            ],
+            "koreader": ["Import from KOReader"],
+            "pocketcasts": [
+                "Import from Pocket Casts",
+                "Import from Pocket Casts (Recurring)",
+            ],
             "gpodder": ["Import from GPodder", "Import from GPodder (Recurring)"],
+            "stremio": [
+                "Import from Stremio",
+                "Import from Stremio (Recurring)",
+            ],
             "lastfm": ["Import from Last.fm History"],
-            "hardcover": ["Import from Hardcover"],
+            "hardcover": [
+                "Import from Hardcover",
+                "Import from Hardcover Account",
+            ],
+            "storygraph": ["Import from StoryGraph"],
+            "youtube": ["Import from YouTube Takeout"],
+            "koito": ["Import from Koito History"],
         }
         schedule_task_names = {
             **result_task_names,
             "radarr": ["Import from Radarr (Recurring)"],
             "sonarr": ["Import from Sonarr (Recurring)"],
+            "mylar": ["Import from Mylar3 (Recurring)"],
+            "kapowarr": ["Import from Kapowarr (Recurring)"],
             "audiobookshelf": ["Import from Audiobookshelf (Recurring)"],
+            "kavita": ["Import from Kavita (Recurring)"],
+            "komga": ["Import from Komga (Recurring)"],
+            "hardcover": ["Import from Hardcover Account"],
             "storyteller": ["Import from Storyteller (Recurring)"],
             "pocketcasts": ["Import from Pocket Casts (Recurring)"],
             "gpodder": ["Import from GPodder (Recurring)"],
+            "xbox": ["Import from Xbox (Recurring)"],
+            "psn": ["Import from PSN (Recurring)"],
+            "stremio": ["Import from Stremio (Recurring)"],
             "lastfm": ["Poll Last.fm for all users"],
+            "koito": ["Poll Koito for user"],
         }
 
         # Reverse mapping to get source from task name
@@ -1493,26 +2123,26 @@ class User(AbstractUser):
         }
         schedule_import_task_names = list(schedule_task_to_source)
 
-        task_result_filters = (
-            Q(task_kwargs__contains=f"'user_id': {self.id},")
-            | Q(task_kwargs__contains=f"'user_id': {self.id}" + "}")
-            | Q(task_kwargs__contains=f'"user_id": {self.id},')
-            | Q(task_kwargs__contains=f'"user_id": {self.id}' + "}")
-        )
+        task_result_filters = self.task_result_filter()
 
         # Get all task results for this user (last 7 days only).
         # Exclude stale PENDING records (created >30 min ago and never updated)
         # — these represent tasks lost to worker crashes or queue buildup.
         seven_days_ago = timezone.now() - timedelta(days=7)
         pending_cutoff = timezone.now() - timedelta(minutes=30)
-        task_results = TaskResult.objects.filter(
-            task_result_filters,
-            task_name__in=result_import_task_names,
-            date_created__gte=seven_days_ago,
-        ).exclude(
-            status=states.PENDING,
-            date_created__lt=pending_cutoff,
-        ).order_by("-date_done", "-date_created")
+        task_results = (
+            TaskResult.objects.filter(
+                task_result_filters,
+                Q(task_name__startswith="Import ")
+                | Q(task_name__in=result_import_task_names),
+                date_created__gte=seven_days_ago,
+            )
+            .exclude(
+                status=states.PENDING,
+                date_created__lt=pending_cutoff,
+            )
+            .order_by("-date_done", "-date_created")
+        )
 
         # Build results list
         results = []
@@ -1524,23 +2154,42 @@ class User(AbstractUser):
                     task.result = async_result.result
                     task.traceback = async_result.traceback
                     task.date_done = async_result.date_done or timezone.now()
-                    task.save(update_fields=["status", "result", "traceback", "date_done"])
+                    task.save(
+                        update_fields=["status", "result", "traceback", "date_done"]
+                    )
             elif task.status == states.FAILURE and not task.traceback:
                 async_result = AsyncResult(task.task_id)
                 if async_result.traceback:
                     task.traceback = async_result.traceback
                     task.save(update_fields=["traceback"])
 
-            source = result_task_to_source[task.task_name]
+            source = result_task_to_source.get(
+                task.task_name,
+                task.task_name.removeprefix("Import from ").removeprefix("Import "),
+            )
             processed_task = helpers.process_task_result(task)
+
+            progress = None
+            if task.status == states.STARTED:
+                progress = import_progress.get_progress(task.task_id)
+
             results.append(
                 {
                     "task": processed_task,
+                    "task_id": task.task_id,
                     "source": source,
                     "date": task.date_done,
                     "status": task.status,
                     "summary": processed_task.summary,
                     "errors": processed_task.errors,
+                    "progress_current": progress.get("current") if progress else None,
+                    "progress_total": progress.get("total") if progress else None,
+                    "progress_label": progress.get("label") if progress else None,
+                    "progress_percent": (
+                        round(progress["current"] / progress["total"] * 100, 1)
+                        if progress and progress.get("total")
+                        else None
+                    ),
                 },
             )
 
@@ -1575,18 +2224,17 @@ class User(AbstractUser):
         )
         periodic_tasks = PeriodicTask.objects.filter(
             periodic_tasks_filter,
-            task__in=schedule_import_task_names,
+            Q(task__startswith="Import ") | Q(task__in=schedule_import_task_names),
             enabled=True,
         ).select_related("crontab", "interval")
 
         # Build schedules list
         schedules = []
         for periodic_task in periodic_tasks:
-            source = schedule_task_to_source.get(periodic_task.task, "unknown")
-
-            # Skip if source is unknown (task not in our mapping)
-            if source == "unknown":
-                continue
+            source = schedule_task_to_source.get(
+                periodic_task.task,
+                periodic_task.task.removeprefix("Import from ").removeprefix("Import "),
+            )
 
             # Extract username from task name if available
             username = ""
@@ -1615,11 +2263,19 @@ class User(AbstractUser):
                 )
 
         # Check for global Last.fm task (uses IntervalSchedule, not user-specific)
-        if hasattr(self, "lastfm_account") and self.lastfm_account and self.lastfm_account.is_connected:
-            lastfm_task = PeriodicTask.objects.filter(
-                task="Poll Last.fm for all users",
-                enabled=True,
-            ).select_related("interval").first()
+        if (
+            hasattr(self, "lastfm_account")
+            and self.lastfm_account
+            and self.lastfm_account.is_connected
+        ):
+            lastfm_task = (
+                PeriodicTask.objects.filter(
+                    task="Poll Last.fm for all users",
+                    enabled=True,
+                )
+                .select_related("interval")
+                .first()
+            )
 
             if lastfm_task and lastfm_task.interval:
                 # Calculate next run from interval schedule
@@ -1659,9 +2315,11 @@ class User(AbstractUser):
 
         # Get task results for this user
         task_result_filter_text = f"'user_id': {self.id},"
+        seven_days_ago = timezone.now() - timedelta(days=7)
         task_results = TaskResult.objects.filter(
             task_kwargs__contains=task_result_filter_text,
             task_name=export_task_name,
+            date_done__gte=seven_days_ago,
         ).order_by("-date_done")
 
         results = []
@@ -1697,6 +2355,7 @@ class User(AbstractUser):
                         "schedule": schedule_info["frequency"],
                         "media_types": schedule_info["media_types"],
                         "include_lists": schedule_info["include_lists"],
+                        "include_collection": schedule_info["include_collection"],
                     },
                 )
 
@@ -1709,6 +2368,32 @@ class User(AbstractUser):
     def has_authenticator_configured(self):
         """Return whether this user has a confirmed authenticator setup."""
         return self.authenticator_enabled and bool(self.authenticator_secret)
+
+    def get_playback_webhook_secret(self):
+        """Return the decrypted playback webhook secret, or "" when unset.
+
+        A secret that will not decrypt — the usual cause is a changed
+        SECRET_KEY — is treated as absent rather than raised: the webhook then
+        sends unsigned, which a receiver rejects, instead of every playback
+        event dying in the worker.
+        """
+        if not self.playback_webhook_secret:
+            return ""
+
+        from cryptography.fernet import InvalidToken
+
+        from integrations.imports.helpers import decrypt
+
+        try:
+            return decrypt(self.playback_webhook_secret)
+        except (InvalidToken, ValueError):
+            return ""
+
+    def set_playback_webhook_secret(self, raw_secret):
+        """Encrypt and store a playback webhook secret; blank clears it."""
+        from integrations.imports.helpers import encrypt
+
+        self.playback_webhook_secret = encrypt(raw_secret) if raw_secret else ""
 
     def get_or_create_authenticator_secret(self):
         """Return existing authenticator secret or create one."""
@@ -1741,7 +2426,11 @@ class User(AbstractUser):
 
         import pyotp
 
-        return bool(pyotp.TOTP(self.authenticator_secret).verify(str(code).strip(), valid_window=1))
+        return bool(
+            pyotp.TOTP(self.authenticator_secret).verify(
+                str(code).strip(), valid_window=1
+            )
+        )
 
     def generate_recovery_codes(self, count=8):
         """Generate one-time recovery codes and persist their hashes."""
@@ -1750,7 +2439,7 @@ class User(AbstractUser):
 
         self.recovery_codes.all().delete()
         codes = []
-        for _ in range(count):
+        for _index in range(count):
             raw_code = secrets.token_hex(4).upper()
             codes.append(raw_code)
             UserRecoveryCode.objects.create(
@@ -1807,7 +2496,13 @@ class UserRecoveryCode(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["-created_at"]
+
+    def __str__(self):
+        """Return a readable label for this user recovery code."""
+        return f"{self.user}"
 
     @staticmethod
     def hash_code(raw_code):
@@ -1836,7 +2531,7 @@ class HomeScreenRow(models.Model):
     )
     media_type = models.CharField(
         max_length=16,
-        choices=MediaTypes.choices,
+        choices=[(HOME_ALL_MEDIA_TYPE, "All media"), *MediaTypes.choices],
     )
     position = models.PositiveIntegerField(default=0)
     enabled = models.BooleanField(default=True)
@@ -1864,6 +2559,8 @@ class HomeScreenRow(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["media_type", "position", "id"]
         constraints = [
             models.CheckConstraint(
@@ -1887,3 +2584,45 @@ class HomeScreenRow(models.Model):
     def __str__(self):
         """Return a compact label for admin/debug use."""
         return f"{self.user_id}:{self.media_type}:{self.row_type}:{self.position}"
+
+
+# Saved views of the History page live beside the media list ones, keyed by
+# this pseudo media type.
+HISTORY_VIEW_TYPE = "history"
+
+
+class SavedView(models.Model):
+    """A named media list or History view (filters, sort, layout) in the sidebar."""
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="saved_views",
+    )
+    media_type = models.CharField(
+        max_length=16,
+        choices=[*MediaTypes.choices, (HISTORY_VIEW_TYPE, "History")],
+    )
+    name = models.CharField(max_length=100)
+    # The media list (or History) query string, e.g. "sort=score&direction=desc&status=Completed".
+    query = models.TextField(blank=True, default="")
+    position = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        ordering = ["media_type", "position", "id"]
+        indexes = [models.Index(fields=["user", "media_type", "position"])]
+
+    def __str__(self):
+        """Return a compact label for admin/debug use."""
+        return f"{self.user_id}:{self.media_type}:{self.name}"
+
+    def get_absolute_url(self):
+        """Return the media list or History URL that reproduces this view."""
+        if self.media_type == HISTORY_VIEW_TYPE:
+            base = reverse("history")
+        else:
+            base = reverse("medialist", args=[self.media_type])
+        return f"{base}?{self.query}" if self.query else base

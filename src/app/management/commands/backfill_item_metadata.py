@@ -1,10 +1,12 @@
 """Management command to backfill metadata fields for existing Items."""
+
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from app import metadata_utils
 from app.models import Item
 from app.providers import services
+from app.services import metadata_resolution
 
 
 class Command(BaseCommand):
@@ -18,18 +20,18 @@ class Command(BaseCommand):
             "--limit",
             type=int,
             default=None,
-            help="Limit number of items to process (for testing)"
+            help="Limit number of items to process (for testing)",
         )
         parser.add_argument(
             "--media-type",
             type=str,
             default=None,
-            help='Only process specific media type (e.g., "tv", "movie", "anime")'
+            help='Only process specific media type (e.g., "tv", "movie", "anime")',
         )
         parser.add_argument(
             "--force",
             action="store_true",
-            help="Force re-fetch metadata even if already fetched before"
+            help="Force re-fetch metadata even if already fetched before",
         )
 
     def handle(self, *args, **options):
@@ -47,7 +49,7 @@ class Command(BaseCommand):
             queryset = queryset.filter(media_type=options["media_type"])
 
         if options["limit"]:
-            queryset = queryset[:options["limit"]]
+            queryset = queryset[: options["limit"]]
 
         total = queryset.count()
         self.stdout.write(f"Backfilling metadata for {total} items...")
@@ -58,9 +60,7 @@ class Command(BaseCommand):
         for i, item in enumerate(queryset, 1):
             try:
                 metadata = services.get_media_metadata(
-                    item.media_type,
-                    item.media_id,
-                    item.source
+                    item.media_type, item.media_id, item.source
                 )
 
                 update_fields = metadata_utils.apply_item_metadata(
@@ -74,6 +74,18 @@ class Command(BaseCommand):
                 update_fields.append("metadata_fetched_at")
                 item.save(update_fields=update_fields)
 
+                # provider_external_ids is in neither CORE_METADATA_FIELDS nor
+                # PROVIDER_METADATA_FIELDS, so apply_item_metadata() above
+                # never touches it. Without this the command couldn't repair a
+                # missing IMDb ID even with --force, though that is the repair
+                # route users are pointed at (issue #1066).
+                metadata_resolution.upsert_provider_links(
+                    item,
+                    metadata,
+                    provider=item.source,
+                    provider_media_type=item.media_type,
+                )
+
                 success_count += 1
                 self.stdout.write(
                     f"[{i}/{total}] ✓ {item.title} ({item.media_type}): "
@@ -82,10 +94,10 @@ class Command(BaseCommand):
 
             except Exception as e:
                 error_count += 1
-                self.stderr.write(
-                    f"[{i}/{total}] ✗ Error for {item.title}: {e!s}"
-                )
+                self.stderr.write(f"[{i}/{total}] ✗ Error for {item.title}: {e!s}")
 
-        self.stdout.write(self.style.SUCCESS(
-            f"\nBackfill complete! Success: {success_count}, Errors: {error_count}"
-        ))
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"\nBackfill complete! Success: {success_count}, Errors: {error_count}"
+            )
+        )

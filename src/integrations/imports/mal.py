@@ -11,6 +11,8 @@ from django.utils.dateparse import parse_datetime
 import app
 import app.providers.mal
 from app.models import MediaTypes, Sources, Status
+from app.providers import credentials
+from integrations import import_progress
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 from integrations.webhooks import anime_mappings
@@ -43,6 +45,7 @@ class MyAnimeListImporter:
 
         # Track existing media for "new" mode
         self.existing_media = helpers.get_existing_media(user)
+        self.deleted_media = helpers.get_deleted_media(user)
 
         # Track media IDs to delete in overwrite mode
         self.to_delete = defaultdict(lambda: defaultdict(set))
@@ -104,7 +107,9 @@ class MyAnimeListImporter:
                 return
             raise
 
-        for content in response["data"]:
+        total = len(response["data"])
+        for i, content in enumerate(response["data"], start=1):
+            import_progress.report(i, total, f"MyAnimeList ({media_type})")
             try:
                 self._process_entry(content, media_type)
             except Exception as error:
@@ -113,7 +118,7 @@ class MyAnimeListImporter:
 
     def _get_whole_response(self, url, params):
         """Fetch whole data from user."""
-        headers = {"X-MAL-CLIENT-ID": settings.MAL_API}
+        headers = {"X-MAL-CLIENT-ID": credentials.get("mal", "client_id")}
 
         data = app.providers.services.api_request(
             "MAL",
@@ -155,10 +160,12 @@ class MyAnimeListImporter:
             Sources.MAL.value,
             str(content["node"]["id"]),
             self.mode,
+            deleted_media=self.deleted_media,
         ):
             return
 
-        item, _ = app.models.Item.objects.get_or_create(
+        item, _ = helpers.get_or_create_item_across_buckets(
+            user=self.user,
             media_id=str(content["node"]["id"]),
             source=Sources.MAL.value,
             media_type=media_type,
@@ -258,6 +265,7 @@ class MyAnimeListImporter:
             source,
             tmdb_movie_id_str,
             self.mode,
+            deleted_media=self.deleted_media,
         ):
             return
 

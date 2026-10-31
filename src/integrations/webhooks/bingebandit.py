@@ -51,6 +51,8 @@ def _positive_id(value) -> str | None:
 class BingeBanditWebhookProcessor(BaseWebhookProcessor):
     """Processor for BingeBandit's native JSON webhooks."""
 
+    SOURCE_LABEL = "bingebandit"
+
     MEDIA_TYPE_MAPPING = {
         "episode": MediaTypes.TV.value,
         "movie": MediaTypes.MOVIE.value,

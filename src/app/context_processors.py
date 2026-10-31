@@ -1,11 +1,14 @@
 # https://docs.djangoproject.com/en/stable/ref/templates/api/#writing-your-own-context-processors
 
 from django.conf import settings
+from django.utils.functional import SimpleLazyObject
 
 from app.models import MediaTypes, Sources, Status
+from users.helpers import is_first_run
+from users.release_notes import release_tag
 
 
-def export_vars(request):  # noqa: ARG001
+def export_vars(request):
     """Export variables to templates."""
     return {
         "REGISTRATION": settings.REGISTRATION,
@@ -14,10 +17,12 @@ def export_vars(request):  # noqa: ARG001
         "TRACK_TIME": settings.TRACK_TIME,
         "FORK_OWNER_NAME": settings.FORK_OWNER_NAME,
         "FORK_OWNER_URL": settings.FORK_OWNER_URL,
+        "IS_FIRST_RUN": SimpleLazyObject(is_first_run),
+        "RELEASE_TAG": release_tag(settings.VERSION),
     }
 
 
-def media_enums(request):  # noqa: ARG001
+def media_enums(request):
     """Export media enums to templates."""
     return {
         "MediaTypes": MediaTypes,

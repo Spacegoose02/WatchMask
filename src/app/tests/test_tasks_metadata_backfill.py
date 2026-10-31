@@ -7,6 +7,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from app import tasks
+from app import tasks_genre as genre_tasks
 from app.interactive_requests import (
     INTERACTIVE_REQUEST_CACHE_KEY,
     INTERACTIVE_REQUEST_TTL_SECONDS,
@@ -14,6 +15,7 @@ from app.interactive_requests import (
 from app.models import (
     CREDITS_BACKFILL_VERSION,
     TV,
+    BackfillReconcileState,
     BasicMedia,
     Episode,
     Item,
@@ -23,6 +25,7 @@ from app.models import (
     MediaTypes,
     MetadataBackfillField,
     MetadataBackfillState,
+    Movie,
     Person,
     PersonGender,
     Season,
@@ -37,8 +40,6 @@ from integrations.models import CollectionSourceState
 User = get_user_model()
 
 
-# Genre backfill treats TMDB TV as a candidate only while TVDB is configured.
-@override_settings(TVDB_API_KEY="test-tvdb-key")
 class MetadataBackfillTaskTests(TestCase):
     def setUp(self):
         cache.delete(INTERACTIVE_REQUEST_CACHE_KEY)
@@ -47,6 +48,57 @@ class MetadataBackfillTaskTests(TestCase):
     def tearDown(self):
         cache.delete(INTERACTIVE_REQUEST_CACHE_KEY)
         super().tearDown()
+
+    @patch("app.tasks._fetch_item_metadata")
+    @patch("app.tasks_metadata_language.services.get_media_metadata")
+    def test_periodic_backfill_repairs_existing_language_within_its_budget(
+        self, mock_language_metadata, mock_other_metadata,
+    ):
+        user = User.objects.create_user(username="spanish", metadata_language="es-ES")
+        item = Item.objects.create(
+            media_id="238", source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value, title="The Godfather",
+            synopsis="An English overview.", metadata_fetched_at=timezone.now(),
+        )
+        Movie.objects.bulk_create([
+            Movie(item=item, user=user, status=Status.PLANNING.value),
+        ])
+        mock_language_metadata.return_value = {
+            "title": "El padrino", "synopsis": "La historia de una familia.",
+        }
+
+        result = tasks.backfill_item_metadata_task(batch_size=1)
+
+        self.assertEqual(result["success_count"], 1)
+        self.assertEqual(result["metadata_language_repair"]["attempted"], 1)
+        mock_other_metadata.assert_not_called()
+        item.refresh_from_db()
+        self.assertEqual(item.localized_title, "El padrino")
+        self.assertEqual(item.synopsis, "La historia de una familia.")
+
+    @patch("app.tasks._fetch_item_metadata")
+    def test_status_backfill_preserves_existing_localized_synopsis(self, mock_metadata):
+        item = Item.objects.create(
+            media_id="238",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="El padrino",
+            localized_title="El padrino",
+            synopsis="La historia de una familia.",
+            metadata_fetched_at=timezone.now(),
+        )
+        mock_metadata.return_value = {
+            "title": "The Godfather",
+            "synopsis": "An English overview.",
+            "details": {"status": "Released"},
+            "related": {},
+        }
+        result = tasks.backfill_item_metadata_task(batch_size=1)
+        self.assertEqual(result["success_count"], 1)
+        item.refresh_from_db()
+        self.assertEqual(item.status, "Released")
+        self.assertEqual(item.synopsis, "La historia de una familia.")
+        self.assertEqual(item.localized_title, "El padrino")
 
     @patch("app.tasks._fetch_item_metadata")
     def test_backfill_item_metadata_task_skips_when_interactive_request_active(
@@ -143,12 +195,12 @@ class MetadataBackfillTaskTests(TestCase):
             image="https://example.com/ted.jpg",
             metadata_fetched_at=old_fetched_at,
         )
-        # Saving as completed would fan out through the mocked provider, so
-        # mark it completed directly
+        # Create as PLANNING then flip via update() so the fixture does not
+        # trigger the completed-on-create fan-out (which fetches metadata).
         tv = TV.objects.create(
             item=tv_item,
             user=user,
-            status=Status.IN_PROGRESS.value,
+            status=Status.PLANNING.value,
         )
         TV.objects.filter(pk=tv.pk).update(status=Status.COMPLETED.value)
         tv.refresh_from_db()
@@ -167,9 +219,11 @@ class MetadataBackfillTaskTests(TestCase):
             item=season1_item,
             related_tv=tv,
             user=user,
-            status=Status.IN_PROGRESS.value,
+            status=Status.PLANNING.value,
         )
-        Season.objects.filter(pk=season1.pk).update(status=Status.COMPLETED.value)
+        Season.objects.filter(pk=season1.pk).update(
+            status=Status.COMPLETED.value,
+        )
         season1.refresh_from_db()
         season2_item = Item.objects.create(
             media_id="201834",
@@ -248,7 +302,10 @@ class MetadataBackfillTaskTests(TestCase):
                 "episodes": [
                     {
                         "episode_number": episode_number,
-                        "air_date": f"2025-01-{episode_number:02d}",
+                        # Reopening completed TV requires future events (#1348).
+                        "air_date": (
+                            timezone.now() + timedelta(days=episode_number)
+                        ).strftime("%Y-%m-%d"),
                         "still_path": f"/s2e{episode_number}.jpg",
                         "runtime": 30,
                     }
@@ -260,9 +317,7 @@ class MetadataBackfillTaskTests(TestCase):
         result = tasks.backfill_item_metadata_task(batch_size=1)
 
         tv.refresh_from_db()
-        # Season 2 has already aired, and only seasons with upcoming episodes
-        # reopen a completed show
-        self.assertEqual(tv.status, Status.COMPLETED.value)
+        self.assertEqual(tv.status, Status.IN_PROGRESS.value)
         season2 = tv.seasons.get(item__season_number=2)
         self.assertEqual(season2.status, Status.PLANNING.value)
         self.assertEqual(
@@ -292,7 +347,8 @@ class MetadataBackfillTaskTests(TestCase):
         ).first()
         self.assertIsNotNone(tv_media)
         self.assertEqual(tv_media.progress, 7)
-        self.assertEqual(tv_media.max_progress, 15)
+        # max_progress counts released episodes only; season 2 is all-future.
+        self.assertEqual(tv_media.max_progress, 7)
 
         mock_clear_time_left_cache.assert_any_call(user.id)
         self.assertEqual(result["success_count"], 1)
@@ -319,12 +375,12 @@ class MetadataBackfillTaskTests(TestCase):
             metadata_fetched_at=old_fetched_at,
             release_datetime=first_air_date,
         )
-        # Saving as completed would fan out through the mocked provider, so
-        # mark it completed directly
+        # Create as PLANNING then flip via update() so the fixture does not
+        # trigger the completed-on-create fan-out (which fetches metadata).
         tv = TV.objects.create(
             item=tv_item,
             user=user,
-            status=Status.IN_PROGRESS.value,
+            status=Status.PLANNING.value,
         )
         TV.objects.filter(pk=tv.pk).update(status=Status.COMPLETED.value)
         tv.refresh_from_db()
@@ -343,9 +399,11 @@ class MetadataBackfillTaskTests(TestCase):
             item=season1_item,
             related_tv=tv,
             user=user,
-            status=Status.IN_PROGRESS.value,
+            status=Status.PLANNING.value,
         )
-        Season.objects.filter(pk=season1.pk).update(status=Status.COMPLETED.value)
+        Season.objects.filter(pk=season1.pk).update(
+            status=Status.COMPLETED.value,
+        )
         season1.refresh_from_db()
         season2_item = Item.objects.create(
             media_id="201835",
@@ -424,7 +482,10 @@ class MetadataBackfillTaskTests(TestCase):
                 "episodes": [
                     {
                         "episode_number": episode_number,
-                        "air_date": f"2025-01-{episode_number:02d}",
+                        # Reopening completed TV requires future events (#1348).
+                        "air_date": (
+                            timezone.now() + timedelta(days=episode_number)
+                        ).strftime("%Y-%m-%d"),
                         "still_path": f"/s2e{episode_number}.jpg",
                         "runtime": 30,
                     }
@@ -437,9 +498,7 @@ class MetadataBackfillTaskTests(TestCase):
         result = tasks.backfill_item_metadata_task(batch_size=1)
 
         tv.refresh_from_db()
-        # Season 2 has already aired, and only seasons with upcoming episodes
-        # reopen a completed show
-        self.assertEqual(tv.status, Status.COMPLETED.value)
+        self.assertEqual(tv.status, Status.IN_PROGRESS.value)
         season2 = tv.seasons.get(item__season_number=2)
         self.assertEqual(season2.status, Status.PLANNING.value)
         self.assertEqual(
@@ -460,7 +519,8 @@ class MetadataBackfillTaskTests(TestCase):
         ).first()
         self.assertIsNotNone(tv_media)
         self.assertEqual(tv_media.progress, 7)
-        self.assertEqual(tv_media.max_progress, 15)
+        # max_progress counts released episodes only; season 2 is all-future.
+        self.assertEqual(tv_media.max_progress, 7)
 
         mock_clear_time_left_cache.assert_any_call(user.id)
         self.assertEqual(result["success_count"], 1)
@@ -509,7 +569,9 @@ class MetadataBackfillTaskTests(TestCase):
         )
 
     @patch("app.providers.services.get_media_metadata")
-    def test_backfill_initial_metadata_includes_release_datetime(self, mock_get_media_metadata):
+    def test_backfill_initial_metadata_includes_release_datetime(
+        self, mock_get_media_metadata
+    ):
         item = Item.objects.create(
             media_id="9999",
             source=Sources.OPENLIBRARY.value,
@@ -591,7 +653,9 @@ class MetadataBackfillTaskTests(TestCase):
             fetch_hltb=True,
         )
 
-    def test_game_length_queryset_includes_existing_igdb_games_until_current_version_marked(self):
+    def test_game_length_queryset_includes_existing_igdb_games_until_current_version_marked(
+        self,
+    ):
         old_fetched_at = timezone.now() - timedelta(days=30)
         candidate = Item.objects.create(
             media_id="325609",
@@ -633,7 +697,9 @@ class MetadataBackfillTaskTests(TestCase):
             provider_game_lengths_fetched_at=old_fetched_at,
         )
 
-        candidate_ids = set(tasks._game_length_items_queryset().values_list("id", flat=True))
+        candidate_ids = set(
+            tasks._game_length_items_queryset().values_list("id", flat=True)
+        )
         self.assertIn(candidate.id, candidate_ids)
         self.assertNotIn(ambiguous.id, candidate_ids)
         self.assertNotIn(resolved.id, candidate_ids)
@@ -645,7 +711,9 @@ class MetadataBackfillTaskTests(TestCase):
             last_success_at=timezone.now(),
         )
 
-        candidate_ids = set(tasks._game_length_items_queryset().values_list("id", flat=True))
+        candidate_ids = set(
+            tasks._game_length_items_queryset().values_list("id", flat=True)
+        )
         self.assertNotIn(candidate.id, candidate_ids)
 
     @patch("app.tasks.game_length_services.refresh_game_lengths")
@@ -682,7 +750,9 @@ class MetadataBackfillTaskTests(TestCase):
             "active_source": "hltb",
         }
 
-        result = tasks.backfill_item_metadata_task(batch_size=1, game_length_batch_size=1)
+        result = tasks.backfill_item_metadata_task(
+            batch_size=1, game_length_batch_size=1
+        )
 
         state = MetadataBackfillState.objects.get(
             item=item,
@@ -703,8 +773,13 @@ class MetadataBackfillTaskTests(TestCase):
             fetch_hltb=True,
         )
 
-    @patch("app.tasks.game_length_services.refresh_game_lengths", side_effect=RuntimeError("boom"))
-    def test_refresh_item_game_lengths_records_failure(self, _mock_refresh_game_lengths):
+    @patch(
+        "app.tasks.game_length_services.refresh_game_lengths",
+        side_effect=RuntimeError("boom"),
+    )
+    def test_refresh_item_game_lengths_records_failure(
+        self, _mock_refresh_game_lengths
+    ):
         item = Item.objects.create(
             media_id="325609",
             source=Sources.IGDB.value,
@@ -725,7 +800,9 @@ class MetadataBackfillTaskTests(TestCase):
         self.assertIn("boom", state.last_error)
 
     @patch("app.tasks.game_length_services.refresh_game_lengths")
-    def test_refresh_item_game_lengths_clears_refresh_lock_on_success(self, mock_refresh_game_lengths):
+    def test_refresh_item_game_lengths_clears_refresh_lock_on_success(
+        self, mock_refresh_game_lengths
+    ):
         item = Item.objects.create(
             media_id="325609",
             source=Sources.IGDB.value,
@@ -746,8 +823,13 @@ class MetadataBackfillTaskTests(TestCase):
         self.assertTrue(result["updated"])
         self.assertIsNone(cache.get(lock_key))
 
-    @patch("app.tasks.game_length_services.refresh_game_lengths", side_effect=RuntimeError("boom"))
-    def test_refresh_item_game_lengths_clears_refresh_lock_on_failure(self, _mock_refresh_game_lengths):
+    @patch(
+        "app.tasks.game_length_services.refresh_game_lengths",
+        side_effect=RuntimeError("boom"),
+    )
+    def test_refresh_item_game_lengths_clears_refresh_lock_on_failure(
+        self, _mock_refresh_game_lengths
+    ):
         item = Item.objects.create(
             media_id="325609",
             source=Sources.IGDB.value,
@@ -767,7 +849,9 @@ class MetadataBackfillTaskTests(TestCase):
         self.assertIsNone(cache.get(lock_key))
 
     @patch("app.providers.services.get_media_metadata")
-    def test_backfill_updates_movie_provider_recommendation_metadata(self, mock_get_media_metadata):
+    def test_backfill_updates_movie_provider_recommendation_metadata(
+        self, mock_get_media_metadata
+    ):
         item = Item.objects.create(
             media_id="501",
             source=Sources.TMDB.value,
@@ -801,7 +885,9 @@ class MetadataBackfillTaskTests(TestCase):
         self.assertEqual(item.provider_collection_name, "Mystery Collection")
         self.assertEqual(result["success_count"], 1)
 
-    def test_discover_movie_metadata_queryset_includes_existing_tmdb_movies_until_version_marked(self):
+    def test_discover_movie_metadata_queryset_includes_existing_tmdb_movies_until_version_marked(
+        self,
+    ):
         item = Item.objects.create(
             media_id="601",
             source=Sources.TMDB.value,
@@ -812,7 +898,9 @@ class MetadataBackfillTaskTests(TestCase):
         )
 
         candidate_ids = set(
-            tasks._discover_movie_metadata_items_queryset().values_list("id", flat=True),
+            tasks._discover_movie_metadata_items_queryset().values_list(
+                "id", flat=True
+            ),
         )
         self.assertIn(item.id, candidate_ids)
 
@@ -824,7 +912,9 @@ class MetadataBackfillTaskTests(TestCase):
         )
 
         candidate_ids = set(
-            tasks._discover_movie_metadata_items_queryset().values_list("id", flat=True),
+            tasks._discover_movie_metadata_items_queryset().values_list(
+                "id", flat=True
+            ),
         )
         self.assertNotIn(item.id, candidate_ids)
 
@@ -852,7 +942,7 @@ class MetadataBackfillTaskTests(TestCase):
 
         with patch(
             "app.models.providers.services.get_media_metadata",
-            return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
+            return_value={"max_progress": 1},
         ):
             Movie.objects.create(
                 item=item,
@@ -884,13 +974,48 @@ class MetadataBackfillTaskTests(TestCase):
         self.assertEqual(item.provider_rating, 8.1)
         self.assertEqual(item.provider_rating_count, 1400)
         self.assertEqual(item.provider_certification, "PG")
-        self.assertEqual(state.strategy_version, tasks.DISCOVER_MOVIE_METADATA_BACKFILL_VERSION)
+        self.assertEqual(
+            state.strategy_version, tasks.DISCOVER_MOVIE_METADATA_BACKFILL_VERSION
+        )
         self.assertIsNotNone(state.last_success_at)
         self.assertEqual(result["success_count"], 1)
         self.assertIn("remaining_discover_movie_metadata", result)
 
         mock_refresh_profiles.assert_called_once()
         self.assertEqual(mock_refresh_tab_cache.call_count, 2)
+
+    @patch("app.providers.services.get_media_metadata")
+    def test_backfill_fills_blank_status_for_already_fetched_tv(
+        self,
+        mock_get_media_metadata,
+    ):
+        old_fetched_at = timezone.now() - timedelta(days=30)
+        item = Item.objects.create(
+            media_id="9999",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Blank Status Show",
+            image="https://example.com/blank-status.jpg",
+            metadata_fetched_at=old_fetched_at,
+            status="",
+        )
+
+        self.assertIn(item.id, tasks._status_items_queryset().values_list("id", flat=True))
+
+        mock_get_media_metadata.return_value = {
+            "details": {"status": "Ended"},
+        }
+
+        result = tasks.backfill_item_metadata_task(batch_size=1)
+
+        item.refresh_from_db()
+        self.assertEqual(item.status, "Ended")
+        self.assertEqual(result["success_count"], 1)
+        self.assertIn("remaining_status", result)
+        self.assertNotIn(
+            item.id,
+            tasks._status_items_queryset().values_list("id", flat=True),
+        )
 
     @patch("app.providers.services.get_media_metadata")
     def test_backfill_prioritizes_never_fetched_items(self, mock_get_media_metadata):
@@ -931,7 +1056,9 @@ class MetadataBackfillTaskTests(TestCase):
         )
 
     @patch("app.providers.services.get_media_metadata")
-    def test_backfill_skips_sonarr_seeded_season_and_episode_rows(self, mock_get_media_metadata):
+    def test_backfill_skips_sonarr_seeded_season_and_episode_rows(
+        self, mock_get_media_metadata
+    ):
         user = User.objects.create_user(username="sonarr-user", password="pw")
         season_item = Item.objects.create(
             media_id="95396",
@@ -1016,7 +1143,10 @@ class MetadataBackfillTaskTests(TestCase):
         self.assertIn(comic.id, queued_ids)
         self.assertIn(manga.id, queued_ids)
 
-    def test_genre_backfill_queryset_includes_tmdb_tv_until_current_version_marked(self):
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
+    def test_genre_backfill_queryset_includes_tmdb_tv_until_current_version_marked(
+        self,
+    ):
         item = Item.objects.create(
             media_id="tmdb-tv-genre",
             source=Sources.TMDB.value,
@@ -1039,6 +1169,7 @@ class MetadataBackfillTaskTests(TestCase):
         queued_ids = set(tasks._genre_items_queryset().values_list("id", flat=True))
         self.assertNotIn(item.id, queued_ids)
 
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
     @patch("app.tasks_genre.enqueue_genre_backfill_items")
     def test_reconcile_genre_backfill_queues_current_candidates_on_startup(
         self,
@@ -1074,8 +1205,9 @@ class MetadataBackfillTaskTests(TestCase):
             strategy_version=tasks.GENRE_BACKFILL_VERSION,
             last_success_at=timezone.now(),
         )
-        cache.delete(f"genre_backfill_reconciled_v{tasks.GENRE_BACKFILL_VERSION}")
-        mock_enqueue_genre_backfill_items.side_effect = lambda item_ids, countdown=10: len(item_ids)
+        mock_enqueue_genre_backfill_items.side_effect = lambda item_ids, countdown=10: (
+            len(item_ids)
+        )
 
         result = tasks.reconcile_genre_backfill(
             strategy_version=tasks.GENRE_BACKFILL_VERSION,
@@ -1086,14 +1218,10 @@ class MetadataBackfillTaskTests(TestCase):
             mock_enqueue_genre_backfill_items.call_args_list,
             [
                 call([first_item.id], countdown=10),
-                call([second_item.id], countdown=10),
+                call([second_item.id], countdown=25),
             ],
         )
-        self.assertEqual(result, {"selected": 2, "enqueued": 2})
-        self.assertEqual(
-            cache.get(f"genre_backfill_reconciled_v{tasks.GENRE_BACKFILL_VERSION}"),
-            "done",
-        )
+        self.assertEqual(result, {"selected": 2, "enqueued": 2, "cursor": 0})
 
     @patch("app.tasks_genre.reconcile_genre_backfill")
     def test_ensure_genre_backfill_reconcile_runs_when_version_not_done(
@@ -1108,7 +1236,9 @@ class MetadataBackfillTaskTests(TestCase):
             image="https://example.com/ensure-reconcile-run.jpg",
             genres=["Drama"],
         )
-        cache.delete(f"genre_backfill_reconciled_v{tasks.GENRE_BACKFILL_VERSION}")
+        BackfillReconcileState.objects.filter(
+            key=genre_tasks.RECONCILE_KEY,
+        ).delete()
         mock_reconcile_genre_backfill.return_value = {"selected": 3, "enqueued": 3}
 
         result = tasks.ensure_genre_backfill_reconcile(batch_size=25)
@@ -1132,7 +1262,9 @@ class MetadataBackfillTaskTests(TestCase):
 
         result = tasks.ensure_genre_backfill_reconcile()
 
-        self.assertEqual(result, {"skipped": True, "reason": "interactive_request_active"})
+        self.assertEqual(
+            result, {"skipped": True, "reason": "interactive_request_active"}
+        )
         mock_reconcile_genre_backfill.assert_not_called()
 
     def test_warm_discover_api_cache_skips_when_interactive_request_active(self):
@@ -1155,7 +1287,7 @@ class MetadataBackfillTaskTests(TestCase):
         )
 
     @patch("app.tasks_genre.reconcile_genre_backfill")
-    def test_ensure_genre_backfill_reconcile_skips_pending_startup_run(
+    def test_ensure_genre_backfill_reconcile_skips_a_completed_strategy(
         self,
         mock_reconcile_genre_backfill,
     ):
@@ -1167,16 +1299,32 @@ class MetadataBackfillTaskTests(TestCase):
             image="https://example.com/ensure-reconcile-pending.jpg",
             genres=["Drama"],
         )
-        cache.set(
-            f"genre_backfill_reconciled_v{tasks.GENRE_BACKFILL_VERSION}",
-            "pending",
-            timeout=300,
+        BackfillReconcileState.objects.create(
+            key=genre_tasks.RECONCILE_KEY,
+            strategy_version=tasks.GENRE_BACKFILL_VERSION,
+            completed_at=timezone.now(),
         )
 
         result = tasks.ensure_genre_backfill_reconcile()
 
         mock_reconcile_genre_backfill.assert_not_called()
-        self.assertEqual(result, {"skipped": True, "reason": "pending"})
+        self.assertEqual(result, {"skipped": True, "reason": "not_due"})
+
+    @patch("app.tasks_genre.reconcile_genre_backfill")
+    def test_ensure_genre_backfill_reconcile_skips_a_backing_off_strategy(
+        self,
+        mock_reconcile_genre_backfill,
+    ):
+        BackfillReconcileState.objects.create(
+            key=genre_tasks.RECONCILE_KEY,
+            strategy_version=tasks.GENRE_BACKFILL_VERSION,
+            next_run_after=timezone.now() + timedelta(hours=1),
+        )
+
+        result = tasks.ensure_genre_backfill_reconcile()
+
+        mock_reconcile_genre_backfill.assert_not_called()
+        self.assertEqual(result, {"skipped": True, "reason": "not_due"})
 
     @patch("app.tasks_genre.reconcile_genre_backfill")
     def test_ensure_genre_backfill_reconcile_reruns_when_done_cache_is_stale(
@@ -1191,6 +1339,8 @@ class MetadataBackfillTaskTests(TestCase):
             image="https://example.com/stale-done.jpg",
             genres=["Drama"],
         )
+        # A stale cache value must not suppress the run: completion is now a
+        # database fact, so the cache can say whatever it likes.
         cache.set(
             f"genre_backfill_reconciled_v{tasks.GENRE_BACKFILL_VERSION}",
             "done",
@@ -1202,10 +1352,11 @@ class MetadataBackfillTaskTests(TestCase):
 
         mock_reconcile_genre_backfill.assert_called_once_with(
             strategy_version=tasks.GENRE_BACKFILL_VERSION,
-            batch_size=tasks.NIGHTLY_METADATA_QUALITY_GENRE_BATCH_SIZE,
+            batch_size=genre_tasks._GENRE_BATCH_SIZE_DEFAULT,
         )
         self.assertEqual(result, {"selected": 1, "enqueued": 1})
 
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
     @patch("app.providers.services.get_media_metadata")
     def test_populate_genre_data_for_tmdb_tv_adds_anime_from_tvdb_mapping(
         self,
@@ -1255,6 +1406,7 @@ class MetadataBackfillTaskTests(TestCase):
         self.assertEqual(result["errors"], 0)
         self.assertEqual(state.strategy_version, tasks.GENRE_BACKFILL_VERSION)
 
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
     @patch("app.providers.services.get_media_metadata")
     def test_populate_genre_data_for_tmdb_tv_non_anime_marks_strategy_current(
         self,
@@ -1308,6 +1460,7 @@ class MetadataBackfillTaskTests(TestCase):
             set(tasks._genre_items_queryset().values_list("id", flat=True)),
         )
 
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
     @patch("app.providers.services.get_media_metadata")
     def test_populate_genre_data_for_tmdb_tv_discovers_tvdb_mapping_from_tmdb_metadata(
         self,
@@ -1402,6 +1555,7 @@ class MetadataBackfillTaskTests(TestCase):
             item.source,
         )
 
+    @override_settings(TVDB_API_KEY="test-tvdb-key")
     @patch("app.providers.services.get_media_metadata")
     def test_populate_genre_data_for_tmdb_tv_records_failure_on_tvdb_error(
         self,
@@ -1505,11 +1659,67 @@ class MetadataBackfillTaskTests(TestCase):
             last_success_at=timezone.now(),
         )
 
-        candidate_ids = tasks._next_credits_backfill_item_ids(batch_size=5, scan_multiplier=5)
+        candidate_ids = tasks._next_credits_backfill_item_ids(
+            batch_size=5, scan_multiplier=5
+        )
 
         self.assertIn(missing_movie.id, candidate_ids)
         self.assertIn(episode_missing_strategy.id, candidate_ids)
         self.assertNotIn(complete_movie.id, candidate_ids)
+
+    def _completed_credits_items(self, count):
+        items = Item.objects.bulk_create(
+            [
+                Item(
+                    media_id=f"done-{i}",
+                    source=Sources.TMDB.value,
+                    media_type=MediaTypes.MOVIE.value,
+                    title=f"Done {i}",
+                    image="https://example.com/done.jpg",
+                )
+                for i in range(count)
+            ]
+        )
+        MetadataBackfillState.objects.bulk_create(
+            [
+                MetadataBackfillState(
+                    item=item,
+                    field=MetadataBackfillField.CREDITS,
+                    strategy_version=CREDITS_BACKFILL_VERSION,
+                    last_success_at=timezone.now(),
+                )
+                for item in items
+            ]
+        )
+        return items
+
+    def test_next_credits_backfill_item_ids_reaches_past_completed_window(self):
+        self._completed_credits_items(12)
+        missing = Item.objects.create(
+            media_id="late-missing",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Late Missing",
+            image="https://example.com/late.jpg",
+        )
+
+        # Window is batch_size * multiplier = 4, far smaller than the 12
+        # completed rows ahead of the missing one.
+        candidate_ids = tasks._next_credits_backfill_item_ids(
+            batch_size=2, scan_multiplier=2
+        )
+
+        self.assertEqual(candidate_ids, [missing.id])
+
+    def test_next_credits_backfill_item_ids_query_count_is_bounded(self):
+        self._completed_credits_items(40)
+
+        with self.assertNumQueries(1):
+            candidate_ids = tasks._next_credits_backfill_item_ids(
+                batch_size=2, scan_multiplier=2
+            )
+
+        self.assertEqual(candidate_ids, [])
 
     @patch("app.tasks.enqueue_credits_backfill_items", return_value=4)
     @patch("app.tasks.enqueue_episode_runtime_backfill", return_value=3)
@@ -1598,7 +1808,9 @@ class MetadataBackfillTaskTests(TestCase):
 
     # _reset_stale_give_up_episode_runtimes tests
 
-    def _make_episode_item(self, media_id="ep-1", runtime_minutes=None, release_datetime=None):
+    def _make_episode_item(
+        self, media_id="ep-1", runtime_minutes=None, release_datetime=None
+    ):
         return Item.objects.create(
             media_id=media_id,
             source=Sources.TMDB.value,

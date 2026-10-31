@@ -11,9 +11,9 @@ from django.core.cache import cache
 from django.db.models.functions import ExtractDay, ExtractMonth
 from django.utils import timezone
 
-from app import history_cache
+from app import backdrops, history_cache
 from app import statistics as stats
-from app.models import MediaTypes, Sources
+from app.models import MediaTypes
 
 logger = logging.getLogger(__name__)
 
@@ -81,183 +81,100 @@ def _history_entry_card_payload(entry):
         "item": item,
         "media_type": entry.get("media_type") or getattr(item, "media_type", None),
         "title": title,
-        "image": _get_horizontal_history_image(item, fallback_image, allow_network=True),
+        "image": _poster_image(item, fallback_image),
         "played_at": played_at,
     }
 
 
 def _cached_horizontal_backdrop(item) -> str | None:
     """Return a cached horizontal backdrop without triggering provider lookups."""
-    if not item:
-        return None
+    return backdrops.cached_backdrop(item)
 
-    if isinstance(item, dict):
-        source = item.get("source")
-        media_type = item.get("media_type")
-        media_id = item.get("media_id")
+
+def _poster_image(item, fallback_image):
+    """Return the stored portrait artwork for a card, before backdrop upgrade."""
+    if item is None:
+        poster = fallback_image
+    elif isinstance(item, dict):
+        poster = fallback_image or item.get("image", "")
     else:
-        source = getattr(item, "source", None)
-        media_type = getattr(item, "media_type", None)
-        media_id = getattr(item, "media_id", None)
-
-    if not source or not media_type or not media_id:
-        return None
-
-    if source == Sources.TMDB.value:
-        backdrop_media_type = media_type
-        if media_type in (MediaTypes.EPISODE.value, MediaTypes.SEASON.value, MediaTypes.ANIME.value):
-            backdrop_media_type = MediaTypes.TV.value
-        if backdrop_media_type in (MediaTypes.MOVIE.value, MediaTypes.TV.value):
-            cached_backdrop = cache.get(f"tmdb_backdrop_{backdrop_media_type}_{media_id}")
-            if cached_backdrop and cached_backdrop != settings.IMG_NONE:
-                return cached_backdrop
-
-    if source == Sources.TVDB.value and media_type in (
-        MediaTypes.TV.value,
-        MediaTypes.SEASON.value,
-        MediaTypes.EPISODE.value,
-        MediaTypes.ANIME.value,
-    ):
-        ext_ids = (
-            item.get("provider_external_ids") if isinstance(item, dict)
-            else getattr(item, "provider_external_ids", None)
-        ) or {}
-        tmdb_id = ext_ids.get("tmdb_id")
-        if tmdb_id:
-            cached_backdrop = cache.get(f"tmdb_backdrop_tv_{tmdb_id}")
-            if cached_backdrop and cached_backdrop != settings.IMG_NONE:
-                return cached_backdrop
-
-    if source == Sources.IGDB.value and media_type == MediaTypes.GAME.value:
-        cached_backdrop = cache.get(f"igdb_backdrop_{media_id}")
-        if cached_backdrop and cached_backdrop != settings.IMG_NONE:
-            return cached_backdrop
-
-    return None
+        poster = fallback_image or getattr(item, "image", "")
+    return poster or settings.IMG_NONE
 
 
-def _get_horizontal_history_image(item, fallback_image, *, allow_network=True):
-    """Prefer horizontal artwork when available, matching list hub behavior."""
-    if not item:
-        return fallback_image or settings.IMG_NONE
+def _get_horizontal_history_image(item, fallback_image, *, allow_network=False):
+    """Prefer horizontal artwork when available, matching list hub behavior.
 
-    # Handle both dict (serialized) and model instance
-    if isinstance(item, dict):
-        image = fallback_image or item.get("image", "")
-        source = item.get("source")
-        media_type = item.get("media_type")
-        media_id = item.get("media_id")
-    else:
-        image = fallback_image or getattr(item, "image", "")
-        source = getattr(item, "source", None)
-        media_type = getattr(item, "media_type", None)
-        media_id = getattr(item, "media_id", None)
-
-    if not source or not media_type or not media_id:
-        return image or settings.IMG_NONE
-
-    cached_backdrop = _cached_horizontal_backdrop(item)
-    if cached_backdrop:
-        return cached_backdrop
-
-    if not allow_network:
-        return image or settings.IMG_NONE
-
-    try:
-        from lists.models import CustomList
-    except Exception:
-        return image or settings.IMG_NONE
-
-    # For episodes/seasons/anime, use the TV show's media_id to get the backdrop.
-    # Episodes/seasons share the same media_id as their TV show; TMDB stores
-    # anime as TV shows, so anime items (source=tmdb, media_type=anime) are
-    # fetched via the /tv/{id} endpoint too.
-    if source == Sources.TMDB.value and media_type in (
-        MediaTypes.EPISODE.value,
-        MediaTypes.SEASON.value,
-        MediaTypes.ANIME.value,
-    ):
-        try:
-            backdrop_url = CustomList()._get_tmdb_backdrop(MediaTypes.TV.value, media_id)
-            if backdrop_url and backdrop_url != settings.IMG_NONE:
-                return backdrop_url
-        except Exception:
-            pass
-
-    if source == Sources.TMDB.value and media_type in (MediaTypes.MOVIE.value, MediaTypes.TV.value):
-        try:
-            backdrop_url = CustomList()._get_tmdb_backdrop(media_type, media_id)
-            if backdrop_url and backdrop_url != settings.IMG_NONE:
-                return backdrop_url
-        except Exception:
-            pass
-
-    # TVDB items store a tmdb_id cross-reference in provider_external_ids
-    # (populated by the TVDB provider when it finds a TMDB match).
-    # TV, Season, Episode, and Anime are all valid TVDB types.
-    if source == Sources.TVDB.value and media_type in (
-        MediaTypes.TV.value,
-        MediaTypes.SEASON.value,
-        MediaTypes.EPISODE.value,
-        MediaTypes.ANIME.value,
-    ):
-        ext_ids = (
-            item.get("provider_external_ids") if isinstance(item, dict)
-            else getattr(item, "provider_external_ids", None)
-        ) or {}
-        tmdb_id = ext_ids.get("tmdb_id")
-        if tmdb_id:
-            try:
-                backdrop_url = CustomList()._get_tmdb_backdrop(MediaTypes.TV.value, tmdb_id)
-                if backdrop_url and backdrop_url != settings.IMG_NONE:
-                    return backdrop_url
-            except Exception:
-                pass
-
-    if source == Sources.IGDB.value and media_type == MediaTypes.GAME.value:
-        try:
-            backdrop_url = CustomList()._get_igdb_backdrop(media_id)
-            if backdrop_url and backdrop_url != settings.IMG_NONE:
-                return backdrop_url
-        except Exception:
-            pass
-
-    return image or settings.IMG_NONE
+    Statistics code always leaves ``allow_network`` off; missing backdrops are
+    warmed in the background by ``normalize_highlight_images`` instead.
+    """
+    backdrop = backdrops.resolve_backdrop(item, allow_network=allow_network)
+    return backdrop or _poster_image(item, fallback_image)
 
 
-def _normalize_history_highlight_images(history_highlights):
-    """Ensure highlight cards prefer horizontal artwork, even for cached payloads."""
+def _highlight_entries(history_highlights):
+    """Yield the card entries of one highlights dict that carry artwork."""
     if not isinstance(history_highlights, dict):
         return
-
     for key in ("first_play", "last_play"):
         entry = history_highlights.get(key)
-        if not isinstance(entry, dict):
-            continue
-        fallback = entry.get("image") or entry.get("poster")
-        entry["image"] = _get_horizontal_history_image(
-            entry.get("item"),
-            fallback,
-            allow_network=True,
-        )
+        if isinstance(entry, dict):
+            yield entry
     today_card = history_highlights.get("today_card")
     if isinstance(today_card, dict):
         entry = today_card.get("entry")
         if isinstance(entry, dict):
-            fallback = entry.get("image") or entry.get("poster")
-            entry["image"] = _get_horizontal_history_image(
-                entry.get("item"),
-                fallback,
-                allow_network=True,
-            )
+            yield entry
+
+
+def _upgrade_entry_images(entries) -> None:
+    """Swap cached backdrops into card entries; warm the misses in background.
+
+    Never calls a provider. An entry marked ``image_is_backdrop`` already holds
+    its backdrop URL and is left alone, so payloads keep serving landscape
+    artwork after the Redis backdrop key expires.
+    """
+    to_warm = []
+    for entry in entries:
+        if entry.get("image_is_backdrop"):
+            continue
+        item = entry.get("item")
+        backdrop = _cached_horizontal_backdrop(item)
+        if backdrop:
+            entry["image"] = backdrop
+            entry["image_is_backdrop"] = True
+            continue
+        entry["image"] = _poster_image(item, entry.get("image") or entry.get("poster"))
+        if item is not None:
+            to_warm.append(item)
+    if to_warm:
+        backdrops.schedule_backdrop_warm(to_warm)
+
+
+def normalize_highlight_images(data) -> None:
+    """Prefer horizontal artwork on every highlight card of a statistics payload.
+
+    Runs on reads and before a rebuilt payload is published; see the
+    "Highlight artwork" section of docs/architecture/statistics-refresh-runs.md.
+    """
+    if not isinstance(data, dict):
+        return
+    entries = list(_highlight_entries(data.get("history_highlights")))
+    by_type = data.get("history_highlights_by_type")
+    if isinstance(by_type, dict):
+        for type_highlights in by_type.values():
+            entries.extend(_highlight_entries(type_highlights))
+    _upgrade_entry_images(entries)
+
+
+def _normalize_history_highlight_images(history_highlights):
+    """Apply ``normalize_highlight_images`` to a single highlights dict."""
+    _upgrade_entry_images(list(_highlight_entries(history_highlights)))
 
 
 def _normalize_history_highlights_by_type(highlights_by_type):
-    """Apply image normalization to each per-type highlights dict."""
-    if not isinstance(highlights_by_type, dict):
-        return
-    for type_highlights in highlights_by_type.values():
-        _normalize_history_highlight_images(type_highlights)
+    """Apply ``normalize_highlight_images`` to each per-type highlights dict."""
+    normalize_highlight_images({"history_highlights_by_type": highlights_by_type})
 
 
 _TV_FAMILY = {MediaTypes.TV.value, MediaTypes.EPISODE.value, MediaTypes.SEASON.value}
@@ -275,12 +192,16 @@ def _entry_matches_type_filter(entry, media_type_filter):
     return entry_type == media_type_filter
 
 
-def _select_history_entry_for_day(day_payload, pick_earliest=False, pick_latest=False, media_type_filter=None):
+def _select_history_entry_for_day(
+    day_payload, pick_earliest=False, pick_latest=False, media_type_filter=None
+):
     if not day_payload:
         return None
     entries = day_payload.get("entries") or []
     if media_type_filter:
-        entries = [e for e in entries if _entry_matches_type_filter(e, media_type_filter)]
+        entries = [
+            e for e in entries if _entry_matches_type_filter(e, media_type_filter)
+        ]
     if not entries:
         return None
     if pick_earliest:
@@ -288,7 +209,7 @@ def _select_history_entry_for_day(day_payload, pick_earliest=False, pick_latest=
     elif pick_latest:
         entry = entries[0]
     else:
-        entry = random.choice(entries)
+        entry = random.choice(entries)  # noqa: S311  # sampling/jitter only, not cryptographic
     return _history_entry_card_payload(entry)
 
 
@@ -312,15 +233,19 @@ def _get_today_history_entries(user, media_type_filter=None):
         random.shuffle(candidates)
         for candidate in candidates[:12]:
             payload = _get_history_day_payload(user, candidate)
-            entry = _select_history_entry_for_day(payload, media_type_filter=media_type_filter)
+            entry = _select_history_entry_for_day(
+                payload, media_type_filter=media_type_filter
+            )
             if entry:
                 return entry, candidate.year
         return None, None
 
     available_years = sorted({day_date.year for day_date in matching_dates})
-    selected_year = random.choice(available_years)
-    year_dates = [day_date for day_date in matching_dates if day_date.year == selected_year]
-    selected_date = random.choice(year_dates) if year_dates else None
+    selected_year = random.choice(available_years)  # noqa: S311  # sampling/jitter only, not cryptographic
+    year_dates = [
+        day_date for day_date in matching_dates if day_date.year == selected_year
+    ]
+    selected_date = random.choice(year_dates) if year_dates else None  # noqa: S311  # sampling/jitter only, not cryptographic
     if not selected_date:
         return None, None
 
@@ -328,26 +253,29 @@ def _get_today_history_entries(user, media_type_filter=None):
     return _select_history_entry_for_day(day_payload), selected_year
 
 
-def _get_today_release_entry(user, media_type_filter=None):
-    today = timezone.localdate()
-    active_types = list(getattr(user, "get_active_media_types", list)())
-    if not active_types:
-        active_types = list(MediaTypes.values)
-    include_podcasts = MediaTypes.PODCAST.value in active_types
-    active_types = [
-        media_type
-        for media_type in active_types
-        if media_type not in (MediaTypes.EPISODE.value, MediaTypes.PODCAST.value)
-    ]
-    if media_type_filter:
-        if media_type_filter == MediaTypes.TV.value:
-            allowed = _TV_FAMILY - {MediaTypes.EPISODE.value}
-        elif media_type_filter == MediaTypes.ANIME.value:
-            allowed = _ANIME_FAMILY
-        else:
-            allowed = {media_type_filter}
-        active_types = [mt for mt in active_types if mt in allowed]
-        include_podcasts = include_podcasts and media_type_filter == MediaTypes.PODCAST.value
+# The candidate scan is library-wide (no date index can narrow it to a
+# month/day), and one range aggregation asks for it once per media type. Keep
+# the handful of matching items for a few minutes so the ranges of a sync pass
+# share one scan instead of repeating it per range and per type.
+TODAY_RELEASE_CACHE_TIMEOUT = 60 * 5
+
+
+def _today_release_candidates(
+    user,
+    today,
+    active_types,
+    *,
+    include_episodes,
+    include_podcasts,
+):
+    key = (
+        f"stats:highlights:release:{user.id}:{today.isoformat()}:"
+        f"{','.join(sorted(active_types))}:{int(include_episodes)}:"
+        f"{int(include_podcasts)}"
+    )
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
 
     items_by_year = defaultdict(list)
     seen_item_ids = set()
@@ -375,18 +303,19 @@ def _get_today_release_entry(user, media_type_filter=None):
             if not localized:
                 continue
             release_date = localized.date()
-            items_by_year[release_date.year].append({
-                "item": item,
-                "media_type": item.media_type,
-                "title": item.title,
-                "image": _get_horizontal_history_image(item, item.image, allow_network=True),
-                "release_date": release_date,
-            })
+            items_by_year[release_date.year].append(
+                {
+                    "item": item,
+                    "media_type": item.media_type,
+                    "title": item.title,
+                    "image": _poster_image(item, item.image),
+                    "release_date": release_date,
+                }
+            )
 
-    include_episodes = not media_type_filter or media_type_filter in (MediaTypes.TV.value,)
     Episode = apps.get_model("app", "Episode")
     episode_qs = (
-        Episode.objects.filter(
+        Episode.all_objects.filter(
             related_season__user=user,
             item__release_datetime__isnull=False,
         )
@@ -400,7 +329,8 @@ def _get_today_release_entry(user, media_type_filter=None):
             release_day=ExtractDay("item__release_datetime"),
         )
         .filter(release_month=today.month, release_day=today.day)
-        if include_episodes else []
+        if include_episodes
+        else []
     )
     for episode in episode_qs:
         episode_item = getattr(episode, "item", None)
@@ -416,21 +346,21 @@ def _get_today_release_entry(user, media_type_filter=None):
         release_date = localized.date()
         display_title = history_cache._get_episode_display_title(episode)
         episode_poster = history_cache._get_episode_poster(episode)
-        items_by_year[release_date.year].append({
-            "item": episode_item,
-            "media_type": MediaTypes.EPISODE.value,
-            "title": display_title or episode_item.title,
-            "image": _get_horizontal_history_image(
-                episode_item,
-                episode_poster,
-                allow_network=True,
-            ),
-            "release_date": release_date,
-        })
+        items_by_year[release_date.year].append(
+            {
+                "item": episode_item,
+                "media_type": MediaTypes.EPISODE.value,
+                "title": display_title or episode_item.title,
+                "image": _poster_image(episode_item, episode_poster),
+                "release_date": release_date,
+            }
+        )
 
     if include_podcasts:
         Podcast = apps.get_model("app", "Podcast")
-        podcast_base = Podcast.objects.filter(user=user).select_related("item", "episode", "show")
+        podcast_base = Podcast.objects.filter(user=user).select_related(
+            "item", "episode", "show"
+        )
         podcast_qs = (
             podcast_base.filter(episode__published__isnull=False)
             .annotate(
@@ -454,19 +384,19 @@ def _get_today_release_entry(user, media_type_filter=None):
             if not show:
                 show = podcast.show
             image = (show.image if show and show.image else None) or item.image
-            title = item.title or getattr(getattr(podcast, "episode", None), "title", "")
+            title = item.title or getattr(
+                getattr(podcast, "episode", None), "title", ""
+            )
             seen_item_ids.add(item.id)
-            items_by_year[release_date.year].append({
-                "item": item,
-                "media_type": MediaTypes.PODCAST.value,
-                "title": title,
-                "image": _get_horizontal_history_image(
-                    item,
-                    image,
-                    allow_network=False,
-                ),
-                "release_date": release_date,
-            })
+            items_by_year[release_date.year].append(
+                {
+                    "item": item,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "title": title,
+                    "image": _poster_image(item, image),
+                    "release_date": release_date,
+                }
+            )
 
         podcast_fallback_qs = (
             podcast_base.filter(
@@ -494,26 +424,65 @@ def _get_today_release_entry(user, media_type_filter=None):
             if not show:
                 show = podcast.show
             image = (show.image if show and show.image else None) or item.image
-            title = item.title or getattr(getattr(podcast, "episode", None), "title", "")
+            title = item.title or getattr(
+                getattr(podcast, "episode", None), "title", ""
+            )
             seen_item_ids.add(item.id)
-            items_by_year[release_date.year].append({
-                "item": item,
-                "media_type": MediaTypes.PODCAST.value,
-                "title": title,
-                "image": _get_horizontal_history_image(
-                    item,
-                    image,
-                    allow_network=False,
-                ),
-                "release_date": release_date,
-            })
+            items_by_year[release_date.year].append(
+                {
+                    "item": item,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "title": title,
+                    "image": _poster_image(item, image),
+                    "release_date": release_date,
+                }
+            )
 
+    cache.set(key, items_by_year, timeout=TODAY_RELEASE_CACHE_TIMEOUT)
+    return items_by_year
+
+
+def _get_today_release_entry(user, media_type_filter=None):
+    today = timezone.localdate()
+    active_types = list(getattr(user, "get_active_media_types", list)())
+    if not active_types:
+        active_types = list(MediaTypes.values)
+    include_podcasts = MediaTypes.PODCAST.value in active_types
+    active_types = [
+        media_type
+        for media_type in active_types
+        if media_type not in (MediaTypes.EPISODE.value, MediaTypes.PODCAST.value)
+    ]
+    if media_type_filter:
+        if media_type_filter == MediaTypes.TV.value:
+            allowed = _TV_FAMILY - {MediaTypes.EPISODE.value}
+        elif media_type_filter == MediaTypes.ANIME.value:
+            allowed = _ANIME_FAMILY
+        else:
+            allowed = {media_type_filter}
+        active_types = [mt for mt in active_types if mt in allowed]
+        include_podcasts = (
+            include_podcasts and media_type_filter == MediaTypes.PODCAST.value
+        )
+
+    include_episodes = not media_type_filter or media_type_filter == MediaTypes.TV.value
+    items_by_year = _today_release_candidates(
+        user,
+        today,
+        active_types,
+        include_episodes=include_episodes,
+        include_podcasts=include_podcasts,
+    )
     if not items_by_year:
         return None, None
 
     available_years = sorted(items_by_year.keys())
-    selected_year = random.choice(available_years)
-    selected_item = random.choice(items_by_year[selected_year]) if items_by_year[selected_year] else None
+    selected_year = random.choice(available_years)  # noqa: S311  # sampling/jitter only, not cryptographic
+    selected_item = (
+        random.choice(items_by_year[selected_year])  # noqa: S311  # sampling/jitter only, not cryptographic
+        if items_by_year[selected_year]
+        else None
+    )
     if not selected_item:
         return None, None
     return selected_item, selected_year
@@ -527,8 +496,13 @@ def _get_history_index_days(user):
         if isinstance(days, list):
             return days
 
-    day_keys = history_cache.build_history_index(user, logging_style_override=logging_style)
-    history_cache.cache_history_index(user.id, logging_style, day_keys)
+    # Capture the era before reading rows (see history_cache_reader) so this
+    # publish cannot embed rows from before a concurrent invalidation.
+    era = history_cache._current_history_era(user.id, logging_style)
+    day_keys = history_cache.build_history_index(
+        user, logging_style_override=logging_style
+    )
+    history_cache.cache_history_index(user.id, logging_style, day_keys, era=era)
     return day_keys
 
 
@@ -543,10 +517,12 @@ def _get_history_day_payload(user, day_value):
     if cached_payload:
         return history_cache._deserialize_history_day(cached_payload)
 
-    return history_cache.build_history_day(
+    # Keep the day it had to build. Every range of a Statistics sync picks its
+    # own random day, and an uncached day cost ~80 ms each time it came up.
+    return history_cache._build_and_cache_history_day(
         user,
         day_key,
-        logging_style_override=logging_style,
+        logging_style,
     )
 
 

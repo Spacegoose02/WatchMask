@@ -10,65 +10,126 @@ from django.utils.dateparse import parse_datetime
 import app
 from app import helpers as app_helpers
 from app.models import MediaTypes, Sources, Status
-from app.providers import services
+from app.providers import credentials, services
+from integrations import import_progress
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 
 logger = logging.getLogger(__name__)
 
 
-def get_token(request, redirect_uri=None):
-    """View for getting the SIMKL OAuth2 token."""
-    code = request.GET["code"]
-    url = "https://api.simkl.com/oauth/token"
+def get_token(request, redirect_uri=None, code_verifier=None):
+    """View for getting the SIMKL OAuth2 token.
 
-    headers = {
-        "Content-Type": "application/json",
-    }
-
-    params = {
-        "client_id": settings.SIMKL_ID,
-        "client_secret": settings.SIMKL_SECRET,
-        "code": code,
+    AUTH V2 sends a PKCE verifier; AUTH V1 apps have none and no refresh token.
+    """
+    data = {
+        "code": request.GET["code"],
         "grant_type": "authorization_code",
-        "redirect_uri": redirect_uri or app_helpers.build_absolute_app_url(
+        "redirect_uri": redirect_uri
+        or app_helpers.build_absolute_app_url(
             request,
             reverse("import_simkl_private"),
         ),
     }
-
-    try:
-        token_response = app.providers.services.api_request(
-            "SIMKL",
-            "POST",
-            url,
-            headers=headers,
-            params=params,
-        )
-    except services.ProviderAPIError as error:
-        if error.status_code == requests.codes.unauthorized:
-            msg = "Invalid SIMKL secret key."
-            raise MediaImportError(msg) from error
-        raise
+    if code_verifier:
+        data["code_verifier"] = code_verifier
+    token_response = _request_token(data, auth_v1=not code_verifier)
 
     return {
         "access_token": token_response["access_token"],
+        "refresh_token": token_response.get("refresh_token"),
         "username": get_username(token_response["access_token"]),
+    }
+
+
+def get_access_token(encrypted_refresh_token):
+    """Get access token from encrypted refresh token.
+
+    SIMKL refresh tokens don't rotate, so the stored one stays valid.
+    """
+    return _request_token(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": helpers.decrypt_or_raise(encrypted_refresh_token),
+        },
+    )["access_token"]
+
+
+def _request_token(data, auth_v1=False):
+    """Exchange a code or refresh token at SIMKL's token endpoint."""
+    headers = {
+        "simkl-api-key": credentials.get("simkl", "client_id"),
+        "User-Agent": f"Watchmask/{settings.VERSION}",
+    }
+    data = {
+        "client_id": credentials.get("simkl", "client_id"),
+        "client_secret": credentials.get("simkl", "client_secret"),
+        **data,
+    }
+
+    try:
+        if auth_v1:
+            # AUTH V1 takes a JSON body; remove when it retires (~April 2027)
+            return app.providers.services.api_request(
+                "SIMKL",
+                "POST",
+                "https://api.simkl.com/oauth/token",
+                headers=headers,
+                params=data,
+            )
+        return app.providers.services.api_request(
+            "SIMKL",
+            "POST",
+            "https://api.simkl.com/oauth2/token",
+            headers=headers,
+            data=data,
+        )
+    except requests.exceptions.HTTPError as error:
+        # api_request re-raises HTTP errors as-is, so a rejected exchange
+        # surfaced as a 500 page instead of this message (#1318).
+        if error.response.status_code in (
+            requests.codes.unauthorized,
+            requests.codes.forbidden,
+        ):
+            msg = (
+                "SIMKL rejected the Client ID and Client secret. Check them in "
+                "Settings > Metadata, and that the SIMKL app's redirect URI "
+                "matches this Watchmask address."
+            )
+            raise MediaImportError(msg) from error
+        raise
+
+
+def _api_headers(token):
+    """Headers SIMKL requires on authenticated API calls."""
+    return {
+        "Authorization": f"Bearer {token}",
+        "simkl-api-key": credentials.get("simkl", "client_id"),
+        "User-Agent": f"Watchmask/{settings.VERSION}",
+    }
+
+
+def _api_params():
+    """Query parameters SIMKL requires on every API call."""
+    return {
+        "client_id": credentials.get("simkl", "client_id"),
+        "app-name": "floppy",
+        "app-version": settings.VERSION,
     }
 
 
 def get_username(token):
     """Get the username from SIMKL using the provided token."""
     try:
+        # GET: AUTH V2 tokens without a scope are read-only, and SIMKL
+        # treats POST /users/settings as a write
         user_info = app.providers.services.api_request(
             "SIMKL",
-            "POST",
+            "GET",
             "https://api.simkl.com/users/settings",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "simkl-api-key": settings.SIMKL_ID,
-                "Content-Type": "application/json",
-            },
+            headers=_api_headers(token),
+            params=_api_params(),
         )
     except services.ProviderAPIError as error:
         if error.status_code == requests.codes.unauthorized:
@@ -79,9 +140,15 @@ def get_username(token):
     return user_info["user"]["name"]
 
 
-def importer(token, user, mode):
+def importer(
+    token,
+    user,
+    mode,
+    anime_destination=MediaTypes.ANIME.value,
+    refresh_token=None,
+):
     """Import tv shows, movies and anime from SIMKL."""
-    simkl_importer = SimklImporter(token, user, mode)
+    simkl_importer = SimklImporter(token, user, mode, refresh_token=refresh_token)
     return simkl_importer.import_data()
 
 
@@ -90,21 +157,42 @@ class SimklImporter:
 
     SIMKL_API_BASE_URL = "https://api.simkl.com"
 
-    def __init__(self, token, user, mode):
+    def __init__(
+        self,
+        token,
+        user,
+        mode,
+        anime_destination=MediaTypes.ANIME.value,
+        refresh_token=None,
+    ):
         """Initialize the importer with token, user, and mode.
 
         Args:
             token (str): Simkl OAuth token
             user: Django user object to import data for
             mode (str): Import mode ("new" or "overwrite")
+            anime_destination (str): accepted and ignored. It used to choose
+                between the Anime library and plain TV/Movie rows, which was a
+                workaround for scrobbles and imports disagreeing (issue #468).
+                Both now follow one rule, so the third shape it produced only
+                created shows tracked in two libraries at once. Recurring
+                schedules persist this kwarg, so it is still accepted.
+            refresh_token (str, optional): Encrypted AUTH V2 refresh token.
+                Recurring schedules store it because the access token expires
+                after 7 days; schedules from AUTH V1 have none.
         """
-        self.token = helpers.decrypt(token)
+        if refresh_token:
+            self.token = get_access_token(refresh_token)
+        else:
+            self.token = helpers.decrypt_or_raise(token)
         self.user = user
         self.mode = mode
         self.warnings = []
 
         # Track existing media for "new" mode
         self.existing_media = helpers.get_existing_media(user)
+        self.deleted_media = helpers.get_deleted_media(user)
+        self.existing_children = helpers.get_existing_children(user)
 
         # Track media IDs to delete in overwrite mode
         self.to_delete = defaultdict(lambda: defaultdict(set))
@@ -141,11 +229,8 @@ class SimklImporter:
     def _get_user_list(self):
         """Get the user's list from Simkl."""
         url = f"{self.SIMKL_API_BASE_URL}/sync/all-items/"
-        headers = {
-            "Authorization": f"Bearer: {self.token}",
-            "simkl-api-key": settings.SIMKL_ID,
-        }
         params = {
+            **_api_params(),
             "extended": "full",
             "episode_watched_at": "yes",
             "memos": "yes",
@@ -155,12 +240,19 @@ class SimklImporter:
             "SIMKL",
             "GET",
             url,
-            headers=headers,
+            headers=_api_headers(self.token),
             params=params,
         )
 
     def _process_media_lists(self, data):
         """Process all media types from Simkl."""
+        self._progress_total = (
+            len(data.get("shows", []))
+            + len(data.get("movies", []))
+            + len(data.get("anime", []))
+        )
+        self._progress_current = 0
+
         if "shows" in data:
             self._process_tv_list(data["shows"])
         if "movies" in data:
@@ -174,6 +266,8 @@ class SimklImporter:
         existing_tv_ids = set()
 
         for tv in tv_list:
+            self._progress_current += 1
+            import_progress.report(self._progress_current, self._progress_total, "SIMKL")
             try:
                 title = tv["show"]["title"]
                 logger.debug("Processing %s", title)
@@ -214,36 +308,51 @@ class SimklImporter:
                     raise
 
                 # Check if we should process this entry based on mode.
-                if not helpers.should_process_media(
+                should_process_tv = helpers.should_process_media(
                     self.existing_media,
                     self.to_delete,
                     MediaTypes.TV.value,
                     tv_source,
                     str(tv_media_id),
                     self.mode,
-                ):
+                    deleted_media=self.deleted_media,
+                )
+
+                if should_process_tv:
+                    tv_item, _ = helpers.get_or_create_item_across_buckets(
+                        user=self.user,
+                        preferred_bucket=MediaTypes.TV.value,
+                        media_id=tv_media_id,
+                        source=tv_source,
+                        media_type=MediaTypes.TV.value,
+                        defaults={
+                            **app.models.Item.title_fields_from_metadata(metadata),
+                            "image": metadata["image"],
+                        },
+                    )
+
+                    tv_instance = app.models.TV(
+                        item=tv_item,
+                        user=self.user,
+                        status=tv_status,
+                        score=tv["user_rating"],
+                        notes=tv["memo"]["text"] if tv["memo"] != {} else "",
+                    )
+                    tv_instance._history_date = self._get_history_date(tv)
+                    self.bulk_media[MediaTypes.TV.value].append(tv_instance)
+                    existing_tv_ids.add(tmdb_id)
+                elif self.mode == "new":
+                    # The show already exists, but this entry's seasons/
+                    # episodes shouldn't be dropped wholesale - reuse the
+                    # existing TV row so any it doesn't have yet can still
+                    # be added below.
+                    tv_instance = self.existing_media[MediaTypes.TV.value][
+                        tv_source
+                    ].get(str(tv_media_id))
+                    if tv_instance is None:
+                        continue
+                else:
                     continue
-
-                tv_item, _ = app.models.Item.objects.get_or_create(
-                    media_id=tv_media_id,
-                    source=tv_source,
-                    media_type=MediaTypes.TV.value,
-                    defaults={
-                        **app.models.Item.title_fields_from_metadata(metadata),
-                        "image": metadata["image"],
-                    },
-                )
-
-                tv_instance = app.models.TV(
-                    item=tv_item,
-                    user=self.user,
-                    status=tv_status,
-                    score=tv["user_rating"],
-                    notes=tv["memo"]["text"] if tv["memo"] != {} else "",
-                )
-                tv_instance._history_date = self._get_history_date(tv)
-                self.bulk_media[MediaTypes.TV.value].append(tv_instance)
-                existing_tv_ids.add(tmdb_id)
 
                 if season_numbers:
                     self._process_seasons_and_episodes(
@@ -324,6 +433,18 @@ class SimklImporter:
             for season_number in season_numbers
         )
 
+    def _child_bucket(self, show_item, default_bucket):
+        """Return the library bucket a show's season/episode rows belong in.
+
+        Mirrors Season.get_episode_item: children follow the show's grouping
+        bucket (grouped anime lives on TV rows) and otherwise fall back to
+        their own media type, never inheriting a container's 'tv' bucket.
+        """
+        show_bucket = show_item.library_media_type
+        if show_bucket and show_bucket != MediaTypes.TV.value:
+            return show_bucket
+        return default_bucket
+
     def _process_seasons_and_episodes(
         self,
         tv,
@@ -354,48 +475,94 @@ class SimklImporter:
                 )
                 continue
 
-            # Use season poster if available, otherwise fallback to TV show poster
-            season_image = season_metadata.get("image") or metadata.get("image")
+            # In "new" mode, an already-tracked show must not block a season
+            # it doesn't have yet - check this season's own existence rather
+            # than skip solely because the show already exists.
+            existing_season = None
+            if self.mode == "new":
+                existing_season = self.existing_children[MediaTypes.SEASON.value][
+                    tv_source
+                ].get((tv_media_id, season_number))
 
-            season_item, _ = app.models.Item.objects.get_or_create(
-                media_id=tv_media_id,
-                source=tv_source,
-                media_type=MediaTypes.SEASON.value,
-                season_number=season_number,
-                defaults={
-                    **app.models.Item.title_fields_from_metadata(metadata),
-                    "image": season_image,
-                },
-            )
-
-            if episodes[-1]["number"] == season_metadata["max_progress"]:
-                season_status = Status.COMPLETED.value
+            if existing_season is not None:
+                season_instance = existing_season
             else:
-                season_status = tv_instance.status
+                # Use season poster if available, otherwise fallback to TV
+                # show poster
+                season_image = season_metadata.get("image") or metadata.get("image")
 
-            season_instance = app.models.Season(
-                item=season_item,
-                user=self.user,
-                related_tv=tv_instance,
-                status=season_status,
-            )
-            season_instance._history_date = self._get_history_date(tv)
-            self.bulk_media[MediaTypes.SEASON.value].append(season_instance)
+                season_bucket = self._child_bucket(
+                    tv_instance.item,
+                    MediaTypes.SEASON.value,
+                )
+                season_item = helpers.find_item_across_buckets(
+                    preferred_bucket=season_bucket,
+                    media_id=tv_media_id,
+                    source=tv_source,
+                    media_type=MediaTypes.SEASON.value,
+                    season_number=season_number,
+                )
+                if season_item is None:
+                    season_item, _ = app.models.Item.objects.get_or_create(
+                        media_id=tv_media_id,
+                        source=tv_source,
+                        media_type=MediaTypes.SEASON.value,
+                        library_media_type=season_bucket,
+                        season_number=season_number,
+                        defaults={
+                            **app.models.Item.title_fields_from_metadata(metadata),
+                            "image": season_image,
+                        },
+                    )
+
+                if episodes[-1]["number"] == helpers.season_last_episode_number(
+                    season_metadata,
+                ):
+                    season_status = Status.COMPLETED.value
+                else:
+                    season_status = tv_instance.status
+
+                season_instance = app.models.Season(
+                    item=season_item,
+                    user=self.user,
+                    related_tv=tv_instance,
+                    status=season_status,
+                )
+                season_instance._history_date = self._get_history_date(tv)
+                self.bulk_media[MediaTypes.SEASON.value].append(season_instance)
 
             # Process episodes
             for episode in episodes:
+                if self.mode == "new" and (
+                    tv_media_id,
+                    season_number,
+                    episode["number"],
+                ) in self.existing_children[MediaTypes.EPISODE.value][tv_source]:
+                    continue
+
                 ep_img = self._get_episode_image(episode, season_number, metadata)
-                episode_item, _ = app.models.Item.objects.get_or_create(
+                episode_bucket = self._child_bucket(tv_instance.item, MediaTypes.EPISODE.value)
+                episode_item = helpers.find_item_across_buckets(
+                    preferred_bucket=episode_bucket,
                     media_id=tv_media_id,
                     source=tv_source,
                     media_type=MediaTypes.EPISODE.value,
                     season_number=season_number,
                     episode_number=episode["number"],
-                    defaults={
-                        **app.models.Item.title_fields_from_metadata(metadata),
-                        "image": ep_img,
-                    },
                 )
+                if episode_item is None:
+                    episode_item, _ = app.models.Item.objects.get_or_create(
+                        media_id=tv_media_id,
+                        source=tv_source,
+                        media_type=MediaTypes.EPISODE.value,
+                        library_media_type=episode_bucket,
+                        season_number=season_number,
+                        episode_number=episode["number"],
+                        defaults={
+                            **app.models.Item.title_fields_from_metadata(metadata),
+                            "image": ep_img,
+                        },
+                    )
 
                 episode_instance = app.models.Episode(
                     item=episode_item,
@@ -432,6 +599,8 @@ class SimklImporter:
         existing_movie_ids = set()
 
         for movie in movie_list:
+            self._progress_current += 1
+            import_progress.report(self._progress_current, self._progress_total, "SIMKL")
             try:
                 title = movie["movie"]["title"]
                 logger.debug("Processing %s", title)
@@ -456,6 +625,7 @@ class SimklImporter:
                     Sources.TMDB.value,
                     str(tmdb_id),
                     self.mode,
+                    deleted_media=self.deleted_media,
                 ):
                     continue
 
@@ -472,7 +642,8 @@ class SimklImporter:
                         continue
                     raise
 
-                movie_item, _ = app.models.Item.objects.get_or_create(
+                movie_item, _ = helpers.get_or_create_item_across_buckets(
+                    user=self.user,
                     media_id=tmdb_id,
                     source=Sources.TMDB.value,
                     media_type=MediaTypes.MOVIE.value,
@@ -508,79 +679,86 @@ class SimklImporter:
         existing_anime_ids = set()
 
         for anime in anime_list:
+            self._progress_current += 1
+            import_progress.report(self._progress_current, self._progress_total, "SIMKL")
             try:
-                title = anime["show"]["title"]
-                logger.debug("Processing %s", title)
-
-                try:
-                    mal_id = anime["show"]["ids"]["mal"]
-                except KeyError:
-                    self.warnings.append(f"{title}: No MyAnimeList ID found")
-                    continue
-
-                if mal_id in existing_anime_ids:
-                    self.warnings.append(
-                        f"{title} ({mal_id}) already present in the import list",
-                    )
-                    continue
-
-                # Check if we should process this entry based on mode
-                if not helpers.should_process_media(
-                    self.existing_media,
-                    self.to_delete,
-                    MediaTypes.ANIME.value,
-                    Sources.MAL.value,
-                    str(mal_id),
-                    self.mode,
-                ):
-                    continue
-
-                anime_status = self._get_status(anime["status"])
-
-                try:
-                    metadata = app.providers.mal.anime(mal_id)
-                except services.ProviderAPIError as error:
-                    if error.status_code == requests.codes.not_found:
-                        self.warnings.append(
-                            f"{title}: not found in {Sources.MAL.label} "
-                            f"with ID {mal_id}.",
-                        )
-                        continue
-                    raise
-
-                anime_item, _ = app.models.Item.objects.get_or_create(
-                    media_id=mal_id,
-                    source=Sources.MAL.value,
-                    media_type=MediaTypes.ANIME.value,
-                    defaults={
-                        **app.models.Item.title_fields_from_metadata(metadata),
-                        "image": metadata["image"],
-                    },
-                )
-
-                anime_instance = app.models.Anime(
-                    item=anime_item,
-                    user=self.user,
-                    status=anime_status,
-                    score=anime["user_rating"],
-                    progress=anime["watched_episodes_count"],
-                    start_date=self._get_start_date(anime),
-                    end_date=self._get_end_date(
-                        anime_status,
-                        anime.get("last_watched_at"),
-                    ),
-                    notes=anime["memo"]["text"] if anime["memo"] != {} else "",
-                )
-                anime_instance._history_date = self._get_history_date(anime)
-
-                self.bulk_media[MediaTypes.ANIME.value].append(anime_instance)
-                existing_anime_ids.add(mal_id)
-
+                self._process_single_anime_entry(anime, existing_anime_ids)
             except Exception as error:
                 msg = f"Error processing entry: {anime}"
                 raise MediaImportUnexpectedError(msg) from error
 
         logger.info("Processed %d anime", len(anime_list))
+
+    def _process_single_anime_entry(self, anime, existing_anime_ids):
+        """Process a single anime entry into the Anime bucket via MAL."""
+        title = anime["show"]["title"]
+        logger.debug("Processing %s", title)
+
+        try:
+            mal_id = anime["show"]["ids"]["mal"]
+        except KeyError:
+            self.warnings.append(f"{title}: No MyAnimeList ID found")
+            return
+
+        if mal_id in existing_anime_ids:
+            self.warnings.append(
+                f"{title} ({mal_id}) already present in the import list",
+            )
+            return
+
+        # Check if we should process this entry based on mode
+        if not helpers.should_process_media(
+            self.existing_media,
+            self.to_delete,
+            MediaTypes.ANIME.value,
+            Sources.MAL.value,
+            str(mal_id),
+            self.mode,
+            deleted_media=self.deleted_media,
+        ):
+            return
+
+        anime_status = self._get_status(anime["status"])
+
+        try:
+            metadata = app.providers.mal.anime(mal_id)
+        except services.ProviderAPIError as error:
+            if error.status_code == requests.codes.not_found:
+                self.warnings.append(
+                    f"{title}: not found in {Sources.MAL.label} "
+                    f"with ID {mal_id}.",
+                )
+                return
+            raise
+
+        anime_item, _ = helpers.get_or_create_item_across_buckets(
+            user=self.user,
+            media_id=mal_id,
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            defaults={
+                **app.models.Item.title_fields_from_metadata(metadata),
+                "image": metadata["image"],
+            },
+        )
+
+        anime_instance = app.models.Anime(
+            item=anime_item,
+            user=self.user,
+            status=anime_status,
+            score=anime["user_rating"],
+            progress=anime["watched_episodes_count"],
+            start_date=self._get_start_date(anime),
+            end_date=self._get_end_date(
+                anime_status,
+                anime.get("last_watched_at"),
+            ),
+            notes=anime["memo"]["text"] if anime["memo"] != {} else "",
+        )
+        anime_instance._history_date = self._get_history_date(anime)
+
+        self.bulk_media[MediaTypes.ANIME.value].append(anime_instance)
+        existing_anime_ids.add(mal_id)
 
     def _get_status(self, status):
         """Map Simkl status to internal status."""

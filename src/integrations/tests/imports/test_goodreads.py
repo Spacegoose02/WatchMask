@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, tag
 
 from app.models import (
     Book,
@@ -22,6 +22,7 @@ app_mock_path = (
 )
 
 
+@tag("network")
 class ImportGoodreads(TestCase):
     """Test importing media from GoodReads CSV."""
 
@@ -66,8 +67,7 @@ class ImportGoodreads(TestCase):
             "Private Notes",
         ]
         csv_payload = (
-            ",".join(headers)
-            + "\n"
+            ",".join(headers) + "\n"
             "1,Book with Unknown Shelf,Author,9780000000001,0,320,owned,,,\n"
         )
 
@@ -101,8 +101,7 @@ class ImportGoodreads(TestCase):
             "Private Notes",
         ]
         csv_payload = (
-            ",".join(headers)
-            + "\n"
+            ",".join(headers) + "\n"
             "2,Date-less Book,Author,9780000000002,4,220,read,,,\n"
         )
 
@@ -117,6 +116,40 @@ class ImportGoodreads(TestCase):
         imported_book = Book.objects.get(user=self.user, item__media_id="1002")
         self.assertEqual(imported_book.status, Status.COMPLETED.value)
         self.assertEqual(imported_book.progress, 220)
+
+    def test_import_handles_decimal_rating(self):
+        """Decimal ratings (e.g. '3.0') should not crash import."""
+        headers = [
+            "Book Id",
+            "Title",
+            "Author",
+            "ISBN13",
+            "My Rating",
+            "Number of Pages",
+            "Exclusive Shelf",
+            "Date Added",
+            "Date Read",
+            "Private Notes",
+        ]
+        csv_payload = (
+            ",".join(headers) + "\n"
+            "3,Decimal Rating Book,Author,9780000000003,3.0,245,read,,,\n"
+        )
+
+        resolved_book = {
+            "media_id": "1003",
+            "title": "Decimal Rating Book",
+            "image": "",
+        }
+        with patch.object(
+            goodreads.GoodReadsImporter,
+            "_search_book",
+            return_value=resolved_book,
+        ):
+            goodreads.importer(BytesIO(csv_payload.encode("utf-8")), self.user, "new")
+
+        imported_book = Book.objects.get(user=self.user, item__media_id="1003")
+        self.assertEqual(imported_book.score, 6)
 
 
 class ImportGoodreadsProviderErrors(TestCase):

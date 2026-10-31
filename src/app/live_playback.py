@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
+from urllib.parse import quote
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django.urls import reverse
+from django.urls import get_script_prefix
 from django.utils import timezone
+from django.utils.http import RFC3986_SUBDELIMS, escape_leading_slashes
 from django.utils.text import slugify
 
 from app import helpers
 from app.metadata_utils import ANIME_SUPPLEMENT_GENRE, genre_list_has_name
 from app.models import Item, MediaTypes, Sources
+from app.models.episode_runtimes import (
+    EXCLUDED_RUNTIME_SENTINELS,
+    usable_runtime_minutes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +28,36 @@ PLAYBACK_CACHE_PREFIX = "active_playback_v2"
 PLAYBACK_CACHE_TIMEOUT_SECONDS = 6 * 60 * 60
 PLAYBACK_HARD_STALE_SECONDS = 4 * 60 * 60
 PLAYBACK_PAUSE_STALE_SECONDS = 45 * 60
-PLAYBACK_SCROBBLE_BUFFER_SECONDS = 30        # small buffer after calculated end time
+PLAYBACK_SCROBBLE_BUFFER_SECONDS = 30  # small buffer after calculated end time
+# Watched threshold the media servers scrobble at, used as the floor for a
+# scrobbled title's progress when the event carries no view offset.
+PLAYBACK_SCROBBLE_MIN_PROGRESS_RATIO = 0.9
 PLAYBACK_SCROBBLE_FALLBACK_SECONDS = 15 * 60  # fallback when duration unavailable
 PLAYBACK_STOP_GRACE_SECONDS = 60
 
 PLAYBACK_STATUS_PLAYING = "playing"
 PLAYBACK_STATUS_PAUSED = "paused"
 PLAYBACK_STATUS_STOPPED = "stopped"
+
+PLAYBACK_PROGRESS_EVENTS = (
+    "media.pause",
+    "media.resume",
+    "media.stop",
+    "media.scrobble",
+)
+PLAYBACK_COMPLETION_TAIL_RATIO = 0.1
+
+# Types a manual Check-in can put on the card. Media servers only report movies
+# and episodes; these have no runtime to play against, so the card shows elapsed
+# time instead of progress.
+SESSION_MEDIA_TYPES = (
+    MediaTypes.GAME.value,
+    MediaTypes.BOARDGAME.value,
+    MediaTypes.BOOK.value,
+    MediaTypes.COMIC.value,
+    MediaTypes.MANGA.value,
+    MediaTypes.VIDEO.value,
+)
 
 IMAGE_RESOLVE_GUARD_PREFIX = "playback_img_fill"
 IMAGE_RESOLVE_GUARD_SECONDS = 60
@@ -79,6 +110,37 @@ def _extract_offset_seconds(payload: dict) -> int | None:
     return max(0, offset_ms // 1000)
 
 
+def position_from_percent(percent, duration_seconds) -> int | None:
+    """Turn "how far through" into seconds, or None when the length is unknown."""
+    duration = _coerce_int(duration_seconds, 0) or 0
+    if percent is None or duration <= 0:
+        return None
+    return round(duration * min(max(float(percent), 0.0), 100.0) / 100)
+
+
+def runtime_seconds(item) -> int:
+    """Return the provider runtime of a tracked item in seconds, 0 if unknown."""
+    minutes = usable_runtime_minutes(item.runtime_minutes if item else None)
+    return minutes * 60 if minutes else 0
+
+
+def _offset_from_percent(percent, *, duration_seconds, ref) -> int | None:
+    """Seconds for a client that reports only a percentage.
+
+    The event's own duration wins; otherwise the runtime Floppy holds for the
+    title. `ref` is any dict `_resolve_state_item` can read.
+    """
+    if percent is None:
+        return None
+    duration = _coerce_int(duration_seconds, 0) or 0
+    if duration <= 0 and ref.get("media_type") in (
+        MediaTypes.MOVIE.value,
+        MediaTypes.EPISODE.value,
+    ):
+        duration = runtime_seconds(_resolve_state_item(ref))
+    return position_from_percent(percent, duration)
+
+
 def _extract_episode_numbers(payload: dict) -> tuple[int | None, int | None]:
     metadata = payload.get("Metadata", {}) or {}
     season_number = _coerce_int(metadata.get("parentIndex"))
@@ -93,11 +155,78 @@ def set_user_playback_state(user_id: int, state: dict) -> None:
         state,
         timeout=PLAYBACK_CACHE_TIMEOUT_SECONDS,
     )
+    _queue_playback_webhook(user_id)
+
+
+def _queue_playback_webhook(user_id: int) -> None:
+    """Queue the outgoing playback webhook, for users who configured one.
+
+    Hung off the single writer rather than the event handlers so it cannot
+    miss a state change: play, pause, resume, stop, scrobble and the deferred
+    artwork fill all land here.
+
+    A user who has configured nothing pays one indexed EXISTS query and no
+    more — everything past that check happens in a separate task, so a slow
+    endpoint cannot delay the state write that just succeeded. The media-server
+    webhooks all reach this from a Celery worker (`process_webhook.delay`), but
+    `ScrobbleView._update_live_playback` reaches it in-request, so that query is
+    on the response path for the scrobble API.
+    """
+    has_webhook = (
+        get_user_model()
+        .objects.filter(pk=user_id)
+        .exclude(playback_webhook_url="")
+        .exists()
+    )
+    if not has_webhook:
+        return
+
+    from app.tasks import post_playback_webhook
+
+    post_playback_webhook.delay(user_id)
+
+
+def peek_user_playback_state(user_id: int) -> dict | None:
+    """Return the cached card state as stored, without expiry side effects."""
+    return cache.get(_cache_key(user_id))
 
 
 def clear_user_playback_state(user_id: int) -> None:
     """Remove playback state from cache."""
     cache.delete(_cache_key(user_id))
+
+
+def get_session_start(
+    user_id: int,
+    *,
+    playback_media_type: str,
+    media_id,
+    rating_key: str | None = None,
+):
+    """Return when Now Playing first saw this title playing, or None.
+
+    A stop or scrobble is what writes a tracking row, but by then the
+    play has already been underway; the session start is the real start time.
+    None when nothing is cached for this title (e.g. after a restart), or when
+    the cached state was created by the event being processed (a scrobble that
+    arrives with a cold cache starts and updates its state in the same second).
+    """
+    state = cache.get(_cache_key(user_id))
+    if not _state_matches(
+        state,
+        rating_key=rating_key,
+        media_id=media_id,
+        playback_media_type=playback_media_type,
+    ):
+        return None
+    started_at_ts = _coerce_int(state.get("started_at_ts"))
+    updated_at_ts = _coerce_int(state.get("updated_at_ts"))
+    if not started_at_ts or (updated_at_ts and started_at_ts >= updated_at_ts):
+        return None
+    return datetime.fromtimestamp(started_at_ts, tz=UTC).replace(
+        second=0,
+        microsecond=0,
+    )
 
 
 def _state_matches(
@@ -124,7 +253,157 @@ def _state_matches(
     return False
 
 
-def apply_playback_event(  # noqa: C901, PLR0912
+def _identifiers_from_state(
+    state: dict | None,
+    *,
+    rating_key: str | None,
+    media_id: str | None,
+    season_number: int | None,
+    episode_number: int | None,
+) -> tuple[str | None, int | None, int | None]:
+    """Recover identifiers omitted by a pause/stop event from matching state."""
+    if media_id is not None or not rating_key or not state:
+        return media_id, season_number, episode_number
+
+    if str(state.get("rating_key") or "") != str(rating_key):
+        return media_id, season_number, episode_number
+
+    return (
+        state.get("media_id"),
+        season_number if season_number is not None else state.get("season_number"),
+        episode_number if episode_number is not None else state.get("episode_number"),
+    )
+
+
+def _store_playback_progress(
+    user_id: int,
+    *,
+    event_type: str,
+    playback_media_type: str | None,
+    media_id: str | None = None,
+    source: str = Sources.TMDB.value,
+    season_number: int | None = None,
+    episode_number: int | None = None,
+    view_offset_seconds: int | None,
+    duration_seconds: int | None,
+    item: Item | None = None,
+    provider_completed: bool | None = None,
+    event_at: int | None = None,
+) -> None:
+    """Mirror a webhook position into the durable progress store.
+
+    ``item`` is supplied after webhook media processing for first-session and
+    cold-cache stops.  When it is absent, only an exact existing Item lookup
+    is allowed; no provider or title-based guess is made.
+
+    ``event_at`` is when the webhook request arrived, so a queued event that is
+    processed after a newer one cannot overwrite that newer progress.
+    """
+    if event_type not in PLAYBACK_PROGRESS_EVENTS:
+        return
+
+    completion_only = event_type == "media.scrobble" and view_offset_seconds is None
+    if view_offset_seconds is None and not completion_only:
+        return
+
+    try:
+        if item is None:
+            item = _resolve_state_item(
+                {
+                    "media_id": media_id,
+                    "source": source,
+                    "media_type": playback_media_type,
+                    "season_number": season_number,
+                    "episode_number": episode_number,
+                },
+            )
+        if item is None or item.media_type != playback_media_type:
+            return
+
+        from api.fork_views_playback import upsert_playback_progress
+
+        user = get_user_model().objects.get(pk=user_id)
+        duration = _coerce_int(duration_seconds)
+        duration = max(0, duration) if duration is not None else None
+        if duration == 0:
+            duration = None
+
+        if completion_only:
+            upsert_playback_progress(
+                user,
+                item,
+                None,
+                duration,
+                completed=True,
+                preserve_position=True,
+                fill_missing_duration=True,
+                event_at=event_at,
+            )
+            return
+
+        position = _coerce_int(view_offset_seconds)
+        if position is None:
+            return
+        position = max(0, position)
+
+        completion = (
+            provider_completed
+            if provider_completed is not None
+            else event_type == "media.scrobble"
+        )
+        preserve_completion = (
+            provider_completed is None
+            and event_type != "media.scrobble"
+            and duration is not None
+            and position >= duration * (1 - PLAYBACK_COMPLETION_TAIL_RATIO)
+        )
+        upsert_playback_progress(
+            user,
+            item,
+            position,
+            duration,
+            completed=completion,
+            preserve_duration=duration is None,
+            preserve_completed=preserve_completion,
+            event_at=event_at,
+        )
+    except Exception:
+        logger.warning("Webhook playback-progress update failed", exc_info=True)
+
+
+def store_playback_progress(
+    user_id: int,
+    *,
+    event_type: str,
+    playback_media_type: str | None,
+    view_offset_seconds: int | None,
+    duration_seconds: int | None,
+    item: Item,
+    provider_completed: bool | None = None,
+    event_at: int | None = None,
+) -> None:
+    """Persist a stop position against an Item resolved by webhook processing."""
+    _store_playback_progress(
+        user_id,
+        event_type=event_type,
+        playback_media_type=playback_media_type,
+        view_offset_seconds=view_offset_seconds,
+        duration_seconds=duration_seconds,
+        item=item,
+        provider_completed=provider_completed,
+        event_at=event_at,
+    )
+
+
+def _release_checkin_card(user_id: int, state: dict | None) -> None:
+    """Tell the check-in a real event is replacing its card (see ``app.checkin``)."""
+    if state and state.get("checkin_token"):
+        from app import checkin
+
+        checkin.mark_taken_over(user_id, state.pop("checkin_token"))
+
+
+def apply_playback_event(
     *,
     user_id: int,
     event_type: str,
@@ -139,60 +418,190 @@ def apply_playback_event(  # noqa: C901, PLR0912
     episode_number: int | None = None,
     view_offset_seconds: int | None = None,
     duration_seconds: int | None = None,
+    progress_percent: float | None = None,
+    store_progress: bool = False,
+    provider_completed: bool | None = None,
+    image: str | None = None,
+    checkin_token: str | None = None,
+    ends_at_ts: int | None = None,
+    event_ts: int | None = None,
 ) -> None:
     """Update live playback cache state from a webhook event.
 
     All fields are pre-extracted by the caller (Plex / Jellyfin
     processor) so this function is source-agnostic.  Event types
     use the normalised ``media.*`` naming regardless of origin.
+
+    ``progress_percent`` is for clients that cannot report seconds: it is
+    turned into a position with the event's duration, else the title's runtime,
+    and only used when the event carries no offset of its own.
+    ``store_progress`` mirrors webhook positions into the durable store.
+    ``provider_completed`` is an explicit completion value when the source
+    provides one; ``None`` leaves completion inference source-agnostic.
+
+    ``checkin_token`` marks the card as a manual Check-in's (see
+    ``app.checkin``); any later event for the title rebuilds the state without
+    it, which is how a real scrobble takes the card over. ``ends_at_ts`` closes
+    the card at an assumed end.
+
+    ``event_ts`` is when the request arrived, not when it was processed. A
+    queued play can otherwise overtake the scrobble that finished after it and
+    leave the card (or progress row) showing an earlier state.
     """
     if playback_media_type not in (
         MediaTypes.MOVIE.value,
         MediaTypes.EPISODE.value,
+        *SESSION_MEDIA_TYPES,
     ):
         return
 
     if not event_type:
         return
 
+    source_event_type = event_type
     if event_type == "media.resume":
         event_type = "media.play"
 
     key = _cache_key(user_id)
     existing_state = cache.get(key)
     now_ts = _now_ts()
-
-    if event_type == "media.stop":
-        if existing_state and (_state_matches(
+    event_ts = _coerce_int(event_ts)
+    effective_ts = event_ts if event_ts is not None else now_ts
+    out_of_order = bool(
+        event_ts is not None
+        and existing_state
+        and _state_matches(
             existing_state,
             rating_key=rating_key,
             media_id=media_id,
             playback_media_type=playback_media_type,
-        ) or not rating_key):
+        )
+        and event_ts < _coerce_int(existing_state.get("updated_at_ts"), 0)
+    )
+    if out_of_order:
+        logger.info(
+            "Ignoring out-of-order playback event: event_ts=%s state_ts=%s",
+            event_ts,
+            existing_state.get("updated_at_ts"),
+        )
+
+    if event_type == "media.stop":
+        if not out_of_order and (
+            existing_state
+            and (
+                _state_matches(
+                    existing_state,
+                    rating_key=rating_key,
+                    media_id=media_id,
+                    playback_media_type=playback_media_type,
+                )
+                or not rating_key
+            )
+        ):
+            _release_checkin_card(user_id, existing_state)
             # Grace period instead of immediate deletion — keeps the
             # card visible across auto-play transitions and brief gaps.
-            if view_offset_seconds is not None:
-                existing_state["view_offset_seconds"] = max(
-                    0,
-                    view_offset_seconds,
+            stop_offset = view_offset_seconds
+            if stop_offset is None:
+                stop_offset = _offset_from_percent(
+                    progress_percent,
+                    duration_seconds=duration_seconds
+                    or existing_state.get("duration_seconds"),
+                    ref=existing_state,
                 )
+            if stop_offset is not None:
+                existing_state["view_offset_seconds"] = max(0, stop_offset)
             if duration_seconds is not None:
                 existing_state["duration_seconds"] = max(0, duration_seconds)
-            existing_state["updated_at_ts"] = now_ts
+            existing_state["progress_percent"] = (
+                progress_percent if stop_offset is None else None
+            )
+            existing_state["updated_at_ts"] = effective_ts
             existing_state["pause_expires_at_ts"] = None
             existing_state["scrobble_expires_at_ts"] = None
             existing_state["status"] = PLAYBACK_STATUS_STOPPED
             existing_state["stop_expires_at_ts"] = (
-                now_ts + PLAYBACK_STOP_GRACE_SECONDS
+                effective_ts + PLAYBACK_STOP_GRACE_SECONDS
             )
             set_user_playback_state(user_id, existing_state)
+        if store_progress:
+            stop_media_id, stop_season, stop_episode = _identifiers_from_state(
+                existing_state,
+                rating_key=rating_key,
+                media_id=media_id,
+                season_number=season_number,
+                episode_number=episode_number,
+            )
+            _store_playback_progress(
+                user_id,
+                event_type=source_event_type,
+                playback_media_type=playback_media_type,
+                media_id=stop_media_id,
+                source=source,
+                season_number=stop_season,
+                episode_number=stop_episode,
+                view_offset_seconds=view_offset_seconds,
+                duration_seconds=duration_seconds,
+                provider_completed=provider_completed,
+                event_at=event_ts,
+            )
         return
 
     if event_type not in ("media.play", "media.pause", "media.scrobble"):
         return
 
+    if out_of_order:
+        if store_progress:
+            store_media_id, store_season, store_episode = _identifiers_from_state(
+                existing_state,
+                rating_key=rating_key,
+                media_id=media_id,
+                season_number=season_number,
+                episode_number=episode_number,
+            )
+            _store_playback_progress(
+                user_id,
+                event_type=source_event_type,
+                playback_media_type=playback_media_type,
+                media_id=store_media_id,
+                source=source,
+                season_number=store_season,
+                episode_number=store_episode,
+                view_offset_seconds=view_offset_seconds,
+                duration_seconds=duration_seconds,
+                provider_completed=provider_completed,
+                event_at=event_ts,
+            )
+        return
+
+    if not checkin_token:
+        _release_checkin_card(user_id, existing_state)
+
     offset_seconds = view_offset_seconds
     dur_seconds = duration_seconds
+    percent_unplaced = None
+
+    if offset_seconds is None and progress_percent is not None:
+        matches_existing = _state_matches(
+            existing_state,
+            rating_key=rating_key,
+            media_id=media_id,
+            playback_media_type=playback_media_type,
+        )
+        offset_seconds = _offset_from_percent(
+            progress_percent,
+            duration_seconds=duration_seconds
+            or (existing_state.get("duration_seconds") if matches_existing else None),
+            ref={
+                "media_type": playback_media_type,
+                "media_id": media_id,
+                "source": source,
+                "season_number": season_number,
+                "episode_number": episode_number,
+            },
+        )
+        if offset_seconds is None:
+            percent_unplaced = progress_percent
 
     if _state_matches(
         existing_state,
@@ -201,15 +610,28 @@ def apply_playback_event(  # noqa: C901, PLR0912
         playback_media_type=playback_media_type,
     ):
         if offset_seconds is None:
-            offset_seconds = _coerce_int(
-                existing_state.get("view_offset_seconds"), 0,
-            )
+            # **The estimate, not the raw stored offset.**
+            #
+            # Not every client reports a view offset on every event — some send
+            # none at all. While playing that costs nothing, because
+            # `_estimate_progress_seconds` adds wall-clock on read. But a pause
+            # writes a new state, and storing the raw offset there discards the
+            # position the server had just computed: a session that started at
+            # zero and ran for two minutes was stored as zero the moment it was
+            # paused, and every reader — the web card, the API, a client's Lock
+            # Screen — showed 0:00 for something two minutes in.
+            #
+            # Taking the estimate keeps what playing had already established,
+            # and is a no-op when the event does carry an offset, since this
+            # branch only runs when it does not.
+            offset_seconds = _estimate_progress_seconds(existing_state, effective_ts)
         if dur_seconds is None:
             dur_seconds = _coerce_int(
-                existing_state.get("duration_seconds"), 0,
+                existing_state.get("duration_seconds"),
+                0,
             )
 
-    started_at_ts = now_ts
+    started_at_ts = effective_ts
     if _state_matches(
         existing_state,
         rating_key=rating_key,
@@ -241,27 +663,40 @@ def apply_playback_event(  # noqa: C901, PLR0912
         "episode_number": episode_number,
         "view_offset_seconds": max(0, offset_seconds or 0),
         "duration_seconds": max(0, dur_seconds or 0),
+        "progress_percent": percent_unplaced,
         "started_at_ts": started_at_ts,
         "status": status,
-        "updated_at_ts": now_ts,
-        "expires_at_ts": now_ts + PLAYBACK_HARD_STALE_SECONDS,
+        "updated_at_ts": effective_ts,
+        "expires_at_ts": effective_ts + PLAYBACK_HARD_STALE_SECONDS,
         "pause_expires_at_ts": None,
         "scrobble_expires_at_ts": None,
     }
 
+    if checkin_token:
+        state["checkin_token"] = checkin_token
+        state["scrobble_expires_at_ts"] = ends_at_ts
+
     if event_type == "media.pause":
-        state["pause_expires_at_ts"] = now_ts + PLAYBACK_PAUSE_STALE_SECONDS
+        state["pause_expires_at_ts"] = effective_ts + PLAYBACK_PAUSE_STALE_SECONDS
     elif event_type == "media.scrobble":
         dur = dur_seconds or 0
         off = offset_seconds or 0
         if dur > 0:
+            if view_offset_seconds is None:
+                # Plex sends the scrobble itself without a view offset, and the
+                # last one it did report can be far behind after a seek. The
+                # event does say the server considers the title watched, so
+                # take its threshold as the floor rather than trusting a stale
+                # position. An offset the event actually carries is kept.
+                off = max(off, int(dur * PLAYBACK_SCROBBLE_MIN_PROGRESS_RATIO))
+                state["view_offset_seconds"] = off
             remaining = max(0, dur - off)
             state["scrobble_expires_at_ts"] = (
-                now_ts + remaining + PLAYBACK_SCROBBLE_BUFFER_SECONDS
+                effective_ts + remaining + PLAYBACK_SCROBBLE_BUFFER_SECONDS
             )
         else:
             state["scrobble_expires_at_ts"] = (
-                now_ts + PLAYBACK_SCROBBLE_FALLBACK_SECONDS
+                effective_ts + PLAYBACK_SCROBBLE_FALLBACK_SECONDS
             )
 
     if _state_matches(
@@ -275,12 +710,43 @@ def apply_playback_event(  # noqa: C901, PLR0912
         state["image_resolved_at_ts"] = existing_state.get(
             "image_resolved_at_ts",
         )
+    elif image:
+        # The caller already resolved artwork (e.g. a MAL cour that the
+        # source-agnostic episode resolver below cannot look up).
+        state["image"] = image
+        state["image_source"] = "primary"
+        state["image_resolved_at_ts"] = now_ts
     else:
         # Runs in the webhook Celery worker, so provider calls are
         # allowed here; the request path only ever reads the result.
         _attach_resolved_image(state)
 
     set_user_playback_state(user_id, state)
+
+    if not checkin_token:
+        _learn_runtime(state, dur_seconds)
+
+    if store_progress:
+        store_media_id, store_season, store_episode = _identifiers_from_state(
+            existing_state,
+            rating_key=rating_key,
+            media_id=media_id,
+            season_number=season_number,
+            episode_number=episode_number,
+        )
+        _store_playback_progress(
+            user_id,
+            event_type=source_event_type,
+            playback_media_type=playback_media_type,
+            media_id=store_media_id,
+            source=source,
+            season_number=store_season,
+            episode_number=store_episode,
+            view_offset_seconds=view_offset_seconds,
+            duration_seconds=duration_seconds,
+            provider_completed=provider_completed,
+            event_at=event_ts,
+        )
 
 
 def apply_plex_event(
@@ -292,6 +758,9 @@ def apply_plex_event(
     source: str = Sources.TMDB.value,
     season_number: int | None = None,
     episode_number: int | None = None,
+    store_progress: bool = True,
+    provider_completed: bool | None = None,
+    event_ts: int | None = None,
 ) -> None:
     """Plex-specific wrapper: extract fields and delegate."""
     event_type = payload.get("event")
@@ -317,16 +786,15 @@ def apply_plex_event(
             if playback_media_type == MediaTypes.EPISODE.value
             else None
         ),
-        season_number=(
-            season_number if season_number is not None
-            else payload_season
-        ),
+        season_number=(season_number if season_number is not None else payload_season),
         episode_number=(
-            episode_number if episode_number is not None
-            else payload_episode
+            episode_number if episode_number is not None else payload_episode
         ),
         view_offset_seconds=_extract_offset_seconds(payload),
         duration_seconds=_extract_duration_seconds(payload),
+        store_progress=store_progress,
+        provider_completed=provider_completed,
+        event_ts=event_ts,
     )
 
 
@@ -376,7 +844,8 @@ def get_user_playback_state(user_id: int, now=None) -> dict | None:
 
     state_copy = dict(state)
     state_copy["estimated_progress_seconds"] = _estimate_progress_seconds(
-        state_copy, now_ts,
+        state_copy,
+        now_ts,
     )
     return state_copy
 
@@ -388,6 +857,29 @@ def _format_clock(total_seconds: int) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+def _learn_runtime(state: dict, duration_seconds: int | None) -> None:
+    """Fill an unknown runtime from the duration the media server reported.
+
+    Only items marked unknown (999998/999999) are touched, so a runtime from a
+    provider is never overwritten by a server's file length.
+    """
+    minutes = (_coerce_int(duration_seconds, 0) or 0) // 60
+    if minutes < 1 or usable_runtime_minutes(minutes) is None:
+        return
+    if state.get("media_type") not in (
+        MediaTypes.MOVIE.value,
+        MediaTypes.EPISODE.value,
+    ):
+        return
+    item = _resolve_state_item(state)
+    if item is None or item.runtime_minutes not in EXCLUDED_RUNTIME_SENTINELS:
+        return
+    Item.objects.filter(
+        pk=item.pk,
+        runtime_minutes__in=EXCLUDED_RUNTIME_SENTINELS,
+    ).update(runtime_minutes=minutes)
 
 
 def _resolve_state_item(state: dict):
@@ -410,41 +902,32 @@ def _resolve_state_item(state: dict):
         season_number = _coerce_int(state.get("season_number"))
         episode_number = _coerce_int(state.get("episode_number"))
 
-        if season_number is not None and episode_number is not None:
-            episode_item = Item.objects.filter(
-                media_id=media_id,
-                source=source,
-                media_type=MediaTypes.EPISODE.value,
-                season_number=season_number,
-                episode_number=episode_number,
-            ).first()
-            if episode_item:
-                return episode_item
+        if season_number is None or episode_number is None:
+            return None
 
-        tv_item = Item.objects.filter(
+        return Item.objects.filter(
             media_id=media_id,
             source=source,
-            media_type=MediaTypes.TV.value,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=season_number,
+            episode_number=episode_number,
         ).first()
-        if tv_item:
-            return tv_item
 
-        if season_number is not None:
-            return Item.objects.filter(
-                media_id=media_id,
-                source=source,
-                media_type=MediaTypes.SEASON.value,
-                season_number=season_number,
-            ).first()
+    if playback_media_type in SESSION_MEDIA_TYPES:
+        return Item.objects.filter(
+            media_id=media_id,
+            source=source,
+            media_type=playback_media_type,
+        ).first()
 
     return None
 
 
 def _slugify_title(title: str, media_id: str | None = None) -> str:
     """Slugify a title, matching the template ``slug`` filter behaviour."""
-    from urllib.parse import quote  # noqa: PLC0415
+    from urllib.parse import quote
 
-    from unidecode import unidecode  # noqa: PLC0415
+    from unidecode import unidecode
 
     cleaned = slugify(title)
     if not cleaned:
@@ -455,59 +938,60 @@ def _slugify_title(title: str, media_id: str | None = None) -> str:
     return cleaned
 
 
+def _app_path(path: str = "") -> str:
+    """Return the absolute path to an app page, exactly as ``reverse()`` would.
+
+    Built by hand because the outgoing playback webhook renders this card in a
+    Celery worker, whose ROOT_URLCONF (``config.celery_urls``) is deliberately
+    empty, so every ``reverse()`` there raises NoReverseMatch. Pointing
+    ``reverse()`` at ``config.urls`` instead is no way out: resolving it
+    imports allauth, which workers leave out of INSTALLED_APPS — the same
+    constraint ``audiobookshelf_cover.build_cover_proxy_url`` works around.
+    Callers pass the route from ``app/urls.py`` (``home``, ``media_details``,
+    ``season_details``); ``LiveDetailsUrlTests`` holds them to it.
+
+    A worker also never handles a request, so the script prefix stays at its
+    "/" default and never picks up a BASE_URL subpath. Apply it by hand only
+    while that default is in effect, so a request with the real prefix already
+    set is not double-prefixed. Quoting matches ``reverse()`` byte for byte.
+    """
+    prefix = get_script_prefix()
+    if prefix == "/" and settings.FORCE_SCRIPT_NAME:
+        prefix = settings.FORCE_SCRIPT_NAME.rstrip("/") + "/"
+    return escape_leading_slashes(
+        quote(prefix + path, safe=RFC3986_SUBDELIMS + "/~:@"),
+    )
+
+
 def _build_details_url(state: dict, library_media_type: str | None = None) -> str:
     """Build a URL to the media details page for the playing item."""
     media_id = state.get("media_id")
     source = state.get("source") or Sources.TMDB.value
     playback_media_type = state.get("media_type")
     if not media_id:
-        return reverse("home")
+        return _app_path()
 
     title = (state.get("series_title") or state.get("title") or "").strip()
     slug_title = _slugify_title(title, media_id)
 
     if playback_media_type == MediaTypes.EPISODE.value:
         if library_media_type == MediaTypes.ANIME.value:
-            return reverse(
-                "media_details",
-                kwargs={
-                    "source": source,
-                    "media_type": MediaTypes.ANIME.value,
-                    "media_id": media_id,
-                    "title": slug_title,
-                },
+            return _app_path(
+                f"details/{source}/{MediaTypes.ANIME.value}/{media_id}/{slug_title}",
             )
         season_number = _coerce_int(state.get("season_number"))
         if season_number is not None:
-            return reverse(
-                "season_details",
-                kwargs={
-                    "source": source,
-                    "media_id": media_id,
-                    "title": slug_title,
-                    "season_number": season_number,
-                },
+            return _app_path(
+                f"details/{source}/{MediaTypes.TV.value}/{media_id}/{slug_title}"
+                f"/season/{season_number}",
             )
         # No season number — fall back to TV show details
-        return reverse(
-            "media_details",
-            kwargs={
-                "source": source,
-                "media_type": MediaTypes.TV.value,
-                "media_id": media_id,
-                "title": slug_title,
-            },
+        return _app_path(
+            f"details/{source}/{MediaTypes.TV.value}/{media_id}/{slug_title}",
         )
 
-    return reverse(
-        "media_details",
-        kwargs={
-            "source": source,
-            "media_type": playback_media_type or MediaTypes.MOVIE.value,
-            "media_id": media_id,
-            "title": slug_title,
-        },
-    )
+    media_type = playback_media_type or MediaTypes.MOVIE.value
+    return _app_path(f"details/{source}/{media_type}/{media_id}/{slug_title}")
 
 
 def _resolve_card_title(state, state_item):
@@ -531,6 +1015,9 @@ def _resolve_card_subtitle(state, title):
     episode_code = None
     if season_number is not None and episode_number is not None:
         episode_code = f"S{season_number:02d}E{episode_number:02d}"
+    elif episode_number is not None:
+        # Flat MAL anime cours have no season; show the cour-relative number.
+        episode_code = f"E{episode_number:02d}"
     episode_title = (state.get("episode_title") or "").strip()
     if episode_code and episode_title and episode_title != title:
         return episode_code, f"{episode_code} • {episode_title}"
@@ -544,19 +1031,40 @@ def _resolve_card_subtitle(state, title):
 def _resolve_progress(state, state_item):
     """Compute duration, progress, display string, and percent."""
     duration = max(0, _coerce_int(state.get("duration_seconds"), 0))
-    if not duration and state_item and state_item.runtime_minutes:
-        duration = max(0, int(state_item.runtime_minutes) * 60)
-    progress = max(0, _coerce_int(
-        state.get("estimated_progress_seconds"), 0,
-    ))
+    # A card cached before the sentinel runtime was excluded still carries it.
+    if duration in {m * 60 for m in EXCLUDED_RUNTIME_SENTINELS}:
+        duration = 0
+    runtime_minutes = usable_runtime_minutes(
+        state_item.runtime_minutes if state_item else None,
+    )
+    if (
+        not duration
+        and runtime_minutes
+        and state.get("media_type") not in SESSION_MEDIA_TYPES
+    ):
+        duration = runtime_minutes * 60
+    progress = max(
+        0,
+        _coerce_int(
+            state.get("estimated_progress_seconds"),
+            0,
+        ),
+    )
     if duration:
         progress = min(progress, duration)
     if duration:
         display = f"{_format_clock(progress)} / {_format_clock(duration)}"
         percent = round((progress / duration) * 100, 2)
     else:
-        display = _format_clock(progress)
-        percent = 0
+        reported = state.get("progress_percent")
+        if reported is None:
+            display = _format_clock(progress)
+            percent = 0
+        else:
+            # A client that reports only a percentage, for a title whose
+            # length Floppy does not know: show what it told us.
+            percent = round(float(reported), 2)
+            display = f"{round(percent)}%"
     return duration, progress, display, percent
 
 
@@ -596,20 +1104,16 @@ def _fetch_episode_still(show_id, season_number, episode_number):
 
     result = (None, "none")
     try:
-        from app.providers import tmdb  # noqa: PLC0415
+        from app.providers import tmdb
 
         ep_data = tmdb.episode(show_id, season_number, episode_number)
         image = ep_data.get("image")
         if helpers.has_real_image(image):
             result = (image, ep_data.get("image_source") or "primary")
-    except Exception:  # noqa: BLE001, S110
+    except Exception:  # noqa: S110
         pass
 
-    ttl = (
-        EPISODE_STILL_SUCCESS_SECONDS
-        if result[0]
-        else EPISODE_STILL_FAILURE_SECONDS
-    )
+    ttl = EPISODE_STILL_SUCCESS_SECONDS if result[0] else EPISODE_STILL_FAILURE_SECONDS
     cache.set(cache_key, result, ttl)
     return result
 
@@ -623,7 +1127,7 @@ def _attach_resolved_image(state: dict) -> None:
     try:
         state_item = _resolve_state_item(state)
         image, image_source = _resolve_landscape_image(state, state_item)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("Live playback image resolution failed", exc_info=True)
         return
     if image:
@@ -675,7 +1179,7 @@ def _stored_episode_image_is_inherited(state_item):
     )
 
 
-def _resolve_landscape_image(state, state_item):  # noqa: C901
+def _resolve_landscape_image(state, state_item):
     """Resolve a landscape image for the playback card.
 
     For episodes: prefers the episode-specific still (the same image
@@ -686,10 +1190,7 @@ def _resolve_landscape_image(state, state_item):  # noqa: C901
     source = state.get("source") or Sources.TMDB.value
 
     # ── Episode: prefer the episode still ──────────────────────
-    if (
-        media_type == MediaTypes.EPISODE.value
-        and source == Sources.TMDB.value
-    ):
+    if media_type == MediaTypes.EPISODE.value and source == Sources.TMDB.value:
         show_id = _resolve_show_media_id(state, state_item, source)
 
         # 1. Episode Item already in DB → use its stored still unless it is
@@ -742,11 +1243,14 @@ def build_home_playback_card(user) -> dict | None:
     if not state:
         return None
 
+    from app import checkin
+
+    control = checkin.card_control(user.id, state)
     state_item = _resolve_state_item(state)
     title = _resolve_card_title(state, state_item)
     episode_code, subtitle = _resolve_card_subtitle(state, title)
-    duration_seconds, _, progress_display, progress_percent = (
-        _resolve_progress(state, state_item)
+    duration_seconds, _, progress_display, progress_percent = _resolve_progress(
+        state, state_item
     )
 
     # Request path: never call metadata providers here.  The image is
@@ -764,7 +1268,7 @@ def build_home_playback_card(user) -> dict | None:
             image, image_source = settings.IMG_NONE, "pending"
         guard_key = f"{IMAGE_RESOLVE_GUARD_PREFIX}:{user.id}"
         if cache.add(guard_key, True, IMAGE_RESOLVE_GUARD_SECONDS):
-            from app.tasks import resolve_playback_image  # noqa: PLC0415
+            from app.tasks_interactive import resolve_playback_image
 
             resolve_playback_image.delay(user.id)
 
@@ -778,20 +1282,28 @@ def build_home_playback_card(user) -> dict | None:
     ):
         _ep_media_id = state.get("media_id")
         _ep_source = state.get("source") or Sources.TMDB.value
-        if _ep_media_id:
-            tv_item = Item.objects.filter(
-                media_id=_ep_media_id,
-                source=_ep_source,
-                media_type=MediaTypes.TV.value,
-            ).values("library_media_type", "genres").first()
-            if tv_item:
-                if (
-                    tv_item["library_media_type"] == MediaTypes.ANIME.value
-                    or genre_list_has_name(tv_item["genres"], ANIME_SUPPLEMENT_GENRE)
-                ):
-                    library_media_type = MediaTypes.ANIME.value
+        if _ep_source == Sources.MAL.value:
+            # A MAL-sourced episode card is a flat anime cour by construction
+            # (see GenericScrobbleProcessor.resolve_anime_live_identity).
+            library_media_type = MediaTypes.ANIME.value
+        elif _ep_media_id:
+            tv_item = (
+                Item.objects.filter(
+                    media_id=_ep_media_id,
+                    source=_ep_source,
+                    media_type=MediaTypes.TV.value,
+                )
+                .values("library_media_type", "genres")
+                .first()
+            )
+            if tv_item and (
+                tv_item["library_media_type"] == MediaTypes.ANIME.value
+                or genre_list_has_name(tv_item["genres"], ANIME_SUPPLEMENT_GENRE)
+            ):
+                library_media_type = MediaTypes.ANIME.value
 
     return {
+        "checkin_control": control,
         "title": title,
         "subtitle": subtitle,
         "episode_code": episode_code,

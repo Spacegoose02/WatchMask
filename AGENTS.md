@@ -144,7 +144,7 @@ Also validate when:
 - the user asked for validation
 - the change affects multiple routes, components, or packages
 
-Prefer targeted tests first (`scripts/test.sh <dotted.label>`), then `ruff check src`, then the fast suite (`scripts/test.sh`) only when risk justifies it. See the Testing section.
+Prefer targeted tests first (`scripts/test.sh <dotted.label>`), then `uv run --no-sync ruff check src`, then the fast suite (`scripts/test.sh`) only when risk justifies it. See the Testing section.
 
 Prefer the cheapest useful check:
 
@@ -154,6 +154,17 @@ Prefer the cheapest useful check:
 4. build only when build behavior matters
 
 Do not run a full test suite or full build unless risk justifies it or the user asks.
+
+### Preexisting Failures (Baseline Zero Policy)
+
+App tests, ruff, and lint were driven to zero as a dedicated cleanup effort. The expectation is to hold that baseline at zero, not merely avoid adding to it. Baseline zero means zero — finding a preexisting failure is the trigger to fix it, not to leave it and move on.
+
+If you discover a test/ruff/lint failure while working on something unrelated:
+
+1. Check it against baseline to confirm it's preexisting and not introduced by your change.
+2. Fix it. Do not defer it, note it as acceptable to skip, or treat "it's fine not to fix it inline" as the default — that lets the baseline erode one skipped finding at a time. Skipping is the exception, reserved for fixes that are large, risky, or clearly outside what you're equipped to validate right now — and even then say so explicitly and why, don't just quietly pass over it.
+3. Tell the user what you found and that you fixed it (or, in the exception case, why you didn't).
+4. Prefer landing the fix in a separate commit, and where practical a separate PR, so the cleanup is easy to review independently of the change at hand — separate from the main change, not skipped.
 
 ## Command Output
 
@@ -243,49 +254,30 @@ Keep summaries short. Do not explain obvious edits.
 
 Oververbosity:low
 
-# Yamtrack Notes
-Yamtrack is a Django 5.2 app for self-hosted media tracking with Celery workers and Redis. Tailwind CSS output is committed under `src/static/css/`, and templates load `src/static/css/main.css` via `src/templates/base.html`.
+# Floppy Notes
+Floppy is a Django 5.2 app for self-hosted media tracking with Celery workers and Redis. Tailwind CSS output is committed under `src/static/css/`, and templates load `src/static/css/main.css` via `src/templates/base.html`.
 
 ## Branch Policy
-- `dev` must be an exact mirror of upstream `FuzzyGrim/Yamtrack:dev` with no fork-only commits or edits. You will never update this branch.
-- Any local `dev` divergence should be reset/fast-forwarded back to upstream before merging. `dev` will always be a perfect mirror of upstream.
-- `latest` is the fork integration branch for day-to-day feature work and upstream sync merges.
+- `upstream` (formerly named `dev` in this fork) must be an exact mirror of `FuzzyGrim/Yamtrack:dev`. Never commit to it, target it with a PR, or add fork-only edits. Refresh it only by exact fast-forward/reset to the upstream remote.
+- `latest` is the fork integration branch for day-to-day work and semantic upstream ports. Do not merge or rebase `upstream` into `latest`.
 - `release` is for versioned release/container publication flow, not the primary integration branch.
 
-## Merge Workflow
-This workspace is the fork `dannyvfilms/Yamtrack`, branch `latest`. When syncing upstream `dev` into `latest`, treat the merge as a conflict-resolution task where upstream `dev` brings maintenance changes and `latest` preserves fork features.
+## Upstream Resolution Workflow
 
-High-level rules:
-- Use upstream `dev` as the source of truth for dependency versions, security/bugfix patches, small refactors, settings/config changes, CSS cleanups, and tests.
-- Use `latest` as the source of truth for fork-specific features and behavior changes.
-- When logic overlaps, merge intent from both sides rather than choosing one side wholesale.
+The upstream-port ledger (`UPSTREAM_PORTS.md`, kept locally and never committed) is the durable source of truth. “Up to date” means zero unclassified upstream outcomes, not matching Git histories.
 
-Current app areas to preserve while merging:
-- Progress, history, and statistics: time-left sorting, time-watched views, history filters, cached range stats, Top Played, media-hours cards, reading/music/podcast stats, comparison tooling, and dropped-show fixes.
-- Lists and sharing: public/private lists, smart lists, public profiles, recommendations, list tags, drag-and-drop ordering, release-date sorting, completion indicators, RSS/JSON feeds, and backup export/import.
-- Media coverage and collection: music, podcasts, books, comics, manga, games, board games, collection/owned-media flows, person/author pages, localized titles, runtime chips, and grouped-anime handling.
-- Integrations, imports, and webhooks: Trakt, Plex, Jellyfin, Jellyseerr, Pocket Casts, Last.fm, Audiobookshelf, TVDB, Steam, Plex-only GUID handling, TMDB episode edge cases, SQLite lock handling during import, and auto-pause for stale in-progress items.
-- UI, mobile, and performance: mobile layouts, compact grids, filter controls, media card/timeline styling, statistics layout refinements, quick season updates, runtime/history caching, startup guards, and iOS/SQLite resiliency.
-- Preferences and settings: sort-direction toggles/indicators, ratings-list sort fixes, aggregate-duplicates behavior, subtitle/date-time/rating-scale preferences, and visibility/sidebar/search settings.
-- Deployment and install: Docker build improvements, Redis-unavailability guard in AppConfig.ready(), and README/install updates.
+For each new outcome in `last-reviewed..upstream/dev`:
 
-Conflict-resolution steps:
-1. Scan for conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) and resolve every file.
-2. For each conflict, understand both sides; keep upstream maintenance changes and layer them into fork features.
-3. For views/templates/runtime/history/statistics/lists/preferences/import/webhook logic, start from `latest` behavior and integrate upstream improvements.
-4. For migration conflicts:
-   - Same migration numbers on different branches are valid in Django; resolve with merge migrations.
-   - Keep upstream migration filenames unchanged in `latest`.
-   - Renumber only fork-local migrations that are unpushed/unreleased.
-   - Never rename or rewrite any migration file that exists in `origin/latest` or any `v*` release tag.
-5. For lists/configs (.gitignore, CSS classes, INSTALLED_APPS, URLs, etc.), keep the union and deduplicate.
-6. Remove all conflict markers; run linters/tests and fix underlying issues, not just tests.
-7. For upstream syncs, run the hard gates that apply to the change:
-   - `cd src && python manage.py makemigrations --merge`
-   - `cd src && python manage.py check_migration_hygiene --strict`
-   - `scripts/replay_upgrade_matrix.sh --from-tag <previous_release_tag> --to-ref latest --db sqlite,postgres --with-drift-scenarios`
-   - `coverage run src/manage.py test app users integrations lists events --parallel`
-8. If a choice is unavoidable, prioritize fork-visible features while honoring upstream data contracts/integrations.
+1. Record the canonical upstream commits and group related implementation, tests, migrations, and repairs.
+2. Choose exactly one evidence-backed decision: Ported, Adapted, Superseded, Deferred, Discarded, or Pending with an owner issue.
+3. Prefer a clean cherry-pick only for isolated changes whose paths and architecture still match. Otherwise implement the behaviour through Floppy's current public APIs and bounded contexts.
+4. Preserve Floppy features, deployment paths, security/privacy, and user data. Dependency versions and generated assets are not upstream sources of truth.
+5. Port useful regression cases even when the implementation is superseded or reimplemented.
+6. For schema work, define final semantics first, audit existing data, and generate new Floppy migrations against the current graph. Never cherry-pick upstream migration files or reproduce an unsafe intermediate migration.
+7. Update the ledger, owning issue, documentation, configuration examples, API schema/output, wiki, and upgrade guidance affected by the outcome.
+8. Validate in proportion to risk using the repository's normal targeted, migration, database, container, and full-suite gates. Record actual evidence in the PR.
+
+Models/migrations and divergent UI normally require manual adaptation. Provider modules and isolated importers may permit small ports. CI, Docker, and dependencies move as coherent platform packages. Branding, version bumps, merge commits, generated churn, and individual dependency-bot commits are normally discarded with the ledger's reason codes.
 
 ## Repository Map
 - `src/` Django project code (apps: `app`, `users`, `lists`, `integrations`, `events`; config in `config/`).
@@ -302,24 +294,56 @@ Conflict-resolution steps:
 - Treat `wiki/` as its own git repo (not a submodule); run commits/pushes from `wiki/`.
 - Do not add `wiki/` to the main repo index; it should remain untracked here.
 - Primary local development is source-run Django with Redis, Celery worker/beat, and Tailwind watcher.
-- Secondary Docker usage is for deployment or quick smoke runs; the compose files use the prebuilt `ghcr.io/dannyvfilms/yamtrack` image.
+- Secondary Docker usage is for deployment or quick smoke runs; the compose files use the prebuilt `ghcr.io/dannyvfilms/floppy` image.
+
+## Documentation Policy
+`docs/` holds only permanent, public-facing, non-situational documentation: install and deployment guides, architecture contracts, integration guides, and playbooks that stay true as the code changes. Everything else is temporary agent storage during development and must not be committed: plans, handoffs, investigations, analyses, requirement checklists, benchmark and PR screenshots, upstream-port ledgers, and per-task reports. Keep those under `docs/plans/` (ignored by git) and delete them when the work lands. When unsure whether a document belongs, apply this rule: if it describes a moment, a task or a person's working context rather than how the project works today, it does not belong in the repo. Never commit absolute local paths, usernames or machine details.
 
 ## Agent Docs
+- `docs/agents/domain_model.md`: generated vocabulary guide; regenerate and check it with the commands under Local Commands.
 - `docs/agents/media_type_integration.md`: playbook for adding new media types safely.
 - `docs/agents/music_integration.md`: music-specific data model and UI integration notes.
+- `docs/agents/psn_integration.md`: how a PSN sync turns lifetime playtime into dated game entries (remembered totals, Sessions vs Repeats, the setup choice).
 - `docs/agents/pocketcasts_workflow.md`: Pocket Casts import/schedule workflow details.
-- `docs/agents/migration_sync_playbook.md`: required hard-gate flow for upstream syncs and migration drift replay.
+- `docs/agents/clz_import.md`: the CLZ importer's header-mapped contract and the shared custom-field resolution layer it sits on.
+- `docs/agents/migration_sync_playbook.md`: hard-gate flow for adapting accepted upstream migration outcomes to Floppy's current graph.
+- `docs/agents/view_authentication.md`: guide for view authentication and declaring public route exemptions.
+- `docs/agents/pr_screenshots.md`: `scripts/pr_screenshots.py` captures before/after screenshots of a PR and posts them to its description.
+- `docs/architecture/log-redaction.md`: the log boundary contract — where credentials are removed, what the rules match, and what they do not cover.
+- `docs/architecture/theming.md`: the theme resolution contract and the six theme states any colour change must hold.
+- `docs/architecture/webhook-write-rules.md`: when a media-server webhook may write tracking rows — the shared policy table every integration is listed in, its exceptions, and the test that catches a missing row.
+- `docs/architecture/webhook-delivery.md`: the sync/async boundary, expected webhook queue latency, the structured `event_id`/`queue_delay_ms`/`outcome` log contract, time limits, and the ordering guard that stops a late play erasing a scrobble (#1708).
+- `docs/architecture/connection-health.md`: when an integration account may be marked `connection_broken` (rejected credentials only), how scheduled work re-probes it, and the test that catches a direct write.
+- `docs/architecture/api-scopes.md`: the integration-token scope contract — the vocabulary, the enforced view map, and what adding an endpoint requires.
+- `docs/architecture/outbound-fetch.md`: the outbound boundary for user-configured URLs — the SSRF controls, the residual DNS-rebinding gap, and why artwork uses a different path.
+- `docs/architecture/library-query.md`: the shared engine for list-shaped surfaces (media list, API, smart lists, Home shelves) — how a page stays bounded, and how to add a filter or sort.
+- `docs/architecture/statistics-sync.md`: how Statistics stay warm — dirty days and snapshots in the database, one budgeted per-user sync, the reconciler that makes a lost Celery message harmless, and which write paths must mark changes.
+- `docs/architecture/game-artwork.md`: where a game's logo and backdrop come from — the provider order, the stored provenance, and how ScreenScraper credentials are kept out of URLs.
+- `docs/architecture/local-covers.md`: covers a person uploads, links or picks — where the files live, what is accepted, how they are fetched, who may change and see them.
+- `docs/architecture/media-card.md`: the one media card and its surfaces — what may differ between pages and why, how a page loads the viewer's rating and status, and the test that catches a grid that drifts.
+- `docs/architecture/history-memory.md`: what a History request costs a web worker — the item columns history must not load, which paths are bounded by the response and which are still bounded by the history.
+- `docs/integrations/nuvio-client-guide.md`: what a third-party tracking client implements, with `api.tests.test_nuvio_conformance` as its runnable half.
+- `docs/integrations/flexget.md`: how a download tool (FlexGet's `floppy_list`, or `curl`) reads lists and reports owned media by provider id, with `api.tests.test_fork_media_collection` as its runnable half.
+- `docs/integrations/wetrakr.md`: sending plays, statuses and ratings out to WeTrakr — what is verified, what is only transcribed from its docs, and how to check it against a real account.
+- `docs/integrations/recommendations-api.md`: the recommendations endpoint for media-server plugins, with `api.tests.test_fork_discover.RecommendationsTests` as its runnable half.
+
 
 ## Local Commands
-- Install dev dependencies: `python -m pip install -U -r requirements-dev.txt`
-- Run migrations: `cd src && python manage.py migrate`
-- Run the app: `cd src && python manage.py runserver`
+- Install locked dev dependencies: `uv sync --locked`
+- Django/manage.py commands require `SECRET` in the environment or `.env`.
+- Run migrations: `uv run --no-sync python src/manage.py migrate`
+- Run the app: `uv run --no-sync python src/manage.py runserver`
+- Run API contract tests: `SECRET=test-only scripts/test.sh users.tests.views.test_about app.tests.test_api_contracts app.tests.test_domain_vocabulary`
+- Generate the domain guide: `PYTHONPATH=src uv run --no-sync python -m app.domain_vocabulary`
+- Check the domain guide: `PYTHONPATH=src uv run --no-sync python -m app.domain_vocabulary --check`
+- Regenerate the verified OpenAPI artifact: `SECRET=test-only uv run --no-sync python src/manage.py spectacular --custom-settings api.schema_contract.STATIC_SPECTACULAR_SETTINGS --fail-on-warn --validate --file src/api/contracts/openapi.yaml`
 - Run Celery (two workers in one command, mirrors production):
   ```bash
-  PYTHONPATH=src celery -A config worker --queues interactive --hostname celery-interactive@%h --loglevel DEBUG &
-  PYTHONPATH=src celery -A config worker --queues celery --beat --scheduler django --hostname celery@%h --loglevel DEBUG
+  PYTHONPATH=src uv run --no-sync celery -A config worker --queues interactive --hostname celery-interactive@%h --loglevel DEBUG &
+  PYTHONPATH=src uv run --no-sync celery -A config worker --queues celery --beat --scheduler django --hostname celery@%h --loglevel DEBUG
   ```
   The interactive worker must be dedicated — **never add `celery` to its `--queues`** or long-running background tasks (Reload calendar, imports) will block user-triggered refreshes.
+  **Queue rule:** `interactive` is only for work a page needs *before it can load* (webhook handling, live playback artwork, Statistics sync the viewer is waiting on). Anything the page does not wait on — feed/RSS refreshes, backfills, follow-ups after a render — goes on the default `celery` queue, with no `queue` route in `CELERY_TASK_ROUTES`.
 - Run Tailwind: `cd src && tailwindcss -i ./static/css/input.css -o ./static/css/main.css --watch`
 - For local setup, see `README.md` for the required `.env` values and Redis startup details.
 
@@ -335,13 +359,24 @@ Run tests through `scripts/test.sh`, in this priority order:
 
 1. **Targeted (default while iterating):** `scripts/test.sh <dotted.label> [...]` — run only the tests for what you touched, e.g. `scripts/test.sh app.tests.views.test_media_details` or a whole app label like `scripts/test.sh lists`.
 2. **Fast suite (default before finishing):** `scripts/test.sh` — the whole suite minus tests tagged `slow` (benchmarks and Playwright integration). Output is bounded (`--buffer` suppresses stdout of passing tests) and no `playwright install` is needed.
-3. **Full suite (CI / rarely needed locally):** `scripts/test.sh --full` — everything, including benchmarks and Playwright. Takes 20+ minutes and produces huge output. Only run it when the user asks or the risk clearly justifies it; CI runs it on every PR anyway.
+3. **Full suite (rarely needed locally):** `scripts/test.sh --full` — all tags, including slow benchmarks/Playwright and live-provider `network` tests. Takes 20+ minutes and produces huge output. Only run it when the user asks or the risk clearly justifies it. Application-impacting PRs run the CI application suite, which excludes `network` tests; documentation-only trigger filtering is owned by `.github/workflows/app-tests.yml`.
 
 Notes:
-- Quick confidence: `ruff check src`
-- Migration sync confidence: `cd src && python manage.py check_migration_hygiene --strict`
-- Upstream sync replay: `scripts/replay_upgrade_matrix.sh --from-tag <previous_release_tag> --to-ref latest --db sqlite,postgres --with-drift-scenarios`
-- Tag vocabulary: `slow` is the exclusion tag used by the fast suite; `benchmark` and `playwright` are sub-selectors (`scripts/test.sh --slow` runs only tagged tests). Any new benchmark/performance or Playwright test **must** be decorated with `@tag("slow", ...)`.
+- **Local diff selection:** `scripts/test.sh --affected` uses `.floppy/affected.coverage` when present. Record it with `scripts/test.sh --affected-record`. Missing or uncovered lines fall back to direct importing tests or the owning app. Templates, static, the lockfile, settings, and the runner run the fast suite; docs-only changes run nothing. This is an iteration aid: application PRs and publication gates run the complete offline suite, including slow/browser tests.
+- Quick confidence: `uv run --no-sync ruff check src`
+- Deployment confidence: `uv run --no-sync python src/manage.py floppy_preflight` — paths,
+  settings, database, migrations and Redis in one pass. Reads only, so it is safe against a
+  running instance. Add `--json` for a machine-readable report. This is the fastest way to tell
+  a broken environment from a broken change, and it is what a bug report should carry when
+  Floppy will not start.
+- Migration sync confidence: `uv run --no-sync python src/manage.py check_migration_hygiene --strict`
+- Migration upgrade replay: `scripts/replay_upgrade_matrix.sh --from-tag <previous_release_tag> --to-ref latest --db sqlite,postgres --with-drift-scenarios`
+- Tag vocabulary: `slow` and `network` are the exclusion tags used by the fast
+  suite. `network` marks tests that call a live provider API: they need keys and
+  internet, they are slow and flaky, and a fork PR cannot read repository secrets,
+  so CI excludes them. Run them with `scripts/test.sh --network`. If you add a test
+  that needs a real provider response, either mock it or tag it.
+- `slow` is the exclusion tag used by the fast suite; `benchmark` and `playwright` are sub-selectors (`scripts/test.sh --slow` runs only tagged tests). Any new benchmark/performance or Playwright test **must** be decorated with `@tag("slow", ...)`.
 - `playwright install` is only needed when actually running Playwright-tagged tests (`scripts/test.sh --full` / `--slow`); the fast suite excludes them.
 - `src/manage.py` sets `DJANGO_SETTINGS_MODULE=config.test_settings` for tests.
 - `config.test_settings` uses fakeredis and sets `CELERY_TASK_ALWAYS_EAGER=True`.
@@ -350,18 +385,20 @@ Notes:
 - Python target is 3.12 (see `Dockerfile` and CI).
 - Ruff config lives in `pyproject.toml` and excludes `migrations/`.
 - Djlint config is in `pyproject.toml`; Stylelint config is in `.stylelintrc`.
-- After model changes, keep migration files under `src/*/migrations/` and run `cd src && python manage.py migrate`.
-- Media type changes follow `docs/agents/media_type_integration.md` (MediaTypes enum + `media_type_config` wiring).
+- After model changes, keep migration files under `src/*/migrations/` and run `uv run --no-sync python src/manage.py migrate`.
+- A PR that touches a migration must contain every migration already on `latest` (`.github/workflows/migration-order.yml`, checked by `scripts/check_migration_order.py`). When it fails, merge `latest` into the branch and point your migration at the new leaf; never add your own merge migration.
+- Media type changes follow `docs/agents/media_type_integration.md` (`app.models.choices.MediaTypes` vocabulary + `app.config.MEDIA_TYPE_CONFIG` wiring).
 
 ## PR / Commit Expectations
 - **Never commit unless the user explicitly asks.** Finishing a task, passing tests, or reaching a natural stopping point does not justify an automatic commit. Wait for a direct instruction such as "commit this", "commit the changes", or "make a commit".
 - **Never amend a commit the user has not seen.** If a hook fails after a commit attempt, fix the issue and create a new commit — do not amend.
-- CI fails PRs that modify `.github/workflows/**` (see `.github/workflows/app-tests.yml`).
+- Workflow changes run normal PR checks. Image publication also requires the reusable application, lint/dependency and SQLite/PostgreSQL upgrade gates (see `.github/workflows/app-tests.yml` and `docker-image.yml`).
 - Large changes should be split into reviewable PRs or clearly justified if they cannot be.
 - Review summaries should call out behavior changes, files touched, validation run, and remaining risk.
 - Commit messages should use a short imperative title, then 1–3 bullet clarifications in the body. Optional issue lines: `Fixes #123` / `Refs #456`.
 
 ## Security / Safety Notes
 - `.env` contains secrets and API keys; do not commit it.
+- A process-wide log record factory redacts credentials before any handler writes them (`src/app/log_safety.py`, installed by `src/config/__init__.py`). Do not move the installation later in the start sequence, and do not widen its `except` clause: both faults are silent. See `docs/architecture/log-redaction.md`.
 - Docker entrypoint runs migrations and changes ownership inside the container (`entrypoint.sh`).
 - Docker compose stores data in `./db`; local dev SQLite lives under `src/db/`.

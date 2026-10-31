@@ -3,6 +3,7 @@ __pycache__
 *.egg-info/
 .env
 .coverage*
+.floppy/
 venv
 src/staticfiles
 src/db/db.sqlite3
@@ -22,9 +23,13 @@ TODO.txt
 .env.dev
 docker-compose.dev.yml
 db-dev/
+src/local_serve.py
 
 # Local dev DB
 db/
+
+# Runtime log file (see LOG_DIR in config/settings.py)
+src/logs/
 
 # Retired Tailwind output path; main.css is the canonical compiled asset.
 src/static/css/tailwind.css
@@ -32,3 +37,39 @@ docs/upstream-review.md
 
 # Pinned tailwindcss CLI (see package.json) — keeps generated main.css reproducible
 node_modules/
+
+# Brand masters are kept outside the repo; only the web-sized derivatives
+# under docs/brand/ and src/static/img/ are committed.
+docs/brand/*-source.png
+.venv/
+
+# Worktrees
+.worktrees/
+worktrees/
+
+# Antigravity Superpowers Docs
+docs/superpowers/
+
+# Local dev
+.env.web-dev
+.flatpak-builder/
+.gstack/
+.worktrees/
+desktop/
+dump.rdb
+
+# Database dumps hold real user data; keep them out of the repository
+*.sql.gz
+
+# Local agent session state; not part of the application or PR.
+.v2c/
+.video_agent/
+# The wiki is an independent repository; historical review notes stay private.
+/wiki/
+/*_AUDIT.md
+/*_FOLLOWUP.md
+/*_REVIEW.md
+/*_CLOSEOUT.md
+
+# Temporary agent storage (see AGENTS.md Documentation Policy)
+/docs/plans/

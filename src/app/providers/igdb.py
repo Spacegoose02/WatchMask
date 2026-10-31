@@ -12,11 +12,11 @@ from django.utils import timezone
 
 from app import helpers
 from app.models import MediaTypes, Sources
-from app.providers import services
+from app.providers import credentials, services
 
 logger = logging.getLogger(__name__)
 base_url = "https://api.igdb.com/v4"
-IGDB_SEARCH_CACHE_VERSION = "v2"
+IGDB_SEARCH_CACHE_VERSION = "v5"
 TOKENIZED_SEARCH_MIN_TERMS = 2
 
 
@@ -45,7 +45,7 @@ class ExternalGameSource(IntEnum):
     GAMEJOLT = 55
 
 
-def handle_error(error):
+def handle_error(error, user=None):
     """Handle IGDB API errors."""
     error_resp = error.response
     status_code = error_resp.status_code
@@ -56,7 +56,13 @@ def handle_error(error):
             "%s: Invalid access token, refreshing",
             Sources.IGDB.label,
         )
-        cache.delete(f"{Sources.IGDB.value}_access_token")
+        suffix = credentials.cache_suffix(
+            "igdb",
+            "client_id",
+            "client_secret",
+            user=user,
+        )
+        cache.delete(f"{Sources.IGDB.value}_access_token_{suffix}")
         return {"retry": True}
 
     try:
@@ -82,14 +88,69 @@ def handle_error(error):
     raise services.ProviderAPIError(Sources.IGDB.value, error)
 
 
-def get_access_token():
+def _retry_after_token_refresh(url, data, headers):
+    """Repeat a request once after a 401 refreshed the token.
+
+    A second failure must surface as a ProviderAPIError like any other IGDB
+    failure; a raw HTTPError escaped to the view as a 500.
+    """
+    try:
+        return services.api_request(
+            Sources.IGDB.value,
+            "POST",
+            url,
+            data=data,
+            headers=headers,
+        )
+    except requests.exceptions.HTTPError as error:
+        if error.response.status_code == requests.codes.unauthorized:
+            raise services.ProviderAPIError(
+                Sources.IGDB.value,
+                error,
+                "IGDB rejected the access token after a refresh; check the "
+                "Twitch client ID and secret.",
+            ) from None
+        handle_error(error)
+        raise
+
+
+def enabled(user=None):
+    """Return whether IGDB is configured."""
+    return credentials.is_configured("igdb", user)
+
+
+def describe_credentials(user=None):
+    """Return where the Twitch ID and secret come from, never their values."""
+    scoped = user or credentials.active_user()
+    return (
+        f"user={getattr(scoped, 'pk', None)} "
+        f"id_from={credentials.source_of('igdb', 'client_id', user)} "
+        f"secret_from={credentials.source_of('igdb', 'client_secret', user)}"
+    )
+
+
+def get_access_token(user=None):
     """Return the access token for the IGDB API."""
-    access_token = cache.get(f"{Sources.IGDB.value}_access_token")
+    if not enabled(user):
+        logger.warning(
+            "%s is not configured for this request (%s)",
+            Sources.IGDB.label,
+            describe_credentials(user),
+        )
+        raise services.ProviderNotConfiguredError(
+            Sources.IGDB.value,
+            "IGDB is not configured. Add your Twitch application's client "
+            "ID and secret in Settings → Metadata providers.",
+        )
+
+    suffix = credentials.cache_suffix("igdb", "client_id", "client_secret", user=user)
+    cache_key = f"{Sources.IGDB.value}_access_token_{suffix}"
+    access_token = cache.get(cache_key)
     if access_token is None:
         url = "https://id.twitch.tv/oauth2/token"
         json = {
-            "client_id": settings.IGDB_ID,
-            "client_secret": settings.IGDB_SECRET,
+            "client_id": credentials.get("igdb", "client_id", user=user),
+            "client_secret": credentials.get("igdb", "client_secret", user=user),
             "grant_type": "client_credentials",
         }
 
@@ -101,11 +162,17 @@ def get_access_token():
                 params=json,
             )
         except requests.exceptions.HTTPError as error:
+            logger.warning(
+                "%s token request rejected (HTTP %s) using %s",
+                Sources.IGDB.label,
+                error.response.status_code,
+                describe_credentials(user),
+            )
             handle_error(error)
 
         access_token = response["access_token"]
         cache.set(
-            f"{Sources.IGDB.value}_access_token",
+            cache_key,
             access_token,
             response["expires_in"] - 60,
         )  # 1 min buffer to avoid using an expired token
@@ -133,7 +200,7 @@ def external_game(external_id, source=ExternalGameSource.STEAM):
             f"external_game_source = {source};"
         )
         headers = {
-            "Client-ID": settings.IGDB_ID,
+            "Client-ID": credentials.get("igdb", "client_id"),
             "Authorization": f"Bearer {access_token}",
         }
 
@@ -150,13 +217,7 @@ def external_game(external_id, source=ExternalGameSource.STEAM):
             if error_resp and error_resp.get("retry"):
                 # Retry the request with the new access token
                 headers["Authorization"] = f"Bearer {get_access_token()}"
-                response = services.api_request(
-                    Sources.IGDB.value,
-                    "POST",
-                    url,
-                    data=query,
-                    headers=headers,
-                )
+                response = _retry_after_token_refresh(url, query, headers)
 
         # Return the IGDB game ID if found, None otherwise
         if response and len(response) > 0:
@@ -180,7 +241,7 @@ def external_game(external_id, source=ExternalGameSource.STEAM):
     return data
 
 
-def search(query, page):
+def search(query, page, user=None):
     """Search for games on IGDB using MultiQuery."""
     normalized_query = _normalize_search_query(query)
     if not normalized_query:
@@ -193,10 +254,10 @@ def search(query, page):
     data = cache.get(cache_key)
 
     if data is None:
-        access_token = get_access_token()
+        access_token = get_access_token(user=user)
         url = f"{base_url}/multiquery"
         headers = {
-            "Client-ID": settings.IGDB_ID,
+            "Client-ID": credentials.get("igdb", "client_id", user=user),
             "Authorization": f"Bearer {access_token}",
         }
 
@@ -221,6 +282,7 @@ def search(query, page):
                     "title": media["name"],
                     "image": get_image_url(media),
                     "year": get_release_year(media),
+                    "platforms": get_list(media, "platforms"),
                 }
                 for media in search_results
             ]
@@ -270,12 +332,18 @@ def _build_search_query_condition(query, *, tokenized=False):
         terms = _tokenize_search_query(query)
         if len(terms) < TOKENIZED_SEARCH_MIN_TERMS:
             return None
-        return " & ".join(f'name ~ *"{term}"*' for term in terms)
+        return " & ".join(
+            f'(name ~ *"{term}"* | alternative_names.name ~ *"{term}"*)'
+            for term in terms
+        )
 
     escaped_query = str(query or "").strip().replace("\\", "\\\\").replace('"', '\\"')
     if not escaped_query:
         return None
-    return f'name ~ *"{escaped_query}"*'
+    return (
+        f'(name ~ *"{escaped_query}"* '
+        f'| alternative_names.name ~ *"{escaped_query}"*)'
+    )
 
 
 def _build_search_multiquery(query, page, *, tokenized=False):
@@ -284,7 +352,7 @@ def _build_search_multiquery(query, page, *, tokenized=False):
     if not search_condition:
         return None
 
-    conditions = [search_condition, "game_type = (0,1,2,3,4,5,6,7,8,9,10)"]
+    conditions = [search_condition, "game_type = (0,1,2,3,4,5,6,7,8,9,10,11)"]
     if not settings.IGDB_NSFW:
         conditions.append("themes != (42)")
 
@@ -293,7 +361,7 @@ def _build_search_multiquery(query, page, *, tokenized=False):
 
     return (
         'query games "SearchResults" {'
-        "fields name,cover.image_id;"
+        "fields name,cover.image_id,platforms.name,first_release_date;"
         "sort total_rating_count desc;"
         f"limit {settings.PER_PAGE};"
         f"offset {offset};"
@@ -319,13 +387,7 @@ def _perform_search_request(url, headers, multiquery):
         error_resp = handle_error(error)
         if error_resp and error_resp.get("retry"):
             headers["Authorization"] = f"Bearer {get_access_token()}"
-            return services.api_request(
-                Sources.IGDB.value,
-                "POST",
-                url,
-                data=multiquery,
-                headers=headers,
-            )
+            return _retry_after_token_refresh(url, multiquery, headers)
 
 
 def _extract_igdb_error_details(error_json):
@@ -367,7 +429,7 @@ def game(media_id):
             "Non-numeric IDs cannot be looked up directly on IGDB."
         )
         raise ValueError(message)
-    cache_key = f"{Sources.IGDB.value}_{MediaTypes.GAME.value}_v2_{media_id}"
+    cache_key = f"{Sources.IGDB.value}_{MediaTypes.GAME.value}_v3_{media_id}"
     data = cache.get(cache_key)
     if data is None:
         access_token = get_access_token()
@@ -377,6 +439,8 @@ def game(media_id):
             "url,summary,game_type,first_release_date,"
             "rating,rating_count,aggregated_rating,aggregated_rating_count,"
             "genres.name,themes.name,platforms.name,"
+            "franchise.id,franchise.name,franchises.id,franchises.name,"
+            "collections.id,collections.name,"
             "involved_companies.company.id,involved_companies.company.name,"
             "involved_companies.company.logo.image_id,"
             "parent_game.name,parent_game.cover.image_id,"
@@ -392,7 +456,7 @@ def game(media_id):
             f"where id = {media_id};"
         )
         headers = {
-            "Client-ID": settings.IGDB_ID,
+            "Client-ID": credentials.get("igdb", "client_id"),
             "Authorization": f"Bearer {access_token}",
         }
 
@@ -409,13 +473,7 @@ def game(media_id):
             if error_resp and error_resp.get("retry"):
                 # Retry the request with the new access token
                 headers["Authorization"] = f"Bearer {get_access_token()}"
-                response = services.api_request(
-                    Sources.IGDB.value,
-                    "POST",
-                    url,
-                    data=data,
-                    headers=headers,
-                )
+                response = _retry_after_token_refresh(url, data, headers)
 
         # Check if response is empty (no results found)
         if not response:
@@ -440,6 +498,18 @@ def game(media_id):
             "score_count": response.get("aggregated_rating_count"),
             "igdb_user_rating": get_user_rating(response),
             "igdb_user_rating_count": response.get("rating_count"),
+            "provider_franchise_id": get_group_field(
+                response, "franchise", "franchises"
+            )[0],
+            "provider_franchise_name": get_group_field(
+                response, "franchise", "franchises"
+            )[1],
+            "provider_collection_id": get_group_field(
+                response, "collections"
+            )[0],
+            "provider_collection_name": get_group_field(
+                response, "collections"
+            )[1],
             "details": {
                 "format": get_game_type(response["game_type"]),
                 "release_date": get_start_date(response),
@@ -496,7 +566,7 @@ def company_profile(company_id):
             f"where id = {company_id};"
         )
         headers = {
-            "Client-ID": settings.IGDB_ID,
+            "Client-ID": credentials.get("igdb", "client_id"),
             "Authorization": f"Bearer {access_token}",
         }
 
@@ -512,13 +582,7 @@ def company_profile(company_id):
             error_resp = handle_error(error)
             if error_resp and error_resp.get("retry"):
                 headers["Authorization"] = f"Bearer {get_access_token()}"
-                response = services.api_request(
-                    Sources.IGDB.value,
-                    "POST",
-                    url,
-                    data=query,
-                    headers=headers,
-                )
+                response = _retry_after_token_refresh(url, query, headers)
 
         if not response:
             return None
@@ -558,7 +622,9 @@ def get_image_url(response):
     # e.g game: 287348
     cover_image_id = response.get("cover", {}).get("image_id")
     if cover_image_id:
-        return f"https://images.igdb.com/igdb/image/upload/t_original/{cover_image_id}.jpg"
+        return (
+            f"https://images.igdb.com/igdb/image/upload/t_original/{cover_image_id}.jpg"
+        )
 
     artworks = response.get("artworks") or []
     for artwork in artworks:
@@ -621,7 +687,7 @@ def _fetch_games_by_ids(game_ids, *, access_token=None):
 
     access_token = access_token or get_access_token()
     headers = {
-        "Client-ID": settings.IGDB_ID,
+        "Client-ID": credentials.get("igdb", "client_id"),
         "Authorization": f"Bearer {access_token}",
     }
     game_rows = []
@@ -646,13 +712,7 @@ def _fetch_games_by_ids(game_ids, *, access_token=None):
             error_resp = handle_error(error)
             if error_resp and error_resp.get("retry"):
                 headers["Authorization"] = f"Bearer {get_access_token()}"
-                response = services.api_request(
-                    Sources.IGDB.value,
-                    "POST",
-                    url,
-                    data=query,
-                    headers=headers,
-                )
+                response = _retry_after_token_refresh(url, query, headers)
         if response:
             game_rows.extend(response)
 
@@ -731,6 +791,28 @@ def get_start_date(response):
         ).strftime("%Y-%m-%d")
     except KeyError:
         return None
+
+
+def get_group_field(response, *fields):
+    """Return the first group reference as ``(id, name)``.
+
+    IGDB returns an expanded relation as a dict, but some responses only carry
+    the numeric id. Empty pairs keep the Item columns stable when IGDB has no
+    grouping data.
+    """
+    fallback_id = ""
+    for field in fields:
+        value = response.get(field)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if isinstance(value, dict):
+            name = str(value.get("name") or "").strip()
+            group_id = str(value.get("id") or "").strip()
+            if name or group_id:
+                return group_id, name
+        elif value not in (None, "") and not fallback_id:
+            fallback_id = str(value).strip()
+    return fallback_id, ""
 
 
 def get_list(response, field):

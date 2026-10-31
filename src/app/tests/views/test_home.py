@@ -18,39 +18,65 @@ from app.models import (
     Podcast,
     PodcastEpisode,
     PodcastShow,
+    PodcastShowTracker,
     ProviderMetadataStatus,
     Season,
     Sources,
     Status,
 )
-from users.models import DateFormatChoices, HomeScreenRow, HomeSortChoices
+from users import home_screen
+from users.home_screen import build_home_page_groups
+from users.models import (
+    DateFormatChoices,
+    DirectionChoices,
+    HomeScreenRow,
+    HomeSortChoices,
+)
 
 
 class HomeViewTests(TestCase):
     """Test the home view."""
 
-    def _get_all_groups(self, response):
-        """Merge shell groups with the deferred home_rest_fragment groups.
-
-        The home shell renders only the first group; the rest hydrates via
-        HTMX. Tests asserting on full-page content combine both responses.
-        """
-        groups = list(response.context["home_groups"])
-        if response.context.get("defer_remaining_groups"):
-            rest = self.client.get(reverse("home_rest_fragment"))
-            groups.extend(rest.context["home_groups"])
+    def _get_deferred_groups(self, response):
+        """Fetch each deferred row fragment the shell would load via HTMX."""
+        groups = []
+        for group in response.context.get("deferred_groups", []):
+            rows = []
+            for row_id in group["row_ids"]:
+                row_response = self.client.get(
+                    reverse("home_row_fragment", args=[row_id]),
+                )
+                row = (row_response.context or {}).get("row")
+                if row is not None:
+                    rows.append(row)
+            if rows:
+                groups.append(
+                    {
+                        "media_type": group["media_type"],
+                        "label": group["label"],
+                        "icon_svg": group["icon_svg"],
+                        "rows": rows,
+                    },
+                )
         return groups
 
+    def _get_all_groups(self, response):
+        """Merge shell groups with the rows deferred to row fragments."""
+        return list(response.context["home_groups"]) + self._get_deferred_groups(
+            response,
+        )
+
     def _get_hydrated_home(self):
-        """Fetch home and append the deferred fragment's HTML.
+        """Fetch home and append the deferred row fragments' HTML.
 
         Mirrors what the browser shows once HTMX hydrates the remaining
-        groups, so content assertions can target the full page.
+        rows, so content assertions can target the full page.
         """
         response = self.client.get(reverse("home"))
-        if response.context.get("defer_remaining_groups"):
-            rest = self.client.get(reverse("home_rest_fragment"))
-            response.content = response.content + rest.content
+        for group in response.context.get("deferred_groups", []):
+            for row_id in group["row_ids"]:
+                rest = self.client.get(reverse("home_row_fragment", args=[row_id]))
+                response.content = response.content + rest.content
         return response
 
     def _get_group(self, response, media_type):
@@ -71,11 +97,7 @@ class HomeViewTests(TestCase):
 
     def _get_media_entry(self, response, media_type, media_id):
         row = self._get_first_row(response, media_type)
-        return next(
-            entry
-            for entry in row["items"]
-            if entry.item.media_id == media_id
-        )
+        return next(entry for entry in row["items"] if entry.item.media_id == media_id)
 
     def setUp(self):
         """Create a user and log in."""
@@ -152,7 +174,8 @@ class HomeViewTests(TestCase):
         self.assertEqual(len(season_row["items"]), 1)
         self.assertEqual(season_row["items"][0].media.progress, 5)
         self.assertEqual(len(anime_row["items"]), 1)
-        # TV has default Home rows of its own now
+        # The implicit TV tracker created by the season fixture surfaces a
+        # TV group (e.g. the "Not Caught Up" row) on Home.
         self.assertIsNotNone(self._get_group(response, MediaTypes.TV.value))
         self.assertContains(
             response,
@@ -160,15 +183,101 @@ class HomeViewTests(TestCase):
             html=False,
         )
         self.assertContains(response, 'data-home-row-sort-toggle="true"', html=False)
-        self.assertContains(response, 'aria-label="Toggle sort direction for In Progress"', html=False)
+        self.assertContains(
+            response, 'aria-label="Toggle sort direction for In Progress"', html=False
+        )
         self.assertNotContains(response, "Sorted by Title • Ascending", html=False)
         self.assertContains(response, 'class="home-row-card w-44 shrink-0"', html=False)
         self.assertContains(response, 'data-home-row="true"', html=False)
-        self.assertNotContains(response, '<h2 class="text-2xl font-semibold">', html=False)
+        self.assertNotContains(
+            response, '<h2 class="text-2xl font-semibold">', html=False
+        )
         self.assertNotContains(response, "Load All")
+
+    def test_home_row_fragment_cards_return_to_home(self):
+        """Cards in a deferred row must not redirect to the fragment URL."""
+        self.client.get(reverse("home"))  # seed the default row configuration
+        row = HomeScreenRow.objects.filter(
+            user=self.user,
+            media_type=MediaTypes.ANIME.value,
+            enabled=True,
+        ).first()
+        response = self.client.get(reverse("home_row_fragment", args=[row.id]))
+
+        self.assertEqual(response.context["return_url"], reverse("home"))
+        self.assertContains(response, '"return_url": "/"', html=False)
+        self.assertNotContains(response, '"return_url": "/home/row/', html=False)
+
+    def test_home_first_paint_does_not_build_deferred_rows(self):
+        """The shell must leave the remaining rows for their own requests."""
+        with patch(
+            "users.home_screen._cached_row_section",
+            wraps=home_screen._cached_row_section,
+        ) as cached:
+            response = self.client.get(reverse("home"))
+
+        built_row_ids = {call.args[1].id for call in cached.call_args_list}
+        deferred_row_ids = {
+            row_id
+            for group in response.context["deferred_groups"]
+            for row_id in group["row_ids"]
+        }
+        self.assertTrue(deferred_row_ids)
+        self.assertFalse(built_row_ids & deferred_row_ids)
+
+    def test_home_row_fragment_builds_only_its_own_row(self):
+        """A deferred row request must not rebuild unrelated shelves."""
+        response = self.client.get(reverse("home"))
+        row_id = response.context["deferred_groups"][0]["row_ids"][0]
+
+        with patch(
+            "users.home_screen._cached_row_section",
+            wraps=home_screen._cached_row_section,
+        ) as cached:
+            fragment = self.client.get(reverse("home_row_fragment", args=[row_id]))
+
+        self.assertEqual(fragment.status_code, 200)
+        self.assertEqual(
+            [call.args[1].id for call in cached.call_args_list],
+            [row_id],
+        )
+
+    def test_home_row_direction_matches_persisted_row(self):
+        """Each row dict must carry its own direction for the header arrow icon.
+
+        Regression test: the row dict previously omitted "direction" entirely,
+        so the template's asc/desc check was always falsy and every row's
+        arrow rendered as descending regardless of its actual sort direction.
+        """
+        # Trigger row creation, then flip one row's direction away from its
+        # default so a stale/omitted value would be caught either way.
+        self.client.get(reverse("home"))
+        row = HomeScreenRow.objects.get(
+            user=self.user,
+            media_type=MediaTypes.SEASON.value,
+            position=0,
+        )
+        row.direction = (
+            DirectionChoices.DESC
+            if row.direction == DirectionChoices.ASC
+            else DirectionChoices.ASC
+        )
+        row.save(update_fields=["direction"])
+
+        response = self._get_hydrated_home()
+        season_row = self._get_first_row(response, MediaTypes.SEASON.value)
+
+        self.assertEqual(season_row["direction"], row.direction)
+        expected_path = (
+            'd="M10 5 L16 15 H4 Z"'
+            if row.direction == DirectionChoices.ASC
+            else 'd="M10 15 L4 5 H16 Z"'
+        )
+        self.assertContains(response, expected_path, html=False)
 
     def test_home_groups_include_label_and_icon(self):
         """Each home group exposes a media-type label and icon for headers."""
+        build_home_page_groups(self.user, 14)  # the shell only inlines warm shelves
         response = self.client.get(reverse("home"))
         groups = response.context["home_groups"]
         self.assertTrue(groups)
@@ -181,7 +290,7 @@ class HomeViewTests(TestCase):
         response = self.client.get(reverse("home"))
         self.assertNotContains(
             response,
-            '<h2 class="text-3xl font-semibold text-gray-100">',
+            '<h2 class="text-3xl font-semibold text-[var(--color-text)]">',
             html=False,
         )
 
@@ -193,7 +302,7 @@ class HomeViewTests(TestCase):
         response = self.client.get(reverse("home"))
         self.assertContains(
             response,
-            '<h2 class="text-3xl font-semibold text-gray-100">',
+            '<h2 class="text-3xl font-semibold text-[var(--color-text)]">',
             html=False,
         )
         anime_group = self._get_group(response, MediaTypes.ANIME.value)
@@ -271,7 +380,9 @@ class HomeViewTests(TestCase):
         )
 
         response = self._get_hydrated_home()
-        entry = self._get_media_entry(response, MediaTypes.MOVIE.value, "home-prefill-movie")
+        entry = self._get_media_entry(
+            response, MediaTypes.MOVIE.value, "home-prefill-movie"
+        )
 
         self.assertEqual(entry.item.display_release_year, 2024)
         self.assertContains(response, "2024", html=False)
@@ -304,18 +415,29 @@ class HomeViewTests(TestCase):
             status=Status.IN_PROGRESS.value,
             progress=300,
         )
+        PodcastShowTracker.objects.create(
+            user=self.user,
+            show=podcast_show,
+            status=Status.IN_PROGRESS.value,
+        )
 
         response = self._get_hydrated_home()
 
         podcast_row = self._get_first_row(response, MediaTypes.PODCAST.value)
         self.assertEqual(podcast_row["card_width_class"], "w-44")
-        self.assertContains(response, 'class="home-row-card w-44 shrink-0 self-start aspect-square min-h-0"', html=False)
+        self.assertContains(
+            response,
+            'class="home-row-card w-44 shrink-0 self-start aspect-square min-h-0"',
+            html=False,
+        )
         self.assertNotContains(response, 'class="w-52 shrink-0"', html=False)
 
     def test_home_view_hides_disabled_sidebar_media_types_even_when_rows_exist(self):
         """Stored rows for disabled libraries should not render on Home.
 
-        Seasons are the exception and always stay on Home, so check Anime.
+        Seasons are exempt: get_home_configurable_media_types always keeps
+        MediaTypes.SEASON so the next-episode pill row stays available, so
+        this test uses anime as the disabled library type.
         """
         self.client.get(reverse("home"))
         self.assertTrue(
@@ -660,7 +782,108 @@ class HomeViewTests(TestCase):
         self.assertEqual(card["image_source"], "fallback")
 
     def test_home_view_htmx_load_more(self):
-        """HTMX row expansion should return only the overflow items."""
+        """HTMX row expansion should page filtered rows through a partial tail."""
+        for i in range(6, 42):  # 37 raw entries; 8 are filtered out below.
+            tv_item = Item.objects.create(
+                media_id=str(i),
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.TV.value,
+                title=f"Test TV Show {i}",
+                image="http://example.com/image.jpg",
+            )
+            tv = TV.objects.create(
+                item=tv_item,
+                user=self.user,
+                status=Status.IN_PROGRESS.value,
+            )
+            season_item = Item.objects.create(
+                media_id=str(i),
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.SEASON.value,
+                title=f"Test TV Show {i}",
+                image="http://example.com/image.jpg",
+                season_number=1,
+                release_datetime=(
+                    timezone.now() + timezone.timedelta(days=1)
+                    if i < 34
+                    else timezone.now() - timezone.timedelta(days=1)
+                ),
+            )
+            Season.objects.create(
+                item=season_item,
+                user=self.user,
+                status=Status.IN_PROGRESS.value,
+                related_tv=tv,
+            )
+
+        self.client.get(reverse("home"))  # seed the default row configuration
+        row_config = HomeScreenRow.objects.get(
+            user=self.user,
+            media_type=MediaTypes.SEASON.value,
+            row_type="library_query",
+            position=0,
+        )
+        row_config.filters = {**row_config.filters, "release": "not_released"}
+        row_config.save(update_fields=["filters"])
+
+        build_home_page_groups(self.user, 14)  # the shell only inlines warm shelves
+        initial_response = self.client.get(reverse("home"))
+        season_row = self._get_first_row(initial_response, MediaTypes.SEASON.value)
+        self.assertContains(initial_response, 'data-loaded-count="14"', html=False)
+        self.assertContains(
+            initial_response, 'data-home-row-sentinel="true"', html=False
+        )
+        self.assertContains(
+            initial_response, 'data-home-row-prefetch-distance="1152"', html=False
+        )
+        self.assertContains(
+            initial_response, 'hx-trigger="home-row-load-more"', html=False
+        )
+        self.assertContains(
+            initial_response,
+            "hx-vals='js:{offset: Number(event.target.dataset.loadedCount || 0), seed: event.target.dataset.seed || \"\"}'",
+            html=False,
+        )
+
+        # Loading another page must not touch other shelves, even when their
+        # cached rows have expired and would need rebuilding.
+        with patch(
+            "users.home_screen._cached_row_section",
+            side_effect=AssertionError("Load more touched an unrelated home row"),
+        ):
+            response = self.client.get(
+                reverse("home") + f"?load_row={season_row['row_id']}&offset=14",
+                headers={"hx-request": "true"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "app/components/home_grid.html")
+        self.assertIn("media_list", response.context)
+        self.assertEqual(season_row["total"], 29)
+        self.assertEqual(len(response.context["media_list"]["items"]), 14)
+        self.assertEqual(response.context["media_list"]["total"], 29)
+        self.assertContains(response, 'class="home-row-card w-44 shrink-0"', html=False)
+        self.assertEqual(response["X-Home-Row-Total"], "29")
+        self.assertEqual(response["X-Home-Row-Loaded"], "28")
+
+        final_response = self.client.get(
+            reverse("home") + f"?load_row={season_row['row_id']}&offset=28",
+            headers={"hx-request": "true"},
+        )
+
+        self.assertEqual(final_response.status_code, 200)
+        self.assertEqual(len(final_response.context["media_list"]["items"]), 1)
+        self.assertEqual(final_response["X-Home-Row-Total"], "29")
+        self.assertEqual(final_response["X-Home-Row-Loaded"], "29")
+
+    def test_home_view_htmx_load_more_zero_progress(self):
+        """A load-more request past the true total returns 0 cards.
+
+        The response must still report the current real total/loaded via
+        headers, since the client relies on that to detect a stale offset
+        and stop retrying (issue #624: without this, the client would keep
+        requesting the same offset forever).
+        """
         for i in range(6, 20):  # Create 14 more TV shows (we already have 1)
             season_item = Item.objects.create(
                 media_id=str(i),
@@ -695,28 +918,49 @@ class HomeViewTests(TestCase):
 
         initial_response = self.client.get(reverse("home"))
         season_row = self._get_first_row(initial_response, MediaTypes.SEASON.value)
-        self.assertContains(initial_response, 'data-loaded-count="14"', html=False)
-        self.assertContains(initial_response, 'data-home-row-sentinel="true"', html=False)
-        self.assertContains(initial_response, 'data-home-row-prefetch-distance="1152"', html=False)
-        self.assertContains(initial_response, 'hx-trigger="home-row-load-more"', html=False)
-        self.assertContains(
-            initial_response,
-            "hx-vals='js:{offset: Number(event.target.dataset.loadedCount || 0)}'",
-            html=False,
-        )
 
+        # Simulate a client holding a stale offset beyond the real total
+        # (e.g. because the underlying row shrank between requests).
         response = self.client.get(
-            reverse("home") + f"?load_row={season_row['row_id']}&offset=14",
+            reverse("home") + f"?load_row={season_row['row_id']}&offset=999",
             headers={"hx-request": "true"},
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertTemplateUsed(response, "app/components/home_grid.html")
-        self.assertIn("media_list", response.context)
-        self.assertEqual(season_row["total"], 15)
-        self.assertEqual(len(response.context["media_list"]["items"]), 1)
+        self.assertEqual(len(response.context["media_list"]["items"]), 0)
         self.assertEqual(response.context["media_list"]["total"], 15)
-        self.assertContains(response, 'class="home-row-card w-44 shrink-0"', html=False)
+        self.assertEqual(response["X-Home-Row-Total"], "15")
+        self.assertEqual(response["X-Home-Row-Loaded"], "15")
+
+    def test_home_view_htmx_load_more_duplicate_entries_still_progress(self):
+        """Duplicate cards in a response still advance the pagination offset."""
+        initial_response = self.client.get(reverse("home"))
+        season_row = self._get_first_row(initial_response, MediaTypes.SEASON.value)
+        duplicate_entry = season_row["items"][0]
+
+        duplicates = [duplicate_entry] * 37
+        with patch(
+            "users.home_screen._library_row_window",
+            side_effect=lambda _user, _row, offset, limit, **_kw: (
+                duplicates[offset : offset + limit],
+                len(duplicates),
+            ),
+        ):
+            response = self.client.get(
+                reverse("home") + f"?load_row={season_row['row_id']}&offset=14",
+                headers={"hx-request": "true"},
+            )
+            final_response = self.client.get(
+                reverse("home") + f"?load_row={season_row['row_id']}&offset=28",
+                headers={"hx-request": "true"},
+            )
+
+        self.assertEqual(len(response.context["media_list"]["items"]), 14)
+        self.assertEqual(response["X-Home-Row-Total"], "37")
+        self.assertEqual(response["X-Home-Row-Loaded"], "28")
+        self.assertEqual(len(final_response.context["media_list"]["items"]), 9)
+        self.assertEqual(final_response["X-Home-Row-Total"], "37")
+        self.assertEqual(final_response["X-Home-Row-Loaded"], "37")
 
     def test_active_playback_fragment_empty(self):
         """Fragment endpoint returns empty body when nothing is playing."""
@@ -755,6 +999,7 @@ class HomeViewTests(TestCase):
         self.assertContains(response, "data-active-playback-card")
         self.assertContains(response, "Test TV Show")
         self.assertContains(response, "S01E02")
+        self.assertNotContains(response, "Stop check-in")
 
 
 class HomeRowCacheTests(TestCase):
@@ -791,31 +1036,50 @@ class HomeRowCacheTests(TestCase):
                 "image": "http://example.com/image.jpg",
             },
         )
-        Episode.objects.create(
-            item=episode_item,
-            related_season=season,
-            end_date=timezone.now(),
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            Episode.objects.create(
+                item=episode_item,
+                related_season=season,
+                end_date=timezone.now(),
+            )
 
     def test_second_home_request_serves_rows_from_cache(self):
         from unittest.mock import patch
 
+        build_home_page_groups(self.user, 14)
         first = self.client.get(reverse("home"))
         self.assertEqual(first.status_code, 200)
         self.assertTrue(first.context["home_groups"])
 
         with patch(
-            "users.home_screen._library_query_entries",
+            "users.home_screen._library_row_window",
         ) as mock_entries:
             second = self.client.get(reverse("home"))
         self.assertEqual(second.status_code, 200)
         mock_entries.assert_not_called()
         self.assertTrue(second.context["home_groups"])
 
+    def test_cold_shell_defers_every_shelf_and_warm_shell_inlines_first_group(self):
+        """The shell never computes a shelf: cold rows load as fragments."""
+        from django.core.cache import cache
+
+        cache.clear()
+        from unittest.mock import patch
+
+        with patch("users.home_screen._library_row_window") as mock_entries:
+            cold = self.client.get(reverse("home"))
+        mock_entries.assert_not_called()
+        self.assertFalse(cold.context["home_groups"])
+        self.assertTrue(cold.context["deferred_groups"])
+
+        build_home_page_groups(self.user, 14)
+        warm = self.client.get(reverse("home"))
+        self.assertTrue(warm.context["home_groups"])
+
     def test_media_save_invalidates_row_cache(self):
         from unittest.mock import patch
 
-        self.client.get(reverse("home"))  # warm cache
+        build_home_page_groups(self.user, 14)  # warm cache
 
         season = Season.objects.filter(user=self.user).first()
         episode_item, _ = Item.objects.get_or_create(
@@ -829,17 +1093,18 @@ class HomeRowCacheTests(TestCase):
                 "image": "http://example.com/image.jpg",
             },
         )
-        Episode.objects.create(
-            item=episode_item,
-            related_season=season,
-            end_date=timezone.now(),
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            Episode.objects.create(
+                item=episode_item,
+                related_season=season,
+                end_date=timezone.now(),
+            )
 
         with patch(
-            "users.home_screen._library_query_entries",
-            return_value=[],
+            "users.home_screen._library_row_window",
+            return_value=([], 0),
         ) as mock_entries:
-            self.client.get(reverse("home"))
+            build_home_page_groups(self.user, 14)
         mock_entries.assert_called()
 
 
@@ -856,6 +1121,16 @@ class HomeArtworkPollTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'id="home-artwork-poller"', response.content)
         self.assertNotIn(b"every 30s", response.content)
+
+    def test_pending_deferred_rows_keep_poller_armed(self):
+        """Rows still loading must not stop the poller before they finish."""
+        response = self.client.get(
+            reverse("home_rows_artwork_refresh") + "?ids=&pending=3",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"every 30s", response.content)
+        self.assertIn(b"load delay:1s", response.content)
 
     def test_rows_return_as_oob_swaps_and_poller_stops_when_covered(self):
         # A music-family row with artwork present should not keep polling.

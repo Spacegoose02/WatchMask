@@ -14,15 +14,17 @@ from django.db.migrations.loader import MigrationLoader
 
 DEFAULT_APPS = ("app", "users", "lists", "integrations", "events")
 DEFAULT_BASE_REF = "upstream/dev"
+UPSTREAM_LATEST_REFS = ("floppy/latest",)
 MIGRATION_FILE_RE = re.compile(r"^\d{4}_.+\.py$")
 RISKY_OP_RE = re.compile(
-    r"\bmigrations\.(AddConstraint|RemoveConstraint|AddIndex|RemoveIndex)\s*\("
+    r"\bmigrations\.(AddConstraint|RemoveConstraint|AddIndex|RemoveIndex|AddField)\s*\("
 )
 RISKY_FIX_HINTS = {
     "AddConstraint": "use AddConstraintIfNotExists",
     "RemoveConstraint": "use RemoveConstraintIfExists",
     "AddIndex": "use AddIndexIfNotExists",
     "RemoveIndex": "use RemoveIndexIfExists",
+    "AddField": "use AddFieldIfNotExists",
 }
 
 
@@ -154,6 +156,12 @@ def _immutable_migration_paths(
             "Could not find origin/latest or local latest for immutable checks."
         )
 
+    # Watchmask tracks Floppy: migrations already shipped on Floppy's latest
+    # branch are upstream history, not new fork-only work.
+    for upstream_ref in UPSTREAM_LATEST_REFS:
+        if _git_ref_exists(repo_root, upstream_ref):
+            immutable_paths.update(_ref_migration_paths(repo_root, upstream_ref, apps))
+
     for tag_ref in _release_tag_refs(repo_root):
         immutable_paths.update(_ref_migration_paths(repo_root, tag_ref, apps))
 
@@ -239,7 +247,7 @@ class Command(BaseCommand):
             ),
         )
 
-    def handle(self, *_args, **options):  # noqa: C901
+    def handle(self, *_args, **options):
         """Run migration hygiene checks and exit non-zero on violations."""
         repo_root = _repo_root()
         apps = _parse_apps(options["apps"])
@@ -249,31 +257,39 @@ class Command(BaseCommand):
             message = "No apps provided. Use --apps with at least one app label."
             raise CommandError(message)
 
-        base_ref, resolution_warnings = _resolve_base_ref(
-            repo_root, options["base_ref"]
-        )
-
         loader = MigrationLoader(connections["default"], ignore_no_migrations=True)
         multi_leaf_apps = _collect_multi_leaf_apps(loader.graph, apps)
 
-        local_paths = _local_migration_paths(repo_root, apps)
-        base_paths = _ref_migration_paths(repo_root, base_ref, apps)
-        fork_only_paths = sorted(local_paths - base_paths)
-
-        immutable_paths, immutable_warnings = _immutable_migration_paths(
-            repo_root, apps
-        )
-        enforce_paths = [
-            path for path in fork_only_paths if path not in immutable_paths
-        ]
-
-        risky_violations = []
-        for rel_path in enforce_paths:
-            risky_violations.extend(
-                _find_risky_operations(repo_root / rel_path, rel_path)
-            )
-
         duplicate_number_info = _duplicate_number_info(repo_root, apps)
+
+        resolution_warnings: list[str] = []
+        immutable_warnings: list[str] = []
+        risky_violations = []
+        base_ref = None
+        try:
+            base_ref, resolution_warnings = _resolve_base_ref(
+                repo_root, options["base_ref"]
+            )
+        except CommandError as exc:
+            resolution_warnings.append(
+                f"could not resolve a base ref ({exc}); skipping risky-operation check."
+            )
+        else:
+            local_paths = _local_migration_paths(repo_root, apps)
+            base_paths = _ref_migration_paths(repo_root, base_ref, apps)
+            fork_only_paths = sorted(local_paths - base_paths)
+
+            immutable_paths, immutable_warnings = _immutable_migration_paths(
+                repo_root, apps
+            )
+            enforce_paths = [
+                path for path in fork_only_paths if path not in immutable_paths
+            ]
+
+            for rel_path in enforce_paths:
+                risky_violations.extend(
+                    _find_risky_operations(repo_root / rel_path, rel_path)
+                )
 
         for warning in [*resolution_warnings, *immutable_warnings]:
             self.stdout.write(self.style.WARNING(f"Warning: {warning}"))
@@ -285,13 +301,20 @@ class Command(BaseCommand):
             )
 
         failures = []
+        if strict and base_ref is None:
+            failures.append(
+                "Strict migration hygiene requires a resolvable base ref; "
+                "fetch it or pass --base-ref explicitly."
+            )
         if multi_leaf_apps:
             lines = ["Multiple migration leaf nodes detected:"]
             for app, nodes in sorted(multi_leaf_apps.items()):
                 rendered_nodes = ", ".join(nodes) if nodes else "<none>"
                 lines.append(f"- {app}: {rendered_nodes}")
                 lines.append(
-                    f"  Fix: python src/manage.py makemigrations {app} --merge"
+                    f"  Fix: point the migration your branch adds at the other leaf "
+                    f"and renumber it. Only when both leaves are already on latest, "
+                    f"run python src/manage.py makemigrations {app} --merge"
                 )
             failures.append("\n".join(lines))
 

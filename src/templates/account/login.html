@@ -1,13 +1,19 @@
 {% extends "account/base_entrance.html" %}
+{% load i18n %}
+
 {% load allauth account %}
 {% load socialaccount %}
 
 {% block head_title %}
-  Login
+  {% translate "Login" %}
 {% endblock head_title %}
 
 {% block content_title %}
-  Sign in to your account
+  {% if IS_FIRST_RUN and REGISTRATION %}
+    {% translate "Welcome to Watchmask — set up your account to get started" %}
+  {% else %}
+    {% translate "Sign in to your account" %}
+  {% endif %}
 {% endblock content_title %}
 
 {% block content %}
@@ -24,7 +30,7 @@
 
       {% slot actions %}
         {% element button type="submit" tags="prominent,login" icon='<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><polyline points="10 17 15 12 10 7"></polyline><line x1="15" x2="3" y1="12" y2="12"></line>' %}
-          Sign In
+          {% translate "Sign In" %}
         {% endelement %}
       {% endslot %}
     {% endelement %}
@@ -36,27 +42,31 @@
 
   {% if not SOCIALACCOUNT_ONLY %}
     <div class="mt-6 text-center">
-      <p class="text-gray-400">
+      <p class="text-[var(--color-text-muted)]">
         {% if REGISTRATION %}
-          Need an account?
-          <a class="text-indigo-400 hover:text-indigo-300"
-             href="{% url 'account_signup' %}">Register now</a>
-          <span class="mx-2 text-gray-600">|</span>
-          <a class="text-indigo-400 hover:text-indigo-300"
-             href="{% url 'password_recover' %}">Forgot Password</a>
+          {% if IS_FIRST_RUN %}
+            {% translate "No account exists yet." %}
+            <a class="text-[var(--color-link)] hover:text-[var(--color-link-hover)]"
+               href="{% url 'account_signup' %}">{% translate "Create your account" %}</a>
+          {% else %}
+            {% translate "Need an account?" %}
+            <a class="text-[var(--color-link)] hover:text-[var(--color-link-hover)]"
+               href="{% url 'account_signup' %}">{% translate "Register now" %}</a>
+            <a class="block mt-2 text-[var(--color-link)] hover:text-[var(--color-link-hover)]"
+               href="{% url 'password_recover' %}">{% translate "Forgot Password" %}</a>
+          {% endif %}
         {% else %}
-          Sign-ups are disabled.
+          {% translate "Sign-ups are disabled." %}
           {% if FORK_OWNER_URL %}
-            <a class="text-indigo-400 hover:text-indigo-300"
+            <a class="text-[var(--color-link)] hover:text-[var(--color-link-hover)]"
                href="{{ FORK_OWNER_URL }}"
                rel="noopener"
-               target="_blank">Host your own</a>
+               target="_blank">{% translate "Host your own" %}</a>
           {% else %}
-            Host your own.
+            {% translate "Host your own." %}
           {% endif %}
-          <span class="mx-2 text-gray-600">|</span>
-          <a class="text-indigo-400 hover:text-indigo-300"
-             href="{% url 'password_recover' %}">Forgot Password</a>
+          <a class="block mt-2 text-[var(--color-link)] hover:text-[var(--color-link-hover)]"
+             href="{% url 'password_recover' %}">{% translate "Forgot Password" %}</a>
         {% endif %}
       </p>
     </div>

@@ -8,7 +8,7 @@ from django.core.cache import cache
 
 from app import helpers
 from app.models import MediaTypes, Sources
-from app.providers import services
+from app.providers import credentials, services
 
 logger = logging.getLogger(__name__)
 base_url = "https://api.myanimelist.net/v2"
@@ -16,6 +16,9 @@ base_fields = (
     "title,main_picture,media_type,start_date,end_date,synopsis,status,genres,"
     "mean,num_scoring_users,recommendations,alternative_titles"
 )
+RATING_FIELDS = "mean,num_scoring_users"
+RATING_CACHE_TIMEOUT = 60 * 60 * 24
+MAX_RATING = 10
 
 
 def handle_error(error):
@@ -43,9 +46,59 @@ def handle_error(error):
     raise services.ProviderAPIError(Sources.MAL.value, error)
 
 
-def search(media_type, query, page):
+def rating(media_id):
+    """Return a cached MyAnimeList rating pair for an anime ID.
+
+    This deliberately requests only the aggregate rating fields so the daily
+    rating sweep does not download full anime metadata for every tracked item.
+    ``None`` means MAL returned no usable rating; provider errors are raised so
+    callers can preserve the last successful local value.
+    """
+    normalized_media_id = str(media_id or "").strip()
+    if not normalized_media_id:
+        return None
+
+    cache_key = f"{Sources.MAL.value}_rating_{normalized_media_id}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        response = services.api_request(
+            Sources.MAL.value,
+            "GET",
+            f"{base_url}/anime/{normalized_media_id}",
+            params={"fields": RATING_FIELDS},
+            headers={"X-MAL-CLIENT-ID": credentials.get("mal", "client_id")},
+        )
+    except requests.exceptions.HTTPError as error:
+        handle_error(error)
+        return None
+
+    try:
+        mean = float(response.get("mean"))
+        rating_count = int(response.get("num_scoring_users"))
+    except (AttributeError, TypeError, ValueError):
+        result = None
+    else:
+        result = (
+            (mean, rating_count)
+            if 0 <= mean <= MAX_RATING and rating_count > 0
+            else None
+        )
+
+    if result is not None:
+        cache.set(cache_key, result, timeout=RATING_CACHE_TIMEOUT)
+    return result
+
+
+def search(media_type, query, page, *, include_nsfw=None):
     """Search for media on MyAnimeList."""
-    cache_key = f"search_{Sources.MAL.value}_{media_type}_{query}_{page}"
+    include_nsfw = settings.MAL_NSFW if include_nsfw is None else include_nsfw
+    cache_key = (
+        f"search_{Sources.MAL.value}_{media_type}_{query}_{page}_"
+        f"nsfw_{int(include_nsfw)}"
+    )
     data = cache.get(cache_key)
 
     if data is None:
@@ -55,7 +108,7 @@ def search(media_type, query, page):
             "fields": "media_type,start_date,alternative_titles",
             "limit": settings.PER_PAGE,
         }
-        if settings.MAL_NSFW:
+        if include_nsfw:
             params["nsfw"] = "true"
 
         try:
@@ -64,7 +117,7 @@ def search(media_type, query, page):
                 "GET",
                 url,
                 params=params,
-                headers={"X-MAL-CLIENT-ID": settings.MAL_API},
+                headers={"X-MAL-CLIENT-ID": credentials.get("mal", "client_id")},
             )
         except requests.exceptions.HTTPError as error:
             response = handle_error(error)
@@ -77,7 +130,8 @@ def search(media_type, query, page):
                 "media_type": media_type,
                 "title": get_localized_title(media["node"]) or media["node"]["title"],
                 "original_title": media["node"]["title"],
-                "localized_title": get_localized_title(media["node"]) or media["node"]["title"],
+                "localized_title": get_localized_title(media["node"])
+                or media["node"]["title"],
                 "image": get_image_url(media["node"]),
                 "year": get_start_year(media["node"]),
             }
@@ -104,7 +158,7 @@ def anime(media_id):
     if data is None:
         url = f"{base_url}/anime/{media_id}"
         params = {
-            "fields": f"{base_fields},num_episodes,average_episode_duration,studios,start_season,broadcast,source,related_anime",  # noqa: E501
+            "fields": f"{base_fields},num_episodes,average_episode_duration,studios,start_season,broadcast,source,related_anime",
         }
 
         try:
@@ -113,7 +167,7 @@ def anime(media_id):
                 "GET",
                 url,
                 params=params,
-                headers={"X-MAL-CLIENT-ID": settings.MAL_API},
+                headers={"X-MAL-CLIENT-ID": credentials.get("mal", "client_id")},
             )
         except requests.exceptions.HTTPError as error:
             handle_error(error)
@@ -178,7 +232,7 @@ def manga(media_id):
                 "GET",
                 url,
                 params=params,
-                headers={"X-MAL-CLIENT-ID": settings.MAL_API},
+                headers={"X-MAL-CLIENT-ID": credentials.get("mal", "client_id")},
             )
         except requests.exceptions.HTTPError as error:
             handle_error(error)
@@ -250,14 +304,34 @@ def get_localized_title(response):
 
     if isinstance(english_title, list):
         english_title = next(
-            (title for title in english_title if isinstance(title, str) and title.strip()),
+            (
+                title
+                for title in english_title
+                if isinstance(title, str) and title.strip()
+            ),
             None,
         )
 
     if isinstance(english_title, str):
         english_title = english_title.strip()
 
-    return english_title or None
+    if english_title:
+        return english_title
+
+    # MAL leaves "en" blank for some entries and keeps the English name only
+    # in synonyms, which carry no language tag; use the first one that is not
+    # a copy of the main title.
+    original_title = (response.get("title") or "").strip()
+    return next(
+        (
+            title.strip()
+            for title in alternative_titles.get("synonyms") or []
+            if isinstance(title, str)
+            and title.strip()
+            and title.strip() != original_title
+        ),
+        None,
+    )
 
 
 def get_title_fields(response):

@@ -13,13 +13,23 @@ from app.discover import cache_repo
 from app.discover.adapters import TRAKT_ADAPTER
 from app.discover.schemas import CandidateItem
 from app.models import MediaTypes, Sources
-from app.providers import bgg, comicvine, igdb, mal, musicbrainz, openlibrary, services
+from app.providers import (
+    bgg,
+    comicvine,
+    credentials,
+    igdb,
+    mal,
+    musicbrainz,
+    openlibrary,
+    services,
+)
 
 logger = logging.getLogger(__name__)
 
 PROVIDER_DISCOVER_TTL_SECONDS = 60 * 60
 PROVIDER_COMING_SOON_WINDOW_DAYS = 180
 TRAKT_POPULAR_PAGE_SIZE = 100
+ISO_DATE_LENGTH = 10
 
 
 def _api_cached_results(
@@ -43,8 +53,7 @@ def _api_cached_results(
             {"results": results},
             ttl_seconds=ttl_seconds,
         )
-        return results
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         if payload:
             logger.warning(
                 "discover_provider_cache_fallback provider=%s endpoint=%s error=%s",
@@ -60,6 +69,8 @@ def _api_cached_results(
             error,
         )
         return []
+    else:
+        return results
 
 
 def _safe_float(value) -> float | None:
@@ -86,7 +97,7 @@ def _iso_date(raw) -> str | None:
     text = str(raw).strip()
     if not text:
         return None
-    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+    if len(text) >= ISO_DATE_LENGTH and text[4:5] == "-" and text[7:8] == "-":
         return text[:10]
     return None
 
@@ -128,7 +139,7 @@ def _openlibrary_first_edition_id(work_key: str) -> str | None:
             f"https://openlibrary.org{work_key}/editions.json",
             params={"limit": 1},
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         cache.set(cache_key, "", timeout=60 * 60 * 6)
         return None
 
@@ -196,7 +207,9 @@ def _openlibrary_trending_candidates(
             f"https://openlibrary.org{endpoint}",
             params=params,
         )
-        works = payload.get("works") or payload.get("docs") or payload.get("results") or []
+        works = (
+            payload.get("works") or payload.get("docs") or payload.get("results") or []
+        )
         if isinstance(works, dict):
             works = list(works.values())
         return [entry for entry in works if isinstance(entry, dict)]
@@ -228,11 +241,9 @@ def _openlibrary_trending_candidates(
             popularity = float(max(len(entries) - index + 1, 1))
 
         subjects = entry.get("subject") or entry.get("subjects") or []
-        genres = [
-            str(subject).strip()
-            for subject in subjects
-            if str(subject).strip()
-        ][:4]
+        genres = [str(subject).strip() for subject in subjects if str(subject).strip()][
+            :4
+        ]
 
         candidates.append(
             CandidateItem(
@@ -321,11 +332,9 @@ def _openlibrary_coming_soon_candidates(
             popularity = float(max(len(entries) - index + 1, 1))
 
         subjects = entry.get("subject") or entry.get("subjects") or []
-        genres = [
-            str(subject).strip()
-            for subject in subjects
-            if str(subject).strip()
-        ][:4]
+        genres = [str(subject).strip() for subject in subjects if str(subject).strip()][
+            :4
+        ]
 
         candidates.append(
             CandidateItem(
@@ -354,7 +363,7 @@ def _comicvine_volume_candidates(
 ) -> list[CandidateItem]:
     endpoint = "/volumes/"
     params = {
-        "api_key": settings.COMICVINE_API,
+        "api_key": credentials.get("comicvine", "api_key"),
         "format": "json",
         "field_list": "id,name,image,start_year,count_of_issues,date_last_updated",
         "sort": sort,
@@ -370,7 +379,9 @@ def _comicvine_volume_candidates(
             params=params,
             headers=comicvine.headers,
         )
-        return [entry for entry in (payload.get("results") or []) if isinstance(entry, dict)]
+        return [
+            entry for entry in (payload.get("results") or []) if isinstance(entry, dict)
+        ]
 
     entries = _api_cached_results(
         Sources.COMICVINE.value,
@@ -417,9 +428,11 @@ def _comicvine_coming_soon_volume_candidates(
 ) -> list[CandidateItem]:
     endpoint = "/issues/"
     start_date = timezone.localdate().isoformat()
-    end_date = (timezone.localdate() + timedelta(days=PROVIDER_COMING_SOON_WINDOW_DAYS)).isoformat()
+    end_date = (
+        timezone.localdate() + timedelta(days=PROVIDER_COMING_SOON_WINDOW_DAYS)
+    ).isoformat()
     params = {
-        "api_key": settings.COMICVINE_API,
+        "api_key": credentials.get("comicvine", "api_key"),
         "format": "json",
         "field_list": "id,name,issue_number,store_date,cover_date,image,volume",
         "filter": f"store_date:{start_date}|{end_date}",
@@ -436,7 +449,9 @@ def _comicvine_coming_soon_volume_candidates(
             params=params,
             headers=comicvine.headers,
         )
-        return [entry for entry in (payload.get("results") or []) if isinstance(entry, dict)]
+        return [
+            entry for entry in (payload.get("results") or []) if isinstance(entry, dict)
+        ]
 
     entries = _api_cached_results(
         Sources.COMICVINE.value,
@@ -452,7 +467,9 @@ def _comicvine_coming_soon_volume_candidates(
         volume_id = _safe_int(volume.get("id"))
         if not volume_id:
             continue
-        release_date = _iso_date(entry.get("store_date")) or _iso_date(entry.get("cover_date"))
+        release_date = _iso_date(entry.get("store_date")) or _iso_date(
+            entry.get("cover_date")
+        )
         existing = earliest_issue_by_volume.get(volume_id)
         if existing is None:
             earliest_issue_by_volume[volume_id] = {
@@ -506,7 +523,7 @@ def _bgg_hot_candidates(
 ) -> list[CandidateItem]:
     endpoint = "/xmlapi2/hot"
     params = {"type": "boardgame"}
-    headers = {"Authorization": f"Bearer {settings.BGG_API_TOKEN}"}
+    headers = {"Authorization": f"Bearer {credentials.get("bgg", "token")}"}
 
     def fetcher() -> list[dict]:
         root = services.api_request(
@@ -540,7 +557,7 @@ def _bgg_hot_candidates(
     )
 
     ids = [str(entry.get("id")) for entry in entries[:limit] if entry.get("id")]
-    thumbnails = bgg._fetch_thumbnails(ids) if ids else {}  # noqa: SLF001
+    thumbnails = bgg._fetch_thumbnails(ids) if ids else {}
 
     candidates: list[CandidateItem] = []
     for index, entry in enumerate(entries, start=1):
@@ -581,7 +598,9 @@ def _musicbrainz_coming_soon_recording_candidates(
 ) -> list[CandidateItem]:
     endpoint = "/recording/"
     start_date = timezone.localdate().isoformat()
-    end_date = (timezone.localdate() + timedelta(days=PROVIDER_COMING_SOON_WINDOW_DAYS)).isoformat()
+    end_date = (
+        timezone.localdate() + timedelta(days=PROVIDER_COMING_SOON_WINDOW_DAYS)
+    ).isoformat()
     params = {
         "query": f"firstreleasedate:[{start_date} TO {end_date}]",
         "limit": min(max(limit, 1), 100),
@@ -651,7 +670,9 @@ def _musicbrainz_coming_soon_recording_candidates(
                 release_date = release_date or _iso_date(selected_release.get("date"))
 
         display_title = title if not artist_name else f"{title} - {artist_name}"
-        popularity = _safe_float(entry.get("score")) or float(max(len(entries) - index + 1, 1))
+        popularity = _safe_float(entry.get("score")) or float(
+            max(len(entries) - index + 1, 1)
+        )
         candidates.append(
             CandidateItem(
                 media_type=MediaTypes.MUSIC.value,
@@ -684,7 +705,7 @@ def _itunes_top_podcasts_candidates(
             "GET",
             f"https://itunes.apple.com/us/rss/toppodcasts/limit={params['limit']}/json",
         )
-        entries = ((payload.get("feed") or {}).get("entry") or [])
+        entries = (payload.get("feed") or {}).get("entry") or []
         if isinstance(entries, dict):
             entries = [entries]
         return [entry for entry in entries if isinstance(entry, dict)]
@@ -699,10 +720,9 @@ def _itunes_top_podcasts_candidates(
 
     candidates: list[CandidateItem] = []
     for index, entry in enumerate(entries, start=1):
-        media_id = (
-            ((entry.get("id") or {}).get("attributes") or {}).get("im:id")
-            or ((entry.get("id") or {}).get("label") or "").strip().rsplit("/", 1)[-1]
-        )
+        media_id = ((entry.get("id") or {}).get("attributes") or {}).get("im:id") or (
+            (entry.get("id") or {}).get("label") or ""
+        ).strip().rsplit("/", 1)[-1]
         title = ((entry.get("im:name") or {}).get("label") or "").strip()
         if not media_id or not title:
             continue
@@ -711,10 +731,9 @@ def _itunes_top_podcasts_candidates(
         images = entry.get("im:image") or []
         if isinstance(images, list) and images:
             image = ((images[-1] or {}).get("label") or "").strip() or settings.IMG_NONE
-        release_text = (
-            ((entry.get("im:releaseDate") or {}).get("label"))
-            or ((entry.get("im:releaseDate") or {}).get("attributes") or {}).get("label")
-        )
+        release_text = ((entry.get("im:releaseDate") or {}).get("label")) or (
+            (entry.get("im:releaseDate") or {}).get("attributes") or {}
+        ).get("label")
         release_date = _iso_date(release_text)
         popularity = float(max(len(entries) - index + 1, 1))
 
@@ -741,13 +760,13 @@ def _lastfm_top_tracks_candidates(
     source_reason: str,
     limit: int = 100,
 ) -> list[CandidateItem]:
-    if not settings.LASTFM_API_KEY:
+    if not credentials.get("lastfm", "api_key"):
         return []
 
     endpoint = "/2.0/chart.gettoptracks"
     params = {
         "method": "chart.gettoptracks",
-        "api_key": settings.LASTFM_API_KEY,
+        "api_key": credentials.get("lastfm", "api_key"),
         "format": "json",
         "limit": min(max(limit, 1), 200),
     }
@@ -759,7 +778,7 @@ def _lastfm_top_tracks_candidates(
             "https://ws.audioscrobbler.com/2.0/",
             params=params,
         )
-        tracks = ((payload.get("tracks") or {}).get("track") or [])
+        tracks = (payload.get("tracks") or {}).get("track") or []
         if isinstance(tracks, dict):
             tracks = [tracks]
         return [track for track in tracks if isinstance(track, dict)]
@@ -818,14 +837,15 @@ def _lastfm_top_tracks_candidates(
     return candidates[:limit]
 
 
-def _mal_manga_ranking_candidates(
+def _mal_ranking_candidates(
     *,
+    media_type: str,
     ranking_type: str,
     row_key: str,
     source_reason: str,
     limit: int = 100,
 ) -> list[CandidateItem]:
-    endpoint = "/manga/ranking"
+    endpoint = f"/{media_type}/ranking"
     params = {
         "ranking_type": ranking_type,
         "limit": min(max(limit, 1), 100),
@@ -840,9 +860,11 @@ def _mal_manga_ranking_candidates(
             "GET",
             f"{mal.base_url}{endpoint}",
             params=params,
-            headers={"X-MAL-CLIENT-ID": settings.MAL_API},
+            headers={"X-MAL-CLIENT-ID": credentials.get("mal", "client_id")},
         )
-        return [entry for entry in (payload.get("data") or []) if isinstance(entry, dict)]
+        return [
+            entry for entry in (payload.get("data") or []) if isinstance(entry, dict)
+        ]
 
     entries = _api_cached_results(
         Sources.MAL.value,
@@ -873,7 +895,7 @@ def _mal_manga_ranking_candidates(
 
         candidates.append(
             CandidateItem(
-                media_type=MediaTypes.MANGA.value,
+                media_type=media_type,
                 source=Sources.MAL.value,
                 media_id=str(media_id),
                 title=title,
@@ -891,6 +913,66 @@ def _mal_manga_ranking_candidates(
         )
 
     return candidates[:limit]
+
+
+def _mal_manga_ranking_candidates(
+    *,
+    ranking_type: str,
+    row_key: str,
+    source_reason: str,
+    limit: int = 100,
+) -> list[CandidateItem]:
+    return _mal_ranking_candidates(
+        media_type=MediaTypes.MANGA.value,
+        ranking_type=ranking_type,
+        row_key=row_key,
+        source_reason=source_reason,
+        limit=limit,
+    )
+
+
+def _mal_anime_ranking_candidates(
+    *,
+    ranking_type: str,
+    row_key: str,
+    source_reason: str,
+    limit: int = 100,
+) -> list[CandidateItem]:
+    return _mal_ranking_candidates(
+        media_type=MediaTypes.ANIME.value,
+        ranking_type=ranking_type,
+        row_key=row_key,
+        source_reason=source_reason,
+        limit=limit,
+    )
+
+
+def _mal_anime_fallback_candidates(row_key: str) -> list[CandidateItem]:
+    ranking_by_row = {
+        "trending_right_now": ("airing", "MAL airing ranking"),
+        "all_time_greats_unseen": ("bypopularity", "MAL popular ranking"),
+        "coming_soon": ("upcoming", "MAL upcoming ranking"),
+    }
+    ranking = ranking_by_row.get(row_key)
+    if ranking is None:
+        return []
+
+    ranking_type, source_reason = ranking
+    candidates = _mal_anime_ranking_candidates(
+        ranking_type=ranking_type,
+        row_key=row_key,
+        source_reason=source_reason,
+        limit=100,
+    )
+    if candidates or row_key != "coming_soon":
+        return candidates
+
+    return _mal_anime_ranking_candidates(
+        ranking_type="airing",
+        row_key=row_key,
+        source_reason="MAL airing fallback",
+        limit=100,
+    )
 
 
 def _igdb_games_candidates(
@@ -911,7 +993,7 @@ def _igdb_games_candidates(
             f"{igdb.base_url}/games",
             data=query,
             headers={
-                "Client-ID": settings.IGDB_ID,
+                "Client-ID": credentials.get("igdb", "client_id"),
                 "Authorization": f"Bearer {access_token}",
             },
         )
@@ -1099,7 +1181,9 @@ def _provider_row_candidates(media_type: str, row_key: str) -> list[CandidateIte
 
     if row_key == "coming_soon":
         if media_type == MediaTypes.MOVIE.value:
-            return TRAKT_ADAPTER.movie_anticipated(page=1, limit=TRAKT_POPULAR_PAGE_SIZE)
+            return TRAKT_ADAPTER.movie_anticipated(
+                page=1, limit=TRAKT_POPULAR_PAGE_SIZE
+            )
         if media_type == MediaTypes.TV.value:
             return TRAKT_ADAPTER.show_anticipated(
                 page=1,

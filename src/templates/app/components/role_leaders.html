@@ -1,3 +1,5 @@
+
+{% load i18n %}
 {% load app_tags %}
 {% comment %}
   Role Leaders — 4 columns (Actors/Actresses/Directors/Writers), each a scrollable
@@ -8,23 +10,27 @@
   Required context: role_leaders (from stats_cast_crew.get_role_leaders),
   current_range_name / current_start_date / current_end_date for the POST body.
 {% endcomment %}
-<div x-data="{
+{% translate "Time" as media_i18n_61 %}{% translate "Titles" as media_i18n_68 %}{% translate "Plays" as media_i18n_62 %}<div x-data="{
        selectedPersonKey: '{{ featured_person.source|default:"" }}:{{ featured_person.person_id|default:"" }}',
        open: false,
        selectedSort: '{{ role_leaders.sort_by|default:"plays"|escapejs }}',
        selectedLabel: '',
        loading: false,
+       refreshQueued: false,
+       mediaTypeTimer: null,
        currentRangeName: '{{ selected_range_name|default:""|escapejs }}',
        currentStartDate: '{{ start_date_str|default:""|escapejs }}',
        currentEndDate: '{{ end_date_str|default:""|escapejs }}',
        totalLibraryTitles: {{ media_count.total|default:0 }},
        selectedMediaType: 'all',
        init() {
-         this.selectedLabel = this.selectedSort === 'time' ? 'Time' : (this.selectedSort === 'titles' ? 'Titles' : 'Plays');
+         this.selectedLabel = this.selectedSort === 'time' ? '{{ media_i18n_61|escapejs }}' : (this.selectedSort === 'titles' ? '{{ media_i18n_68|escapejs }}' : '{{ media_i18n_62|escapejs }}');
          this.selectedMediaType = new URLSearchParams(window.location.search).get('media-type') || 'all';
          window.addEventListener('stats-media-type-changed', () => {
            this.selectedMediaType = new URLSearchParams(window.location.search).get('media-type') || 'all';
-           this.refresh();
+           // Several types can be ticked in quick succession: wait for the last tick.
+           clearTimeout(this.mediaTypeTimer);
+           this.mediaTypeTimer = setTimeout(() => this.refresh(), 300);
          });
          // The initial server render is always the unfiltered all-types aggregate —
          // if the page loaded with a media-type already in the URL (reload,
@@ -76,6 +82,8 @@
        },
        async refresh() {
          if (this.loading) {
+           // A request is running; run once more when it ends so the latest selection wins.
+           this.refreshQueued = true;
            return;
          }
          const previousSort = this.selectedSort;
@@ -151,6 +159,10 @@
            console.error('Failed to refresh top talent cards:', error);
          } finally {
            this.loading = false;
+           if (this.refreshQueued) {
+             this.refreshQueued = false;
+             this.refresh();
+           }
          }
        },
        async setSort(sortBy, label) {
@@ -226,8 +238,8 @@
      }">
   <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
     <div class="flex flex-col space-y-1">
-      <h2 class="text-xl font-semibold text-white">Role Leaders</h2>
-      <p class="text-sm text-gray-400">Top contributors by role across your library.</p>
+      <h2 class="text-xl font-semibold text-[var(--color-text)]">{% translate "Role Leaders" %}</h2>
+      <p class="text-sm text-[var(--color-text-muted)]">{% translate "Top contributors by role across your library." %}</p>
     </div>
 
     <div class="w-full sm:w-auto sm:min-w-32 sm:ml-auto">
@@ -235,7 +247,7 @@
         <button type="button"
                 @click="open = !open"
                 @click.outside="open = false"
-                class="flex items-center justify-between w-full gap-2 px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                class="flex items-center justify-between w-full gap-2 px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
           <span x-text="selectedLabel"></span>
           <svg xmlns="http://www.w3.org/2000/svg"
                width="24"
@@ -246,7 +258,7 @@
                stroke-width="2"
                stroke-linecap="round"
                stroke-linejoin="round"
-               class="w-4 h-4 ml-1 text-gray-400">
+               class="w-4 h-4 ml-1 text-[var(--color-text-muted)]">
             <path d="m6 9 6 6 6-6"></path>
           </svg>
         </button>
@@ -257,21 +269,21 @@
              x-transition:leave="transition ease-in duration-75"
              x-transition:leave-start="transform opacity-100 scale-100"
              x-transition:leave-end="transform opacity-0 scale-95"
-             class="absolute right-0 z-10 mt-2 min-w-full py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden border border-gray-600">
-          <button type="button"
-                  @click="setSort('plays', 'Plays')"
-                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-            Plays
+             class="absolute right-0 z-10 mt-2 min-w-full py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden border border-gray-600">
+          {% translate "Plays" as media_i18n_62 %}<button type="button"
+                  @click="setSort('plays', '{{ media_i18n_62|escapejs }}')"
+                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+            {% translate "Plays" %}
           </button>
-          <button type="button"
-                  @click="setSort('time', 'Time')"
-                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-            Time
+          {% translate "Time" as media_i18n_61 %}<button type="button"
+                  @click="setSort('time', '{{ media_i18n_61|escapejs }}')"
+                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+            {% translate "Time" %}
           </button>
-          <button type="button"
-                  @click="setSort('titles', 'Titles')"
-                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-            Titles
+          {% translate "Titles" as media_i18n_68 %}<button type="button"
+                  @click="setSort('titles', '{{ media_i18n_68|escapejs }}')"
+                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+            {% translate "Titles" %}
           </button>
         </div>
       </div>

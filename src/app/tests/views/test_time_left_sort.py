@@ -151,7 +151,8 @@ class TVTimeLeftSortTests(TestCase):
         self.assertEqual(sorted_excluded.episodes_left_display, 9)
         self.assertEqual(sorted_excluded.time_left_display, "4h 30m")
 
-        # Dropped seasons are left out of the show's own progress math too
+        # Dropped seasons are excluded from episodes_left/time_left as well,
+        # matching the display math.
         self.assertEqual(sorted_excluded.episodes_left, 9)
         self.assertEqual(sorted_excluded.time_left, 270)
 
@@ -277,11 +278,12 @@ class TVTimeLeftCachedOrderTests(TestCase):
                 episode_number=1,
                 runtime_minutes=30,
             )
-            Episode.objects.create(
-                item=episode_item,
-                related_season=season,
-                end_date=timezone.now(),
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                Episode.objects.create(
+                    item=episode_item,
+                    related_season=season,
+                    end_date=timezone.now(),
+                )
 
     def _list_url(self, page=None):
         from django.urls import reverse
@@ -324,11 +326,12 @@ class TVTimeLeftCachedOrderTests(TestCase):
             media_type=MediaTypes.EPISODE.value,
             media_id=season.item.media_id,
         ).first()
-        Episode.objects.create(
-            item=episode_item,
-            related_season=season,
-            end_date=timezone.now(),
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            Episode.objects.create(
+                item=episode_item,
+                related_season=season,
+                end_date=timezone.now(),
+            )
 
         with patch(
             "app.media_list_views._sort_tv_media_by_time_left",

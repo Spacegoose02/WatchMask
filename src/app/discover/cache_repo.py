@@ -16,7 +16,9 @@ from app.models import DiscoverApiCache, DiscoverRowCache, DiscoverTasteProfile
 
 
 def _params_hash(params: dict[str, Any] | None) -> str:
-    payload = json.dumps(params or {}, sort_keys=True, separators=(",", ":"), default=str)
+    payload = json.dumps(
+        params or {}, sort_keys=True, separators=(",", ":"), default=str
+    )
     return stable_hmac(payload, namespace="discover_api_cache")
 
 
@@ -220,12 +222,14 @@ def set_taste_profile(
                 media_type=media_type,
                 defaults=defaults,
             )
-            return entry
         except OperationalError as exc:
             if "database is locked" not in str(exc) or attempt >= max_attempts - 1:
                 raise
-            time.sleep(0.2 * (attempt + 1) + random.random() * 0.3)
-    raise RuntimeError("unreachable")
+            time.sleep(0.2 * (attempt + 1) + random.random() * 0.3)  # noqa: S311  # sampling/jitter only, not cryptographic
+        else:
+            return entry
+    msg = "unreachable"
+    raise RuntimeError(msg)
 
 
 def delete_row_caches(user_ids: list[int], media_types: list[str]) -> int:
@@ -248,3 +252,43 @@ def delete_taste_profiles(user_ids: list[int], media_types: list[str]) -> int:
         media_type__in=media_types,
     ).delete()
     return int(deleted)
+
+
+# Expired rows are still served stale while a refresh runs, so only rows that
+# have been expired well past any plausible refresh are purged.
+EXPIRED_CACHE_RETENTION = timedelta(days=7)
+EXPIRED_CACHE_PURGE_BATCH_SIZE = 1000
+EXPIRED_CACHE_PURGE_MAX_BATCHES = 50
+
+
+def purge_expired_caches(
+    *,
+    now=None,
+    retention: timedelta = EXPIRED_CACHE_RETENTION,
+    batch_size: int = EXPIRED_CACHE_PURGE_BATCH_SIZE,
+    max_batches: int = EXPIRED_CACHE_PURGE_MAX_BATCHES,
+) -> dict[str, int]:
+    """Delete durable Discover cache rows expired longer than ``retention``.
+
+    Deletes by primary key in small batches so SQLite writers are never held
+    for long; each model is bounded to ``batch_size * max_batches`` rows per
+    call and the remainder is picked up by the next scheduled run.
+    """
+    cutoff = (now or timezone.now()) - retention
+    deleted: dict[str, int] = {}
+    for model in (DiscoverApiCache, DiscoverRowCache, DiscoverTasteProfile):
+        total = 0
+        for _ in range(max_batches):
+            pks = list(
+                model.objects.filter(expires_at__lt=cutoff)
+                .order_by("expires_at")
+                .values_list("pk", flat=True)[:batch_size],
+            )
+            if not pks:
+                break
+            count, _details = model.objects.filter(pk__in=pks).delete()
+            total += int(count)
+            if len(pks) < batch_size:
+                break
+        deleted[model.__name__] = total
+    return deleted

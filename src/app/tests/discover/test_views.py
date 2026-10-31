@@ -1,7 +1,6 @@
-# ruff: noqa: D102
-
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import ANY, call, patch
 
 from django.contrib.auth import get_user_model
@@ -11,14 +10,21 @@ from django.urls import reverse
 from app.discover.schemas import CandidateItem, RowResult
 from app.models import (
     TV,
+    Album,
+    AlbumTracker,
     DiscoverFeedback,
     DiscoverFeedbackType,
     Item,
     MediaTypes,
     Movie,
+    Music,
+    Podcast,
+    PodcastShow,
+    PodcastShowTracker,
     Sources,
     Status,
 )
+from app.providers import services
 from app.services.tracking_hydration import HydratedItemResult
 from users.models import DateFormatChoices
 
@@ -44,6 +50,17 @@ class DiscoverViewTests(TestCase):
     def tearDown(self):
         self.warmup_patcher.stop()
 
+    def test_discover_endpoints_404_when_discover_turned_off(self):
+        """Users who turn Discover off get no page, rows, refresh, or actions."""
+        self.user.show_discover = False
+        self.user.save(update_fields=["show_discover"])
+
+        self.assertEqual(self.client.get(reverse("discover")).status_code, 404)
+        self.assertEqual(self.client.get(reverse("discover_rows")).status_code, 404)
+        for name in ("refresh_discover", "discover_action", "discover_toggle_hidden"):
+            with self.subTest(name=name):
+                self.assertEqual(self.client.post(reverse(name)).status_code, 404)
+
     def _row(
         self,
         *,
@@ -65,9 +82,7 @@ class DiscoverViewTests(TestCase):
         return RowResult(
             key=row_key,
             title=(
-                "Top Picks For You"
-                if row_key == "top_picks_for_you"
-                else "Coming Soon"
+                "Top Picks For You" if row_key == "top_picks_for_you" else "Coming Soon"
             ),
             mission=(
                 "Personal Taste Match"
@@ -90,6 +105,24 @@ class DiscoverViewTests(TestCase):
             media_type=MediaTypes.MOVIE.value,
             title=title,
             image="https://example.com/movie.jpg",
+        )
+
+    def _music_item(self, media_id="album-9001", title="Great Album"):
+        return Item.objects.create(
+            media_id=media_id,
+            source=Sources.MUSICBRAINZ.value,
+            media_type=MediaTypes.MUSIC.value,
+            title=title,
+            image="https://example.com/album.jpg",
+        )
+
+    def _podcast_item(self, media_id="show-9001", title="Great Show"):
+        return Item.objects.create(
+            media_id=media_id,
+            source=Sources.POCKETCASTS.value,
+            media_type=MediaTypes.PODCAST.value,
+            title=title,
+            image="https://example.com/show.jpg",
         )
 
     @patch("app.views._invalidate_discover_after_action")
@@ -678,10 +711,272 @@ class DiscoverViewTests(TestCase):
             MediaTypes.TV.value,
         )
 
+    @patch("app.views.discover_tab_cache.invalidate_for_media_change")
+    @patch("app.views.discover_tab_cache.update_undo_snapshot")
+    @patch("app.views.discover_tab_cache.apply_cached_action")
+    @patch("app.views.discover_tab_cache.store_undo_snapshot", return_value="undo-music")
+    @patch("app.views.ensure_item_metadata")
+    def test_discover_action_planning_music_creates_album_tracker(
+        self,
+        mock_ensure_item_metadata,
+        _mock_store_undo_snapshot,
+        mock_apply_cached_action,
+        mock_update_undo_snapshot,
+        _mock_invalidate_for_media_change,
+    ):
+        item = self._music_item()
+        album = Album.objects.create(title="Great Album")
+        mock_ensure_item_metadata.return_value = HydratedItemResult(
+            item=item,
+            metadata={},
+            created=False,
+            album=album,
+        )
+        mock_apply_cached_action.return_value = [self._row(title="Updated Album")]
+
+        response = self.client.post(
+            reverse("discover_action"),
+            {
+                "action": "planning",
+                "candidate_media_type": MediaTypes.MUSIC.value,
+                "source": Sources.MUSICBRAINZ.value,
+                "media_id": item.media_id,
+                "active_media_type": MediaTypes.MUSIC.value,
+                "show_more": "0",
+                "row_key": "top_picks_for_you",
+                "title": item.title,
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            AlbumTracker.objects.filter(
+                user=self.user,
+                album=album,
+                status=Status.PLANNING.value,
+            ).exists(),
+        )
+        self.assertFalse(Music.objects.filter(user=self.user, item=item).exists())
+        mock_update_undo_snapshot.assert_called_once()
+        _, snapshot_kwargs = mock_update_undo_snapshot.call_args
+        self.assertEqual(
+            snapshot_kwargs["side_effect"]["model_label"],
+            "app.albumtracker",
+        )
+
+    @patch("app.views.discover_tab_cache.invalidate_for_media_change")
+    @patch("app.views.discover_tab_cache.update_undo_snapshot")
+    @patch("app.views.discover_tab_cache.apply_cached_action")
+    @patch(
+        "app.views.discover_tab_cache.store_undo_snapshot", return_value="undo-podcast"
+    )
+    @patch("app.views.ensure_item_metadata")
+    def test_discover_action_planning_podcast_creates_show_tracker(
+        self,
+        mock_ensure_item_metadata,
+        _mock_store_undo_snapshot,
+        mock_apply_cached_action,
+        mock_update_undo_snapshot,
+        _mock_invalidate_for_media_change,
+    ):
+        item = self._podcast_item()
+        show = PodcastShow.objects.create(
+            podcast_uuid="show-uuid-9001",
+            title="Great Show",
+        )
+        mock_ensure_item_metadata.return_value = HydratedItemResult(
+            item=item,
+            metadata={},
+            created=False,
+            podcast_show=show,
+        )
+        mock_apply_cached_action.return_value = [self._row(title="Updated Show")]
+
+        response = self.client.post(
+            reverse("discover_action"),
+            {
+                "action": "planning",
+                "candidate_media_type": MediaTypes.PODCAST.value,
+                "source": Sources.POCKETCASTS.value,
+                "media_id": item.media_id,
+                "active_media_type": MediaTypes.PODCAST.value,
+                "show_more": "0",
+                "row_key": "top_picks_for_you",
+                "title": item.title,
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            PodcastShowTracker.objects.filter(
+                user=self.user,
+                show=show,
+                status=Status.PLANNING.value,
+            ).exists(),
+        )
+        self.assertFalse(Podcast.objects.filter(user=self.user, item=item).exists())
+        mock_update_undo_snapshot.assert_called_once()
+
+    def _planning_provider_failure(self, status_code):
+        error = Exception("provider said no")
+        error.response = SimpleNamespace(status_code=status_code, headers={})
+        with patch(
+            "app.views.ensure_item_metadata",
+            side_effect=services.ProviderAPIError(Sources.POCKETCASTS.value, error),
+        ):
+            return self.client.post(
+                reverse("discover_action"),
+                {
+                    "action": "planning",
+                    "candidate_media_type": MediaTypes.PODCAST.value,
+                    "source": Sources.POCKETCASTS.value,
+                    "media_id": "gone-show-uuid",
+                    "active_media_type": MediaTypes.PODCAST.value,
+                    "show_more": "0",
+                    "row_key": "top_picks_for_you",
+                    "title": "Gone Show",
+                },
+                HTTP_HX_REQUEST="true",
+            )
+
+    def test_discover_action_planning_provider_404_is_a_clean_failure(self):
+        response = self._planning_provider_failure(404)
+
+        self.assertEqual(response.status_code, 404)
+        detail = json.loads(response["HX-Trigger"])["discoverActionComplete"]
+        self.assertIn("Gone Show", detail["message"])
+        self.assertIn("no longer has it", detail["message"])
+        self.assertNotIn("undo_token", detail)
+        self.assertFalse(PodcastShowTracker.objects.filter(user=self.user).exists())
+
+    def test_discover_action_planning_unconfigured_provider_keeps_setup_guidance(self):
+        with patch(
+            "app.views.ensure_item_metadata",
+            side_effect=services.ProviderNotConfiguredError(
+                Sources.IGDB.value,
+                "IGDB credentials are not set.",
+            ),
+        ):
+            response = self.client.post(
+                reverse("discover_action"),
+                {
+                    "action": "planning",
+                    "candidate_media_type": MediaTypes.GAME.value,
+                    "source": Sources.IGDB.value,
+                    "media_id": "1",
+                    "active_media_type": MediaTypes.GAME.value,
+                    "title": "A Game",
+                },
+                HTTP_HX_REQUEST="true",
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("HX-Trigger", response)
+
+    def test_discover_action_planning_provider_outage_asks_to_retry(self):
+        response = self._planning_provider_failure(503)
+
+        self.assertEqual(response.status_code, 502)
+        detail = json.loads(response["HX-Trigger"])["discoverActionComplete"]
+        self.assertIn("Please try again", detail["message"])
+
+    @patch("app.views.discover_tab_cache.invalidate_for_feedback_change")
+    @patch("app.views.ensure_item_metadata")
+    def test_discover_action_planning_music_already_in_library(
+        self,
+        mock_ensure_item_metadata,
+        mock_invalidate_for_feedback_change,
+    ):
+        item = self._music_item(media_id="album-9002", title="Existing Album")
+        album = Album.objects.create(title="Existing Album")
+        AlbumTracker.objects.create(
+            user=self.user,
+            album=album,
+            status=Status.PLANNING.value,
+        )
+        mock_ensure_item_metadata.return_value = HydratedItemResult(
+            item=item,
+            metadata={},
+            created=False,
+            album=album,
+        )
+
+        response = self.client.post(
+            reverse("discover_action"),
+            {
+                "action": "planning",
+                "candidate_media_type": MediaTypes.MUSIC.value,
+                "source": Sources.MUSICBRAINZ.value,
+                "media_id": item.media_id,
+                "active_media_type": MediaTypes.MUSIC.value,
+                "show_more": "0",
+                "row_key": "top_picks_for_you",
+                "title": item.title,
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            AlbumTracker.objects.filter(user=self.user, album=album).count(),
+            1,
+        )
+        mock_invalidate_for_feedback_change.assert_called_once_with(
+            self.user.id,
+            MediaTypes.MUSIC.value,
+        )
+
+    @patch("app.views.discover_tab_cache.invalidate_for_media_change")
+    @patch("app.views.discover_tab_cache.restore_undo_snapshot")
+    @patch("app.views.discover_tab_cache.get_undo_snapshot")
+    def test_discover_action_undo_deletes_album_tracker(
+        self,
+        mock_get_undo_snapshot,
+        mock_restore_undo_snapshot,
+        _mock_invalidate_for_media_change,
+    ):
+        album = Album.objects.create(title="Undo Album")
+        tracker = AlbumTracker.objects.create(
+            user=self.user,
+            album=album,
+            status=Status.PLANNING.value,
+        )
+        mock_get_undo_snapshot.return_value = {
+            "side_effect": {
+                "kind": "planning",
+                "media_type": MediaTypes.MUSIC.value,
+                "source": Sources.MUSICBRAINZ.value,
+                "identity_media_type": None,
+                "instance_id": tracker.id,
+                "model_label": "app.albumtracker",
+            },
+        }
+        mock_restore_undo_snapshot.return_value = {
+            "rows": [self._row(title="Restored Album")]
+        }
+
+        response = self.client.post(
+            reverse("discover_action"),
+            {
+                "action": "undo",
+                "undo_token": "undo-music",
+                "active_media_type": MediaTypes.MUSIC.value,
+                "show_more": "0",
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(AlbumTracker.objects.filter(id=tracker.id).exists())
+
     @patch("app.views.discover_tab_cache.update_undo_snapshot")
     @patch("app.views.discover_tab_cache.apply_cached_action")
     @patch("app.views.discover_tab_cache.invalidate_for_feedback_change")
-    @patch("app.views.discover_tab_cache.store_undo_snapshot", return_value="undo-dismiss")
+    @patch(
+        "app.views.discover_tab_cache.store_undo_snapshot", return_value="undo-dismiss"
+    )
     @patch("app.views.ensure_item_metadata")
     def test_discover_action_dismiss_returns_rows_and_trigger(
         self,
@@ -697,7 +992,9 @@ class DiscoverViewTests(TestCase):
             metadata={},
             created=False,
         )
-        mock_apply_cached_action.return_value = [self._row(title="Dismissed Replacement")]
+        mock_apply_cached_action.return_value = [
+            self._row(title="Dismissed Replacement")
+        ]
 
         response = self.client.post(
             reverse("discover_action"),
@@ -727,7 +1024,9 @@ class DiscoverViewTests(TestCase):
         self.assertIn("X-Discover-Activity-Version", response)
         trigger = json.loads(response["HX-Trigger"])
         self.assertEqual(trigger["discoverActionComplete"]["action"], "dismiss")
-        self.assertEqual(trigger["discoverActionComplete"]["undo_token"], "undo-dismiss")
+        self.assertEqual(
+            trigger["discoverActionComplete"]["undo_token"], "undo-dismiss"
+        )
         mock_invalidate_for_feedback_change.assert_called_once_with(
             self.user.id,
             MediaTypes.MOVIE.value,
@@ -755,7 +1054,9 @@ class DiscoverViewTests(TestCase):
                 "feedback_id": feedback.id,
             },
         }
-        mock_restore_undo_snapshot.return_value = {"rows": [self._row(title="Restored Movie")]}
+        mock_restore_undo_snapshot.return_value = {
+            "rows": [self._row(title="Restored Movie")]
+        }
 
         response = self.client.post(
             reverse("discover_action"),
@@ -843,7 +1144,9 @@ class DiscoverViewTests(TestCase):
 
     @patch("app.models.Item.fetch_releases")
     @patch("app.views.discover_tab_cache.update_undo_snapshot")
-    @patch("app.views.discover_tab_cache.store_undo_snapshot", return_value="undo-debug")
+    @patch(
+        "app.views.discover_tab_cache.store_undo_snapshot", return_value="undo-debug"
+    )
     @patch("app.views.discover.get_discover_rows")
     @patch("app.views.discover_tab_cache.clear_lower_level_cache")
     @patch("app.views.discover_tab_cache.bump_activity_version")
@@ -868,7 +1171,9 @@ class DiscoverViewTests(TestCase):
             metadata={},
             created=False,
         )
-        mock_get_discover_rows.return_value = [self._row(title="Debug Planning Replacement")]
+        mock_get_discover_rows.return_value = [
+            self._row(title="Debug Planning Replacement")
+        ]
 
         response = self.client.post(
             reverse("discover_action"),

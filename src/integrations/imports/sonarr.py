@@ -2,16 +2,26 @@
 
 import logging
 from collections import defaultdict
+from functools import partial
 
 import requests
 from django.conf import settings
 from django.utils import timezone
 
-from app.models import CollectionEntry, Item, MediaTypes, Sources
+from app.models import Item, MediaTypes, Sources
 from app.providers import services
-from integrations.imports.helpers import MediaImportError, decrypt, retry_on_lock
-from integrations.models import SonarrAccount
+from integrations import connection_health, import_progress
+from integrations.imports.helpers import (
+    ConnectionAuthError,
+    MediaImportError,
+    decrypt_or_raise,
+    find_item_across_buckets,
+    retry_on_lock,
+)
+from integrations.models import SonarrInstance
+from integrations.safe_fetch import send_to_self_hosted
 from integrations.source_sync import (
+    prune_collection_source_states,
     remove_collection_source_state,
     upsert_collection_source_state,
 )
@@ -29,24 +39,30 @@ class SonarrClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
 
-    def _request(self, path: str, params=None):
+    def _request(self, path: str, params=None, *, method="GET", json=None, timeout=20):
         try:
-            response = requests.get(
+            response = send_to_self_hosted(
+                partial(requests.request, method) if method != "GET" else requests.get,
                 f"{self.base_url}{path}",
                 headers={"X-Api-Key": self.api_key},
                 params=params,
-                timeout=20,
+                timeout=timeout,
+                **({"json": json} if json is not None else {}),
             )
         except requests.RequestException as error:
             msg = f"Could not reach Sonarr: {error}"
             raise MediaImportError(msg) from error
         if response.status_code in (401, 403):
             msg = "Sonarr API key is invalid or unauthorized"
-            raise MediaImportError(msg)
+            raise ConnectionAuthError(msg)
         if response.status_code >= HTTP_STATUS_BAD_REQUEST:
             msg = f"Sonarr request failed ({response.status_code}) for {path}"
             raise MediaImportError(msg)
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as error:
+            msg = "Sonarr returned a response that is not JSON"
+            raise MediaImportError(msg) from error
 
     def healthcheck(self):
         """Verify connection."""
@@ -56,49 +72,86 @@ class SonarrClient:
         """Fetch tracked series rows."""
         return self._request("/api/v3/series")
 
-    def episodes(self, series_id):
-        """Fetch all episodes for a Sonarr series."""
-        return self._request("/api/v3/episode", params={"seriesId": series_id})
+    def episodes(self, series_id, timeout=20):
+        """Fetch all episodes for a Sonarr series, with their file details."""
+        # Sonarr only embeds `episodeFile` (quality, path, size) on request.
+        return self._request(
+            "/api/v3/episode",
+            params={"seriesId": series_id, "includeEpisodeFile": "true"},
+            timeout=timeout,
+        )
+
+    def queue(self, series_id, timeout=8):
+        """Return the queue rows for one series."""
+        return self._request(
+            "/api/v3/queue/details", {"seriesId": series_id}, timeout=timeout
+        )
+
+    def history(self, series_id, season_number=None, timeout=8):
+        """Return the history rows for a series, or one season of it."""
+        params = {"seriesId": series_id, "includeEpisode": "true"}
+        if season_number is not None:
+            params["seasonNumber"] = season_number
+        return self._request("/api/v3/history/series", params, timeout=timeout)
+
+    def search(self, command, timeout=8):
+        """Ask Sonarr to run a search command (EpisodeSearch, SeasonSearch...)."""
+        return self._request(
+            "/api/v3/command", method="POST", json=command, timeout=timeout
+        )
 
 
-def importer(identifier, user, mode):  # noqa: ARG001
+def importer(identifier, user, mode, instance_id=None):
     """Import Sonarr collection ownership."""
-    return SonarrImporter(user).import_data()
+    instance = (
+        SonarrInstance.objects.get(pk=instance_id, user=user) if instance_id else None
+    )
+    return SonarrImporter(user, instance=instance).import_data()
 
 
 class SonarrImporter:
     """Import collection data from Sonarr."""
 
-    def __init__(self, user):
-        """Bind the importer to a user with a connected Sonarr account."""
+    def __init__(self, user, instance=None):
+        """Bind the importer to a user with a connected Sonarr instance."""
         self.user = user
-        try:
-            self.account = user.sonarr_account
-        except SonarrAccount.DoesNotExist as error:
+        if instance is not None:
+            self.instance = instance
+        else:
+            self.instance = user.sonarr_instances.first()
+        if self.instance is None:
             msg = "Connect Sonarr before importing"
-            raise MediaImportError(msg) from error
+            raise MediaImportError(msg)
 
-        self.client = SonarrClient(
-            self.account.base_url,
-            decrypt(self.account.api_key),
-        )
+        try:
+            api_key = decrypt_or_raise(self.instance.api_key)
+        except MediaImportError as error:
+            # An unreadable stored key needs a reconnect as much as a rejected one.
+            connection_health.record_failure(self.instance, error, auth=True)
+            raise
+
+        self.client = SonarrClient(self.instance.base_url, api_key)
         self.warnings = []
 
     def import_data(self):
-        """Sync Sonarr ownership into Yamtrack collection rows."""
+        """Sync Sonarr ownership into Floppy collection rows."""
         imported_counts = defaultdict(int)
+        owned_item_ids = set()
+        complete = True
 
         try:
             series_rows = self.client.series()
         except MediaImportError as error:
-            self.account.connection_broken = True
-            self.account.last_error_message = str(error)
-            self.account.save(
-                update_fields=["connection_broken", "last_error_message", "updated_at"],
+            connection_health.record_failure(
+                self.instance,
+                error,
+                auth=isinstance(error, ConnectionAuthError),
             )
             raise
 
-        for row in series_rows:
+        total = len(series_rows)
+        for i, row in enumerate(series_rows, start=1):
+            import_progress.report(i, total, "Sonarr")
             stats = row.get("statistics") or {}
             episode_file_count = int(stats.get("episodeFileCount") or 0)
             if episode_file_count <= 0:
@@ -112,43 +165,48 @@ class SonarrImporter:
                 imported_counts["skipped_missing_ids"] += 1
                 continue
 
-            if not self._sync_series_episode_collection(item, row):
+            synced_item_ids = self._sync_series_episode_collection(item, row)
+            if synced_item_ids is None:
+                # A failed episode fetch must not make the whole series look
+                # deleted, so skip the reconciliation for this run.
+                complete = False
                 continue
-            imported_counts[item.media_type] += 1
+            owned_item_ids.update(synced_item_ids)
+            imported_counts["collection"] += 1
             imported_counts["updated"] += 1
 
-        self.account.last_sync_at = timezone.now()
-        self.account.connection_broken = False
-        self.account.last_error_message = ""
-        self.account.save(
-            update_fields=[
-                "last_sync_at",
-                "connection_broken",
-                "last_error_message",
-                "updated_at",
-            ],
-        )
+        if complete:
+            removed = prune_collection_source_states(
+                user=self.user,
+                source="sonarr",
+                source_instance_id=self.instance.pk,
+                keep_item_ids=owned_item_ids,
+            )
+            if removed:
+                imported_counts["removed"] += removed
+        self.instance.last_sync_at = timezone.now()
+        connection_health.record_success(self.instance, extra_fields=["last_sync_at"])
 
         return dict(imported_counts), "\n".join(dict.fromkeys(self.warnings))
 
     def _find_series_item(self, row):
-        """Find an existing Yamtrack show item without creating one."""
+        """Find an existing Floppy show item without creating one."""
         tmdb_id = row.get("tmdbId")
         tvdb_id = row.get("tvdbId")
 
         if tmdb_id:
-            return Item.objects.filter(
+            return find_item_across_buckets(
                 media_id=str(tmdb_id),
                 source=Sources.TMDB.value,
                 media_type=MediaTypes.TV.value,
-            ).first()
+            )
 
         if tvdb_id:
-            return Item.objects.filter(
+            return find_item_across_buckets(
                 media_id=str(tvdb_id),
                 source=Sources.TVDB.value,
                 media_type=MediaTypes.TV.value,
-            ).first()
+            )
 
         return None
 
@@ -157,11 +215,11 @@ class SonarrImporter:
         tmdb_id = row.get("tmdbId")
 
         if tmdb_id:
-            existing = Item.objects.filter(
+            existing = find_item_across_buckets(
                 media_id=str(tmdb_id),
                 source=Sources.TMDB.value,
                 media_type=MediaTypes.TV.value,
-            ).first()
+            )
             if existing:
                 return existing
 
@@ -202,33 +260,38 @@ class SonarrImporter:
             return item
 
         if tvdb_id:
-            return Item.objects.filter(
+            return find_item_across_buckets(
                 media_id=str(tvdb_id),
                 source=Sources.TVDB.value,
                 media_type=MediaTypes.TV.value,
-            ).first()
+            )
 
         return None
 
     def _sync_series_episode_collection(self, show_item, row):
-        """Create episode-level Sonarr collection ownership for a show."""
+        """Own the series' episodes, returning the item ids now kept.
+
+        Returns None when the episode list could not be read, so the caller
+        can skip reconciliation instead of treating the series as deleted.
+        """
         series_id = row.get("id")
         if series_id in (None, ""):
             upsert_collection_source_state(
                 user=self.user,
                 item=show_item,
                 source="sonarr",
+                source_instance_id=self.instance.pk,
                 quality_label="",
                 source_updated_at=self._parse_source_timestamp(row),
             )
-            return True
+            return {show_item.id}
 
         try:
             episode_rows = self.client.episodes(series_id)
         except MediaImportError as error:
             title = row.get("title") or row.get("sortTitle") or show_item.title
             self.warnings.append(f"{title}: failed to fetch Sonarr episodes ({error}).")
-            return False
+            return None
 
         self._ensure_season_items(show_item, row, episode_rows)
 
@@ -245,6 +308,7 @@ class SonarrImporter:
                 user=self.user,
                 item=episode_item,
                 source="sonarr",
+                source_instance_id=self.instance.pk,
                 quality_label=self._extract_episode_quality_label(episode_row),
                 source_updated_at=self._parse_source_timestamp(episode_row),
             )
@@ -254,7 +318,31 @@ class SonarrImporter:
             show_item,
             keep_episode_item_ids=collected_episode_item_ids,
         )
-        return True
+        if not collected_episode_item_ids:
+            return collected_episode_item_ids
+
+        # The show gets its own entry so it lists under TV Shows, as Plex does.
+        upsert_collection_source_state(
+            user=self.user,
+            item=show_item,
+            source="sonarr",
+            source_instance_id=self.instance.pk,
+            quality_label="",
+            source_updated_at=self._parse_source_timestamp(row),
+        )
+        return collected_episode_item_ids | {show_item.id}
+
+    def _child_bucket(self, show_item, default_bucket):
+        """Return the library bucket a show's season/episode rows belong in.
+
+        Mirrors Season.get_episode_item: children follow the show's grouping
+        bucket (grouped anime lives on TV rows) and otherwise fall back to
+        their own media type, never inheriting a container's 'tv' bucket.
+        """
+        show_bucket = show_item.library_media_type
+        if show_bucket and show_bucket != MediaTypes.TV.value:
+            return show_bucket
+        return default_bucket
 
     def _ensure_season_items(self, show_item, row, episode_rows):
         """Ensure season items exist so collection stats can map episodes correctly."""
@@ -269,6 +357,8 @@ class SonarrImporter:
             if episode.get("seasonNumber") is not None
         )
 
+        season_bucket = self._child_bucket(show_item, MediaTypes.SEASON.value)
+
         for season_number in season_numbers:
             season_title = (
                 "Specials"
@@ -282,21 +372,32 @@ class SonarrImporter:
                 season_title=season_title,
                 seeded_at=seeded_at,
             ):
-                season_item, _created = Item.objects.get_or_create(
+                season_item = find_item_across_buckets(
+                    preferred_bucket=season_bucket,
                     media_id=show_item.media_id,
                     source=show_item.source,
                     media_type=MediaTypes.SEASON.value,
                     season_number=season_number,
-                    defaults={
-                        "title": season_title,
-                        "original_title": season_title,
-                        "localized_title": season_title,
-                        "image": show_item.image or settings.IMG_NONE,
-                        "release_datetime": show_item.release_datetime,
-                        "genres": show_item.genres or [],
-                        "metadata_fetched_at": seeded_at,
-                    },
+                    episode_number=None,
                 )
+                if season_item is None:
+                    season_item, _created = Item.objects.get_or_create(
+                        media_id=show_item.media_id,
+                        source=show_item.source,
+                        media_type=MediaTypes.SEASON.value,
+                        library_media_type=season_bucket,
+                        season_number=season_number,
+                        episode_number=None,
+                        defaults={
+                            "title": season_title,
+                            "original_title": season_title,
+                            "localized_title": season_title,
+                            "image": show_item.image or settings.IMG_NONE,
+                            "release_datetime": show_item.release_datetime,
+                            "genres": show_item.genres or [],
+                            "metadata_fetched_at": seeded_at,
+                        },
+                    )
                 update_fields = []
                 if season_item.metadata_fetched_at is None:
                     season_item.metadata_fetched_at = seeded_at
@@ -331,24 +432,35 @@ class SonarrImporter:
         episode_title = row.get("title") or f"Episode {episode_number}"
         release_datetime = self._parse_episode_release_datetime(row)
         seeded_at = timezone.now()
+        episode_bucket = self._child_bucket(show_item, MediaTypes.EPISODE.value)
 
         def _get_or_create_episode_item():
-            episode_item, _created = Item.objects.get_or_create(
+            episode_item = find_item_across_buckets(
+                preferred_bucket=episode_bucket,
                 media_id=show_item.media_id,
                 source=show_item.source,
                 media_type=MediaTypes.EPISODE.value,
                 season_number=season_number,
                 episode_number=episode_number,
-                defaults={
-                    "title": episode_title,
-                    "original_title": episode_title,
-                    "localized_title": episode_title,
-                    "image": show_item.image or settings.IMG_NONE,
-                    "release_datetime": release_datetime,
-                    "genres": show_item.genres or [],
-                    "metadata_fetched_at": seeded_at,
-                },
             )
+            if episode_item is None:
+                episode_item, _created = Item.objects.get_or_create(
+                    media_id=show_item.media_id,
+                    source=show_item.source,
+                    media_type=MediaTypes.EPISODE.value,
+                    library_media_type=episode_bucket,
+                    season_number=season_number,
+                    episode_number=episode_number,
+                    defaults={
+                        "title": episode_title,
+                        "original_title": episode_title,
+                        "localized_title": episode_title,
+                        "image": show_item.image or settings.IMG_NONE,
+                        "release_datetime": release_datetime,
+                        "genres": show_item.genres or [],
+                        "metadata_fetched_at": seeded_at,
+                    },
+                )
             update_fields = []
             if episode_item.metadata_fetched_at is None:
                 episode_item.metadata_fetched_at = seeded_at
@@ -379,8 +491,7 @@ class SonarrImporter:
                 episode_item.save(update_fields=update_fields)
             return episode_item
 
-        episode_item = retry_on_lock(_get_or_create_episode_item)
-        return episode_item
+        return retry_on_lock(_get_or_create_episode_item)
 
     def _episode_has_file(self, row):
         """Return True when Sonarr reports a local file for the episode."""
@@ -392,11 +503,7 @@ class SonarrImporter:
         """Extract the episode file quality label when Sonarr includes it."""
         episode_file = row.get("episodeFile") or {}
         quality = episode_file.get("quality") or {}
-        return (
-            (quality.get("quality") or {}).get("name")
-            or quality.get("name")
-            or ""
-        )
+        return (quality.get("quality") or {}).get("name") or quality.get("name") or ""
 
     def _prune_series_collection_state(self, show_item, *, keep_episode_item_ids=None):
         """Drop stale Sonarr collection ownership for a series."""
@@ -410,7 +517,11 @@ class SonarrImporter:
                 media_type=MediaTypes.EPISODE.value,
             )
             .exclude(id__in=keep_episode_item_ids)
-            .filter(source_states__user=self.user, source_states__source="sonarr")
+            .filter(
+                source_states__user=self.user,
+                source_states__source="sonarr",
+                source_states__source_instance_id=self.instance.pk,
+            )
             .values_list("id", flat=True)
             .distinct()
         )
@@ -420,38 +531,17 @@ class SonarrImporter:
                 user=self.user,
                 item=episode_item,
                 source="sonarr",
+                source_instance_id=self.instance.pk,
             )
 
         if keep_episode_item_ids:
-            self._retire_legacy_series_collection_entry(show_item)
+            return
 
         remove_collection_source_state(
             user=self.user,
             item=show_item,
             source="sonarr",
-        )
-
-    def _retire_legacy_series_collection_entry(self, show_item):
-        """Delete the legacy show-level Sonarr row once episode rows exist."""
-        if not show_item.source_states.filter(
-            user=self.user,
-            source="sonarr",
-        ).exists():
-            return
-
-        legacy_entry_ids = list(
-            CollectionEntry.objects.filter(
-                user=self.user,
-                item=show_item,
-            )
-            .order_by("-updated_at", "-collected_at", "-id")
-            .values_list("id", flat=True)
-        )
-        if len(legacy_entry_ids) != 1:
-            return
-
-        retry_on_lock(
-            lambda: CollectionEntry.objects.filter(id=legacy_entry_ids[0]).delete(),
+            source_instance_id=self.instance.pk,
         )
 
     def _parse_episode_release_datetime(self, row):

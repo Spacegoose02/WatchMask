@@ -3,12 +3,11 @@ import time
 from collections import defaultdict
 
 import requests
-from django.conf import settings
 
 import app
 from app.models import MediaTypes, Sources, Status
-from app.providers import services
-from app.providers.igdb import ExternalGameSource, external_game
+from app.providers import credentials, services
+from app.providers.igdb import ExternalGameSource, describe_credentials, external_game
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 
@@ -39,7 +38,7 @@ class SteamImporter:
         self.user = user
         self.mode = mode
         self.warnings = []
-        self.api_key = settings.STEAM_API_KEY
+        self.api_key = credentials.get("steam", "api_key", user=user)
 
         if not self.api_key:
             msg = "Steam API key not configured in environment variables"
@@ -53,9 +52,12 @@ class SteamImporter:
         self.bulk_media = defaultdict(list)
 
         logger.info(
-            "Initialized Steam importer for Steam ID %s with mode %s",
+            "Initialized Steam importer for Steam ID %s with mode %s "
+            "(steam_key_from=%s; igdb %s)",
             steam_id,
             mode,
+            credentials.source_of("steam", "api_key", user),
+            describe_credentials(user),
         )
 
     def import_data(self):
@@ -74,9 +76,10 @@ class SteamImporter:
         # Update existing games
         if self.to_update:
             app.models.Game.objects.bulk_update(
-                self.to_update,
-                fields=["progress", "status"]
+                self.to_update, fields=["progress", "status"]
             )
+            # bulk_update sends no save signal; publish these rows' days.
+            helpers.note_bulk_rows(self.to_update)
             logger.info(
                 "Updated %d existing games for user %s",
                 len(self.to_update),
@@ -86,8 +89,7 @@ class SteamImporter:
         # Update item metadata
         if self.to_update_meta:
             app.models.Item.objects.bulk_update(
-                self.to_update_meta,
-                fields=["title", "image"]
+                self.to_update_meta, fields=["title", "image"]
             )
             logger.info(
                 "Updated metadata for %d items for user %s",
@@ -99,6 +101,11 @@ class SteamImporter:
             media_type: len(media_list)
             for media_type, media_list in self.bulk_media.items()
         }
+        # Updates are reported too: a sync that only raised hours otherwise
+        # reads as "No media was imported" and skips the cache refresh that
+        # makes the new hours show up in History and Statistics.
+        imported_counts["created"] = len(self.bulk_media[MediaTypes.GAME.value])
+        imported_counts["updated"] = len(self.to_update)
 
         logger.info(
             "Steam import completed for user %s: %s",
@@ -200,13 +207,20 @@ class SteamImporter:
                 return
 
             media_id = str(igdb_game["media_id"])
-            existing = self.existing_media[MediaTypes.GAME.value][Sources.IGDB.value].get(media_id)
+            existing = self.existing_media[MediaTypes.GAME.value][
+                Sources.IGDB.value
+            ].get(media_id)
             if existing:
                 if self.mode == "overwrite":
                     existing.progress = playtime_forever
                     # Conscious choice: User manually set status to Completed/Dropped, we should not change it
-                    if existing.status not in {Status.COMPLETED.value, Status.DROPPED.value}:
-                        existing.status = self._determine_game_status(playtime_forever, playtime_2weeks)
+                    if existing.status not in {
+                        Status.COMPLETED.value,
+                        Status.DROPPED.value,
+                    }:
+                        existing.status = self._determine_game_status(
+                            playtime_forever, playtime_2weeks
+                        )
                     self.to_update.append(existing)
 
                 item = existing.item
@@ -227,7 +241,9 @@ class SteamImporter:
                 game = app.models.Game(
                     item=item,
                     user=self.user,
-                    status=self._determine_game_status(playtime_forever, playtime_2weeks),
+                    status=self._determine_game_status(
+                        playtime_forever, playtime_2weeks
+                    ),
                     score=None,
                     progress=playtime_forever,
                     notes=IMPORT_NOTE,

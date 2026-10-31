@@ -1,4 +1,7 @@
-document.addEventListener("alpine:init", () => {
+// Bind once: this script is re-evaluated on boosted (hx-boost) navigation.
+if (!window.__floppyEpisodeBulkTrackFormBound) {
+  window.__floppyEpisodeBulkTrackFormBound = true;
+  document.addEventListener("alpine:init", () => {
   Alpine.data("episodeBulkTrackForm", (domainId) => ({
     domain: null,
     firstSeason: "",
@@ -7,7 +10,7 @@ document.addEventListener("alpine:init", () => {
     lastEpisode: "",
     writeMode: "add",
     distributionMode: "air_date",
-    summaryText: "Choose the first and last item to log a bulk play range.",
+    summaryText: gettext("Choose the first and last item to log a bulk play range."),
     rangeWarning: "",
 
     init() {
@@ -41,15 +44,15 @@ document.addEventListener("alpine:init", () => {
     },
 
     selectionNoun() {
-      return this.domain?.selectionNoun || "episode";
+      return gettext(this.domain?.selectionNoun || "episode");
     },
 
     selectionNounPlural() {
-      return this.domain?.selectionNounPlural || `${this.selectionNoun()}s`;
+      return gettext(this.domain?.selectionNounPlural || "episodes");
     },
 
     distributionTargetLabel() {
-      return this.domain?.distributionTargetLabel || "air date";
+      return gettext(this.domain?.distributionTargetLabel || "air date");
     },
 
     missingTargetDateFallbackDistribution() {
@@ -80,31 +83,8 @@ document.addEventListener("alpine:init", () => {
       return this.selectedEpisode(side)?.air_date || "";
     },
 
-    timeSegment(input) {
-      if (input?.value && input.value.includes("T")) {
-        return input.value.split("T")[1].slice(0, 5);
-      }
-
-      const now = new Date();
-      return `${this.pad(now.getHours())}:${this.pad(now.getMinutes())}`;
-    },
-
-    applyEpisodeAirDate(side, fieldRefName) {
-      const airDate = this.selectedEpisodeAirDate(side);
-      const input = this.$refs[fieldRefName];
-      if (!airDate || !input) {
-        return;
-      }
-
-      const datePart = airDate.slice(0, 10);
-      if (input.type === "datetime-local") {
-        input.value = `${datePart}T${this.timeSegment(input)}`;
-      } else {
-        input.value = datePart;
-      }
-
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
+    selectedEpisodeRuntime(side) {
+      return this.selectedEpisode(side)?.runtime_minutes || "";
     },
 
     syncEpisodeOptions(side) {
@@ -172,7 +152,7 @@ document.addEventListener("alpine:init", () => {
       const selectedEpisodes = this.selectedRangeEpisodes();
       if (selectedEpisodes.length === 0) {
         this.summaryText =
-          `Choose a valid ordered ${this.selectionNoun()} range to log plays.`;
+          gettext("Choose a valid ordered range to log plays.");
         this.rangeWarning = "";
         return;
       }
@@ -181,16 +161,15 @@ document.addEventListener("alpine:init", () => {
         (total, episode) => total + (episode.existing_play_count || 0),
         0,
       );
-      const verb =
-        this.writeMode === "replace" ? "replace" : "add";
-      const distributionLabel =
-        this.distributionMode === "air_date"
-          ? `target ${this.distributionTargetLabel()}s within the selected date range`
-          : "an even date range";
-
-      this.summaryText =
-        `This will ${verb} plays for ${selectedEpisodes.length} ordered ` +
-        `${selectedEpisodes.length === 1 ? this.selectionNoun() : this.selectionNounPlural()} using ${distributionLabel}.`;
+      const distributionLabel = this.distributionMode === "air_date"
+        ? gettext("the target dates within the selected date range")
+        : gettext("an even distribution across the date range");
+      const summary = this.writeMode === "replace"
+        ? ngettext("This will replace plays for %(count)s ordered item using %(distribution)s.", "This will replace plays for %(count)s ordered items using %(distribution)s.", selectedEpisodes.length)
+        : ngettext("This will add plays for %(count)s ordered item using %(distribution)s.", "This will add plays for %(count)s ordered items using %(distribution)s.", selectedEpisodes.length);
+      this.summaryText = interpolate(summary, {
+        count: selectedEpisodes.length, distribution: distributionLabel,
+      }, true);
 
       if (this.distributionMode === "air_date") {
         const missingAirDates = selectedEpisodes.filter(
@@ -199,12 +178,12 @@ document.addEventListener("alpine:init", () => {
         if (missingAirDates > 0) {
           const fallbackDistribution =
             this.missingTargetDateFallbackDistribution();
-          this.rangeWarning =
-            `${missingAirDates} selected ${missingAirDates === 1 ? this.selectionNoun() : this.selectionNounPlural()}` +
-            `${missingAirDates === 1 ? " is" : " are"} missing ${this.distributionTargetLabel()}s.` +
-            (fallbackDistribution === "even"
-              ? " Saving will fall back to even distribution."
-              : "");
+          this.rangeWarning = interpolate(
+            ngettext("%(count)s selected item has no target date.", "%(count)s selected items have no target date.", missingAirDates),
+            { count: missingAirDates }, true,
+          ) + (fallbackDistribution === "even"
+            ? " " + gettext("Saving will fall back to even distribution.")
+            : "");
           return;
         }
       }
@@ -212,17 +191,16 @@ document.addEventListener("alpine:init", () => {
       if (this.writeMode === "replace") {
         this.rangeWarning =
           existingPlayCount > 0
-            ? `This will delete ${existingPlayCount} existing play` +
-              `${existingPlayCount === 1 ? "" : "s"} in the selected range before adding the new ordered pass.`
-            : "No existing plays are currently logged in the selected range.";
+            ? interpolate(ngettext("This will delete %(count)s existing play in the selected range before adding the new ordered pass.", "This will delete %(count)s existing plays in the selected range before adding the new ordered pass.", existingPlayCount), { count: existingPlayCount }, true)
+            : gettext("No existing plays are currently logged in the selected range.");
         return;
       }
 
       this.rangeWarning =
         existingPlayCount > 0
-          ? `This range already has ${existingPlayCount} logged play` +
-            `${existingPlayCount === 1 ? "" : "s"}. New plays will be appended in order.`
+          ? interpolate(ngettext("This range already has %(count)s logged play. New plays will be appended in order.", "This range already has %(count)s logged plays. New plays will be appended in order.", existingPlayCount), { count: existingPlayCount }, true)
           : "";
     },
   }));
-});
+  });
+}

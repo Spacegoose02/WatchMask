@@ -1,11 +1,13 @@
 import json
 import logging
 import time
+from functools import wraps
+from http import HTTPStatus
 from uuid import uuid4
 
 from django.apps import apps
 from django.contrib.auth.decorators import login_required
-from django.http import HttpResponseBadRequest, JsonResponse
+from django.http import Http404, HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.views.decorators.http import require_GET, require_POST
 
@@ -13,13 +15,16 @@ from app import discover
 from app.discover import tab_cache as discover_tab_cache
 from app.models import (
     TV,
+    AlbumTracker,
     DiscoverFeedback,
     DiscoverFeedbackType,
     Item,
     MediaTypes,
+    PodcastShowTracker,
     Season,
     Status,
 )
+from app.providers import services
 from app.services import metadata_resolution
 from app.signals import suppress_media_cache_change_signals
 from app.templatetags import app_tags
@@ -43,6 +48,18 @@ DISCOVER_FAST_LOCAL_PLANNING_MEDIA_TYPES = {
     MediaTypes.TV.value,
     MediaTypes.ANIME.value,
 }
+
+
+def discover_enabled_required(view):
+    """404 a Discover view for users who turned Discover off in Sidebar settings."""
+
+    @wraps(view)
+    def wrapper(request, *args, **kwargs):
+        if not request.user.show_discover:
+            raise Http404
+        return view(request, *args, **kwargs)
+
+    return wrapper
 
 
 def _coerce_discover_media_type(raw_media_type: str | None) -> str:
@@ -157,9 +174,11 @@ def _apply_discover_response_headers(
     response["X-Discover-Media-Type"] = selected_media_type
     response["X-Discover-Show-More"] = "1" if show_more else "0"
     if not discover_debug and selected_media_type != DISCOVER_HIDDEN_SECTION:
-        response["X-Discover-Activity-Version"] = discover_tab_cache.get_activity_version(
-            user_id,
-            selected_media_type,
+        response["X-Discover-Activity-Version"] = (
+            discover_tab_cache.get_activity_version(
+                user_id,
+                selected_media_type,
+            )
         )
     return response
 
@@ -270,18 +289,42 @@ def _get_or_create_discover_item(media_type, media_id, source, season_number, se
     return item
 
 
-def _discover_model_for_media_type(
+def _discover_media_model_for_type(
     media_type: str,
     *,
     source: str | None = None,
     identity_media_type: str | None = None,
 ):
+    """Return the per-item trackable Media model for a Discover media type."""
     model_name = metadata_resolution.get_tracking_media_type(
         media_type,
         source=source,
         identity_media_type=identity_media_type,
     )
     return apps.get_model(app_label="app", model_name=model_name)
+
+
+def _discover_model_for_media_type(
+    media_type: str,
+    *,
+    source: str | None = None,
+    identity_media_type: str | None = None,
+):
+    """Return the model used to persist Discover planning/dismiss state.
+
+    Music and podcasts are tracked at the album/show level (AlbumTracker /
+    PodcastShowTracker), not the per-item Music/Podcast model, so category
+    listing pages and the item detail page see the planning status.
+    """
+    if media_type == MediaTypes.MUSIC.value:
+        return AlbumTracker
+    if media_type == MediaTypes.PODCAST.value:
+        return PodcastShowTracker
+    return _discover_media_model_for_type(
+        media_type,
+        source=source,
+        identity_media_type=identity_media_type,
+    )
 
 
 def _discover_planning_instance(
@@ -291,12 +334,24 @@ def _discover_planning_instance(
     *,
     source: str | None = None,
     identity_media_type: str | None = None,
+    album=None,
+    show=None,
 ):
     model = _discover_model_for_media_type(
         media_type,
         source=source or item.source,
         identity_media_type=identity_media_type or item.media_type,
     )
+    if model is AlbumTracker:
+        if album is None:
+            return None
+        return (
+            model.objects.filter(user=user, album=album).select_related("album").first()
+        )
+    if model is PodcastShowTracker:
+        if show is None:
+            return None
+        return model.objects.filter(user=user, show=show).select_related("show").first()
     return model.objects.filter(user=user, item=item).select_related("item").first()
 
 
@@ -329,6 +384,7 @@ def _invalidate_discover_after_action(
 
 @login_required
 @require_GET
+@discover_enabled_required
 def discover_page(request):
     """Render Discover page with selected media rows."""
     raw_param = request.GET.get("media_type")
@@ -370,6 +426,7 @@ def discover_page(request):
 
 @login_required
 @require_GET
+@discover_enabled_required
 def discover_rows(request):
     """Render Discover rows partial for HTMX row switching."""
     selected_media_type = _resolve_discover_media_type_for_user(
@@ -396,6 +453,7 @@ def discover_rows(request):
 
 @login_required
 @require_POST
+@discover_enabled_required
 def refresh_discover(request):
     """Invalidate the active Discover tab cache and queue a background refresh."""
     media_type = _resolve_discover_media_type_for_user(
@@ -431,8 +489,38 @@ def refresh_discover(request):
     )
 
 
+def _discover_provider_error_response(error, title, active_media_type):
+    """Report a provider failure as a toast, leaving the rows as they are.
+
+    htmx does not swap 4xx/5xx bodies, so the card stays put while HX-Trigger
+    still fires the page's existing toast.
+    """
+    label = title or "this title"
+    if error.status_code == HTTPStatus.NOT_FOUND:
+        message = f'Couldn\'t add "{label}": {error.provider_label} no longer has it.'
+        status = HTTPStatus.NOT_FOUND
+    else:
+        message = (
+            f'Couldn\'t add "{label}": {error.provider_label} did not respond. '
+            "Please try again."
+        )
+        status = HTTPStatus.BAD_GATEWAY
+    response = HttpResponse(status=status)
+    response["HX-Trigger"] = json.dumps(
+        {
+            "discoverActionComplete": {
+                "action": "planning",
+                "message": message,
+                "active_media_type": active_media_type,
+            },
+        },
+    )
+    return response
+
+
 @login_required
 @require_POST
+@discover_enabled_required
 def discover_action(request):
     """Handle Discover quick actions and return the updated rows fragment."""
     from app import views as view_barrel
@@ -472,11 +560,15 @@ def discover_action(request):
         side_effect = snapshot.get("side_effect") or {}
         side_effect_kind = side_effect.get("kind")
         if side_effect_kind == "planning" and side_effect.get("instance_id"):
-            model = _discover_model_for_media_type(
-                side_effect.get("media_type"),
-                source=side_effect.get("source"),
-                identity_media_type=side_effect.get("identity_media_type"),
-            )
+            model_label = side_effect.get("model_label")
+            if model_label:
+                model = apps.get_model(model_label)
+            else:
+                model = _discover_model_for_media_type(
+                    side_effect.get("media_type"),
+                    source=side_effect.get("source"),
+                    identity_media_type=side_effect.get("identity_media_type"),
+                )
             instance = model.objects.filter(
                 id=side_effect["instance_id"],
                 user=request.user,
@@ -552,10 +644,14 @@ def discover_action(request):
     if action not in {"planning", "dismiss"}:
         return HttpResponseBadRequest("Invalid action")
 
-    candidate_media_type = (request.POST.get("candidate_media_type") or "").strip().lower()
+    candidate_media_type = (
+        (request.POST.get("candidate_media_type") or "").strip().lower()
+    )
     source = (request.POST.get("source") or "").strip()
     media_id = (request.POST.get("media_id") or "").strip()
-    identity_media_type = (request.POST.get("identity_media_type") or "").strip() or None
+    identity_media_type = (
+        request.POST.get("identity_media_type") or ""
+    ).strip() or None
     library_media_type = (request.POST.get("library_media_type") or "").strip() or None
     if (
         candidate_media_type not in DISCOVER_ALLOWED_MEDIA_TYPES
@@ -601,16 +697,36 @@ def discover_action(request):
             )
             metadata_strategy = "local_seed"
         else:
-            hydrated = view_barrel.ensure_item_metadata(
-                request.user,
-                candidate_media_type,
-                media_id,
-                source,
-                season_number,
-                identity_media_type=identity_media_type,
-                library_media_type=library_media_type,
-                **candidate_seed,
-            )
+            try:
+                hydrated = view_barrel.ensure_item_metadata(
+                    request.user,
+                    candidate_media_type,
+                    media_id,
+                    source,
+                    season_number,
+                    identity_media_type=identity_media_type,
+                    library_media_type=library_media_type,
+                    **candidate_seed,
+                )
+            except services.ProviderNotConfiguredError:
+                # Setup guidance is rendered by the provider-error middleware.
+                raise
+            except services.ProviderAPIError as error:
+                logger.warning(
+                    "discover_action_provider_error request_id=%s user_id=%s "
+                    "candidate_media_type=%s source=%s media_id=%s status=%s",
+                    request_id,
+                    request.user.id,
+                    candidate_media_type,
+                    source,
+                    media_id,
+                    error.status_code,
+                )
+                return _discover_provider_error_response(
+                    error,
+                    candidate_seed.get("fallback_title"),
+                    active_media_type,
+                )
             metadata_strategy = "provider_fetch"
         existing_instance = _discover_planning_instance(
             request.user,
@@ -618,6 +734,8 @@ def discover_action(request):
             hydrated.item,
             source=source,
             identity_media_type=identity_media_type,
+            album=hydrated.album,
+            show=hydrated.podcast_show,
         )
         if existing_instance:
             DiscoverFeedback.objects.filter(
@@ -645,27 +763,53 @@ def discover_action(request):
                 source=source,
                 identity_media_type=identity_media_type,
             )
-            instance_kwargs = {
-                "item": hydrated.item,
-                "user": request.user,
-                "status": Status.PLANNING.value,
-                "score": None,
-                "notes": "",
-            }
-            if model not in {TV, Season}:
-                instance_kwargs["progress"] = 0
-                instance_kwargs["start_date"] = None
-                instance_kwargs["end_date"] = None
-            instance = model(**instance_kwargs)
-            if candidate_media_type == MediaTypes.MUSIC.value:
-                instance.artist = hydrated.artist
-                instance.album = hydrated.album
-                instance.track = hydrated.track
-            if (
-                candidate_media_type == MediaTypes.PODCAST.value
-                and hydrated.podcast_show is not None
-            ):
-                instance.show = hydrated.podcast_show
+            if model is AlbumTracker and hydrated.album is not None:
+                instance = AlbumTracker(
+                    user=request.user,
+                    album=hydrated.album,
+                    status=Status.PLANNING.value,
+                    score=None,
+                    notes="",
+                    start_date=None,
+                    end_date=None,
+                )
+            elif model is PodcastShowTracker and hydrated.podcast_show is not None:
+                instance = PodcastShowTracker(
+                    user=request.user,
+                    show=hydrated.podcast_show,
+                    status=Status.PLANNING.value,
+                    score=None,
+                    notes="",
+                    start_date=None,
+                    end_date=None,
+                )
+            else:
+                fallback_model = _discover_media_model_for_type(
+                    candidate_media_type,
+                    source=source,
+                    identity_media_type=identity_media_type,
+                )
+                instance_kwargs = {
+                    "item": hydrated.item,
+                    "user": request.user,
+                    "status": Status.PLANNING.value,
+                    "score": None,
+                    "notes": "",
+                }
+                if fallback_model not in {TV, Season}:
+                    instance_kwargs["progress"] = 0
+                    instance_kwargs["start_date"] = None
+                    instance_kwargs["end_date"] = None
+                instance = fallback_model(**instance_kwargs)
+                if candidate_media_type == MediaTypes.MUSIC.value:
+                    instance.artist = hydrated.artist
+                    instance.album = hydrated.album
+                    instance.track = hydrated.track
+                if (
+                    candidate_media_type == MediaTypes.PODCAST.value
+                    and hydrated.podcast_show is not None
+                ):
+                    instance.show = hydrated.podcast_show
             with suppress_media_cache_change_signals():
                 instance.save()
             view_barrel._invalidate_discover_after_action(
@@ -684,6 +828,9 @@ def discover_action(request):
                         "source": source,
                         "identity_media_type": identity_media_type,
                         "instance_id": instance.id,
+                        "model_label": (
+                            f"{instance._meta.app_label}.{instance._meta.model_name}"
+                        ),
                     },
                 )
             message = f'Added "{hydrated.item.title}" to Planning.'
@@ -845,6 +992,7 @@ def _build_track_modal_discover_tab_context(user, metadata_item):
 
 @login_required
 @require_POST
+@discover_enabled_required
 def discover_toggle_hidden(request):
     """Toggle the hidden status of an item from Discover."""
     from app import views as view_barrel

@@ -1,20 +1,66 @@
-from django.urls import path
+from django.urls import path, re_path
 
-from integrations import views
+from integrations import tmdb_views, views, wetrakr_views
 
 urlpatterns = [
+    path("tmdb/connect", tmdb_views.tmdb_connect, name="tmdb_connect"),
+    path("tmdb/callback", tmdb_views.tmdb_callback, name="tmdb_callback"),
+    path("tmdb/settings", tmdb_views.tmdb_settings, name="tmdb_settings"),
+    path("tmdb/disconnect", tmdb_views.tmdb_disconnect, name="tmdb_disconnect"),
+    path(
+        "tmdb/export-ratings",
+        tmdb_views.tmdb_export_ratings,
+        name="tmdb_export_ratings",
+    ),
+    path("wetrakr/connect", wetrakr_views.wetrakr_connect, name="wetrakr_connect"),
+    path("wetrakr/poll", wetrakr_views.wetrakr_poll, name="wetrakr_poll"),
+    path("wetrakr/cancel", wetrakr_views.wetrakr_cancel, name="wetrakr_cancel"),
+    path("wetrakr/settings", wetrakr_views.wetrakr_settings, name="wetrakr_settings"),
+    path(
+        "wetrakr/disconnect",
+        wetrakr_views.wetrakr_disconnect,
+        name="wetrakr_disconnect",
+    ),
+    path("wetrakr/export", wetrakr_views.wetrakr_export, name="wetrakr_export"),
+    path(
+        "matches/<int:item_id>/",
+        views.match_fix,
+        name="match_fix",
+    ),
+    path(
+        "matches/<int:reference_id>/<str:status>/",
+        views.match_reference_status,
+        name="match_reference_status",
+    ),
     path("import/trakt-oauth", views.trakt_oauth, name="trakt_oauth"),
     path(
         "import/trakt/private",
         views.import_trakt_private,
         name="import_trakt_private",
     ),
+    path(
+        "import/trakt/device",
+        views.trakt_device_verify,
+        name="trakt_device_verify",
+    ),
+    path(
+        "import/trakt/device/poll",
+        views.trakt_device_poll,
+        name="trakt_device_poll",
+    ),
     path("import/trakt/public", views.import_trakt_public, name="import_trakt_public"),
     path(
+        "import/trakt/export",
+        views.import_trakt_export_file,
+        name="import_trakt_export_file",
+    ),
+    # Legacy route kept working for anything still pointing at the CSV-only URL.
+    path(
         "import/trakt/collection-csv",
-        views.import_trakt_collection_csv,
+        views.import_trakt_export_file,
         name="import_trakt_collection_csv",
     ),
+    path("import/mdblist", views.import_mdblist, name="import_mdblist"),
     path("import/plex/connect", views.plex_connect, name="plex_connect"),
     path("import/plex/callback", views.plex_callback, name="plex_callback"),
     path("import/plex/disconnect", views.plex_disconnect, name="plex_disconnect"),
@@ -37,6 +83,11 @@ urlpatterns = [
         name="bingebandit_play_button",
     ),
     path("import/bingebandit", views.import_bingebandit, name="import_bingebandit"),
+    path(
+        "import/plex/cover/<str:token>",
+        views.plex_cover,
+        name="plex_cover",
+    ),
     path("import/simkl-oauth", views.simkl_oauth, name="simkl_oauth"),
     path(
         "import/simkl_private",
@@ -56,15 +107,50 @@ urlpatterns = [
         name="import_anilist_public",
     ),
     path("import/kitsu", views.import_kitsu, name="import_kitsu"),
+    path("import/mangabaka", views.import_mangabaka, name="import_mangabaka"),
     path("import/yamtrack", views.import_yamtrack, name="import_yamtrack"),
+    path("import/clz", views.import_clz, name="import_clz"),
     path("import/hltb", views.import_hltb, name="import_hltb"),
+    path("import/playnite", views.import_playnite, name="import_playnite"),
+    path("import/grouvee", views.import_grouvee, name="import_grouvee"),
     path("import/steam", views.import_steam, name="import_steam"),
     path("import/radarr/connect", views.radarr_connect, name="radarr_connect"),
     path("import/radarr/disconnect", views.radarr_disconnect, name="radarr_disconnect"),
     path("import/radarr", views.import_radarr, name="import_radarr"),
+    path("import/mylar/connect", views.mylar_connect, name="mylar_connect"),
+    path("import/mylar/disconnect", views.mylar_disconnect, name="mylar_disconnect"),
+    path("import/mylar", views.import_mylar, name="import_mylar"),
+    path("import/kapowarr/connect", views.kapowarr_connect, name="kapowarr_connect"),
+    path(
+        "import/kapowarr/disconnect",
+        views.kapowarr_disconnect,
+        name="kapowarr_disconnect",
+    ),
+    path("import/kapowarr", views.import_kapowarr, name="import_kapowarr"),
     path("import/sonarr/connect", views.sonarr_connect, name="sonarr_connect"),
     path("import/sonarr/disconnect", views.sonarr_disconnect, name="sonarr_disconnect"),
     path("import/sonarr", views.import_sonarr, name="import_sonarr"),
+    path("jellyfin/connect", views.jellyfin_connect, name="jellyfin_connect"),
+    path("jellyfin/disconnect", views.jellyfin_disconnect, name="jellyfin_disconnect"),
+    path("jellyfin/settings", views.jellyfin_settings, name="jellyfin_settings"),
+    path(
+        "sync/direction",
+        views.sync_direction_settings,
+        name="sync_direction_settings",
+    ),
+    path("sync/pause", views.sync_kill_switch, name="sync_kill_switch"),
+    path(
+        "sync/conflicts/resolve",
+        views.sync_resolve_conflict,
+        name="sync_resolve_conflict",
+    ),
+    path("jellyfin/push", views.jellyfin_push_now, name="jellyfin_push_now"),
+    path("jellyfin/pull", views.jellyfin_pull_now, name="jellyfin_pull_now"),
+    path(
+        "jellyfin/playback-reporting/import",
+        views.jellyfin_playback_reporting_import,
+        name="jellyfin_playback_reporting_import",
+    ),
     path("import/imdb", views.import_imdb, name="import_imdb"),
     path("import/goodreads", views.import_goodreads, name="import_goodreads"),
     path("import/hardcover", views.import_hardcover, name="import_hardcover"),
@@ -78,30 +164,224 @@ urlpatterns = [
         views.cinemask_request_button,
         name="cinemask_request_button",
     ),
-    path("import/audiobookshelf/connect", views.audiobookshelf_connect, name="audiobookshelf_connect"),
-    path("import/audiobookshelf/disconnect", views.audiobookshelf_disconnect, name="audiobookshelf_disconnect"),
-    path("import/audiobookshelf", views.import_audiobookshelf, name="import_audiobookshelf"),
-    path("import/storyteller/connect", views.storyteller_connect, name="storyteller_connect"),
+    path("import/storygraph", views.import_storygraph, name="import_storygraph"),
+    path(
+        "import/youtube-takeout",
+        views.import_youtube_takeout,
+        name="import_youtube_takeout",
+    ),
+    path("import/tvtime", views.import_tvtime, name="import_tvtime"),
+    path("import/wetrakr", views.import_wetrakr, name="import_wetrakr"),
+    path(
+        "import/audiobookshelf/connect",
+        views.audiobookshelf_connect,
+        name="audiobookshelf_connect",
+    ),
+    path(
+        "import/audiobookshelf/disconnect",
+        views.audiobookshelf_disconnect,
+        name="audiobookshelf_disconnect",
+    ),
+    path(
+        "import/audiobookshelf",
+        views.import_audiobookshelf,
+        name="import_audiobookshelf",
+    ),
+    path(
+        "import/hardcover/sync",
+        views.hardcover_sync,
+        name="hardcover_sync",
+    ),
+    path(
+        "import/kavita/connect",
+        views.kavita_connect,
+        name="kavita_connect",
+    ),
+    path(
+        "import/kavita/disconnect",
+        views.kavita_disconnect,
+        name="kavita_disconnect",
+    ),
+    path(
+        "import/kavita",
+        views.import_kavita,
+        name="import_kavita",
+    ),
+    path(
+        "import/kavita/refresh",
+        views.refresh_kavita,
+        name="refresh_kavita",
+    ),
+    path(
+        "import/komga/connect",
+        views.komga_connect,
+        name="komga_connect",
+    ),
+    path(
+        "import/komga/disconnect",
+        views.komga_disconnect,
+        name="komga_disconnect",
+    ),
+    path(
+        "import/komga",
+        views.import_komga,
+        name="import_komga",
+    ),
+    path(
+        "import/audiobookshelf/cover/<str:token>",
+        views.audiobookshelf_cover,
+        name="audiobookshelf_cover",
+    ),
+    path(
+        "import/storyteller/connect",
+        views.storyteller_connect,
+        name="storyteller_connect",
+    ),
     path("import/storyteller/poll", views.storyteller_poll, name="storyteller_poll"),
-    path("import/storyteller/cancel", views.storyteller_cancel, name="storyteller_cancel"),
+    path(
+        "import/storyteller/cancel", views.storyteller_cancel, name="storyteller_cancel"
+    ),
     path(
         "import/storyteller/disconnect",
         views.storyteller_disconnect,
         name="storyteller_disconnect",
     ),
     path("import/storyteller", views.import_storyteller, name="import_storyteller"),
-    path("import/pocketcasts/connect", views.pocketcasts_connect, name="pocketcasts_connect"),
-    path("import/pocketcasts/disconnect", views.pocketcasts_disconnect, name="pocketcasts_disconnect"),
+    path(
+        "import/koreader/connect",
+        views.koreader_connect,
+        name="koreader_connect",
+    ),
+    path(
+        "import/koreader/disconnect",
+        views.koreader_disconnect,
+        name="koreader_disconnect",
+    ),
+    path(
+        "import/koreader/settings",
+        views.koreader_settings,
+        name="koreader_settings",
+    ),
+    path("import/koreader", views.import_koreader, name="import_koreader"),
+    path("import/stremio/connect", views.stremio_connect, name="stremio_connect"),
+    path(
+        "import/stremio/disconnect", views.stremio_disconnect, name="stremio_disconnect"
+    ),
+    path("import/stremio", views.import_stremio, name="import_stremio"),
+    path("import/xbox/connect", views.xbox_connect, name="xbox_connect"),
+    path("import/xbox/disconnect", views.xbox_disconnect, name="xbox_disconnect"),
+    path("import/xbox", views.import_xbox, name="import_xbox"),
+    path("import/psn/connect", views.psn_connect, name="psn_connect"),
+    path("import/psn/disconnect", views.psn_disconnect, name="psn_disconnect"),
+    path("import/psn", views.import_psn, name="import_psn"),
+    path(
+        "import/pocketcasts/connect",
+        views.pocketcasts_connect,
+        name="pocketcasts_connect",
+    ),
+    path(
+        "import/pocketcasts/disconnect",
+        views.pocketcasts_disconnect,
+        name="pocketcasts_disconnect",
+    ),
     path("import/pocketcasts", views.import_pocketcasts, name="import_pocketcasts"),
     path("import/gpodder/connect", views.gpodder_connect, name="gpodder_connect"),
-    path("import/gpodder/disconnect", views.gpodder_disconnect, name="gpodder_disconnect"),
+    path(
+        "import/gpodder/disconnect", views.gpodder_disconnect, name="gpodder_disconnect"
+    ),
     path("import/gpodder", views.import_gpodder, name="import_gpodder"),
     path("import/lastfm/connect", views.lastfm_connect, name="lastfm_connect"),
     path("import/lastfm/disconnect", views.lastfm_disconnect, name="lastfm_disconnect"),
-    path("import/lastfm/history", views.import_lastfm_history_manual, name="import_lastfm_history"),
+    path(
+        "import/lastfm/history",
+        views.import_lastfm_history_manual,
+        name="import_lastfm_history",
+    ),
     path("import/lastfm/poll", views.poll_lastfm_manual, name="poll_lastfm_manual"),
+    path("sync/mal/connect", views.mal_oauth, name="mal_oauth"),
+    path("sync/mal/callback", views.mal_callback, name="mal_callback"),
+    path("sync/mal/disconnect", views.mal_disconnect, name="mal_disconnect"),
+    path("sync/mal/toggle", views.mal_toggle, name="mal_toggle"),
+    path(
+        "sync/mal/toggle-per-item",
+        views.mal_per_item_sync_toggle,
+        name="mal_per_item_sync_toggle",
+    ),
+    path(
+        "sync/mal/filters",
+        views.mal_sync_filters_save,
+        name="mal_sync_filters_save",
+    ),
+    path(
+        "sync/mal/episode-mapping",
+        views.mal_episode_mapping_save,
+        name="mal_episode_mapping_save",
+    ),
+    path(
+        "sync/mal/episode-mapping/revert",
+        views.mal_episode_mapping_revert,
+        name="mal_episode_mapping_revert",
+    ),
+    path(
+        "sync/mal/mapping-ignore",
+        views.mal_mapping_ignore,
+        name="mal_mapping_ignore",
+    ),
+    path(
+        "sync/mal/mapping-search",
+        views.mal_mapping_search,
+        name="mal_mapping_search",
+    ),
+    path(
+        "sync/mal/mapping-episodes",
+        views.mal_mapping_episodes,
+        name="mal_mapping_episodes",
+    ),
+    path(
+        "sync/mal/full/preview",
+        views.mal_full_sync_preview,
+        name="mal_full_sync_preview",
+    ),
+    path(
+        "sync/mal/full/status",
+        views.mal_full_sync_status,
+        name="mal_full_sync_status",
+    ),
+    path("sync/mal/full", views.mal_full_sync, name="mal_full_sync"),
+    path(
+        "sync/mal/full/retry-failed",
+        views.mal_full_sync_retry_failed,
+        name="mal_full_sync_retry_failed",
+    ),
+    path(
+        "sync/mal/export/schedule",
+        views.mal_export_schedule_save,
+        name="mal_export_schedule_save",
+    ),
+    path(
+        "sync/mal/export/schedule/delete",
+        views.mal_export_schedule_delete,
+        name="mal_export_schedule_delete",
+    ),
+    path("import/koito/connect", views.koito_connect, name="koito_connect"),
+    path("import/koito/disconnect", views.koito_disconnect, name="koito_disconnect"),
+    path(
+        "import/koito/history",
+        views.import_koito_history_manual,
+        name="import_koito_history",
+    ),
+    path("import/koito/poll", views.poll_koito_manual, name="poll_koito_manual"),
     path("export/csv", views.export_csv, name="export_csv"),
-    path("import/yamtrack/template", views.import_template_csv, name="import_template_csv"),
+    path(
+        "export/csv/letterboxd",
+        views.export_csv_letterboxd,
+        name="export_csv_letterboxd",
+    ),
+    path(
+        "import/yamtrack/template",
+        views.import_template_csv,
+        name="import_template_csv",
+    ),
     path(
         "webhook/jellyfin/<str:token>",
         views.jellyfin_webhook,
@@ -117,10 +397,31 @@ urlpatterns = [
         views.emby_webhook,
         name="emby_webhook",
     ),
+    # kept: URL path/name unchanged — renaming breaks already-configured Seerr/Jellyseerr webhook URLs
     path(
         "webhook/jellyseerr/<str:token>",
         views.jellyseerr_webhook,
         name="jellyseerr_webhook",
+    ),
+    path(
+        "library/<str:source>/<str:media_type>/<str:media_id>/",
+        views.library_panel,
+        name="library_panel",
+    ),
+    path(
+        "seerr/<str:media_type>/<int:media_id>/",
+        views.seerr_request,
+        name="seerr_request",
+    ),
+    path(
+        "webhook/seerr/global/",
+        views.seerr_global_webhook,
+        name="seerr_global_webhook",
+    ),
+    path(
+        "webhook/bingebandit/<str:token>",
+        views.bingebandit_webhook,
+        name="bingebandit_webhook",
     ),
     path(
         "webhook/cinemask/<str:token>",
@@ -133,8 +434,92 @@ urlpatterns = [
         name="kodi_webhook",
     ),
     path(
-        "webhook/bingebandit/<str:token>",
-        views.bingebandit_webhook,
-        name="bingebandit_webhook",
+        "stremio-addon/<str:token>/manifest.json",
+        views.stremio_addon_manifest,
+        name="stremio_addon_manifest",
+    ),
+    path(
+        "stremio-addon/<str:token>/configure",
+        views.stremio_addon_configure,
+        name="stremio_addon_configure",
+    ),
+    path(
+        "stremio-addon/<str:token>/c/<str:config>/configure",
+        views.stremio_addon_configure,
+        name="stremio_addon_configure_configured",
+    ),
+    path(
+        "stremio-addon/<str:token>/c/<str:config>/manifest.json",
+        views.stremio_addon_manifest,
+        name="stremio_addon_manifest_configured",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/c/(?P<config>[^/]+)/catalog/"
+        r"(?P<media_type>movie|series)/"
+        r"(?P<catalog_id>[^/]+?)(?:/(?P<extra>[^/]*))?\.json$",
+        views.stremio_addon_catalog,
+        name="stremio_addon_catalog_configured",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/c/(?P<config>[^/]+)/subtitles/"
+        r"(?P<media_type>movie|series)/(?P<media_id>[^/]+?)"
+        r"(?:/(?P<extra>[^/]*))?\.json$",
+        views.stremio_addon_subtitles,
+        name="stremio_addon_subtitles_configured",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/catalog/"
+        r"(?P<media_type>movie|series)/"
+        r"(?P<catalog_id>[^/]+?)(?:/(?P<extra>.*))?\.json$",
+        views.stremio_addon_catalog,
+        name="stremio_addon_catalog",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/meta/"
+        r"(?P<media_type>movie|series)/"
+        r"(?P<media_id>[^/]+?)\.json$",
+        views.stremio_addon_meta,
+        name="stremio_addon_meta",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/subtitles/"
+        r"(?P<media_type>movie|series)/(?P<media_id>[^/]+?)"
+        # The extra carries the release filename, which routinely contains a
+        # slash, so it must span path segments. Upstream matched this tail with
+        # a wildcard; capturing it must not narrow what the route accepts.
+        r"(?:/(?P<extra>.*))?\.json$",
+        views.stremio_addon_subtitles,
+        name="stremio_addon_subtitles",
+    ),
+    # `player` and `library` capture the extra: position and duration travel in
+    # it. So does `subtitles`, whose extra carries the selected release's
+    # `videoHash`/`videoSize`/`filename`; it is reported, not yet used.
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/c/(?P<config>[^/]+)/player/"
+        r"(?P<media_type>movie|series)/(?P<media_id>[^/]+?)/"
+        r"(?P<extra>[^/]*)\.json$",
+        views.stremio_addon_player,
+        name="stremio_addon_player_configured",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/player/"
+        r"(?P<media_type>movie|series)/(?P<media_id>[^/]+?)/"
+        r"(?P<extra>[^/]*)\.json$",
+        views.stremio_addon_player,
+        name="stremio_addon_player",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/c/(?P<config>[^/]+)/library/"
+        r"(?P<media_type>movie|series)/(?P<media_id>[^/]+?)/"
+        r"(?P<extra>[^/]*)\.json$",
+        views.stremio_addon_library,
+        name="stremio_addon_library_configured",
+    ),
+    re_path(
+        r"^stremio-addon/(?P<token>[^/]+)/library/"
+        r"(?P<media_type>movie|series)/(?P<media_id>[^/]+?)/"
+        r"(?P<extra>[^/]*)\.json$",
+        views.stremio_addon_library,
+        name="stremio_addon_library",
     ),
 ]

@@ -22,6 +22,7 @@ from app.models import (
     Sources,
     Status,
 )
+from events.calendar.helpers import date_parser
 from events.models import Event
 from users.models import HomeSortChoices, MediaStatusChoices
 
@@ -197,6 +198,81 @@ class MediaManagerTests(TestCase):
 
         self.assertEqual(len(media_list), 1)
 
+    def test_get_media_list_with_completed_date_filter(self):
+        """Completed-date filter matches on end_date, not release year."""
+        manager = MediaManager()
+
+        movie_completed_date = timezone.localdate()
+        Movie.objects.filter(id=self.movie.id).update(
+            end_date=timezone.now(),
+        )
+
+        media_list = manager.get_media_list(
+            user=self.user,
+            media_type=MediaTypes.MOVIE.value,
+            status_filter=MediaStatusChoices.ALL,
+            sort_filter="",
+            list_sql_filters={
+                "completed_date_from": movie_completed_date.isoformat(),
+                "completed_date_to": movie_completed_date.isoformat(),
+            },
+        )
+        self.assertEqual(list(media_list), [self.movie])
+
+        media_list = manager.get_media_list(
+            user=self.user,
+            media_type=MediaTypes.MOVIE.value,
+            status_filter=MediaStatusChoices.ALL,
+            sort_filter="",
+            list_sql_filters={
+                "completed_date_from": "1999-01-01",
+                "completed_date_to": "1999-01-02",
+            },
+        )
+        self.assertEqual(list(media_list), [])
+
+    def test_get_media_list_completed_date_filter_uses_episode_dates_for_tv(self):
+        """TV/Season have no persisted end_date; filter via episode Exists."""
+        manager = MediaManager()
+
+        season_list = manager.get_media_list(
+            user=self.user,
+            media_type=MediaTypes.SEASON.value,
+            status_filter=MediaStatusChoices.ALL,
+            sort_filter="",
+            list_sql_filters={
+                "completed_date_from": "2023-06-01",
+                "completed_date_to": "2023-06-03",
+            },
+        )
+        self.assertEqual(list(season_list), [self.season1])
+
+        tv_list = manager.get_media_list(
+            user=self.user,
+            media_type=MediaTypes.TV.value,
+            status_filter=MediaStatusChoices.ALL,
+            sort_filter="",
+            list_sql_filters={
+                "completed_date_from": "2023-06-01",
+                "completed_date_to": "2023-06-03",
+            },
+        )
+        self.assertEqual(list(tv_list), [self.tv])
+
+        # A range that misses every watched episode excludes the season/show,
+        # even though the show's release year (unset here) can't disambiguate.
+        season_list = manager.get_media_list(
+            user=self.user,
+            media_type=MediaTypes.SEASON.value,
+            status_filter=MediaStatusChoices.ALL,
+            sort_filter="",
+            list_sql_filters={
+                "completed_date_from": "2024-01-01",
+                "completed_date_to": "2024-01-02",
+            },
+        )
+        self.assertEqual(list(season_list), [])
+
     def test_get_in_progress_excludes_latest_completed(self):
         """Ensure home in-progress list ignores items whose latest status is completed."""
         manager = MediaManager()
@@ -262,7 +338,7 @@ class MediaManagerTests(TestCase):
 
         self.assertTrue(hasattr(prefetched_queryset, "_prefetch_related_lookups"))
         prefetch_lookups = prefetched_queryset._prefetch_related_lookups
-        self.assertEqual(len(prefetch_lookups), 3)  # seasons, season events, season episodes
+        self.assertEqual(len(prefetch_lookups), 4)
 
         queryset = Season.objects.filter(user=self.user.id)
         prefetched_queryset = manager._apply_prefetch_related(
@@ -272,7 +348,7 @@ class MediaManagerTests(TestCase):
 
         self.assertTrue(hasattr(prefetched_queryset, "_prefetch_related_lookups"))
         prefetch_lookups = prefetched_queryset._prefetch_related_lookups
-        self.assertEqual(len(prefetch_lookups), 2)
+        self.assertEqual(len(prefetch_lookups), 3)
 
         queryset = Movie.objects.filter(user=self.user.id)
         prefetched_queryset = manager._apply_prefetch_related(
@@ -282,7 +358,7 @@ class MediaManagerTests(TestCase):
 
         self.assertTrue(hasattr(prefetched_queryset, "_prefetch_related_lookups"))
         prefetch_lookups = prefetched_queryset._prefetch_related_lookups
-        self.assertEqual(len(prefetch_lookups), 1)
+        self.assertEqual(len(prefetch_lookups), 2)
 
     def test_get_media_list_with_prefetch_related(self):
         """Test the get_media_list method with prefetch_related for TV and Season."""
@@ -591,6 +667,142 @@ class MediaManagerTests(TestCase):
 
         self.assertIsNone(anime_list[0].next_event)
 
+    def test_annotate_next_event_keeps_date_only_release_until_day_ends(self):
+        """Today's date-only episode is still the next event, not a past one."""
+        manager = MediaManager()
+        item = Item.objects.create(
+            media_id="date-only-next-event",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Date Only Next Event",
+            image="http://example.com/date-only.jpg",
+        )
+        anime = Anime.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        today = timezone.localdate()
+        event = Event.objects.create(
+            item=item,
+            content_number=1,
+            datetime=date_parser(today),
+        )
+        item.prefetched_events = [event]
+        now = datetime(today.year, today.month, today.day, 14, tzinfo=UTC)
+
+        with patch("django.utils.timezone.now", return_value=now):
+            manager._annotate_next_event([anime])
+
+        self.assertEqual(anime.next_event, event)
+
+    def test_released_episode_count_prefers_a_precise_event_over_item_date(self):
+        """A date-only item must not release an episode before its precise event."""
+        manager = MediaManager()
+        tv_item = Item.objects.create(
+            media_id="greys-1588",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Grey's Anatomy",
+            image="http://example.com/greys.jpg",
+        )
+        tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        season_item = Item.objects.create(
+            media_id="greys-1588",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Grey's Anatomy Season 23",
+            image="http://example.com/greys-season.jpg",
+            season_number=23,
+        )
+        Season.objects.create(
+            item=season_item,
+            related_tv=tv,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        Item.objects.create(
+            media_id="greys-1588",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Collide",
+            image="http://example.com/greys-episode.jpg",
+            season_number=23,
+            episode_number=1,
+            release_datetime=date_parser("2026-10-15"),
+        )
+        Event.objects.create(
+            item=season_item,
+            content_number=1,
+            datetime=datetime(2026, 10, 16, 2, 0, tzinfo=UTC),
+        )
+
+        with timezone.override("Europe/Lisbon"):
+            manager._annotate_tv_released_episodes(
+                [tv],
+                datetime(2026, 10, 16, 1, 0, tzinfo=UTC),
+            )
+            self.assertIsNone(tv.max_progress)
+
+            manager._annotate_tv_released_episodes(
+                [tv],
+                datetime(2026, 10, 16, 2, 0, tzinfo=UTC),
+            )
+            self.assertEqual(tv.max_progress, 1)
+
+    def test_released_episode_count_ignores_year_one_unknown_dates(self):
+        """Undated episodes must not crash the count west of UTC (#1717)."""
+        manager = MediaManager()
+        tv_item = Item.objects.create(
+            media_id="262819",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="LOL: Last One Laughing UK",
+            image="http://example.com/lol.jpg",
+        )
+        tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        season_item = Item.objects.create(
+            media_id="262819",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="LOL: Last One Laughing UK Season 3",
+            image="http://example.com/lol-season.jpg",
+            season_number=3,
+        )
+        Season.objects.create(
+            item=season_item,
+            related_tv=tv,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        Event.objects.create(
+            item=season_item,
+            content_number=9,
+            datetime=datetime(1, 1, 1, tzinfo=UTC),
+        )
+        for number in (1, 2):
+            Event.objects.create(
+                item=season_item,
+                content_number=number,
+                datetime=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+
+        with timezone.override("America/Toronto"):
+            manager._annotate_tv_released_episodes(
+                [tv],
+                datetime(2026, 10, 16, 2, 0, tzinfo=UTC),
+            )
+
+        self.assertEqual(tv.max_progress, 2)
+
     def test_sort_in_progress_media(self):
         """Test the _sort_in_progress_media method."""
         manager = MediaManager()
@@ -668,6 +880,227 @@ class MediaManagerTests(TestCase):
         sorted_list = manager._sort_in_progress_media(anime_list, sort_by="recent")
         self.assertEqual(sorted_list, [anime3, anime2, anime1])
 
+    def test_sort_in_progress_media_recent_excludes_unstarted_created_at(self):
+        """Regression for #990: a zero-progress row's created_at must not
+        outrank an actively-watched row's progressed_at in the Recent sort.
+        """
+        manager = MediaManager()
+
+        # Actively-watched: real progress, older progressed_at.
+        watched_item = Item.objects.create(
+            media_id="990-watched",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Silo",
+        )
+        watched = Anime.objects.create(
+            item=watched_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=5,
+        )
+        watched.progressed_at = timezone.now() - timedelta(days=5)
+        watched.created_at = timezone.now() - timedelta(days=10)
+        watched.max_progress = 10
+        watched.next_event = None
+
+        # Auto-created, never watched: no progress, but a newer created_at.
+        unstarted_item = Item.objects.create(
+            media_id="990-unstarted",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Sakamoto Days",
+        )
+        unstarted = Anime.objects.create(
+            item=unstarted_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=0,
+        )
+        unstarted.progressed_at = None
+        unstarted.created_at = timezone.now() - timedelta(days=1)
+        unstarted.max_progress = 10
+        unstarted.next_event = None
+
+        sorted_list = manager._sort_in_progress_media(
+            [unstarted, watched], sort_by="recent"
+        )
+        self.assertEqual(sorted_list, [watched, unstarted])
+
+    def test_sort_in_progress_media_completion_uses_completed_count_for_tv(self):
+        """Regression for #527: completion sort should use watched count, not position."""
+        manager = MediaManager()
+
+        # Skip-ahead season: only episode 9 of 10 watched (furthest position is
+        # high, but only 1 episode actually watched).
+        skip_ahead_item = Item.objects.create(
+            media_id="8892",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+        )
+        skip_ahead_season = Season.objects.create(
+            item=skip_ahead_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        ep9_item = Item.objects.create(
+            media_id="8892",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+            episode_number=9,
+        )
+        Episode.objects.create(
+            item=ep9_item,
+            related_season=skip_ahead_season,
+            end_date=datetime(2023, 6, 9, 0, 0, tzinfo=UTC),
+        )
+        skip_ahead_season.max_progress = 10
+
+        # In-order season: episodes 1-3 of 10 watched (lower furthest position,
+        # but more episodes actually watched).
+        in_order_item = Item.objects.create(
+            media_id="8893",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="In Order Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+        )
+        in_order_season = Season.objects.create(
+            item=in_order_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        for ep_num in (1, 2, 3):
+            item = Item.objects.create(
+                media_id="8893",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.EPISODE.value,
+                title="In Order Show",
+                image="http://example.com/image.jpg",
+                season_number=1,
+                episode_number=ep_num,
+            )
+            Episode.objects.create(
+                item=item,
+                related_season=in_order_season,
+                end_date=datetime(2023, 6, ep_num, 0, 0, tzinfo=UTC),
+            )
+        in_order_season.max_progress = 10
+
+        sorted_list = manager._sort_in_progress_media(
+            [skip_ahead_season, in_order_season],
+            "completion",
+        )
+
+        # By furthest position (9/10=90% vs 3/10=30%) skip_ahead would sort
+        # first; by actual watched count (1/10=10% vs 3/10=30%) it should not.
+        self.assertEqual(sorted_list, [in_order_season, skip_ahead_season])
+
+    def _mal_anime(self, media_id, status, provider_episode_count=12):
+        item = Item.objects.create(
+            media_id=media_id,
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title=f"MAL {media_id}",
+            image="http://example.com/mal.jpg",
+            status=status,
+            provider_episode_count=provider_episode_count,
+            runtime_minutes=24,
+        )
+        return Anime.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=1,
+        )
+
+    def test_annotate_max_progress_finished_anime_without_events(self):
+        """A finished MAL anime with no schedule events uses its episode count."""
+        anime = self._mal_anime("9001", "Finished")
+
+        MediaManager().annotate_max_progress([anime], MediaTypes.ANIME.value)
+
+        self.assertEqual(anime.max_progress, 12)
+        self.assertEqual(anime.total_runtime_minutes, 12 * 24)
+        self.assertNotEqual(anime.formatted_total_runtime, "--")
+
+    def test_annotate_max_progress_airing_anime_without_events(self):
+        """An airing anime waits for real events instead of the planned total."""
+        anime = self._mal_anime("9002", "Airing")
+
+        MediaManager().annotate_max_progress([anime], MediaTypes.ANIME.value)
+
+        self.assertIsNone(anime.max_progress)
+
+    def test_annotate_max_progress_anime_events_beat_episode_count(self):
+        """Released events stay authoritative over the provider episode count."""
+        anime = self._mal_anime("9003", "Finished")
+        Event.objects.create(
+            item=anime.item,
+            content_number=10,
+            datetime=timezone.now() - timedelta(days=1),
+        )
+
+        MediaManager().annotate_max_progress([anime], MediaTypes.ANIME.value)
+
+        self.assertEqual(anime.max_progress, 10)
+
+    def test_released_counts_use_episode_count_for_continued_numbering(self):
+        """A season numbered 51-100 has 50 episodes, not 100 (#1754)."""
+        past = timezone.now() - timedelta(days=30)
+        show_id = "anime-continued"
+        tv_item = Item.objects.create(
+            media_id=show_id,
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.TV.value,
+            title="Continued Numbering",
+            image="http://example.com/tv.jpg",
+        )
+        tv = TV.objects.create(item=tv_item, user=self.user, status=Status.IN_PROGRESS.value)
+        seasons = []
+        for season_number, first in ((1, 1), (2, 51)):
+            season_item = Item.objects.create(
+                media_id=show_id,
+                source=Sources.MANUAL.value,
+                media_type=MediaTypes.SEASON.value,
+                title="Continued Numbering",
+                image="http://example.com/tv.jpg",
+                season_number=season_number,
+            )
+            seasons.append(
+                Season.objects.create(
+                    item=season_item,
+                    user=self.user,
+                    related_tv=tv,
+                    status=Status.IN_PROGRESS.value,
+                ),
+            )
+            for number in range(first, first + 50):
+                Item.objects.create(
+                    media_id=show_id,
+                    source=Sources.MANUAL.value,
+                    media_type=MediaTypes.EPISODE.value,
+                    title="Continued Numbering",
+                    image="http://example.com/tv.jpg",
+                    season_number=season_number,
+                    episode_number=number,
+                    release_datetime=past,
+                )
+
+        manager = MediaManager()
+        manager._annotate_season_released_episodes(seasons, timezone.now())
+        manager._annotate_tv_released_episodes([tv], timezone.now())
+
+        self.assertEqual([season.max_progress for season in seasons], [50, 50])
+        self.assertEqual(tv.max_progress, 100)
+
     def test_annotate_max_progress(self):
         """Test the annotate_max_progress method."""
         manager = MediaManager()
@@ -676,10 +1109,6 @@ class MediaManagerTests(TestCase):
         manager.annotate_max_progress(movie_list, MediaTypes.MOVIE.value)
         self.assertEqual(movie_list[0].max_progress, 1)
 
-        # Manual items take max_progress from custom metadata, so use a provider
-        # source to exercise the event-based path
-        self.anime_item.source = Sources.MAL.value
-        self.anime_item.save(update_fields=["source"])
         anime_list = list(
             Anime.objects.filter(user=self.user.id).select_related("item"),
         )
@@ -700,11 +1129,12 @@ class MediaManagerTests(TestCase):
 
         tv_list = TV.objects.filter(user=self.user.id)
 
-        Event.objects.create(
-            item=self.season1_item,
-            content_number=10,
-            datetime=timezone.now() - timedelta(days=10),
-        )
+        for number in range(1, 11):
+            Event.objects.create(
+                item=self.season1_item,
+                content_number=number,
+                datetime=timezone.now() - timedelta(days=10),
+            )
 
         # Prefetch events
         tv_list = tv_list.prefetch_related(
@@ -719,7 +1149,9 @@ class MediaManagerTests(TestCase):
         self.assertEqual(tv_list[0].max_progress, 10)
 
     @patch("app.models.providers.services.get_media_metadata")
-    def test_annotate_max_progress_for_books_uses_stored_pages_only(self, mock_get_media_metadata):
+    def test_annotate_max_progress_for_books_uses_stored_pages_only(
+        self, mock_get_media_metadata
+    ):
         manager = MediaManager()
 
         self.book_item.number_of_pages = None

@@ -1,0 +1,45 @@
+name: Lint
+
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+
+      - name: Check dependency lock
+        run: uv lock --check
+
+      - name: Install lint dependencies
+        run: uv sync --locked --only-group lint
+
+      - name: Ruff
+        run: uv run --no-sync ruff check src mcp_server
+
+      - name: Dependency vulnerabilities
+        run: scripts/audit_dependencies.sh
+
+      - name: Audit frontend build dependencies
+        run: npm audit --ignore-scripts

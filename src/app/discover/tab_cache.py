@@ -1,6 +1,6 @@
 """Redis-backed tab cache for Discover page payloads."""
 
-# ruff: noqa: BLE001, PLC0415, TRY300
+# ruff: noqa: TRY300
 
 from __future__ import annotations
 
@@ -43,6 +43,10 @@ DISCOVER_TAB_STALE_AFTER = timedelta(minutes=15)
 DISCOVER_TAB_REFRESH_LOCK_TTL = 60 * 5
 DISCOVER_TAB_REFRESH_SCHEDULED_TTL = 60 * 10
 DISCOVER_TAB_ACTIVE_TTL = 45
+# A rebuild costs 20-30 s of CPU on a large library. After one finishes,
+# background invalidations (imports, scrobbles) only mark the tab stale for this
+# long; the next Discover view rebuilds it at once (stale rows are served).
+DISCOVER_BACKGROUND_REBUILD_COOLDOWN = 60 * 10
 DISCOVER_ACTION_UNDO_TTL = 60
 DISCOVER_TAB_RECENTLY_BUILT_SECONDS = 60
 DISCOVER_REQUEST_WARMUP_PREFIX = f"{DISCOVER_TAB_PREFIX}_request_warm"
@@ -59,7 +63,7 @@ DISCOVER_TASK_PRIORITY_INTERACTIVE = getattr(
     "CELERY_TASK_PRIORITY_INTERACTIVE",
     9,
 )
-DISCOVER_TASK_PRIORITY_FOLLOWUP = getattr(settings, "CELERY_TASK_PRIORITY_FOLLOWUP", 7)
+DISCOVER_TASK_PRIORITY_FOLLOWUP = getattr(settings, "CELERY_TASK_PRIORITY_FOLLOWUP", 3)
 DISCOVER_TASK_PRIORITY_BACKGROUND = getattr(
     settings,
     "CELERY_TASK_PRIORITY_BACKGROUND",
@@ -72,7 +76,11 @@ DISCOVER_PROVIDER_BY_MEDIA_TYPE = {
     MediaTypes.TV.value: {"trakt"},
     MediaTypes.ANIME.value: {"trakt"},
     MediaTypes.MUSIC.value: {Sources.MUSICBRAINZ.value},
-    MediaTypes.PODCAST.value: {Sources.POCKETCASTS.value, Sources.GPODDER.value},
+    MediaTypes.PODCAST.value: {
+        Sources.POCKETCASTS.value,
+        Sources.GPODDER.value,
+        Sources.AUDIOBOOKSHELF.value,
+    },
     MediaTypes.BOOK.value: {Sources.OPENLIBRARY.value},
     MediaTypes.COMIC.value: {Sources.COMICVINE.value},
     MediaTypes.MANGA.value: {Sources.MAL.value},
@@ -178,6 +186,13 @@ def _refresh_scheduled_key(
     )
 
 
+def _rebuild_cooldown_key(user_id: int, media_type: str, *, show_more: bool) -> str:
+    return (
+        f"{DISCOVER_TAB_REFRESH_SCHEDULED_PREFIX}_cooldown_{user_id}_"
+        f"{_normalize_media_type(media_type)}_{int(bool(show_more))}"
+    )
+
+
 def _active_key(user_id: int) -> str:
     return f"{DISCOVER_TAB_ACTIVE_PREFIX}_{user_id}"
 
@@ -257,7 +272,9 @@ def get_activity_version(user_id: int, media_type: str) -> str:
 
 def bump_activity_version(user_id: int, media_type: str) -> str:
     """Advance the activity version for a Discover media type."""
-    version = timezone.now().isoformat()
+    # The suffix makes every bump distinct: a coarse clock can give a bump the
+    # same timestamp as the version it replaces, leaving the tab looking fresh.
+    version = f"{timezone.now().isoformat()}-{uuid4().hex[:8]}"
     _cache_set(
         _activity_version_key(user_id, media_type),
         version,
@@ -554,7 +571,8 @@ def target_media_types_for_user_change(user, media_type: str | None) -> list[str
     enabled_targets = [
         target_media_type
         for target_media_type in targets
-        if target_media_type != ALL_MEDIA_KEY and target_media_type in enabled_media_types
+        if target_media_type != ALL_MEDIA_KEY
+        and target_media_type in enabled_media_types
     ]
     if not enabled_targets:
         return []
@@ -659,6 +677,35 @@ def _acquire_refresh_lock(
     return True
 
 
+def release_refresh_lock(user_id: int, media_type: str, *, show_more: bool) -> None:
+    """Drop a tab refresh lock the task did not need to use."""
+    _cache_delete(
+        _refresh_lock_key(
+            user_id, _normalize_media_type(media_type), show_more=show_more
+        )
+    )
+
+
+def release_refresh_reservation(
+    user_id: int, media_type: str, *, show_more: bool
+) -> None:
+    """Drop a queued refresh's lock and scheduled marker when it will not run.
+
+    Unlike release_refresh_lock, this also clears the scheduled marker, so a later
+    request can queue a real rebuild instead of waiting out the marker's TTL.
+    """
+    media_type = _normalize_media_type(media_type)
+    release_refresh_lock(user_id, media_type, show_more=show_more)
+    _cache_delete(
+        _refresh_scheduled_key(
+            user_id,
+            media_type,
+            show_more=show_more,
+            activity_version=_get_activity_version(user_id, media_type),
+        )
+    )
+
+
 def _reserve_scheduled_refresh(
     user_id: int,
     media_type: str,
@@ -743,9 +790,7 @@ def schedule_tab_refresh(
             },
             countdown=countdown,
             priority=(
-                DISCOVER_TASK_PRIORITY_INTERACTIVE
-                if priority is None
-                else priority
+                DISCOVER_TASK_PRIORITY_INTERACTIVE if priority is None else priority
             ),
         )
         return True
@@ -774,6 +819,7 @@ def refresh_tab_cache(
 ) -> list[RowResult]:
     """Rebuild and persist a Discover tab payload."""
     from app.discover.service import get_discover_rows
+    from app.discover.service_helpers import credit_maps_scope
 
     media_type = _normalize_media_type(media_type)
     lock_key = _refresh_lock_key(user.id, media_type, show_more=show_more)
@@ -785,13 +831,14 @@ def refresh_tab_cache(
         if clear_provider_cache:
             clear_provider_cache_for_media_type(media_type)
 
-        rows = get_discover_rows(
-            user,
-            media_type,
-            show_more=show_more,
-            include_debug=False,
-            defer_artwork=False,
-        )
+        with credit_maps_scope():
+            rows = get_discover_rows(
+                user,
+                media_type,
+                show_more=show_more,
+                include_debug=False,
+                defer_artwork=False,
+            )
         current_activity_version = _get_activity_version(user.id, media_type)
         if current_activity_version != build_activity_version:
             version_drifted = True
@@ -815,7 +862,15 @@ def refresh_tab_cache(
         return rows
     finally:
         _cache_delete(lock_key)
-        if version_drifted:
+        _cache_set(
+            _rebuild_cooldown_key(user.id, media_type, show_more=show_more),
+            1,
+            timeout=DISCOVER_BACKGROUND_REBUILD_COOLDOWN,
+        )
+        active_context = get_active_context(user.id) if version_drifted else None
+        if version_drifted and (
+            active_context is not None and active_context.media_type == media_type
+        ):
             schedule_tab_refresh(
                 user.id,
                 media_type,
@@ -835,7 +890,9 @@ def _collect_cached_action_payloads(
 ) -> list[dict]:
     payloads: list[dict] = []
     seen_keys: set[str] = set()
-    for media_type in _action_target_media_types(active_media_type, candidate_media_type):
+    for media_type in _action_target_media_types(
+        active_media_type, candidate_media_type
+    ):
         for show_more in (False, True):
             cache_key = _tab_cache_key(user_id, media_type, show_more=show_more)
             if cache_key in seen_keys:
@@ -864,7 +921,9 @@ def collect_action_payloads(
     Callers that need to pass the same payloads to both store_undo_snapshot and
     apply_cached_action can collect them once here and pass via preloaded_payloads.
     """
-    return _collect_cached_action_payloads(user_id, active_media_type, candidate_media_type)
+    return _collect_cached_action_payloads(
+        user_id, active_media_type, candidate_media_type
+    )
 
 
 def apply_cached_action(
@@ -891,19 +950,25 @@ def apply_cached_action(
     patched_tabs = 0
     hydrated_rows = 0
 
-    entries = preloaded_payloads if preloaded_payloads is not None else _collect_cached_action_payloads(
-        user_id,
-        active_media_type,
-        candidate_media_type,
+    entries = (
+        preloaded_payloads
+        if preloaded_payloads is not None
+        else _collect_cached_action_payloads(
+            user_id,
+            active_media_type,
+            candidate_media_type,
+        )
     )
     for entry in entries:
         rows = _deserialize_rows(entry["payload"].get("rows"))
-        was_active_entry = (
-            entry["media_type"] == normalized_active_media_type
-            and bool(entry["show_more"]) == bool(show_more)
-        )
+        was_active_entry = entry["media_type"] == normalized_active_media_type and bool(
+            entry["show_more"]
+        ) == bool(show_more)
         visible_before = [
-            [candidate.identity() for candidate in row.items[:DISCOVER_VISIBLE_ITEMS_PER_ROW]]
+            [
+                candidate.identity()
+                for candidate in row.items[:DISCOVER_VISIBLE_ITEMS_PER_ROW]
+            ]
             for row in rows
         ]
         for row in rows:
@@ -966,10 +1031,14 @@ def store_undo_snapshot(
     preloaded_payloads: list[dict] | None = None,
 ) -> str | None:
     """Persist a short-lived undo snapshot for Discover card actions."""
-    tabs = preloaded_payloads if preloaded_payloads is not None else _collect_cached_action_payloads(
-        user_id,
-        active_media_type,
-        candidate_media_type,
+    tabs = (
+        preloaded_payloads
+        if preloaded_payloads is not None
+        else _collect_cached_action_payloads(
+            user_id,
+            active_media_type,
+            candidate_media_type,
+        )
     )
     if not tabs and not side_effect:
         return None
@@ -1101,7 +1170,7 @@ def get_tab_rows(
                 )
         return rows
 
-    schedule_tab_refresh(
+    refresh_scheduled = schedule_tab_refresh(
         user.id,
         media_type,
         show_more=show_more,
@@ -1109,7 +1178,16 @@ def get_tab_rows(
         countdown=DISCOVER_PRIORITY_REFRESH_COUNTDOWN,
         priority=DISCOVER_TASK_PRIORITY_INTERACTIVE,
     )
-    if not allow_inline_bootstrap:
+    # Mirror the stale path: when a refresh task is queued (or one is
+    # already in flight holding the lock), let the page render its
+    # "Building Discover rows" state and fill in via polling instead of
+    # paying the multi-second build inline (and doubly, since the task
+    # will rebuild anyway).
+    if not refresh_scheduled:
+        lock_key = _refresh_lock_key(user.id, media_type, show_more=show_more)
+        refresh_lock = _cache_get(lock_key)
+        refresh_scheduled = bool(refresh_lock) and not _lock_is_stale(refresh_lock)
+    if not allow_inline_bootstrap or refresh_scheduled:
         return []
 
     rows = get_discover_rows(
@@ -1199,6 +1277,8 @@ def schedule_user_tab_warmup(
     show_more: bool = False,
 ) -> int:
     """Schedule missing or stale Discover tabs for a user in the background."""
+    if not user.show_discover:
+        return 0
     priority_media_type = _normalize_media_type(prioritize_media_type or ALL_MEDIA_KEY)
     targets = media_types or get_user_tab_targets(user)
     normalized_targets = list(
@@ -1283,6 +1363,12 @@ def _invalidate_targets(
             and active_context.media_type == target_media_type
         )
         prioritized_show_more = active_context.show_more if prioritized else False
+        if not prioritized and _cache_get(
+            _rebuild_cooldown_key(user_id, target_media_type, show_more=False)
+        ):
+            # Rebuilt moments ago and nobody is looking: the version bump
+            # above already marks it stale for the next view.
+            continue
         schedule_tab_refresh(
             user_id,
             target_media_type,
@@ -1293,9 +1379,7 @@ def _invalidate_targets(
                 else debounce_seconds
             ),
             countdown=(
-                DISCOVER_PRIORITY_REFRESH_COUNTDOWN
-                if prioritized
-                else countdown
+                DISCOVER_PRIORITY_REFRESH_COUNTDOWN if prioritized else countdown
             ),
             priority=(
                 DISCOVER_TASK_PRIORITY_INTERACTIVE

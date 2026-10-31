@@ -13,7 +13,7 @@ from django.utils import timezone
 from app.models import MediaTypes, Status
 from integrations.imports import helpers
 from integrations.models import CinemaskRequest, CinemaskRequestStatus
-from integrations.webhooks.jellyseerr import JellyseerrWebhookProcessor
+from integrations.webhooks.seerr import SeerrWebhookProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ def save_request(user, row):
 
 def add_to_tracking(user, media_type, tmdb_id):
     """Add a requested title to the user's list as Planning, if not tracked."""
-    processor = JellyseerrWebhookProcessor()
+    processor = SeerrWebhookProcessor()
     item = processor._get_or_create_tmdb_item(media_type, str(tmdb_id))
     if item:
         processor._get_or_create_user_media(

@@ -23,7 +23,15 @@ from lists.models import CustomList, CustomListItem
 from users.home_screen import ensure_home_screen_rows
 from users.models import HomeScreenRowTypeChoices
 
-logging.disable(logging.DEBUG)
+
+def setUpModule():
+    """Silence log noise for this module only."""
+    logging.disable(logging.DEBUG)
+
+
+def tearDownModule():
+    """Restore logging so other modules' assertLogs still see records."""
+    logging.disable(logging.NOTSET)
 
 
 @tag("slow", "benchmark")
@@ -117,7 +125,9 @@ class AppPageBenchmarkTests(TestCase):
                 f"/?load_row={self.tv_home_row.id}&offset=0",
                 HTTP_HX_REQUEST="true",
             ),
-            self._benchmark_route(reverse("list_detail", args=[self.custom_list.public_reference])),
+            self._benchmark_route(
+                reverse("list_detail", args=[self.custom_list.public_reference])
+            ),
             self._benchmark_route("/medialist/tv"),
             self._benchmark_route("/medialist/anime"),
         ]

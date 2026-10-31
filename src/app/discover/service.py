@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from contextvars import ContextVar
 from datetime import timedelta
 
 from django.conf import settings
@@ -49,8 +51,14 @@ from app.discover.movie_comfort import (
     _entry_phase_evidence,
     _phase_affinity_maps,
 )
-from app.discover.profile import get_or_compute_taste_profile
-from app.discover.provider_candidates import _provider_row_candidates
+from app.discover.profile import (
+    get_or_compute_taste_profile,
+    preload_tv_activity_dates,
+)
+from app.discover.provider_candidates import (
+    _mal_anime_fallback_candidates,
+    _provider_row_candidates,
+)
 from app.discover.registry import ALL_MEDIA_KEY, DISCOVER_MEDIA_TYPES, get_rows
 from app.discover.row_cache_schema import (
     ROW_CACHE_ACTIVITY_VERSION_META_KEY,
@@ -104,7 +112,14 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
-STALE_REFRESH_LOCK_SECONDS = 60
+# Held from the moment a row refresh is queued until the task finishes (which
+# deletes it), so a page view cannot queue a second copy while the first waits
+# behind a long task. The TTL only covers a task that never reports back.
+STALE_REFRESH_LOCK_SECONDS = 10 * 60
+# Rows a library-based candidate pool reads. The visible row is 12 items, and
+# an Item row is wide (synopsis, a dozen JSON columns), so an unbounded read
+# grew a refresh task by hundreds of MiB on a large library.
+COMFORT_LIBRARY_ENTRY_LIMIT = 1500
 ROW_CANDIDATE_BUFFER_MULTIPLIER = 5
 TOP_PICKS_MAX_ANCHORS = 5
 TOP_PICKS_PLANNING_MAX_VISIBLE = 6
@@ -148,20 +163,23 @@ def _recent_completed_tag_coverage(
         return 0.0
 
     cutoff = timezone.now() - timedelta(days=window_days)
-    recent_queryset = (
-        model.objects.filter(
-            user=user,
-            status=Status.COMPLETED.value,
-        )
+    recent_queryset = model.objects.filter(
+        user=user,
+        status=Status.COMPLETED.value,
     )
     if _model_has_field(model, "end_date") or _model_has_field(model, "progressed_at"):
         recent_queryset = recent_queryset.filter(
             _activity_filter_query(model, cutoff, newer_than=True),
         )
+    recent_entries = list(recent_queryset.order_by(*_activity_ordering(model))[:300])
+    preload_tv_activity_dates(recent_entries)
     recent_entries = [
         entry
-        for entry in recent_queryset.order_by(*_activity_ordering(model))[:300]
-        if (_entry_activity_datetime(entry) and _entry_activity_datetime(entry) >= cutoff)
+        for entry in recent_entries
+        if (
+            _entry_activity_datetime(entry)
+            and _entry_activity_datetime(entry) >= cutoff
+        )
     ]
     if not recent_entries:
         return 0.0
@@ -201,6 +219,7 @@ def _comfort_candidates(
         rated_queryset = rated_queryset.filter(
             _activity_filter_query(model, cutoff, newer_than=False),
         )
+    rated_queryset = rated_queryset[:COMFORT_LIBRARY_ENTRY_LIMIT]
 
     unrated_cutoff = now - timedelta(days=max(older_than_days, 90))
     unrated_queryset = (
@@ -216,6 +235,11 @@ def _comfort_candidates(
         unrated_queryset = unrated_queryset.filter(
             _activity_filter_query(model, unrated_cutoff, newer_than=False),
         )
+    unrated_queryset = unrated_queryset[:COMFORT_LIBRARY_ENTRY_LIMIT]
+
+    rated_queryset = list(rated_queryset)
+    unrated_queryset = list(unrated_queryset)
+    preload_tv_activity_dates(rated_queryset + unrated_queryset)
 
     rated_entries = []
     for entry in rated_queryset:
@@ -254,9 +278,19 @@ def _comfort_candidates(
             )
             for entry in entries
         ]
-        strong_phase_entries = [entry for entry, evidence in scored_entries if evidence >= COMFORT_PHASE_EVIDENCE_THRESHOLD]
-        medium_phase_entries = [entry for entry, evidence in scored_entries if 0.0 < evidence < COMFORT_PHASE_EVIDENCE_THRESHOLD]
-        weak_phase_entries = [entry for entry, evidence in scored_entries if evidence <= 0.0]
+        strong_phase_entries = [
+            entry
+            for entry, evidence in scored_entries
+            if evidence >= COMFORT_PHASE_EVIDENCE_THRESHOLD
+        ]
+        medium_phase_entries = [
+            entry
+            for entry, evidence in scored_entries
+            if 0.0 < evidence < COMFORT_PHASE_EVIDENCE_THRESHOLD
+        ]
+        weak_phase_entries = [
+            entry for entry, evidence in scored_entries if evidence <= 0.0
+        ]
         phase_entries = strong_phase_entries + medium_phase_entries
         if phase_entries:
             weak_backfill_limit = min(
@@ -368,7 +402,9 @@ def _top_picks_provider_pool(
     return _hydrate_movie_candidates_from_items(provider_pool)
 
 
-def _top_picks_candidates(user, media_type: str, row_key: str, profile_payload: dict) -> list[CandidateItem]:
+def _top_picks_candidates(
+    user, media_type: str, row_key: str, profile_payload: dict
+) -> list[CandidateItem]:
     candidates = _planning_candidates(
         user,
         media_type,
@@ -400,7 +436,9 @@ def _top_picks_candidates(user, media_type: str, row_key: str, profile_payload: 
             6,
         )
 
-    _apply_top_picks_confidence(candidates, profile_payload, media_type=media_type, user=user)
+    _apply_top_picks_confidence(
+        candidates, profile_payload, media_type=media_type, user=user
+    )
     if media_type == MediaTypes.MOVIE.value:
         _apply_top_picks_source_quotas(candidates)
     return candidates
@@ -496,7 +534,7 @@ def _apply_top_picks_source_quotas(
         for candidate in refill:
             candidate.score_breakdown["source_quota_action"] = "relaxed_fill"
         selected.extend(refill)
-        deferred = deferred[len(refill):]
+        deferred = deferred[len(refill) :]
 
     for candidate in deferred:
         if candidate.score_breakdown.get("source_quota_action") != "deferred":
@@ -520,7 +558,9 @@ def _apply_top_picks_confidence(
     )
 
 
-def _apply_wildcard_novelty(candidates: list[CandidateItem], profile_payload: dict) -> list[CandidateItem]:
+def _apply_wildcard_novelty(
+    candidates: list[CandidateItem], profile_payload: dict
+) -> list[CandidateItem]:
     if not candidates:
         return candidates
 
@@ -539,9 +579,15 @@ def _apply_wildcard_novelty(candidates: list[CandidateItem], profile_payload: di
 
     for candidate in candidates:
         base_score = float(candidate.final_score or 0.0)
-        genre_keys = [str(genre).strip().lower() for genre in (candidate.genres or []) if str(genre).strip()]
+        genre_keys = [
+            str(genre).strip().lower()
+            for genre in (candidate.genres or [])
+            if str(genre).strip()
+        ]
         if genre_keys:
-            exposure_values = [recent_affinity.get(genre_key, 0.0) for genre_key in genre_keys]
+            exposure_values = [
+                recent_affinity.get(genre_key, 0.0) for genre_key in genre_keys
+            ]
             exposure = sum(exposure_values) / len(exposure_values)
         else:
             exposure = 0.5
@@ -568,7 +614,9 @@ def _apply_wildcard_novelty(candidates: list[CandidateItem], profile_payload: di
     return candidates
 
 
-def _wildcard_candidates(user, media_type: str, row_key: str, profile_payload: dict) -> list[CandidateItem]:
+def _wildcard_candidates(
+    user, media_type: str, row_key: str, profile_payload: dict
+) -> list[CandidateItem]:
     planning_candidates = _planning_candidates(
         user,
         media_type,
@@ -610,14 +658,16 @@ def _wildcard_candidates(user, media_type: str, row_key: str, profile_payload: d
     return _apply_wildcard_novelty(candidates, profile_payload)
 
 
-def _movie_night_candidates(user, media_type: str, *, row_key: str) -> list[CandidateItem]:
+def _movie_night_candidates(
+    user, media_type: str, *, row_key: str
+) -> list[CandidateItem]:
     candidates = _planning_candidates(
         user,
         media_type,
         row_key=row_key,
         source_reason="Short runtime planning pick",
     )
-    filtered = [
+    return [
         candidate
         for candidate in candidates
         if (
@@ -629,17 +679,18 @@ def _movie_night_candidates(user, media_type: str, *, row_key: str) -> list[Cand
             ).exists()
         )
     ]
-    return filtered
 
 
-def _short_runs_candidates(user, media_type: str, *, row_key: str) -> list[CandidateItem]:
+def _short_runs_candidates(
+    user, media_type: str, *, row_key: str
+) -> list[CandidateItem]:
     candidates = _planning_candidates(
         user,
         media_type,
         row_key=row_key,
         source_reason="Lower commitment planning pick",
     )
-    filtered = [
+    return [
         candidate
         for candidate in candidates
         if (
@@ -651,7 +702,6 @@ def _short_runs_candidates(user, media_type: str, *, row_key: str) -> list[Candi
             ).exists()
         )
     ]
-    return filtered
 
 
 def _build_row_candidates(
@@ -712,13 +762,25 @@ def _build_row_candidates(
         score_candidates(candidates, profile_payload)
         return candidates
 
-    if row_key in {"because_you_watched", "because_you_liked", "because_you_played", "because_you_read", "because_you_listen"}:
+    if row_key in {
+        "because_you_watched",
+        "because_you_liked",
+        "because_you_played",
+        "because_you_read",
+        "because_you_listen",
+    }:
         return _related_row_candidates(user, media_type, row_key, profile_payload)
 
     if row_key in {"hidden_gems_genres", "genre_spotlight"}:
         return _genre_discovery_candidates(media_type, row_key, profile_payload)
 
-    if row_key in {"comfort_picks", "comfort_binge", "comfort", "comfort_replay", "comfort_rewatches"}:
+    if row_key in {
+        "comfort_picks",
+        "comfort_binge",
+        "comfort",
+        "comfort_replay",
+        "comfort_rewatches",
+    }:
         older = 180 if media_type == MediaTypes.TV.value else 90
         candidates: list[CandidateItem] = []
         seen: set[tuple[str, str, str]] = set()
@@ -772,7 +834,11 @@ def _build_row_candidates(
 
 
 def _blocked_statuses_for_row(row_definition: RowDefinition) -> set[str] | None:
-    if row_definition.key in {"trending_right_now", "all_time_greats_unseen", "coming_soon"}:
+    if row_definition.key in {
+        "trending_right_now",
+        "all_time_greats_unseen",
+        "coming_soon",
+    }:
         return {
             Status.COMPLETED.value,
             Status.DROPPED.value,
@@ -781,19 +847,79 @@ def _blocked_statuses_for_row(row_definition: RowDefinition) -> set[str] | None:
     return None
 
 
-def _queue_stale_refresh(user_id: int, media_type: str, row_key: str, show_more: bool) -> None:
-    lock_key = f"discover:refresh:{user_id}:{media_type}:{row_key}:{int(show_more)}"
+# Set while a refresh task re-renders the tab after rebuilding its own rows.
+# That render meets every other stale row; queueing a refresh for each chained
+# task after task (286 in four hours of one log), and a row that cannot be
+# rebuilt kept the chain alive. Page views still queue stale rows.
+_stale_refresh_suppressed: ContextVar[bool] = ContextVar(
+    "discover_stale_refresh_suppressed", default=False
+)
+
+
+@contextlib.contextmanager
+def stale_refresh_suppressed():
+    """Render rows without queueing refreshes for the stale ones met."""
+    token = _stale_refresh_suppressed.set(True)
+    try:
+        yield
+    finally:
+        _stale_refresh_suppressed.reset(token)
+
+
+def row_refresh_lock_key(
+    user_id: int, media_type: str, row_key: str, show_more: bool
+) -> str:
+    """Return the key that holds one queued row refresh."""
+    return f"discover:refresh:{user_id}:{media_type}:{row_key}:{int(show_more)}"
+
+
+def rows_pending_key(user_id: int, media_type: str, show_more: bool) -> str:
+    """Return the counter of row refreshes queued for one tab."""
+    return f"discover:rows_pending:{user_id}:{media_type}:{int(show_more)}"
+
+
+def release_row_refresh(
+    user_id: int, media_type: str, row_keys: list[str], show_more: bool
+) -> bool:
+    """Drop a finished row refresh's locks; True if it was the tab's last one queued.
+
+    Only the last of several queued row refreshes needs to rebuild the tab: the
+    others would each assemble the whole tab from the same rows again.
+    """
+    for row_key in row_keys:
+        cache.delete(row_refresh_lock_key(user_id, media_type, row_key, show_more))
+    pending_key = rows_pending_key(user_id, media_type, show_more)
+    try:
+        remaining = cache.decr(pending_key)
+    except ValueError:
+        return True
+    if remaining is None or remaining <= 0:
+        cache.delete(pending_key)
+        return True
+    return False
+
+
+def _queue_stale_refresh(
+    user_id: int, media_type: str, row_key: str, show_more: bool
+) -> None:
+    if _stale_refresh_suppressed.get():
+        return
+    lock_key = row_refresh_lock_key(user_id, media_type, row_key, show_more)
     if not cache.add(lock_key, True, timeout=STALE_REFRESH_LOCK_SECONDS):
         return
 
     if getattr(settings, "TESTING", False):
         return
 
+    pending_key = rows_pending_key(user_id, media_type, show_more)
+    cache.add(pending_key, 0, timeout=STALE_REFRESH_LOCK_SECONDS)
     try:
-        from app.tasks import refresh_discover_rows  # noqa: PLC0415
+        from app.tasks import refresh_discover_rows
 
+        cache.incr(pending_key)
         refresh_discover_rows.delay(user_id, media_type, [row_key], show_more=show_more)
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
+        release_row_refresh(user_id, media_type, [row_key], show_more)
         logger.warning(
             "discover_refresh_enqueue_failed user_id=%s media_type=%s row_key=%s error=%s",
             user_id,
@@ -813,9 +939,14 @@ def _prepare_row_from_candidates(
     defer_artwork: bool = False,
     show_more: bool = False,
     source_state: str = "live",
+    blocked_statuses_override: set[str] | None = None,
 ) -> tuple[RowResult, bool]:
     if not row_definition.allow_tracked:
-        blocked_statuses = _blocked_statuses_for_row(row_definition)
+        blocked_statuses = (
+            blocked_statuses_override
+            if blocked_statuses_override is not None
+            else _blocked_statuses_for_row(row_definition)
+        )
         tracked_keys = (
             get_tracked_keys_by_media_type(
                 user,
@@ -862,8 +993,7 @@ def _prepare_row_from_candidates(
     if is_trakt_ranked_row:
         if defer_artwork:
             needs_async_artwork_refresh = any(
-                _is_missing_image(item)
-                for item in candidates[:artwork_hydration_limit]
+                _is_missing_image(item) for item in candidates[:artwork_hydration_limit]
             )
         else:
             _hydrate_trakt_ranked_artwork(
@@ -909,7 +1039,12 @@ def _prepare_row_from_candidates(
     return row, needs_async_artwork_refresh
 
 
-def _trakt_row_provider_fallback_candidates(media_type: str, row_key: str) -> list[CandidateItem]:
+def _trakt_row_provider_fallback_candidates(
+    media_type: str, row_key: str
+) -> list[CandidateItem]:
+    if media_type == MediaTypes.ANIME.value:
+        return _mal_anime_fallback_candidates(row_key)
+
     if media_type not in {MediaTypes.MOVIE.value, MediaTypes.TV.value}:
         return []
 
@@ -977,7 +1112,12 @@ def _build_and_cache_row(
     started = timezone.now()
     build_activity_version = tab_cache.get_activity_version(user.id, media_type)
     row_meta: dict | None = None
-    if media_type in {MediaTypes.MOVIE.value, MediaTypes.TV.value, MediaTypes.ANIME.value} and row_definition.key in {
+    source_state = "live"
+    if media_type in {
+        MediaTypes.MOVIE.value,
+        MediaTypes.TV.value,
+        MediaTypes.ANIME.value,
+    } and row_definition.key in {
         "all_time_greats_unseen",
         "coming_soon",
     }:
@@ -996,10 +1136,23 @@ def _build_and_cache_row(
                 seen_identities=seen_identities,
             )
     else:
-        candidates = _build_row_candidates(user, media_type, row_definition, profile_payload)
+        candidates = _build_row_candidates(
+            user, media_type, row_definition, profile_payload
+        )
+
+    if not candidates and row_definition.source == "trakt":
+        fallback_candidates = _trakt_row_provider_fallback_candidates(
+            media_type,
+            row_definition.key,
+        )
+        if fallback_candidates:
+            candidates = fallback_candidates
+            source_state = "fallback"
 
     row_meta = dict(row_meta or {})
-    required_schema_version = _required_row_cache_schema_version(media_type, row_definition.key)
+    required_schema_version = _required_row_cache_schema_version(
+        media_type, row_definition.key
+    )
     if required_schema_version is not None:
         row_meta[ROW_CACHE_SCHEMA_META_KEY] = required_schema_version
     row_meta[ROW_CACHE_ACTIVITY_VERSION_META_KEY] = build_activity_version
@@ -1012,7 +1165,7 @@ def _build_and_cache_row(
         candidates,
         defer_artwork=defer_artwork,
         show_more=show_more,
-        source_state="live",
+        source_state=source_state,
     )
 
     cache_payload = row.to_dict()
@@ -1070,9 +1223,10 @@ def _allow_empty_row(
 ) -> bool:
     if row_key in ALWAYS_VISIBLE_EMPTY_ROWS:
         return True
-    if media_type in (FIVE_ROW_MEDIA_TYPES - {MediaTypes.MOVIE.value}) and row_key in FIVE_ROW_DISCOVER_KEYS:
-        return True
-    return False
+    return bool(
+        media_type in FIVE_ROW_MEDIA_TYPES - {MediaTypes.MOVIE.value}
+        and row_key in FIVE_ROW_DISCOVER_KEYS
+    )
 
 
 def _media_type_readable_plural(media_type: str) -> str:
@@ -1132,9 +1286,7 @@ def _compose_all_media_rows(
         )
         if not show_more:
             component_rows = [
-                row
-                for row in component_rows
-                if row.key == "trending_right_now"
+                row for row in component_rows if row.key == "trending_right_now"
             ]
 
         row_prefix = _media_type_readable_plural(component_media_type)
@@ -1193,11 +1345,21 @@ def get_discover_rows(
         is_stale = False
         row: RowResult | None = None
         try:
-            cached_payload, is_stale = cache_repo.get_row_cache(user.id, media_type, row_definition.key)
+            cached_payload, is_stale = cache_repo.get_row_cache(
+                user.id, media_type, row_definition.key
+            )
 
             if cached_payload:
                 row = RowResult.from_dict(cached_payload)
-                if row.source != row_definition.source or not _is_row_cache_compatible(media_type, row_definition, cached_payload) or not _row_cache_matches_activity_version(user.id, media_type, cached_payload):
+                if (
+                    row.source != row_definition.source
+                    or not _is_row_cache_compatible(
+                        media_type, row_definition, cached_payload
+                    )
+                    or not _row_cache_matches_activity_version(
+                        user.id, media_type, cached_payload
+                    )
+                ):
                     row = _build_and_cache_row(
                         user,
                         media_type,
@@ -1210,7 +1372,9 @@ def get_discover_rows(
                 elif _row_requires_artwork_rebuild(media_type, row_definition, row):
                     if defer_artwork:
                         row = _apply_row_definition_metadata(row, row_definition)
-                        _queue_stale_refresh(user.id, media_type, row_definition.key, show_more)
+                        _queue_stale_refresh(
+                            user.id, media_type, row_definition.key, show_more
+                        )
                     else:
                         row = _build_and_cache_row(
                             user,
@@ -1226,7 +1390,9 @@ def get_discover_rows(
                     if is_stale:
                         row.is_stale = True
                         row.source_state = "stale"
-                        _queue_stale_refresh(user.id, media_type, row_definition.key, show_more)
+                        _queue_stale_refresh(
+                            user.id, media_type, row_definition.key, show_more
+                        )
                     else:
                         row.source_state = "cache"
             else:
@@ -1240,13 +1406,12 @@ def get_discover_rows(
                     show_more=show_more,
                 )
 
-        except Exception as error:  # noqa: BLE001
+        except Exception:
             logger.exception(
-                "discover_row_failed user_id=%s media_type=%s row_key=%s error=%s",
+                "discover_row_failed user_id=%s media_type=%s row_key=%s error=",
                 user.id,
                 media_type,
                 row_definition.key,
-                error,
             )
             row = _build_row_error_fallback(
                 user,
@@ -1304,13 +1469,18 @@ def get_discover_rows(
         all_time_row = row_definition.key == "all_time_greats_unseen"
         if all_time_row:
             deduped_items = dedupe_candidates(row.items, seen_identities=set())
-            seen_identities.update(item.identity() for item in deduped_items[:MAX_ITEMS_PER_ROW])
+            seen_identities.update(
+                item.identity() for item in deduped_items[:MAX_ITEMS_PER_ROW]
+            )
         else:
-            deduped_items = dedupe_candidates(row.items, seen_identities=seen_identities)
+            deduped_items = dedupe_candidates(
+                row.items, seen_identities=seen_identities
+            )
         dedupe_removed = before_count - len(deduped_items)
 
         if (
-            media_type in {MediaTypes.MOVIE.value, MediaTypes.TV.value, MediaTypes.ANIME.value}
+            media_type
+            in {MediaTypes.MOVIE.value, MediaTypes.TV.value, MediaTypes.ANIME.value}
             and row_definition.key == "coming_soon"
             and len(deduped_items) < MAX_ITEMS_PER_ROW
             and dedupe_removed > 0
@@ -1327,7 +1497,9 @@ def get_discover_rows(
                 show_more=show_more,
             )
             before_count = len(row.items)
-            deduped_items = dedupe_candidates(row.items, seen_identities=seen_identities)
+            deduped_items = dedupe_candidates(
+                row.items, seen_identities=seen_identities
+            )
             dedupe_removed = before_count - len(deduped_items)
 
         row.items = deduped_items[:MAX_ITEMS_PER_ROW]
@@ -1385,6 +1557,48 @@ def get_discover_rows(
     return rows
 
 
+def get_live_row(
+    user,
+    media_type: str,
+    row_key: str,
+    *,
+    skip_planning: bool = True,
+) -> RowResult | None:
+    """Build a single Discover row live, bypassing the shared row cache.
+
+    Used by callers that need per-request filtering (e.g. optionally including
+    Planning items) the cached row can't safely provide, since that cache is
+    shared with the main Discover page and isn't keyed by such filters.
+    """
+    media_type = _coerce_media_type(media_type)
+    row_definition = next(
+        (row for row in get_rows(media_type) if row.key == row_key),
+        None,
+    )
+    if row_definition is None:
+        return None
+
+    profile_payload = get_or_compute_taste_profile(user, media_type)
+    candidates = _build_row_candidates(
+        user, media_type, row_definition, profile_payload
+    )
+
+    blocked_statuses_override = None
+    if not skip_planning:
+        blocked_statuses_override = {Status.COMPLETED.value, Status.DROPPED.value}
+
+    row, _needs_async_artwork_refresh = _prepare_row_from_candidates(
+        user,
+        media_type,
+        row_definition,
+        profile_payload,
+        candidates,
+        blocked_statuses_override=blocked_statuses_override,
+    )
+    row.items = dedupe_candidates(row.items, seen_identities=set())[:MAX_ITEMS_PER_ROW]
+    return row
+
+
 def get_discover_payload(
     user,
     media_type: str,
@@ -1409,12 +1623,13 @@ def get_discover_payload(
     )
 
 
-def refresh_rows_for_user(user, media_type: str, row_keys: list[str], *, show_more: bool = False) -> int:
+def refresh_rows_for_user(
+    user, media_type: str, row_keys: list[str], *, show_more: bool = False
+) -> int:
     """Rebuild selected rows and refresh row cache entries."""
     media_type = _coerce_media_type(media_type)
-    if (
-        media_type != ALL_MEDIA_KEY
-        and not tab_cache.media_type_is_enabled_for_user(user, media_type)
+    if media_type != ALL_MEDIA_KEY and not tab_cache.media_type_is_enabled_for_user(
+        user, media_type
     ):
         logger.debug(
             "discover_row_refresh_skipped user_id=%s media_type=%s reason=disabled_media_type",

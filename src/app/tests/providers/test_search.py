@@ -2,7 +2,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.core.cache import cache
-from django.test import TestCase
+from django.test import TestCase, override_settings, tag
 
 from app.models import MediaTypes, Sources
 from app.providers import (
@@ -25,6 +25,7 @@ class Search(TestCase):
         """Clear the cache so search tests do not share IGDB responses."""
         cache.clear()
 
+    @tag("network")
     def test_anime(self):
         """Test the search method for anime.
 
@@ -37,12 +38,14 @@ class Search(TestCase):
         for anime in response["results"]:
             self.assertTrue(all(key in anime for key in required_keys))
 
+    @tag("network")
     def test_anime_not_found(self):
         """Test the search method for anime with no results."""
         response = mal.search(MediaTypes.ANIME.value, "q", 1)
 
         self.assertEqual(response["results"], [])
 
+    @tag("network")
     def test_mangaupdates(self):
         """Test the search method for manga.
 
@@ -54,12 +57,14 @@ class Search(TestCase):
         for manga in response["results"]:
             self.assertTrue(all(key in manga for key in required_keys))
 
+    @tag("network")
     def test_manga_not_found(self):
         """Test the search method for manga with no results."""
         response = mangaupdates.search("", 1)
 
         self.assertEqual(response["results"], [])
 
+    @tag("network")
     def test_tv(self):
         """Test the search method for TV shows.
 
@@ -71,6 +76,7 @@ class Search(TestCase):
         for tv in response["results"]:
             self.assertTrue(all(key in tv for key in required_keys))
 
+    @tag("network")
     def test_games(self):
         """Test the search method for games.
 
@@ -157,6 +163,7 @@ class Search(TestCase):
         )
         mock_get_access_token.assert_called_once()
 
+    @tag("network")
     def test_books(self):
         """Test the search method for books.
 
@@ -168,6 +175,7 @@ class Search(TestCase):
         for book in response["results"]:
             self.assertTrue(all(key in book for key in required_keys))
 
+    @tag("network")
     def test_comics(self):
         """Test the search method for comics.
 
@@ -179,6 +187,7 @@ class Search(TestCase):
         for comic in response["results"]:
             self.assertTrue(all(key in comic for key in required_keys))
 
+    @tag("network")
     def test_hardcover(self):
         """Test the search method for books from Hardcover.
 
@@ -192,10 +201,84 @@ class Search(TestCase):
         for book in response["results"]:
             self.assertTrue(all(key in book for key in required_keys))
 
+    @tag("network")
     def test_hardcover_not_found(self):
         """Test the search method for books from Hardcover with no results."""
         response = hardcover.search("xjkqzptmvnsieurytowahdbfglc", 1)
         self.assertEqual(response["results"], [])
+
+    @override_settings(MU_NSFW=False, MAL_NSFW=False)
+    @patch("app.providers.mangaupdates.services.api_request")
+    def test_mangaupdates_filter_applied_when_both_flags_off(self, mock_api_request):
+        """With MU_NSFW off, the adult genres are excluded."""
+        cache.clear()
+        mock_api_request.return_value = {"results": [], "total_hits": 0}
+
+        mangaupdates.search("one piece", 1)
+
+        params = mock_api_request.call_args.kwargs["params"]
+        self.assertEqual(params["exclude_genre"], ["Adult", "Hentai", "Doujinshi"])
+
+    @override_settings(MU_NSFW=False, MAL_NSFW=True)
+    @patch("app.providers.mangaupdates.services.api_request")
+    def test_mangaupdates_nsfw_filter_uses_its_own_setting(self, mock_api_request):
+        """MAL_NSFW must not loosen MangaUpdates.
+
+        This is the case the bug got wrong: the provider used to read
+        MAL_NSFW, so an anime setting silently un-filtered manga search.
+        """
+        cache.clear()
+        mock_api_request.return_value = {"results": [], "total_hits": 0}
+
+        mangaupdates.search("one piece", 1)
+
+        params = mock_api_request.call_args.kwargs["params"]
+        self.assertEqual(params["exclude_genre"], ["Adult", "Hentai", "Doujinshi"])
+
+    @override_settings(MU_NSFW=True, MAL_NSFW=False)
+    @patch("app.providers.mangaupdates.services.api_request")
+    def test_mangaupdates_nsfw_setting_drops_the_filter(self, mock_api_request):
+        """Turning MU_NSFW on must lift the exclusion list."""
+        cache.clear()
+        mock_api_request.return_value = {"results": [], "total_hits": 0}
+
+        mangaupdates.search("one piece", 1)
+
+        params = mock_api_request.call_args.kwargs["params"]
+        self.assertNotIn("exclude_genre", params)
+
+    @override_settings(MU_NSFW=False, MAL_NSFW=False)
+    @patch("app.providers.mangaupdates.services.api_request")
+    def test_mangaupdates_nsfw_cached_under_its_own_key(self, mock_api_request):
+        """Both flag states must be cached separately, not share one entry.
+
+        A shared key would let a search made under one MU_NSFW value satisfy a
+        request made under the other for the rest of the cache lifetime.
+        """
+        cache.clear()
+        mock_api_request.return_value = {"results": [], "total_hits": 0}
+
+        with override_settings(MU_NSFW=False):
+            mangaupdates.search("shared-key-probe", 1)
+        with override_settings(MU_NSFW=True):
+            mangaupdates.search("shared-key-probe", 1)
+
+        self.assertEqual(mock_api_request.call_count, 2)
+
+    @override_settings(MU_NSFW=False, MAL_NSFW=False)
+    @patch("app.providers.mangaupdates.services.api_request")
+    def test_mangaupdates_same_flag_state_reuses_the_cache(self, mock_api_request):
+        """One flag state must still hit its own cache, so the fix costs no calls.
+
+        Guards over-invalidation, not the flag bug itself.
+        """
+        cache.clear()
+        mock_api_request.return_value = {"results": [], "total_hits": 0}
+
+        mangaupdates.search("same-state-probe", 1)
+        mangaupdates.search("same-state-probe", 1)
+
+        self.assertEqual(mock_api_request.call_count, 1)
 
     @patch("app.providers.hardcover.services.api_request")
     def test_hardcover_title_query_is_capped(self, mock_api_request):
@@ -369,7 +452,7 @@ class SearchById(TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result["results"][0]["title"], "Dune")
-        mock_book.assert_called_once_with(42)
+        mock_book.assert_called_once_with(42, user=None)
 
     def test_non_id_title_query_returns_none(self):
         """search_by_id returns None for a plain-text (non-ID) query."""
@@ -387,15 +470,88 @@ class SearchById(TestCase):
             result = services.search_by_id(MediaTypes.MOVIE.value, "99999999")
         self.assertIsNone(result)
 
+    @patch("app.providers.tmdb.search")
     @patch("app.providers.tmdb.movie")
-    def test_search_uses_id_lookup_on_page_1(self, mock_movie):
-        """services.search() returns ID-lookup result on page 1 for a numeric query."""
+    def test_search_uses_id_lookup_on_page_1(self, mock_movie, mock_tmdb_search):
+        """services.search() includes the ID-lookup result on page 1 for a numeric query."""
         mock_movie.return_value = self._make_metadata(
             MediaTypes.MOVIE.value, Sources.TMDB.value, "238", "The Godfather"
         )
+        mock_tmdb_search.return_value = {
+            "page": 1,
+            "total_results": 0,
+            "total_pages": 1,
+            "results": [],
+        }
         result = services.search(MediaTypes.MOVIE.value, "238", 1, Sources.TMDB.value)
         self.assertEqual(result["total_results"], 1)
         self.assertEqual(result["results"][0]["media_id"], "238")
+
+    @patch("app.providers.tmdb.search")
+    @patch("app.providers.tmdb.tv")
+    def test_search_merges_id_lookup_with_numeric_title_match(
+        self, mock_tv, mock_tmdb_search
+    ):
+        """A numeric title match isn't hidden behind an unrelated numeric ID.
+
+        Regression test: searching "1883" used to return only TMDB tv/1883
+        ("Dog the Bounty Hunter"), completely hiding the real show "1883"
+        (TMDB id 118357) that a text search for the same query would find.
+        """
+        mock_tv.return_value = self._make_metadata(
+            MediaTypes.TV.value, Sources.TMDB.value, "1883", "Dog the Bounty Hunter"
+        )
+        mock_tmdb_search.return_value = {
+            "page": 1,
+            "total_results": 1,
+            "total_pages": 1,
+            "results": [
+                {
+                    "media_id": "118357",
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.TV.value,
+                    "title": "1883",
+                    "original_title": "1883",
+                    "localized_title": "1883",
+                    "image": "http://example.com/img.jpg",
+                }
+            ],
+        }
+        result = services.search(MediaTypes.TV.value, "1883", 1, Sources.TMDB.value)
+
+        self.assertEqual(result["total_results"], 2)
+        media_ids = [item["media_id"] for item in result["results"]]
+        self.assertEqual(media_ids, ["1883", "118357"])
+
+    @patch("app.providers.tmdb.search")
+    @patch("app.providers.tmdb.movie")
+    def test_search_id_lookup_does_not_duplicate_text_search_match(
+        self, mock_movie, mock_tmdb_search
+    ):
+        """If the ID match is also returned by the text search, it isn't duplicated."""
+        mock_movie.return_value = self._make_metadata(
+            MediaTypes.MOVIE.value, Sources.TMDB.value, "238", "The Godfather"
+        )
+        mock_tmdb_search.return_value = {
+            "page": 1,
+            "total_results": 1,
+            "total_pages": 1,
+            "results": [
+                {
+                    "media_id": "238",
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "title": "The Godfather",
+                    "original_title": "The Godfather",
+                    "localized_title": "The Godfather",
+                    "image": "http://example.com/img.jpg",
+                }
+            ],
+        }
+        result = services.search(MediaTypes.MOVIE.value, "238", 1, Sources.TMDB.value)
+
+        self.assertEqual(result["total_results"], 1)
+        self.assertEqual(len(result["results"]), 1)
 
     @patch("app.providers.tmdb.search")
     @patch("app.providers.tmdb.movie")

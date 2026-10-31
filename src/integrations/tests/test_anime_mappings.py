@@ -2,7 +2,7 @@ import json
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import Client, TestCase
+from django.test import Client, TestCase, tag
 from django.urls import reverse
 
 from integrations.webhooks import anime_mappings
@@ -10,6 +10,136 @@ from integrations.webhooks import anime_mappings
 
 class AnimeMappingsTests(TestCase):
     """Tests for AniBridge mapping resolution."""
+
+    def test_tmdb_episode_mapping_resolves_split_anime_season(self):
+        """Re:Zero TVDB S4E12 maps to the canonical TMDB S1E78."""
+        mapping_data = {
+            "tvdb_show:305089:s4": {
+                "tmdb_show:65942:s1": {"1-19": "67-85"},
+            },
+        }
+
+        self.assertEqual(
+            anime_mappings.get_tmdb_episode_mapping(
+                mapping_data,
+                65942,
+                4,
+                12,
+                tvdb_id=305089,
+            ),
+            (1, 78),
+        )
+
+    def test_tmdb_episode_mapping_rejects_other_target_shows(self):
+        """A mapping for another TMDB show cannot change show identity."""
+        mapping_data = {
+            "tvdb_show:305089:s4": {
+                "tmdb_show:99999:s1": {"1-19": "67-85"},
+            },
+        }
+
+        self.assertIsNone(
+            anime_mappings.get_tmdb_episode_mapping(
+                mapping_data,
+                65942,
+                4,
+                12,
+                tvdb_id=305089,
+            ),
+        )
+
+    def test_tmdb_episode_mapping_refuses_ambiguous_target_season(self):
+        """Identical ranges under two target seasons resolve to no mapping.
+
+        In the pinned graph ``tvdb_show:70900:s6`` maps onto both
+        ``tmdb_show:40424:s5`` and ``tmdb_show:40424:s6`` with ranges
+        ``{"1-4": "1-4"}``, so returning either would depend only on the JSON
+        key order.
+        """
+        mapping_data = {
+            "tvdb_show:70900:s6": {
+                "tmdb_show:40424:s5": {"1-4": "1-4"},
+                "tmdb_show:40424:s6": {"1-4": "1-4"},
+            },
+        }
+
+        self.assertIsNone(
+            anime_mappings.get_tmdb_episode_mapping(
+                mapping_data,
+                40424,
+                6,
+                3,
+                tvdb_id=70900,
+            ),
+        )
+
+    def test_tmdb_episode_mapping_only_uses_tvdb_sources(self):
+        """IMDb and TMDB source slices never name a target on their own.
+
+        The pinned graph has no ``imdb_show`` keys and no
+        ``tmdb_show -> tmdb_show`` pair, so without a TVDB id there is no
+        source to resolve from.
+        """
+        mapping_data = {
+            "imdb_show:tt5607616:s4": {
+                "tmdb_show:65942:s1": {"1-19": "67-85"},
+            },
+            "tmdb_show:65942:s4": {
+                "tmdb_show:65942:s1": {"1-19": "67-85"},
+            },
+        }
+
+        self.assertIsNone(
+            anime_mappings.get_tmdb_episode_mapping(mapping_data, 65942, 4, 12),
+        )
+
+    def test_tmdb_episode_mapping_pivots_through_a_shared_list_entry(self):
+        """Without a direct link, a shared AniList entry places the episode.
+
+        TVDB splits Medabots into S1 and S2 while TMDB keeps all 52 episodes in
+        S1, and the graph links the two only through AniList.
+        """
+        mapping_data = {
+            "tvdb_show:76906:s2": {"anilist:1138": {"1-26": "27-52"}},
+            "tmdb_show:888:s1": {"anilist:1138": {"1-52": "1-52"}},
+            "tmdb_show:888:s2": {"mal:4052": {"1-39": "1-39"}},
+        }
+
+        self.assertEqual(
+            anime_mappings.get_tmdb_episode_mapping(
+                mapping_data, 888, 2, 1, tvdb_id=76906,
+            ),
+            (1, 27),
+        )
+
+    def test_tmdb_episode_mapping_follows_joined_target_ranges(self):
+        """A comma joins one target sequence, so each episode still has one target."""
+        mapping_data = {
+            "tvdb_show:305089:s2": {
+                "tmdb_show:65942:s1": {"1-10": "26-30,32-36"},
+            },
+        }
+
+        self.assertEqual(
+            anime_mappings.get_tmdb_episode_mapping(
+                mapping_data, 65942, 2, 7, tvdb_id=305089,
+            ),
+            (1, 33),
+        )
+
+    def test_tmdb_episode_mapping_refuses_ratio_ranges(self):
+        """A ratio range sends one episode to several, so it moves nothing."""
+        mapping_data = {
+            "tvdb_show:305089:s2": {
+                "tmdb_show:65942:s1": {"1-5": "1-10|2"},
+            },
+        }
+
+        self.assertIsNone(
+            anime_mappings.get_tmdb_episode_mapping(
+                mapping_data, 65942, 2, 3, tvdb_id=305089,
+            ),
+        )
 
     def test_find_entries_for_mal_id_skips_malformed_target_descriptors(self):
         """Reverse lookup ignores malformed target descriptors."""
@@ -25,6 +155,7 @@ class AnimeMappingsTests(TestCase):
             [{"tvdb_id": "74796", "season_number": 17, "episode_offset": 13}],
         )
 
+    @tag("network")
     def test_fetch_mapping_data_downloads_mapping_data(self):
         """Test mapping data downloads from AniBridge."""
         mapping_data = anime_mappings.fetch_mapping_data()
@@ -32,6 +163,7 @@ class AnimeMappingsTests(TestCase):
         self.assertIn("tvdb_show:74796:s17", mapping_data)
         self.assertIn("anidb:3651:R", mapping_data)
 
+    @tag("network")
     def test_bleach_thousand_year_blood_war_part_two(self):
         """Test Bleach S17E14 maps to Thousand-Year Blood War part two."""
         mal_id, episode_number = anime_mappings.get_mal_id_from_tvdb(
@@ -44,6 +176,7 @@ class AnimeMappingsTests(TestCase):
         self.assertEqual(mal_id, 53998)
         self.assertEqual(episode_number, 1)
 
+    @tag("network")
     def test_bleach_season_one_maps_directly(self):
         """Test Bleach S01E09 maps directly to original Bleach progress."""
         mal_id, episode_number = anime_mappings.get_mal_id_from_tvdb(
@@ -84,18 +217,25 @@ class AnimeMappingsWebhookPayloadTests(TestCase):
         self.user = get_user_model().objects.create_superuser(**self.credentials)
 
     @patch("integrations.webhooks.base.BaseWebhookProcessor._handle_anime")
-    @patch("integrations.webhooks.base.tvdb_provider.episode")
+    @patch("app.providers.tmdb.tv_with_seasons")
+    @patch("app.providers.tmdb.find")
     def test_jellyfin_bleach_payload_uses_tvdb_mapping(
         self,
-        mock_tvdb_episode,
+        mock_tmdb_find,
+        mock_tv_with_seasons,
         mock_handle_anime,
     ):
         """Test Jellyfin TVDB payload maps Bleach S17E14 to MAL episode 1."""
-        mock_tvdb_episode.return_value = {
-            "episode_id": 999,
-            "series_id": 74796,
-            "season_number": 17,
-            "episode_number": 14,
+        # The TMDB find API resolves the episode-level TVDB id to the show.
+        mock_tmdb_find.return_value = {
+            "tv_episode_results": [
+                {"show_id": 30984, "season_number": 17, "episode_number": 14},
+            ],
+        }
+        mock_tv_with_seasons.return_value = {
+            "media_id": "30984",
+            "title": "Bleach",
+            "tvdb_id": 74796,
         }
         payload = {
             "Event": "Stop",
@@ -119,7 +259,7 @@ class AnimeMappingsWebhookPayloadTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        mock_tvdb_episode.assert_called_once_with(999)
+        mock_tmdb_find.assert_called_with("999", "tvdb_id")
         mock_handle_anime.assert_called_once_with(53998, 1, payload, self.user)
 
     @patch("integrations.webhooks.base.BaseWebhookProcessor._handle_anime")

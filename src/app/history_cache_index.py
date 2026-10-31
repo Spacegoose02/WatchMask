@@ -13,18 +13,37 @@ from django.utils import timezone
 from app.history_cache_serialization import _serialize_history_day
 from app.history_cache_utils import (
     HISTORY_CACHE_TIMEOUT,
+    HISTORY_CACHE_VERSION,
     HISTORY_DAY_CACHE_TIMEOUT,
     _cache_key,
+    _current_history_era,
     _day_cache_key,
     _day_key_for_date,
     _day_key_from_value,
     _localize_datetime,
     _music_history_user_q,
     _normalize_logging_style,
+    _touch_history_era,
+    _typed_history_index_key,
+    _typed_history_index_registry_key,
+    expand_history_media_types,
 )
-from app.models import BoardGame, Episode, Game, Movie
+from app.history_entry_builders import flat_anime_episode_watches
+from app.models import (
+    Anime,
+    BoardGame,
+    Book,
+    Comic,
+    Episode,
+    Game,
+    Manga,
+    Movie,
+    VideoPlay,
+)
 
 logger = logging.getLogger(__name__)
+
+HISTORY_SHARED_DAYS_TIMEOUT = 120
 
 
 def _add_days(days_set, days_iterable):
@@ -36,107 +55,330 @@ def _add_days(days_set, days_iterable):
     return added
 
 
-def build_history_index(user, logging_style_override=None):
-    """Build an ordered list of active history days for a user."""
-    build_start = time.perf_counter()
-    logging_style = _normalize_logging_style(logging_style_override, user)
+def _build_shared_history_days(user, requested_media_types):
+    """Return the days both logging styles index, and the per-type counts.
+
+    Games and board games are the only types whose days depend on the style.
+    """
+    include_episode = requested_media_types is None or "episode" in requested_media_types
+    include_movie = requested_media_types is None or "movie" in requested_media_types
+    include_music = requested_media_types is None or "music" in requested_media_types
+    include_podcast = requested_media_types is None or "podcast" in requested_media_types
+    include_video = requested_media_types is None or "video" in requested_media_types
     days = set()
 
-    episode_days = Episode.objects.filter(
-        related_season__user=user,
-        end_date__isnull=False,
-    ).annotate(
-        day=TruncDate("end_date"),
-    ).values_list("day", flat=True).distinct()
+    episode_days = (
+        Episode.all_objects.filter(
+            related_season__user=user,
+            end_date__isnull=False,
+        )
+        .annotate(
+            day=TruncDate("end_date"),
+        )
+        .order_by()
+        .values_list("day", flat=True)
+        .distinct()
+    ) if include_episode else []
+    # An open play is indexed on the day it started, as a movie is.
+    episode_start_days = (
+        Episode.all_objects.filter(
+            related_season__user=user,
+            end_date__isnull=True,
+            start_date__isnull=False,
+        )
+        .annotate(
+            day=TruncDate("start_date"),
+        )
+        .order_by()
+        .values_list("day", flat=True)
+        .distinct()
+    ) if include_episode else []
     episode_count = _add_days(days, episode_days)
+    episode_count += _add_days(days, episode_start_days)
 
-    movie_qs = Movie.objects.filter(user=user).filter(
-        models.Q(end_date__isnull=False) | models.Q(start_date__isnull=False),
+    movie_qs = Movie.objects.none()
+    if include_movie:
+        movie_qs = Movie.objects.filter(user=user).filter(
+            models.Q(end_date__isnull=False) | models.Q(start_date__isnull=False),
+        )
+    movie_end_days = (
+        movie_qs.filter(
+            end_date__isnull=False,
+        )
+        .annotate(
+            day=TruncDate("end_date"),
+        )
+        .order_by()
+        .values_list("day", flat=True)
+        .distinct()
     )
-    movie_end_days = movie_qs.filter(
-        end_date__isnull=False,
-    ).annotate(
-        day=TruncDate("end_date"),
-    ).values_list("day", flat=True).distinct()
-    movie_start_days = movie_qs.filter(
-        end_date__isnull=True,
-        start_date__isnull=False,
-    ).annotate(
-        day=TruncDate("start_date"),
-    ).values_list("day", flat=True).distinct()
+    movie_start_days = (
+        movie_qs.filter(
+            end_date__isnull=True,
+            start_date__isnull=False,
+        )
+        .annotate(
+            day=TruncDate("start_date"),
+        )
+        .order_by()
+        .values_list("day", flat=True)
+        .distinct()
+    )
     movie_count = _add_days(days, movie_end_days)
     movie_count += _add_days(days, movie_start_days)
 
-    HistoricalMusic = apps.get_model("app", "HistoricalMusic")
-    music_days = HistoricalMusic.objects.filter(
-        _music_history_user_q(user),
-        end_date__isnull=False,
-    ).annotate(
-        day=TruncDate("end_date"),
-    ).values_list("day", flat=True).distinct()
+    # Reading (books, comics, manga) and flat anime. These are rendered by
+    # build_history_day() in exactly this shape, so they have to be indexed
+    # here too - a day whose only activity is a finished book is otherwise
+    # never asked for, and the read silently never appears in history.
+    reading_count = 0
+    for model, media_type in (
+        (Book, "book"),
+        (Comic, "comic"),
+        (Manga, "manga"),
+        (Anime, "anime"),
+    ):
+        if not (
+            requested_media_types is None or media_type in requested_media_types
+        ):
+            continue
+        if model is Anime:
+            # Flat anime episodes are dated by the entry's change log, so the
+            # days come from the same expansion the day builder renders.
+            anime_records = list(
+                Anime.objects.filter(user=user).only(
+                    "id",
+                    "progress",
+                    "start_date",
+                    "end_date",
+                ),
+            )
+            episode_watches = flat_anime_episode_watches(anime_records)
+            anime_days = set()
+            for record in anime_records:
+                watches = episode_watches.get(record.id)
+                if watches:
+                    anime_days.update(
+                        _localize_datetime(watched_at).date()
+                        for _number, watched_at in watches
+                    )
+                elif record.end_date or record.start_date:
+                    anime_days.add(
+                        _localize_datetime(record.end_date or record.start_date).date(),
+                    )
+            reading_count += _add_days(days, anime_days)
+            continue
+        reading_qs = model.objects.filter(user=user)
+        reading_end_days = (
+            reading_qs.filter(end_date__isnull=False)
+            .annotate(day=TruncDate("end_date"))
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
+        reading_start_days = (
+            reading_qs.filter(end_date__isnull=True, start_date__isnull=False)
+            .annotate(day=TruncDate("start_date"))
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
+        reading_count += _add_days(days, reading_end_days)
+        reading_count += _add_days(days, reading_start_days)
+
+    music_days = []
+    if include_music:
+        HistoricalMusic = apps.get_model("app", "HistoricalMusic")
+        music_days = (
+            HistoricalMusic.objects.filter(
+                _music_history_user_q(user),
+                end_date__isnull=False,
+            )
+            .annotate(
+                day=TruncDate("end_date"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
     music_count = _add_days(days, music_days)
 
-    HistoricalPodcast = apps.get_model("app", "HistoricalPodcast")
-    podcast_days = HistoricalPodcast.objects.filter(
-        models.Q(history_user=user) | models.Q(history_user__isnull=True),
-        end_date__isnull=False,
-    ).annotate(
-        day=TruncDate("end_date"),
-    ).values_list("day", flat=True).distinct()
+    podcast_days = []
+    if include_podcast:
+        HistoricalPodcast = apps.get_model("app", "HistoricalPodcast")
+        podcast_days = (
+            HistoricalPodcast.objects.filter(
+                models.Q(history_user=user) | models.Q(history_user__isnull=True),
+                end_date__isnull=False,
+            )
+            .annotate(
+                day=TruncDate("end_date"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
     podcast_count = _add_days(days, podcast_days)
+
+    video_count = 0
+    if include_video:
+        video_days = (
+            VideoPlay.objects.filter(video__user=user)
+            .annotate(day=TruncDate("end_date"))
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
+        video_count = _add_days(days, video_days)
+
+    return days, (
+        episode_count,
+        movie_count,
+        reading_count,
+        music_count,
+        podcast_count,
+        video_count,
+    )
+
+
+def _shared_history_days(user, requested_media_types, memo_eras):
+    """``_build_shared_history_days``, reused across the styles of one save.
+
+    A save refreshes the sessions and repeats indexes back to back and the
+    shared scan is identical for both. ``memo_eras`` is the pair of style eras
+    captured before the build: any invalidation bumps an era and so changes the
+    key, and the short TTL bounds anything that changes rows without one.
+    """
+    if memo_eras is None:
+        return _build_shared_history_days(user, requested_media_types)
+    key = "history_shared_days_v{}:{}:{}:{}".format(
+        HISTORY_CACHE_VERSION,
+        user.id,
+        ",".join(sorted(requested_media_types or ["*"])),
+        ":".join(memo_eras),
+    )
+    hit = cache.get(key)
+    if hit is not None:
+        return set(hit[0]), hit[1]
+    days, counts = _build_shared_history_days(user, requested_media_types)
+    cache.set(key, (sorted(days), counts), timeout=HISTORY_SHARED_DAYS_TIMEOUT)
+    return days, counts
+
+
+def build_history_index(
+    user, logging_style_override=None, media_types=None, memo_eras=None
+):
+    """Build an ordered list of active history days for a user."""
+    build_start = time.perf_counter()
+    logging_style = _normalize_logging_style(logging_style_override, user)
+    requested_media_types = expand_history_media_types(media_types)
+    include_game = requested_media_types is None or "game" in requested_media_types
+    include_boardgame = requested_media_types is None or "boardgame" in requested_media_types
+    days, (
+        episode_count,
+        movie_count,
+        reading_count,
+        music_count,
+        podcast_count,
+        video_count,
+    ) = _shared_history_days(user, requested_media_types, memo_eras)
 
     game_count = 0
     boardgame_count = 0
     if logging_style == "sessions":
-        games = Game.objects.filter(user=user)
-        game_end_days = games.filter(
-            end_date__isnull=False,
-        ).annotate(
-            day=TruncDate("end_date"),
-        ).values_list("day", flat=True).distinct()
-        game_start_days = games.filter(
-            end_date__isnull=True,
-            start_date__isnull=False,
-        ).annotate(
-            day=TruncDate("start_date"),
-        ).values_list("day", flat=True).distinct()
-        game_created_days = games.filter(
-            end_date__isnull=True,
-            start_date__isnull=True,
-        ).annotate(
-            day=TruncDate("created_at"),
-        ).values_list("day", flat=True).distinct()
+        games = Game.objects.filter(user=user) if include_game else Game.objects.none()
+        game_end_days = (
+            games.filter(
+                end_date__isnull=False,
+            )
+            .annotate(
+                day=TruncDate("end_date"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
+        game_start_days = (
+            games.filter(
+                end_date__isnull=True,
+                start_date__isnull=False,
+            )
+            .annotate(
+                day=TruncDate("start_date"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
+        game_created_days = (
+            games.filter(
+                end_date__isnull=True,
+                start_date__isnull=True,
+            )
+            .annotate(
+                day=TruncDate("created_at"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
         game_count += _add_days(days, game_end_days)
         game_count += _add_days(days, game_start_days)
         game_count += _add_days(days, game_created_days)
 
-        boardgames = BoardGame.objects.filter(user=user)
-        boardgame_end_days = boardgames.filter(
-            end_date__isnull=False,
-        ).annotate(
-            day=TruncDate("end_date"),
-        ).values_list("day", flat=True).distinct()
-        boardgame_start_days = boardgames.filter(
-            end_date__isnull=True,
-            start_date__isnull=False,
-        ).annotate(
-            day=TruncDate("start_date"),
-        ).values_list("day", flat=True).distinct()
-        boardgame_created_days = boardgames.filter(
-            end_date__isnull=True,
-            start_date__isnull=True,
-        ).annotate(
-            day=TruncDate("created_at"),
-        ).values_list("day", flat=True).distinct()
+        boardgames = (
+            BoardGame.objects.filter(user=user)
+            if include_boardgame
+            else BoardGame.objects.none()
+        )
+        boardgame_end_days = (
+            boardgames.filter(
+                end_date__isnull=False,
+            )
+            .annotate(
+                day=TruncDate("end_date"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
+        boardgame_start_days = (
+            boardgames.filter(
+                end_date__isnull=True,
+                start_date__isnull=False,
+            )
+            .annotate(
+                day=TruncDate("start_date"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
+        boardgame_created_days = (
+            boardgames.filter(
+                end_date__isnull=True,
+                start_date__isnull=True,
+            )
+            .annotate(
+                day=TruncDate("created_at"),
+            )
+            .order_by()
+            .values_list("day", flat=True)
+            .distinct()
+        )
         boardgame_count += _add_days(days, boardgame_end_days)
         boardgame_count += _add_days(days, boardgame_start_days)
         boardgame_count += _add_days(days, boardgame_created_days)
     else:
-        games = Game.objects.filter(user=user).only(
-            "start_date",
-            "end_date",
-            "created_at",
-            "progress",
+        games = (
+            Game.objects.filter(user=user).only(
+                "start_date",
+                "end_date",
+                "created_at",
+                "progress",
+            )
+            if include_game
+            else Game.objects.none()
         )
         for game in games.iterator():
             total_minutes = game.progress or 0
@@ -161,17 +403,23 @@ def build_history_index(user, logging_style_override=None):
                     days.add(day_value)
                     game_count += 1
 
-        boardgames = BoardGame.objects.filter(user=user).only(
-            "start_date",
-            "end_date",
-            "created_at",
-            "progress",
+        boardgames = (
+            BoardGame.objects.filter(user=user).only(
+                "start_date",
+                "end_date",
+                "created_at",
+                "progress",
+            )
+            if include_boardgame
+            else BoardGame.objects.none()
         )
         for boardgame in boardgames.iterator():
             total_plays = boardgame.progress or 0
             if total_plays <= 0:
                 continue
-            start_dt = boardgame.start_date or boardgame.end_date or boardgame.created_at
+            start_dt = (
+                boardgame.start_date or boardgame.end_date or boardgame.created_at
+            )
             end_dt = boardgame.end_date or boardgame.start_date or boardgame.created_at
             if not start_dt or not end_dt:
                 continue
@@ -193,14 +441,16 @@ def build_history_index(user, logging_style_override=None):
     day_list = sorted(days, reverse=True)
     day_keys = [_day_key_for_date(day) for day in day_list]
     logger.info(
-        "history_index_build user_id=%s logging_style=%s days=%s episode_days=%s movie_days=%s music_days=%s podcast_days=%s game_days=%s boardgame_days=%s elapsed_ms=%.2f",
+        "history_index_build user_id=%s logging_style=%s days=%s episode_days=%s movie_days=%s reading_days=%s music_days=%s podcast_days=%s video_days=%s game_days=%s boardgame_days=%s elapsed_ms=%.2f",
         user.id,
         logging_style,
         len(day_keys),
         episode_count,
         movie_count,
+        reading_count,
         music_count,
         podcast_count,
+        video_count,
         game_count,
         boardgame_count,
         (time.perf_counter() - build_start) * 1000,
@@ -213,7 +463,12 @@ def cache_history_days(user_id: int, logging_style: str, history_days):
     cache_history_payloads(user_id, logging_style, history_days)
 
 
-def cache_history_payloads(user_id: int, logging_style: str, history_days):
+def cache_history_payloads(
+    user_id: int,
+    logging_style: str,
+    history_days,
+    era: str | None = None,
+):
     """Persist index + per-day history payloads in cache."""
     logging_style = _normalize_logging_style(logging_style)
     index_days = []
@@ -225,19 +480,24 @@ def cache_history_payloads(user_id: int, logging_style: str, history_days):
             continue
         if isinstance(day_date, str):
             try:
-                day_date = datetime.strptime(day_date, "%Y-%m-%d").date()
+                day_date = datetime.strptime(day_date, "%Y-%m-%d").date()  # noqa: DTZ007  # date-only value; no timezone applies
             except ValueError:
                 continue
         day_key = _day_key_for_date(day_date)
         index_days.append(day_key)
         total_entries += len(day.get("entries", []))
-        day_payloads[_day_cache_key(user_id, logging_style, day_key)] = _serialize_history_day(day)
+        day_payloads[_day_cache_key(user_id, logging_style, day_key)] = (
+            _serialize_history_day(day)
+        )
 
+    if era is None:
+        era = _current_history_era(user_id, logging_style)
     cache.set(
         _cache_key(user_id, logging_style),
         {
             "days": index_days,
             "built_at": timezone.now(),
+            "era": era,
         },
         timeout=HISTORY_CACHE_TIMEOUT,
     )
@@ -252,18 +512,56 @@ def cache_history_payloads(user_id: int, logging_style: str, history_days):
     )
 
 
-def cache_history_index(user_id: int, logging_style: str, day_keys, built_at=None):
+def cache_history_index(
+    user_id: int,
+    logging_style: str,
+    day_keys,
+    built_at=None,
+    media_types=None,
+    era: str | None = None,
+):
+    """Return the cache history index.
+
+    ``era`` must be the token captured *before* the rows the index was built
+    from were read (callers that build from rows pass their captured token;
+    callers without row reads may omit it and the current era is resolved at
+    publish time). The token is embedded in the payload and, for typed
+    indexes, namespaced into the key, which is what lets invalidation retire
+    a concurrent builder's publish without deleting it first.
+    """
     logging_style = _normalize_logging_style(logging_style)
     if built_at is None:
         built_at = timezone.now()
+    if era is None:
+        era = _current_history_era(user_id, logging_style)
+    cache_key = _cache_key(user_id, logging_style)
+    if media_types is not None:
+        cache_key = _typed_history_index_key(
+            user_id,
+            logging_style,
+            media_types,
+            era,
+        )
     cache.set(
-        _cache_key(user_id, logging_style),
+        cache_key,
         {
             "days": day_keys,
             "built_at": built_at,
+            "era": era,
         },
         timeout=HISTORY_CACHE_TIMEOUT,
     )
+    _touch_history_era(user_id, logging_style)
+    if media_types is not None:
+        registry_key = _typed_history_index_registry_key(user_id, logging_style)
+        registry = cache.get(registry_key) or []
+        if cache_key not in registry:
+            registry.append(cache_key)
+            cache.set(
+                registry_key,
+                registry,
+                timeout=HISTORY_CACHE_TIMEOUT,
+            )
     return built_at
 
 
@@ -279,7 +577,10 @@ def _missing_history_day_keys(user_id: int, logging_style: str, day_keys):
         return []
 
     payloads = cache.get_many(
-        [_day_cache_key(user_id, logging_style, day_key) for day_key in normalized_keys],
+        [
+            _day_cache_key(user_id, logging_style, day_key)
+            for day_key in normalized_keys
+        ],
     )
     return [
         day_key

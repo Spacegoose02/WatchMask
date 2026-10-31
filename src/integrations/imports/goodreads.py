@@ -9,6 +9,7 @@ from django.utils import timezone
 import app
 from app.models import MediaTypes, Sources, Status
 from app.providers import services
+from integrations import import_progress
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 
@@ -64,9 +65,11 @@ class GoodReadsImporter:
             msg = "Invalid file format. Please upload a CSV file."
             raise MediaImportError(msg) from e
 
-        reader = DictReader(decoded_file)
+        rows = list(DictReader(decoded_file))
+        total = len(rows)
 
-        for row in reader:
+        for i, row in enumerate(rows, start=1):
+            import_progress.report(i, total, "Goodreads")
             try:
                 self._process_row(row)
             except services.ProviderAPIError as error:
@@ -111,7 +114,7 @@ class GoodReadsImporter:
         return imported_counts, deduplicated_messages
 
     def _row_description(self, row):
-        """Return a useful label for warnings without assuming Yamtrack fields."""
+        """Return a useful label for warnings without assuming Floppy fields."""
         title = row.get("Title")
         book_id = row.get("Book Id")
 
@@ -230,8 +233,7 @@ class GoodReadsImporter:
         page_count = (row.get("Number of Pages") or "").strip()
         book_progress = (
             int(page_count)
-            if book_status == Status.COMPLETED.value
-            and page_count.isnumeric()
+            if book_status == Status.COMPLETED.value and page_count.isnumeric()
             else 0
         )
 
@@ -249,7 +251,7 @@ class GoodReadsImporter:
         instance = model(
             item=item,
             user=self.user,
-            score=None if rating in {"", "0"} else int(rating) * 2,
+            score=None if rating in {"", "0"} else float(rating) * 2,
             progress=book_progress,
             status=book_status,
             end_date=date_rated,

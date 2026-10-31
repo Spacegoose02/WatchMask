@@ -34,8 +34,8 @@ def bulk_episode_plays_task(
     library_media_type: str | None = None,
 ):
     """Apply a bulk episode play range in the background after the modal has closed."""
-    from app.models import PodcastShow  # noqa: PLC0415
-    from app.services import bulk_episode_tracking, metadata_resolution  # noqa: PLC0415
+    from app.models import PodcastShow
+    from app.services import bulk_episode_tracking, metadata_resolution
 
     logger.info(
         "bulk_episode_plays_task_start task_id=%s user_id=%d media_id=%s",
@@ -43,8 +43,8 @@ def bulk_episode_plays_task(
         user_id,
         media_id,
     )
-    User = get_user_model()
-    user = User.objects.get(id=user_id)
+    user_model = get_user_model()
+    user = user_model.objects.get(id=user_id)
 
     metadata_item = None
     base_metadata = None
@@ -54,6 +54,7 @@ def bulk_episode_plays_task(
     if media_type == MediaTypes.PODCAST.value and source in {
         Sources.POCKETCASTS.value,
         Sources.GPODDER.value,
+        Sources.AUDIOBOOKSHELF.value,
     }:
         podcast_show = PodcastShow.objects.filter(podcast_uuid=media_id).first()
     else:
@@ -105,8 +106,7 @@ def bulk_episode_plays_task(
 
     all_episodes = episode_domain.get("episodes", [])
     episode_lookup = {
-        (ep["season_number"], ep["episode_number"]): ep
-        for ep in all_episodes
+        (ep["season_number"], ep["episode_number"]): ep for ep in all_episodes
     }
     first_ep = episode_lookup.get((first_season_number, first_episode_number))
     last_ep = episode_lookup.get((last_season_number, last_episode_number))
@@ -121,22 +121,23 @@ def bulk_episode_plays_task(
         return
 
     selected_episodes = [
-        ep for ep in all_episodes
+        ep
+        for ep in all_episodes
         if first_ep["order"] <= ep["order"] <= last_ep["order"]
     ]
 
-    # Keep the time of day the user picked; date-only values lose it
-    start_date = bulk_episode_tracking.coerce_episode_datetime(start_date_str)
-    end_date = bulk_episode_tracking.coerce_episode_datetime(end_date_str)
-
-    if distribution_mode == "air_date" and any(
-        not ep.get("air_date") for ep in selected_episodes
-    ):
-        logger.warning(
-            "bulk_episode_plays_task: selected episodes missing air dates media_id=%s",
-            media_id,
-        )
-        return
+    # Keep the picker's time-of-day (when TRACK_TIME gave the user one) instead
+    # of collapsing the range to whole dates — see #1232.
+    start_date = (
+        bulk_episode_tracking.coerce_episode_datetime(start_date_str)
+        if start_date_str
+        else None
+    )
+    end_date = (
+        bulk_episode_tracking.coerce_episode_datetime(end_date_str)
+        if end_date_str
+        else None
+    )
 
     result = bulk_episode_tracking.apply_bulk_episode_plays(
         user,
@@ -171,8 +172,8 @@ def bulk_music_plays_task(
     end_date_str: str | None,
 ):
     """Apply a bulk music play range in the background after the modal has closed."""
-    from app.models import Album, Artist  # noqa: PLC0415
-    from app.services import bulk_episode_tracking, bulk_music_tracking  # noqa: PLC0415
+    from app.models import Album, Artist
+    from app.services import bulk_music_tracking
 
     logger.info(
         "bulk_music_plays_task_start task_id=%s user_id=%d context_kind=%s context_id=%d",
@@ -181,8 +182,8 @@ def bulk_music_plays_task(
         context_kind,
         context_id,
     )
-    User = get_user_model()
-    user = User.objects.get(id=user_id)
+    user_model = get_user_model()
+    user = user_model.objects.get(id=user_id)
 
     if context_kind == "artist":
         artist = Artist.objects.filter(id=context_id).first()
@@ -210,8 +211,7 @@ def bulk_music_plays_task(
 
     all_episodes = bulk_domain.get("episodes", [])
     episode_lookup = {
-        (ep["season_number"], ep["episode_number"]): ep
-        for ep in all_episodes
+        (ep["season_number"], ep["episode_number"]): ep for ep in all_episodes
     }
     first_ep = episode_lookup.get((first_season_number, first_episode_number))
     last_ep = episode_lookup.get((last_season_number, last_episode_number))
@@ -226,13 +226,23 @@ def bulk_music_plays_task(
         return
 
     selected_episodes = [
-        ep for ep in all_episodes
+        ep
+        for ep in all_episodes
         if first_ep["order"] <= ep["order"] <= last_ep["order"]
     ]
 
-    # Keep the time of day the user picked; date-only values lose it
-    start_date = bulk_episode_tracking.coerce_episode_datetime(start_date_str)
-    end_date = bulk_episode_tracking.coerce_episode_datetime(end_date_str)
+    # Keep the picker's time-of-day instead of collapsing the range to whole
+    # dates — same defect as #1232's episode task, applied here too.
+    start_date = (
+        bulk_music_tracking.coerce_episode_datetime(start_date_str)
+        if start_date_str
+        else None
+    )
+    end_date = (
+        bulk_music_tracking.coerce_episode_datetime(end_date_str)
+        if end_date_str
+        else None
+    )
 
     result = bulk_music_tracking.apply_bulk_music_plays(
         user,

@@ -32,6 +32,12 @@ from app.models import (
     Status,
 )
 from app.providers import services
+from app.services.completion import normalize_completed_entry
+from app.services.episode_coordinates import (
+    InvalidEpisodeCoordinateError,
+    cleanup_episode_history_for_route,
+    resolve_episode_coordinate,
+)
 from app.services.tracking_hydration import ensure_item_metadata
 from app.signals import (
     flush_media_change_side_effects,
@@ -144,8 +150,7 @@ def distribute_target_timestamps(
 
     fallback_dt = fallback_dt or end_dt or start_dt or timezone.now()
     normalized_targets = [
-        coerce_episode_datetime(value) or fallback_dt
-        for value in target_datetimes
+        coerce_episode_datetime(value) or fallback_dt for value in target_datetimes
     ]
     if not start_dt or not end_dt:
         return ensure_increasing_datetimes(normalized_targets)
@@ -229,11 +234,7 @@ def _season_title_from_payload(payload, season_number):
 
 
 def _episode_title_from_payload(payload, episode_number):
-    return (
-        payload.get("name")
-        or payload.get("title")
-        or f"Episode {episode_number}"
-    )
+    return payload.get("name") or payload.get("title") or f"Episode {episode_number}"
 
 
 def _podcast_selector_label(episode, selector_number):
@@ -317,8 +318,7 @@ def _podcast_domain(user, show):
         "season_payloads": {},
         "episodes": selector_episodes,
         "episode_lookup": {
-            (1, episode["episode_number"]): episode
-            for episode in selector_episodes
+            (1, episode["episode_number"]): episode for episode in selector_episodes
         },
         "season_episode_map": {1: selector_episodes},
         "seasons": [
@@ -549,6 +549,7 @@ def _build_domain_payload(
                 "episode_title": _episode_title_from_payload(episode, episode_number),
                 "air_date": air_date,
                 "release_datetime": air_date,
+                "runtime_minutes": episode.get("runtime_minutes") or episode.get("runtime") or "",
                 "existing_play_count": play_counts.get(
                     (season_number, episode_number),
                     0,
@@ -580,9 +581,7 @@ def _build_domain_payload(
         "tracking_media_id": media_id,
         "tracking_media_type": MediaTypes.TV.value,
         "identity_media_type": (
-            MediaTypes.TV.value
-            if route_media_type == MediaTypes.ANIME.value
-            else None
+            MediaTypes.TV.value if route_media_type == MediaTypes.ANIME.value else None
         ),
         "library_media_type": library_media_type,
         "season_payloads": season_payloads,
@@ -620,7 +619,12 @@ def build_episode_play_domain(
 ):
     """Return an episode selection domain for detail track modal tabs."""
     if route_media_type == MediaTypes.PODCAST.value:
-        if source not in {Sources.POCKETCASTS.value, Sources.GPODDER.value}:
+        if source not in {
+            Sources.POCKETCASTS.value,
+            Sources.GPODDER.value,
+            Sources.AUDIOBOOKSHELF.value,
+            Sources.MANUAL.value,
+        }:
             return None
         show = podcast_show or PodcastShow.objects.filter(podcast_uuid=media_id).first()
         if show is None:
@@ -742,9 +746,7 @@ def _season_item_defaults(grouped_tv, season_payload, *, library_media_type):
         ),
         "library_media_type": library_media_type,
         "image": (
-            season_payload.get("image")
-            or grouped_tv.item.image
-            or settings.IMG_NONE
+            season_payload.get("image") or grouped_tv.item.image or settings.IMG_NONE
         ),
     }
 
@@ -775,9 +777,7 @@ def _get_or_create_season_tracker(
         season_item.library_media_type = library_media_type
         update_fields.append("library_media_type")
     season_image = (
-        season_payload.get("image")
-        or grouped_tv.item.image
-        or settings.IMG_NONE
+        season_payload.get("image") or grouped_tv.item.image or settings.IMG_NONE
     )
     if season_image and season_item.image != season_image:
         season_item.image = season_image
@@ -817,6 +817,30 @@ def _episode_delete_filter(selected_episodes):
             item__episode_number=episode["episode_number"],
         )
     return filters
+
+
+def _inherited_scores(season_trackers, item_ids):
+    """Return the latest existing (score, scored_at) per item id for replay inheritance.
+
+    A rating belongs to the episode, not to one viewing of it (see
+    Episode.save()), but bulk-logged plays are written with bulk_create,
+    which skips save() entirely, so this mirrors that inheritance rule here.
+    """
+    if not item_ids:
+        return {}
+    scored_plays = (
+        Episode.objects.filter(
+            related_season__in=season_trackers,
+            item_id__in=item_ids,
+        )
+        .exclude(score__isnull=True)
+        .order_by("item_id", "-end_date", "-created_at")
+        .values_list("item_id", "score", "scored_at")
+    )
+    scores = {}
+    for item_id, score, scored_at in scored_plays:
+        scores.setdefault(item_id, (score, scored_at))
+    return scores
 
 
 def _get_or_create_podcast_episode_item(show, episode):
@@ -877,19 +901,18 @@ def _apply_bulk_podcast_plays(
             [episode["air_date"] for episode in selected_episodes],
             start_date,
             end_date,
-            fallback_dt=timezone.now().replace(second=0, microsecond=0),
+            fallback_dt=timezone.now(),
         )
     else:
         timestamps = distribute_timestamps(
             start_date,
             end_date,
             len(selected_episodes),
-            fallback_dt=timezone.now().replace(second=0, microsecond=0),
+            fallback_dt=timezone.now(),
         )
 
     selected_episode_ids = [
-        episode["podcast_episode_id"]
-        for episode in selected_episodes
+        episode["podcast_episode_id"] for episode in selected_episodes
     ]
     episode_map = PodcastEpisode.objects.in_bulk(selected_episode_ids)
     created_count = 0
@@ -898,7 +921,11 @@ def _apply_bulk_podcast_plays(
     affected_day_keys = set()
     affected_items = []
 
-    with transaction.atomic(), disable_fetch_releases(), suppress_media_change_side_effects():
+    with (
+        transaction.atomic(),
+        disable_fetch_releases(),
+        suppress_media_change_side_effects(),
+    ):
         if write_mode == "replace" and selected_episode_ids:
             existing_entries = list(
                 Podcast.objects.filter(
@@ -910,15 +937,21 @@ def _apply_bulk_podcast_plays(
             replaced_episode_count = len(existing_entries)
             if replaced_episode_count:
                 for entry in existing_entries:
-                    day_key = history_cache.history_day_key(getattr(entry, "end_date", None))
+                    day_key = history_cache.history_day_key(
+                        getattr(entry, "end_date", None)
+                    )
                     if day_key:
                         affected_day_keys.add(day_key)
                     if entry.item_id:
                         affected_items.append(entry.item)
-                Podcast.objects.filter(id__in=[entry.id for entry in existing_entries]).delete()
+                Podcast.objects.filter(
+                    id__in=[entry.id for entry in existing_entries]
+                ).delete()
 
         episodes_to_create = []
-        for episode_payload, watched_at in zip(selected_episodes, timestamps, strict=False):
+        for episode_payload, watched_at in zip(
+            selected_episodes, timestamps, strict=False
+        ):
             episode = episode_map.get(episode_payload["podcast_episode_id"])
             if episode is None:
                 continue
@@ -942,7 +975,9 @@ def _apply_bulk_podcast_plays(
             )
 
         if episodes_to_create:
-            bulk_create_with_history(episodes_to_create, Podcast)
+            created_episodes = bulk_create_with_history(episodes_to_create, Podcast)
+            for episode in created_episodes:
+                normalize_completed_entry(episode)
             created_count = len(episodes_to_create)
 
     if created_count or replaced_episode_count:
@@ -971,11 +1006,7 @@ def _apply_bulk_podcast_plays(
 
 def _enqueue_bulk_episode_credits_backfill(grouped_tv, episode_item_ids):
     """Queue one deduped credits backfill pass for bulk episode saves."""
-    item_ids = {
-        item_id
-        for item_id in episode_item_ids or []
-        if item_id
-    }
+    item_ids = {item_id for item_id in episode_item_ids or [] if item_id}
     if getattr(grouped_tv, "item_id", None):
         item_ids.add(grouped_tv.item_id)
     if not item_ids:
@@ -1008,6 +1039,27 @@ def apply_bulk_episode_plays(
             end_date=end_date,
         )
 
+    for episode in selected_episodes:
+        season_number = episode["season_number"]
+        try:
+            resolve_episode_coordinate(
+                domain["tracking_media_id"],
+                domain["tracking_source"],
+                season_number,
+                episode["episode_number"],
+                season_metadata=domain["season_payloads"][season_number],
+            )
+        except InvalidEpisodeCoordinateError:
+            cleanup_episode_history_for_route(
+                user,
+                domain["tracking_media_id"],
+                domain["tracking_source"],
+                season_number,
+                episode["episode_number"],
+                library_media_type=domain.get("library_media_type"),
+            )
+            raise
+
     grouped_tv, migrated_flat_anime, created_grouped_tracking = _resolve_grouped_target(
         user,
         domain,
@@ -1034,7 +1086,11 @@ def apply_bulk_episode_plays(
             fallback_dt=timezone.now().replace(second=0, microsecond=0),
         )
 
-    with transaction.atomic(), disable_fetch_releases(), suppress_media_change_side_effects():
+    with (
+        transaction.atomic(),
+        disable_fetch_releases(),
+        suppress_media_change_side_effects(),
+    ):
         for episode in selected_episodes:
             season_number = episode["season_number"]
             season_payload = domain["season_payloads"][season_number]
@@ -1054,19 +1110,23 @@ def apply_bulk_episode_plays(
                 existing_entries = list(
                     Episode.objects.filter(
                         related_season__in=touched_seasons.values(),
-                    ).filter(delete_filters).select_related("item")
+                    )
+                    .filter(delete_filters)
+                    .select_related("item")
                 )
                 replaced_episode_count = len(existing_entries)
                 if existing_entries:
                     for entry in existing_entries:
-                        day_key = history_cache.history_day_key(getattr(entry, "end_date", None))
+                        day_key = history_cache.history_day_key(
+                            getattr(entry, "end_date", None)
+                        )
                         if day_key:
                             affected_day_keys.add(day_key)
                     Episode.objects.filter(
                         id__in=[entry.id for entry in existing_entries],
                     ).delete()
 
-        episodes_to_create = []
+        episode_specs = []
         for episode, watched_at in zip(selected_episodes, timestamps, strict=False):
             season_tracker = touched_seasons[episode["season_number"]]
             episode_item_exists = Item.objects.filter(
@@ -1089,21 +1149,45 @@ def apply_bulk_episode_plays(
             played_day_key = history_cache.history_day_key(watched_at)
             if played_day_key:
                 affected_day_keys.add(played_day_key)
-            episodes_to_create.append(
-                Episode(
-                    related_season=season_tracker,
-                    item=episode_item,
-                    end_date=watched_at,
-                ),
+            episode_specs.append((season_tracker, episode_item, watched_at))
+
+        inherited_scores = _inherited_scores(
+            touched_seasons.values(),
+            {episode_item.id for _, episode_item, _ in episode_specs},
+        )
+        episodes_to_create = [
+            Episode(
+                related_season=season_tracker,
+                item=episode_item,
+                end_date=watched_at,
+                score=inherited[0],
+                scored_at=inherited[1],
             )
+            for season_tracker, episode_item, watched_at in episode_specs
+            for inherited in [inherited_scores.get(episode_item.id, (None, None))]
+        ]
 
         if episodes_to_create:
-            bulk_create_with_history(episodes_to_create, Episode)
+            created_episodes = bulk_create_with_history(episodes_to_create, Episode)
+            for episode in created_episodes:
+                normalize_completed_entry(episode)
             created_count = len(episodes_to_create)
 
-    for season_tracker in touched_seasons.values():
+    # bulk_create skips Episode.save, which is what completes a season on a
+    # single play, so settle each season here with the provider's episode
+    # count, in watch order so each completion hands on to the next season.
+    for season_number in sorted(touched_seasons):
+        season_tracker = touched_seasons[season_number]
         season_tracker.refresh_from_db()
-        season_tracker._sync_status_after_episode_change()
+        season_payload = domain["season_payloads"][season_number]
+        season_tracker._sync_status_after_episode_change(
+            max_progress=(
+                season_payload.get("max_progress")
+                or len(season_payload.get("episodes") or [])
+                or None
+            ),
+            plays_added=bool(created_count),
+        )
 
     if created_count or replaced_episode_count:
         flush_media_change_side_effects(

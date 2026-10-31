@@ -9,6 +9,7 @@ from django.utils.dateparse import parse_datetime
 
 import app
 from app.models import MediaTypes, Sources, Status
+from integrations import import_progress
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 
@@ -42,6 +43,7 @@ class KitsuImporter:
 
         # Track existing media for "new" mode
         self.existing_media = helpers.get_existing_media(user)
+        self.deleted_media = helpers.get_deleted_media(user)
 
         # Track media IDs to delete in overwrite mode
         self.to_delete = defaultdict(lambda: defaultdict(set))
@@ -121,7 +123,9 @@ class KitsuImporter:
             if item["type"] == "mappings"
         }
 
-        for entry in response["entries"]:
+        total = len(response["entries"])
+        for i, entry in enumerate(response["entries"], start=1):
+            import_progress.report(i, total, f"Kitsu ({media_type})")
             try:
                 self._process_entry(entry, media_type, media_lookup, mapping_lookup)
             except MediaImportError as error:
@@ -196,6 +200,7 @@ class KitsuImporter:
             item.source,
             item.media_id,
             self.mode,
+            deleted_media=self.deleted_media,
         ):
             return
 
@@ -320,7 +325,8 @@ class KitsuImporter:
 
         image_url = self._get_image_url(kitsu_metadata)
 
-        item, _ = app.models.Item.objects.get_or_create(
+        item, _ = helpers.get_or_create_item_across_buckets(
+            user=self.user,
             media_id=media_id,
             source=source,
             media_type=media_type,
@@ -328,7 +334,9 @@ class KitsuImporter:
                 **app.models.Item.title_fields_from_metadata(
                     {
                         "title": kitsu_metadata["attributes"]["canonicalTitle"],
-                        "localized_title": kitsu_metadata["attributes"]["canonicalTitle"],
+                        "localized_title": kitsu_metadata["attributes"][
+                            "canonicalTitle"
+                        ],
                         "original_title": None,
                     },
                 ),

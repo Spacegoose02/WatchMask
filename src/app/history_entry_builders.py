@@ -1,7 +1,9 @@
 """Functions that build per-entry history dicts for each media type."""
 
 import logging
+from collections import defaultdict
 
+from django.apps import apps
 from django.conf import settings
 from django.utils import formats
 
@@ -17,8 +19,24 @@ from app.models import MediaTypes
 
 logger = logging.getLogger(__name__)
 
+RUNTIME_UNKNOWN_AIRED = 999998  # aired but runtime unknown
+MINUTES_PER_HOUR = 60
+
 
 # ── Model serializers ─────────────────────────────────────────────────────────
+
+
+def _entry_dates(record, *, added_from=None):
+    """Return the tracking dates a History card can show as card properties.
+
+    ``added_from`` supplies created_at when ``record`` is a history row, which
+    does not store it.
+    """
+    return {
+        "created_at": getattr(added_from or record, "created_at", None),
+        "start_date": getattr(record, "start_date", None),
+        "end_date": getattr(record, "end_date", None),
+    }
 
 
 def _serialize_item(item):
@@ -36,7 +54,9 @@ def _serialize_item(item):
     data = {
         "id": getattr(item, "id", None),
         "media_type": item.media_type,
-        "media_id": str(getattr(item, "media_id", "")) if getattr(item, "media_id", None) is not None else None,
+        "media_id": str(getattr(item, "media_id", ""))
+        if getattr(item, "media_id", None) is not None
+        else None,
         "source": getattr(item, "source", None),
         "title": getattr(item, "title", "") or "",
         "original_title": getattr(item, "original_title", None),
@@ -83,6 +103,74 @@ def _attach_entry_score(entry, media):
     return entry
 
 
+def flat_anime_episode_watches(records):
+    """Return ``{anime_id: [(episode_number, watched_at), ...]}`` for flat anime.
+
+    A flat entry stores progress, not episodes, so each rise in its change log
+    dates the episodes it covered. A rise saved after the entry's own end date
+    (an import of an old watch) is dated on that end date. Each episode keeps
+    its latest date, and only episodes up to the current progress are kept, so
+    a lowered progress drops the ones above it. An entry with no change log
+    dates every episode on its end or start date.
+    """
+    records = [record for record in records if (record.progress or 0) > 0]
+    if not records:
+        return {}
+    HistoricalAnime = apps.get_model("app", "HistoricalAnime")
+    rows = (
+        HistoricalAnime.objects.filter(id__in=[record.id for record in records])
+        .order_by("history_date", "history_id")
+        .values_list("id", "progress", "end_date", "history_date")
+    )
+    dated_by_id = defaultdict(dict)
+    previous_progress = {}
+    for anime_id, row_progress, row_end_date, history_date in rows:
+        progress = row_progress or 0
+        before = previous_progress.get(anime_id, 0)
+        previous_progress[anime_id] = progress
+        if progress <= before:
+            continue
+        watched_at = min(history_date, row_end_date) if row_end_date else history_date
+        for episode_number in range(before + 1, progress + 1):
+            dated_by_id[anime_id][episode_number] = watched_at
+
+    watches = {}
+    for record in records:
+        dated = dated_by_id.get(record.id)
+        if not dated:
+            fallback = record.end_date or record.start_date
+            if not fallback:
+                continue
+            dated = dict.fromkeys(range(1, record.progress + 1), fallback)
+        watches[record.id] = sorted(
+            (number, watched_at)
+            for number, watched_at in dated.items()
+            if number <= record.progress
+        )
+    return watches
+
+
+def flat_anime_episode_entries(entry, watches, final_episode):
+    """Split a flat anime card into one card per dated episode.
+
+    The entry's score stays on the card of its last watched episode only.
+    """
+    cards = []
+    for episode_number, watched_at in watches:
+        card = {
+            **entry,
+            "episode_label": f"E{episode_number:02d}",
+            "episode_code": f"E{episode_number:02d}",
+            "episode_number": episode_number,
+            "played_at_local": _localize_datetime(watched_at),
+            "entry_key": f"{entry['entry_key']}-e{episode_number}",
+        }
+        if episode_number != final_episode:
+            card.pop("score", None)
+        cards.append(card)
+    return cards
+
+
 def _serialize_show(show):
     if not show:
         return None
@@ -94,6 +182,7 @@ def _serialize_show(show):
         "slug": getattr(show, "slug", "") or "",
         "podcast_uuid": getattr(show, "podcast_uuid", None),
         "image": getattr(show, "image", "") or "",
+        "website_url": getattr(show, "website_url", "") or "",
     }
 
 
@@ -107,7 +196,7 @@ def _resolve_runtime_minutes(*items):
             continue
         runtime = getattr(item, "runtime_minutes", None)
         # Exclude fallback values: 999998 (aired but runtime unknown) and 999999 (unknown runtime)
-        if runtime and runtime < 999998:
+        if runtime and runtime < RUNTIME_UNKNOWN_AIRED:
             return runtime
     return 0
 
@@ -115,8 +204,8 @@ def _resolve_runtime_minutes(*items):
 def _format_game_hours(minutes: int) -> str:
     """Show hours only if at least 1h, otherwise keep minutes."""
     minutes = minutes or 0
-    if minutes >= 60:
-        return f"{minutes // 60}h"
+    if minutes >= MINUTES_PER_HOUR:
+        return f"{minutes // MINUTES_PER_HOUR}h"
     return f"{minutes}min"
 
 
@@ -135,14 +224,12 @@ def _get_episode_poster(episode):
     getattr(episode, "item", None)
     tv_item = getattr(getattr(episode.related_season, "related_tv", None), "item", None)
 
-    poster = (
+    return (
         getattr(tv_item, "image", None)
         or getattr(season_item, "image", None)
         or getattr(episode.item, "image", None)
         or settings.IMG_NONE
     )
-
-    return poster
 
 
 def _get_episode_display_title(episode, episode_title_map=None):
@@ -157,6 +244,7 @@ def _get_episode_display_title(episode, episode_title_map=None):
             getattr(episode_item, "source", None),
             getattr(episode_item, "season_number", None),
             getattr(episode_item, "episode_number", None),
+            getattr(episode_item, "library_media_type", None),
         )
 
     if episode_title_map and key in episode_title_map:
@@ -172,7 +260,9 @@ def _get_episode_display_title(episode, episode_title_map=None):
 
 
 def _build_episode_entry(episode, episode_title_map=None):
-    played_at_local = _localize_datetime(episode.end_date or episode.created_at)
+    played_at_local = _localize_datetime(
+        episode.end_date or episode.start_date or episode.created_at
+    )
     if not played_at_local:
         return None
 
@@ -201,23 +291,43 @@ def _build_episode_entry(episode, episode_title_map=None):
 
     episode_label = None
     episode_code = None
-    if episode_item and episode_item.season_number is not None and episode_item.episode_number is not None:
-        episode_label = f"{episode_item.season_number}x{episode_item.episode_number:02d}"
-        episode_code = f"S{episode_item.season_number:02d}E{episode_item.episode_number:02d}"
+    if (
+        episode_item
+        and episode_item.season_number is not None
+        and episode_item.episode_number is not None
+    ):
+        episode_label = (
+            f"{episode_item.season_number}x{episode_item.episode_number:02d}"
+        )
+        episode_code = (
+            f"S{episode_item.season_number:02d}E{episode_item.episode_number:02d}"
+        )
 
     entry = {
         "media_type": MediaTypes.EPISODE.value,
         "item": _serialize_item(entry_item),
+        "show": _serialize_show(tv_item),
         "poster": _get_episode_poster(episode),
         "title": title,
         "display_title": display_title,
         "episode_label": episode_label,
         "episode_code": episode_code,
+        # Tiebreaker for entries.sort()'s played_at_local key: plays logged
+        # in one bulk action often share an exact timestamp, so the season
+        # order they actually play in decides ties rather than whatever
+        # arbitrary order the query happened to return them in.
+        "season_number": episode_item.season_number if episode_item else None,
+        "episode_number": episode_item.episode_number if episode_item else None,
+        "status": episode.status,
         "played_at_local": played_at_local,
+        **_entry_dates(episode),
         "runtime_minutes": runtime_minutes,
-        "runtime_display": helpers.minutes_to_hhmm(runtime_minutes) if runtime_minutes else None,
+        "runtime_display": helpers.minutes_to_hhmm(runtime_minutes)
+        if runtime_minutes
+        else None,
         "instance_id": episode.id,
-        "entry_key": episode.id,
+        "entry_key": str(episode.id),
+        "entry_source": episode.entry_source,
     }
     _attach_entry_score(entry, episode)
     if genres:
@@ -228,7 +338,9 @@ def _build_episode_entry(episode, episode_title_map=None):
 
 
 def _build_movie_entry(movie):
-    played_at_local = _localize_datetime(movie.end_date or movie.start_date or movie.created_at)
+    played_at_local = _localize_datetime(
+        movie.end_date or movie.start_date or movie.created_at
+    )
     if not played_at_local:
         return None
 
@@ -247,10 +359,14 @@ def _build_movie_entry(movie):
         "episode_label": None,
         "episode_code": None,
         "played_at_local": played_at_local,
+        **_entry_dates(movie),
         "runtime_minutes": runtime_minutes,
-        "runtime_display": helpers.minutes_to_hhmm(runtime_minutes) if runtime_minutes else None,
+        "runtime_display": helpers.minutes_to_hhmm(runtime_minutes)
+        if runtime_minutes
+        else None,
         "instance_id": movie.id,
-        "entry_key": movie.id,
+        "entry_key": str(movie.id),
+        "entry_source": movie.entry_source,
     }
     _attach_entry_score(entry, movie)
     if genres:
@@ -258,6 +374,37 @@ def _build_movie_entry(movie):
     if implied_genres:
         entry["implied_genres"] = implied_genres
     return entry
+
+
+def _build_video_play_entry(play):
+    """One history row per video play.
+
+    @param play - VideoPlay with video and item selected.
+    @returns Entry dict, or None when the play has no timestamp.
+    """
+    video = play.video
+    played_at_local = _localize_datetime(play.end_date or video.created_at)
+    if not played_at_local:
+        return None
+    runtime_minutes = video.length_seconds // 60 if video.length_seconds else None
+    return {
+        "media_type": MediaTypes.VIDEO.value,
+        "item": _serialize_item(video.item),
+        "poster": video.item.image or settings.IMG_NONE,
+        "title": video.item.title,
+        "display_title": video.item.title,
+        "status": video.status,
+        "play_count": 1,
+        "episode_label": video.channel or None,
+        "episode_code": None,
+        "played_at_local": played_at_local,
+        **_entry_dates(play, added_from=video),
+        "runtime_minutes": runtime_minutes,
+        "runtime_display": helpers.minutes_to_hhmm(runtime_minutes) if runtime_minutes else None,
+        "instance_id": play.id,
+        "entry_key": f"video:{play.id}",
+        "entry_source": "youtube",
+    }
 
 
 # ── Music builders ────────────────────────────────────────────────────────────
@@ -299,7 +446,14 @@ def _get_music_runtime_minutes(music_entry, track_duration_cache=None):
     return 0
 
 
-def _build_music_album_entries(music_entries_for_album, album, day_date, user, track_duration_cache=None, album_scores=None):
+def _build_music_album_entries(
+    music_entries_for_album,
+    album,
+    day_date,
+    user,
+    track_duration_cache=None,
+    album_scores=None,
+):
     """Build a single history entry for an album's plays on a given day.
 
     Groups all track plays for an album on a day into one card showing:
@@ -369,7 +523,9 @@ def _build_music_album_entries(music_entries_for_album, album, day_date, user, t
     entry_item = primary_music.item if primary_music and primary_music.item else None
     instance_id = primary_music.id if primary_music else None
     track = getattr(primary_music, "track", None) if primary_music else None
-    genres = _resolve_music_genres(album=album, artist=album.artist if album else None, track=track)
+    genres = _resolve_music_genres(
+        album=album, artist=album.artist if album else None, track=track
+    )
     implied_genres = _coerce_genre_list(getattr(album, "implied_genres", None))
     entry_key = f"{album.id if album else 'album'}-{day_date.strftime('%Y%m%d')}"
 
@@ -391,8 +547,12 @@ def _build_music_album_entries(music_entries_for_album, album, day_date, user, t
         "episode_label": None,
         "episode_code": None,
         "played_at_local": latest_time,  # Use latest play for sorting
+        **_entry_dates(primary_music),
+        "end_date": latest_time,
         "runtime_minutes": total_runtime_minutes,
-        "runtime_display": helpers.minutes_to_hhmm(total_runtime_minutes) if total_runtime_minutes else None,
+        "runtime_display": helpers.minutes_to_hhmm(total_runtime_minutes)
+        if total_runtime_minutes
+        else None,
         "instance_id": instance_id,
         "entry_key": entry_key,
         "score": album_score,  # Album tracker score

@@ -1,8 +1,16 @@
 import traceback
+from urllib.parse import urlparse
 
+from django.contrib import messages
+from django.contrib.auth.decorators import login_not_required
+from django.contrib.auth.views import redirect_to_login
 from django.http import HttpRequest, HttpResponse
-from django.shortcuts import render
+from django.shortcuts import redirect, render
+from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 
 
 def format_exception_traceback(exception: BaseException | None) -> str:
@@ -42,7 +50,7 @@ def _safe_request_value(
         value = getattr(request, attr_name)
         if callable(value):
             value = value()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return default
     return _display_value(value, default=default)
 
@@ -82,8 +90,7 @@ def build_error_report(
             f"Host: {_safe_request_value(request, 'get_host')}",
             f"Scheme: {_display_value(getattr(request, 'scheme', None))}",
             (
-                "User: "
-                f"{_display_value(getattr(user, 'username', None), 'anonymous')}"
+                f"User: {_display_value(getattr(user, 'username', None), 'anonymous')}"
                 if is_authenticated
                 else "User: anonymous"
             ),
@@ -194,8 +201,8 @@ def page_not_found(request: HttpRequest, exception: BaseException) -> HttpRespon
 
 def server_error(request: HttpRequest) -> HttpResponse:
     """Render the custom 500 page."""
-    exception = getattr(request, "_yamtrack_captured_exception", None)
-    traceback_text = getattr(request, "_yamtrack_captured_traceback", None)
+    exception = getattr(request, "_floppy_captured_exception", None)
+    traceback_text = getattr(request, "_floppy_captured_traceback", None)
     return render_error_page(
         request,
         "500.html",
@@ -208,12 +215,81 @@ def server_error(request: HttpRequest) -> HttpResponse:
     )
 
 
+def _is_entrance_url(path: str) -> bool:
+    """Return whether a path is a login/signup page.
+
+    Redirecting a CSRF failure to one of these produces an infinite loop.
+    """
+    entrance_paths = set()
+    for name in ("account_login", "account_signup"):
+        try:
+            entrance_paths.add(reverse(name))
+        except NoReverseMatch:  # pragma: no cover - both names are always wired
+            continue
+    return path in entrance_paths
+
+
+def _safe_return_url(request: HttpRequest) -> str:
+    """Return a same-host URL to send the user back to, falling back to home."""
+    referer = request.META.get("HTTP_REFERER")
+    if referer and url_has_allowed_host_and_scheme(
+        url=referer,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
+        return referer
+    return reverse("home")
+
+
+@require_POST
+@csrf_exempt
+@login_not_required
+def retry_startup_check(request: HttpRequest) -> HttpResponse:
+    """Handle a stale SQLite recovery-page retry after Floppy has resumed.
+
+    The recovery server owns this endpoint while Django is offline. If a
+    browser submits its page after Django is serving again, no startup action
+    remains to perform; return the user to the page that opened recovery
+    instead of rendering a misleading 404.
+    """
+    messages.info(
+        request,
+        "Watchmask has already resumed; the startup check no longer needs a retry.",
+    )
+    return redirect(_safe_return_url(request))
+
+
 def csrf_failure(
     request: HttpRequest,
     reason: str = "",
     template_name: str = "403_csrf.html",
 ) -> HttpResponse:
-    """Render the custom CSRF failure page."""
+    """Handle CSRF failures by redirecting instead of showing a dead end.
+
+    A CSRF failure doesn't necessarily mean the session is invalid - the CSRF
+    cookie and session have independent lifetimes, so a stale/missing CSRF
+    token can happen while the user is still logged in. Only send the user to
+    the login page when they're genuinely unauthenticated; otherwise bounce
+    them back to where they were with a fresh CSRF token on reload.
+    """
+    user = getattr(request, "user", None)
+    if user is not None:
+        return_url = _safe_return_url(request)
+        if not user.is_authenticated:
+            # Never bounce an unauthenticated user to a page that is itself an
+            # entrance page: the login POST would fail CSRF again and land back
+            # on the same form with no explanation, looping forever (#386).
+            if not _is_entrance_url(request.path) and not _is_entrance_url(
+                urlparse(return_url).path,
+            ):
+                return redirect_to_login(return_url)
+        else:
+            messages.info(
+                request,
+                "That action needed a quick refresh - please try again.",
+            )
+            return redirect(return_url)
+
     return render_error_page(
         request,
         template_name,
@@ -222,7 +298,10 @@ def csrf_failure(
         heading="Access Forbidden",
         error_message=(
             "CSRF verification failed for this request. This usually means the CSRF "
-            "cookie was missing, expired, or didn't match the form token."
+            "cookie was missing, expired, or didn't match the form token. If "
+            "Watchmask is behind an HTTPS reverse proxy, set the CSRF (or URLS) "
+            "environment variable to the address you use to reach it, and set "
+            "USE_X_FORWARDED=true."
         ),
         traceback_text=(
             "Traceback unavailable. Django rejected the request during CSRF "

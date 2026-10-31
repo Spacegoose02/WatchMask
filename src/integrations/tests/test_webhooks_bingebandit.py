@@ -97,7 +97,8 @@ class BingeBanditWebhookViewTests(TestCase):
     def test_valid_payload_is_queued(self, mock_delay):
         payload = _event("playback.start", MOVIE_DATA)
         self.assertEqual(self._post(payload).status_code, 200)
-        mock_delay.assert_called_once_with("bingebandit", payload, self.user.id)
+        mock_delay.assert_called_once()
+        self.assertEqual(mock_delay.call_args.args, ("bingebandit", payload, self.user.id))
 
     @patch("integrations.tasks.process_webhook.delay")
     def test_users_filter_skips_other_users(self, mock_delay):

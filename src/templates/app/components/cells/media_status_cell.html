@@ -1,17 +1,19 @@
+
+{% load i18n %}
 {% load app_tags %}
-{% if media.is_untracked %}
-  <span class="text-gray-300">No Status</span>
+{% if media.is_statusless %}
+  <span class="text-[var(--color-text-secondary)]">{% translate "No Status" %}</span>
 {% elif media.aggregated_status %}
   <div class="font-medium">{{ media.aggregated_status|media_status_readable }}</div>
   {% if media.repeats > 1 %}
     {% if media.item.media_type != MediaTypes.GAME.value and media.item.media_type != MediaTypes.BOARDGAME.value or user.game_logging_style != 'sessions' %}
-      <div class="text-xs text-indigo-400 mt-1">
-        <span>Latest</span>
+      <div class="text-xs text-[var(--color-link)] mt-1">
+        <span>{% translate "Latest" %}</span>
       </div>
     {% endif %}
   {% endif %}
 {% elif media.status %}
   {{ media.status|media_status_readable }}
 {% else %}
-  <span class="text-gray-500">-</span>
+  <span class="text-[var(--color-text-muted)]">-</span>
 {% endif %}

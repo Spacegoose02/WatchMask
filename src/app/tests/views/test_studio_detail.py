@@ -5,7 +5,15 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
-from app.models import Item, ItemStudioCredit, MediaTypes, Sources, Studio
+from app.models import (
+    Item,
+    ItemStudioCredit,
+    MediaTypes,
+    Movie,
+    Sources,
+    Status,
+    Studio,
+)
 
 
 class StudioDetailViewTests(TestCase):
@@ -67,6 +75,54 @@ class StudioDetailViewTests(TestCase):
         )
         self.assertEqual(response.context["studio"], studio)
         self.assertEqual(len(response.context["credited_titles"]), 1)
+
+    def test_studio_detail_movie_studio_shows_movie_label(self):
+        """Movie studio pages should label credits as movies, not games (#713)."""
+        studio = Studio.objects.create(
+            source=Sources.TMDB.value,
+            source_studio_id="1",
+            name="Warner Bros. Pictures",
+            logo="https://image.tmdb.org/t/p/original/logo.png",
+        )
+        item = Item.objects.create(
+            media_id="155",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Dark Knight",
+            image="http://example.com/dark-knight.jpg",
+            release_datetime=timezone.now(),
+        )
+        ItemStudioCredit.objects.create(item=item, studio=studio)
+
+        response = self.client.get(
+            reverse(
+                "studio_detail",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "studio_id": "1",
+                    "name": "warner-bros-pictures",
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "app/studio_detail.html")
+        self.assertContains(response, "Warner Bros. Pictures")
+        self.assertContains(response, "Movies")
+        self.assertContains(response, "The Dark Knight")
+        self.assertContains(
+            response,
+            reverse(
+                "media_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "media_id": "155",
+                    "title": "the-dark-knight",
+                },
+            ),
+        )
+        self.assertEqual(response.context["credited_media_type"], MediaTypes.MOVIE.value)
 
     @patch("app.providers.igdb.company_profile")
     def test_studio_detail_renders_provider_catalog(self, mock_company_profile):
@@ -153,7 +209,68 @@ class StudioDetailViewTests(TestCase):
         self.assertContains(response, "Developer, Publisher")
         self.assertContains(response, "2 games")
         self.assertEqual(response.context["studio"], studio)
-        self.assertEqual(response.context["studio_source_url"], "https://www.cdprojekt.com/")
+        self.assertEqual(
+            response.context["studio_source_url"], "https://www.cdprojekt.com/"
+        )
         self.assertEqual(response.context["studio_games_count"], 2)
         self.assertEqual(len(response.context["credited_titles"]), 2)
-        self.assertEqual(response.context["credited_titles"][0]["title"], "Cyberpunk 2077")
+        self.assertEqual(
+            response.context["credited_titles"][0]["title"], "Cyberpunk 2077"
+        )
+
+    def test_studio_titles_use_the_shared_media_card(self):
+        """A studio's titles show hover actions and the viewer's own tracking (#1534)."""
+        studio = Studio.objects.create(
+            source=Sources.TMDB.value,
+            source_studio_id="1",
+            name="Warner Bros. Pictures",
+        )
+        tracked_item = Item.objects.create(
+            media_id="155",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Dark Knight",
+            image="http://example.com/dark-knight.jpg",
+            release_datetime=timezone.now(),
+        )
+        other_item = Item.objects.create(
+            media_id="156",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Batman Begins",
+            image="http://example.com/begins.jpg",
+            release_datetime=timezone.now(),
+        )
+        ItemStudioCredit.objects.create(item=tracked_item, studio=studio)
+        ItemStudioCredit.objects.create(item=other_item, studio=studio)
+        movie = Movie.objects.create(
+            item=tracked_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            progress=1,
+            score=9,
+        )
+
+        response = self.client.get(
+            reverse(
+                "studio_detail",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "studio_id": "1",
+                    "name": "warner-bros-pictures",
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        # Both cards, tracked or not, get the hover actions.
+        self.assertContains(response, 'class="media-card-overlay', count=2)
+        # Only the tracked one has a status chip and a rating to change.
+        self.assertContains(response, 'class="media-status-chip', count=1)
+        self.assertContains(
+            response,
+            reverse(
+                "update_media_score",
+                args=[MediaTypes.MOVIE.value, movie.id],
+            ),
+        )

@@ -2,6 +2,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -28,6 +29,7 @@ from app.models import (
     Status,
     Studio,
 )
+from users.card_metadata import ABSORBED_PREFERENCE_FIELDS, apply_absorbed_preference
 from users.models import DateFormatChoices
 
 
@@ -52,6 +54,50 @@ class PersonDetailViewTests(TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    @patch("app.providers.tmdb.person")
+    def test_filter_toolbar_omits_filters_this_page_cannot_run(self, mock_person):
+        """The shared filter menu must not render controls with no state here.
+
+        This page has no completed-date support and a single-select platform,
+        so emitting those controls would bind Alpine expressions to variables
+        that do not exist and throw on every render.
+        """
+        mock_person.return_value = {
+            "person_id": "123",
+            "source": Sources.TMDB.value,
+            "name": "Jane Star",
+            "image": "http://example.com/jane.jpg",
+            "biography": "",
+            "known_for_department": "Acting",
+            "gender": "female",
+            "birth_date": "1990-01-01",
+            "death_date": None,
+            "place_of_birth": "Los Angeles",
+            "filmography": [],
+        }
+
+        response = self.client.get(
+            reverse(
+                "person_detail",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "person_id": "123",
+                    "name": "jane-star",
+                },
+            ),
+        )
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+
+        for name in (
+            "completed_date_from",
+            "completed_date_within",
+            "release_date_within",
+            "date_added_within",
+            "platform_mode",
+        ):
+            self.assertNotIn(f'name="{name}"', content, name)
+
     @staticmethod
     def _credit(person, role="Lead", sort_order=0):
         return {
@@ -71,7 +117,9 @@ class PersonDetailViewTests(TestCase):
                 },
             )
 
-    def _create_tmdb_tv_show(self, media_id, title, studio, show_credits, seasons, base_time):
+    def _create_tmdb_tv_show(
+        self, media_id, title, studio, show_credits, seasons, base_time
+    ):
         tv_item = Item.objects.create(
             media_id=media_id,
             source=Sources.TMDB.value,
@@ -125,17 +173,21 @@ class PersonDetailViewTests(TestCase):
                     media_id=media_id,
                     source=Sources.TMDB.value,
                     media_type=MediaTypes.EPISODE.value,
-                    title=episode_spec.get("title") or f"{title} Episode {season_number}-{episode_number}",
-                    image=episode_spec.get("image") or f"http://example.com/{media_id}-s{season_number}e{episode_number}.jpg",
+                    title=episode_spec.get("title")
+                    or f"{title} Episode {season_number}-{episode_number}",
+                    image=episode_spec.get("image")
+                    or f"http://example.com/{media_id}-s{season_number}e{episode_number}.jpg",
                     season_number=season_number,
                     episode_number=episode_number,
                     runtime_minutes=episode_spec.get("runtime_minutes", 45),
                 )
-                Episode.objects.create(
-                    item=episode_item,
-                    related_season=season,
-                    end_date=base_time + timedelta(minutes=episode_spec.get("offset_minutes", 0)),
-                )
+                with self.captureOnCommitCallbacks(execute=True):
+                    Episode.objects.create(
+                        item=episode_item,
+                        related_season=season,
+                        end_date=base_time
+                        + timedelta(minutes=episode_spec.get("offset_minutes", 0)),
+                    )
                 for credit in episode_spec.get("credits", []):
                     ItemPersonCredit.objects.create(
                         item=episode_item,
@@ -148,8 +200,8 @@ class PersonDetailViewTests(TestCase):
 
     @patch("app.providers.tmdb.person")
     def test_person_detail_shows_filmography_and_history_link(self, mock_person):
-        self.user.media_card_subtitle_display = "always"
-        self.user.save(update_fields=["media_card_subtitle_display"])
+        apply_absorbed_preference(self.user, ABSORBED_PREFERENCE_FIELDS[0], "always")
+        self.user.save(update_fields=["card_metadata"])
 
         item = Item.objects.create(
             media_id="501",
@@ -248,8 +300,146 @@ class PersonDetailViewTests(TestCase):
         self.assertContains(response, "Tracked Movie")
         self.assertContains(response, "Other Show")
         self.assertContains(response, "?person_source=tmdb&amp;person_id=123")
-        self.assertContains(response, "media-card-subtitle-always")
+        self.assertContains(response, "media-card-line-dormant")
+        # Tracked and untracked credits both get the shared card's hover actions;
+        # only the tracked one has the viewer's status chip (#1534).
+        self.assertContains(response, 'class="media-card-overlay', count=3)
+        self.assertContains(response, 'class="media-status-chip', count=2)
         self.assertNotContains(response, "Tracked Titles")
+
+    @patch("app.providers.tmdb.person")
+    def test_watched_content_includes_completed_titles_without_end_date(
+        self, mock_person
+    ):
+        """A completed title counts as watched even with no recorded end date.
+
+        Filmography already reads the tracking row's completed status; the
+        watched shelf must not use the end date as its watched criterion.
+        """
+        movie_item = Item.objects.create(
+            media_id="601",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Undated Movie",
+            image="http://example.com/undated-movie.jpg",
+        )
+        ItemPersonCredit.objects.create(
+            item=movie_item,
+            person=self.person,
+            role_type=CreditRoleType.CAST.value,
+            role="Lead",
+        )
+        Movie.objects.create(
+            item=movie_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+        )
+
+        show_item = Item.objects.create(
+            media_id="602",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Undated Show",
+            image="http://example.com/undated-show.jpg",
+        )
+        show = TV.objects.create(
+            item=show_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+        )
+        ItemPersonCredit.objects.create(
+            item=show_item,
+            person=self.person,
+            role_type=CreditRoleType.CAST.value,
+            role="Lead",
+        )
+        season_item = Item.objects.create(
+            media_id="602",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Undated Show",
+            image="http://example.com/undated-season.jpg",
+            season_number=1,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=show,
+            status=Status.COMPLETED.value,
+        )
+        episode_item = Item.objects.create(
+            media_id="602",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Undated Episode",
+            image="http://example.com/undated-episode.jpg",
+            season_number=1,
+            episode_number=1,
+        )
+        Episode.objects.create(
+            item=episode_item,
+            related_season=season,
+            status=Status.COMPLETED.value,
+        )
+
+        mock_person.return_value = {
+            "person_id": "123",
+            "source": Sources.TMDB.value,
+            "name": "Jane Star",
+            "image": "http://example.com/jane.jpg",
+            "biography": "",
+            "known_for_department": "Acting",
+            "gender": "female",
+            "birth_date": "1990-01-01",
+            "death_date": None,
+            "place_of_birth": "Los Angeles",
+            "filmography": [
+                {
+                    "media_id": "601",
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "title": "Undated Movie",
+                    "image": "http://example.com/undated-movie.jpg",
+                    "year": 2024,
+                    "credit_type": "cast",
+                    "role": "Lead",
+                    "department": "Acting",
+                },
+                {
+                    "media_id": "602",
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.TV.value,
+                    "title": "Undated Show",
+                    "image": "http://example.com/undated-show.jpg",
+                    "year": 2024,
+                    "credit_type": "cast",
+                    "role": "Lead",
+                    "department": "Acting",
+                },
+            ],
+        }
+
+        response = self.client.get(
+            reverse(
+                "person_detail",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "person_id": "123",
+                    "name": "jane-star",
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["watched_movie_count"], 1)
+        self.assertEqual(response.context["watched_show_count"], 1)
+        self.assertEqual(
+            {entry["title"] for entry in response.context["watched_filmography"]},
+            {"Undated Movie", "Undated Show"},
+        )
+        self.assertTrue(
+            all(entry["is_watched"] for entry in response.context["filmography"])
+        )
 
     @patch("app.providers.tmdb.person")
     def test_person_detail_dates_respect_user_preference(self, mock_person):
@@ -485,7 +675,9 @@ class PersonDetailViewTests(TestCase):
             role_type=CreditRoleType.CAST.value,
             role="Guest",
         )
-        self._mark_tmdb_credits_current(show_item, season_item, first_episode_item, second_episode_item)
+        self._mark_tmdb_credits_current(
+            show_item, season_item, first_episode_item, second_episode_item
+        )
 
         mock_person.return_value = {
             "person_id": "123",
@@ -589,6 +781,7 @@ class PersonDetailViewTests(TestCase):
             },
             base_time=base_time,
         )
+        cache.clear()
 
         mock_person.return_value = {
             "person_id": "7790",
@@ -632,14 +825,108 @@ class PersonDetailViewTests(TestCase):
         self.assertEqual(response.context["tracked_hours_count"], "0h 45min")
         self.assertEqual(response.context["watched_show_count"], 1)
         self.assertEqual(len(response.context["watched_filmography"]), 1)
-        self.assertEqual(response.context["watched_filmography"][0]["title"], "Season Ladder Show")
         self.assertEqual(
-            response.context["watched_filmography"][0]["watched_person_runtime_display"],
+            response.context["watched_filmography"][0]["title"], "Season Ladder Show"
+        )
+        self.assertEqual(
+            response.context["watched_filmography"][0][
+                "watched_person_runtime_display"
+            ],
             "45min",
         )
 
+    @patch("app.providers.mangabaka.author_profile")
+    def test_person_detail_author_bibliography_sorts_by_year(self, mock_author_profile):
+        """Providers that return relevance order must still sort by date.
+
+        MangaBaka (like Hardcover and OpenLibrary) returns search-relevance
+        order and carries only `year`, but the default sort trusted the
+        provider to hand back newest-first, so it was a no-op and the
+        bibliography rendered in what looked like random order.
+        """
+        person = Person.objects.create(
+            source=Sources.MANGABAKA.value,
+            source_person_id="MIURA Kentaro",
+            name="MIURA Kentaro",
+        )
+        mock_author_profile.return_value = {
+            "person_id": "MIURA Kentaro",
+            "source": Sources.MANGABAKA.value,
+            "name": "MIURA Kentaro",
+            "known_for_department": "Author",
+            "bibliography": [
+                {"media_id": "3", "media_type": MediaTypes.MANGA.value,
+                 "title": "Middle", "year": 1997},
+                {"media_id": "1", "media_type": MediaTypes.MANGA.value,
+                 "title": "Newest", "year": 2021},
+                {"media_id": "2", "media_type": MediaTypes.MANGA.value,
+                 "title": "Oldest", "year": 1985},
+                {"media_id": "4", "media_type": MediaTypes.MANGA.value,
+                 "title": "Undated", "year": None},
+            ],
+        }
+
+        response = self.client.get(
+            reverse(
+                "person_detail",
+                kwargs={
+                    "source": Sources.MANGABAKA.value,
+                    "person_id": "MIURA Kentaro",
+                    "name": "miura-kentaro",
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        titles = [e["title"] for e in response.context["filmography"]]
+        # Default direction is newest-first, undated entries last.
+        self.assertEqual(titles, ["Newest", "Middle", "Oldest", "Undated"])
+
+    @patch("app.providers.mangabaka.author_profile")
+    def test_person_detail_author_bibliography_oldest_first_on_ascending(
+        self,
+        mock_author_profile,
+    ):
+        person = Person.objects.create(
+            source=Sources.MANGABAKA.value,
+            source_person_id="MIURA Kentaro",
+            name="MIURA Kentaro",
+        )
+        mock_author_profile.return_value = {
+            "person_id": "MIURA Kentaro",
+            "source": Sources.MANGABAKA.value,
+            "name": "MIURA Kentaro",
+            "known_for_department": "Author",
+            "bibliography": [
+                {"media_id": "1", "media_type": MediaTypes.MANGA.value,
+                 "title": "Newest", "year": 2021},
+                {"media_id": "2", "media_type": MediaTypes.MANGA.value,
+                 "title": "Oldest", "year": 1985},
+            ],
+        }
+
+        response = self.client.get(
+            reverse(
+                "person_detail",
+                kwargs={
+                    "source": Sources.MANGABAKA.value,
+                    "person_id": "MIURA Kentaro",
+                    "name": "miura-kentaro",
+                },
+            )
+            + "?sort=release_date&direction=asc",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [e["title"] for e in response.context["filmography"]],
+            ["Oldest", "Newest"],
+        )
+
     @patch("app.providers.openlibrary.author_profile")
-    def test_person_detail_openlibrary_author_uses_bibliography(self, mock_author_profile):
+    def test_person_detail_openlibrary_author_uses_bibliography(
+        self, mock_author_profile
+    ):
         person = Person.objects.create(
             source=Sources.OPENLIBRARY.value,
             source_person_id="OL1A",
@@ -709,7 +996,9 @@ class PersonDetailViewTests(TestCase):
         self.assertContains(response, "?person_source=openlibrary&amp;person_id=OL1A")
 
     @patch("app.providers.hardcover.author_profile")
-    def test_person_detail_hardcover_author_uses_bibliography(self, mock_author_profile):
+    def test_person_detail_hardcover_author_uses_bibliography(
+        self, mock_author_profile
+    ):
         person = Person.objects.create(
             source=Sources.HARDCOVER.value,
             source_person_id="78661",
@@ -851,7 +1140,9 @@ class PersonDetailViewTests(TestCase):
         self.assertContains(response, "A Clash of Kings")
 
     @patch("app.providers.comicvine.person_profile")
-    def test_person_detail_comicvine_falls_back_to_local_credited_items(self, mock_person_profile):
+    def test_person_detail_comicvine_falls_back_to_local_credited_items(
+        self, mock_person_profile
+    ):
         person = Person.objects.create(
             source=Sources.COMICVINE.value,
             source_person_id="44",
@@ -908,8 +1199,12 @@ class PersonDetailViewTests(TestCase):
         self.assertEqual(response.context["tracked_plays_count"], 1)
         self.assertEqual(response.context["watched_book_count"], 1)
         self.assertEqual(len(response.context["watched_filmography"]), 1)
-        self.assertEqual(response.context["filmography"][0]["title"], "Ultimate Spider-Man")
-        self.assertEqual(response.context["watched_filmography"][0]["title"], "Ultimate Spider-Man")
+        self.assertEqual(
+            response.context["filmography"][0]["title"], "Ultimate Spider-Man"
+        )
+        self.assertEqual(
+            response.context["watched_filmography"][0]["title"], "Ultimate Spider-Man"
+        )
         self.assertContains(response, "Ultimate Spider-Man")
 
     @patch("app.providers.mangaupdates.author_profile")
@@ -981,8 +1276,79 @@ class PersonDetailViewTests(TestCase):
         self.assertEqual(response.context["tracked_plays_count"], 1)
         self.assertEqual(response.context["watched_book_count"], 1)
         self.assertEqual(len(response.context["watched_filmography"]), 1)
-        self.assertEqual(response.context["watched_filmography"][0]["title"], "Manga Title")
+        self.assertEqual(
+            response.context["watched_filmography"][0]["title"], "Manga Title"
+        )
         self.assertContains(response, "Manga Title")
+
+    @patch("app.providers.tvdb.person")
+    def test_person_detail_shows_tvdb_filmography(self, mock_person):
+        item = Item.objects.create(
+            media_id="81189",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Tracked Show",
+            image="http://example.com/tracked.jpg",
+        )
+        person = Person.objects.create(
+            source=Sources.TVDB.value,
+            source_person_id="291115",
+            name="Bryan Cranston",
+        )
+        ItemPersonCredit.objects.create(
+            item=item,
+            person=person,
+            role_type=CreditRoleType.CAST.value,
+            role="Walter White",
+        )
+        TV.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+
+        mock_person.return_value = {
+            "person_id": "291115",
+            "source": Sources.TVDB.value,
+            "name": "Bryan Cranston",
+            "image": "http://example.com/bryan.jpg",
+            "biography": "American actor.",
+            "known_for_department": "Actor",
+            "gender": "male",
+            "birth_date": "1956-03-07",
+            "death_date": None,
+            "place_of_birth": "Hollywood, California, USA",
+            "filmography": [
+                {
+                    "media_id": "81189",
+                    "source": Sources.TVDB.value,
+                    "media_type": MediaTypes.TV.value,
+                    "title": "Tracked Show",
+                    "image": "http://example.com/tracked.jpg",
+                    "year": 2008,
+                    "credit_type": "cast",
+                    "role": "Walter White",
+                    "department": "Acting",
+                },
+            ],
+        }
+
+        response = self.client.get(
+            reverse(
+                "person_detail",
+                kwargs={
+                    "source": Sources.TVDB.value,
+                    "person_id": "291115",
+                    "name": "bryan-cranston",
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "app/person_detail.html")
+        self.assertEqual(len(response.context["filmography"]), 1)
+        self.assertContains(response, "Tracked Show")
+        self.assertContains(response, "?person_source=tvdb&amp;person_id=291115")
 
     def test_person_detail_rejects_unsupported_source(self):
         response = self.client.get(

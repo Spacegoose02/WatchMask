@@ -1,0 +1,271 @@
+# FORK: import/export endpoints mirroring the web import-data page's
+# one-off import dispatches, CSV export, and import activity.
+# OAuth-based connects (Trakt/Plex/SIMKL/AniList-private) stay web-only.
+# URL wiring lives in fork_urls.py.
+import logging
+from http import HTTPStatus as HTTP  # noqa: N814
+
+from django.conf import settings
+from django.http import HttpResponse, StreamingHttpResponse
+from django.utils import timezone
+from rest_framework import views as drf_views
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.response import Response
+
+from app.redis_diagnosis import queue_failure_message
+from integrations import exports, tasks
+from integrations.imports import helpers as import_helpers
+from integrations.upload_staging import (
+    enqueue_staged_task,
+    stage_uploaded_file,
+    staging_failure_message,
+)
+from users.models import ImportModeChoices
+
+logger = logging.getLogger(__name__)
+
+# Username-driven imports: service -> (task export, identifier label).
+# Resolve the task only when this endpoint is used so URL loading does not
+# import every provider implementation into each Gunicorn worker.
+_USERNAME_IMPORTS = {
+    "mal": ("import_mal", "MyAnimeList username"),
+    "anilist": ("import_anilist", "AniList username"),
+    "kitsu": ("import_kitsu", "Kitsu user ID"),
+    "steam": ("import_steam", "Steam ID"),
+}
+
+# Token-driven imports: service -> (task export, credential label). These have
+# no public username to read, so the credential is the only way in, and it is
+# encrypted before it reaches the broker.
+_TOKEN_IMPORTS = {
+    "mangabaka": ("import_mangabaka", "MangaBaka API token"),
+}
+
+# File-driven imports: service -> (task export, file label).
+_FILE_IMPORTS = {
+    # Service key stays "yamtrack": it is a public API parameter value.
+    "yamtrack": ("import_yamtrack", "Watchmask backup or Yamtrack CSV"),
+    "trakt-collection": ("import_trakt_collection_csv", "Trakt collection CSV"),
+    "trakt-export": ("import_trakt_export", "Trakt data export zip"),
+    "hltb": ("import_hltb", "HowLongToBeat CSV"),
+    "grouvee": ("import_grouvee", "Grouvee export (JSON or zip)"),
+    "imdb": ("import_imdb", "IMDB CSV"),
+    "goodreads": ("import_goodreads", "Goodreads CSV"),
+    "hardcover": ("import_hardcover", "Hardcover CSV"),
+    "storygraph": ("import_storygraph", "StoryGraph CSV"),
+    "youtube-takeout": (
+        "import_youtube_takeout",
+        "YouTube Takeout watch history (JSON or zip)",
+    ),
+}
+
+
+def _resolve_mode(request):
+    """Validate the import mode (defaults to the user's preference)."""
+    mode = request.data.get("mode") or request.user.import_mode
+    if mode not in ImportModeChoices.values:
+        return None
+    return mode
+
+
+def _queue_failure_response(error):
+    """Return 503 naming an unreachable Redis broker rather than a bare 500."""
+    detail = queue_failure_message(
+        error,
+        "The import could not be queued.",
+        "",
+        settings.CELERY_BROKER_URL,
+    )
+    return Response({"detail": detail}, status=HTTP.SERVICE_UNAVAILABLE)
+
+
+# /api/v1/imports/[service]/
+class ImportDispatchView(drf_views.APIView):
+    """Queue a one-off import for a service (mirrors the web import forms).
+
+    Username services (mal, anilist, kitsu, steam) take {"username", "mode"}.
+    Token services (mangabaka) take {"token", "mode"} and never a username.
+    File services (yamtrack, trakt-collection, trakt-export, hltb, grouvee,
+    imdb, goodreads, hardcover, storygraph, youtube-takeout) take a multipart upload in the
+    "file" field plus an optional "mode". Returns 202 with a task_id pollable at
+    /api/v1/tasks/{task_id}. Recurring schedules stay web-only.
+    """
+
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    def post(self, request, service):
+        """Dispatch the import task for the service."""
+        mode = _resolve_mode(request)
+        if mode is None:
+            return Response(
+                {
+                    "detail": "Invalid mode.",
+                    "choices": list(ImportModeChoices.values),
+                },
+                status=HTTP.BAD_REQUEST,
+            )
+
+        if service in _USERNAME_IMPORTS:
+            task_export, label = _USERNAME_IMPORTS[service]
+            task_fn = getattr(tasks, task_export)
+            username = (str(request.data.get("username") or "")).strip()
+            if not username:
+                return Response(
+                    {"detail": f"{label} is required in 'username'."},
+                    status=HTTP.BAD_REQUEST,
+                )
+            try:
+                task = task_fn.delay(
+                    username=username,
+                    user_id=request.user.id,
+                    mode=mode,
+                )
+            except Exception as error:
+                logger.exception("Could not queue %s import", label)
+                return _queue_failure_response(error)
+            return Response({"task_id": task.id}, status=HTTP.ACCEPTED)
+
+        if service in _TOKEN_IMPORTS:
+            task_export, label = _TOKEN_IMPORTS[service]
+            task_fn = getattr(tasks, task_export)
+            token = (str(request.data.get("token") or "")).strip()
+            if not token:
+                return Response(
+                    {"detail": f"{label} is required in 'token'."},
+                    status=HTTP.BAD_REQUEST,
+                )
+            task = task_fn.delay(
+                token=import_helpers.encrypt(token),
+                user_id=request.user.id,
+                mode=mode,
+            )
+            return Response({"task_id": task.id}, status=HTTP.ACCEPTED)
+
+        if service in _FILE_IMPORTS:
+            task_export, label = _FILE_IMPORTS[service]
+            task_fn = getattr(tasks, task_export)
+            file = request.FILES.get("file")
+            if not file:
+                return Response(
+                    {"detail": f"{label} upload is required in 'file'."},
+                    status=HTTP.BAD_REQUEST,
+                )
+            try:
+                staged_file = str(stage_uploaded_file(file))
+            except OSError as error:
+                logger.exception("Could not stage %s upload", label)
+                return Response(
+                    {"detail": staging_failure_message(error)},
+                    status=HTTP.INSUFFICIENT_STORAGE,
+                )
+            try:
+                task = enqueue_staged_task(
+                    task_fn,
+                    user_id=request.user.id,
+                    file=staged_file,
+                    mode=mode,
+                    staged_paths=(staged_file,),
+                )
+            except Exception as error:
+                logger.exception("Could not queue %s upload", label)
+                return _queue_failure_response(error)
+            return Response({"task_id": task.id}, status=HTTP.ACCEPTED)
+
+        return Response(
+            {
+                "detail": "Unknown import service.",
+                "services": sorted(
+                    [*_USERNAME_IMPORTS, *_TOKEN_IMPORTS, *_FILE_IMPORTS],
+                ),
+            },
+            status=HTTP.NOT_FOUND,
+        )
+
+
+# /api/v1/imports/activity/
+class ImportActivityView(drf_views.APIView):
+    """Recent import task history (mirrors the web import activity panel)."""
+
+    def get(self, request):
+        """Return the user's recent import task results and schedules."""
+        data = request.user.get_import_tasks()
+        results = [
+            {
+                "source": entry.get("source"),
+                "status": entry.get("status"),
+                "date": entry.get("date"),
+                "summary": entry.get("summary"),
+                "errors": entry.get("errors"),
+            }
+            for entry in data.get("results", [])
+        ]
+        schedules = [
+            {
+                "source": entry.get("source"),
+                "username": entry.get("username"),
+                "last_run": entry.get("last_run"),
+                "next_run": entry.get("next_run"),
+                "schedule": entry.get("schedule"),
+                "mode": entry.get("mode"),
+            }
+            for entry in data.get("schedules", [])
+        ]
+        return Response(
+            {"results": results, "schedules": schedules},
+            status=HTTP.OK,
+        )
+
+
+# /api/v1/export/csv/
+class ExportCsvView(drf_views.APIView):
+    """Stream the user's library as CSV (mirrors the web export)."""
+
+    def get(self, request):
+        """Stream the CSV backup.
+
+        Query params: media_types (repeatable) to restrict types,
+        include_lists=0 to skip custom lists, include_collection=0 to skip
+        collection entries, only=collection for a collection-only export.
+        """
+        selected_media_types = request.GET.getlist("media_types")
+        include_lists = request.GET.get("include_lists", "1") not in ("0", "false")
+        include_collection = request.GET.get("include_collection", "1") not in (
+            "0",
+            "false",
+        )
+        media_types = selected_media_types or None
+
+        if request.GET.get("only") == "collection":
+            media_types = []
+            include_lists = False
+            include_collection = True
+
+        now = timezone.localtime()
+        response = StreamingHttpResponse(
+            streaming_content=exports.generate_rows(
+                request.user,
+                media_types=media_types,
+                include_lists=include_lists,
+                include_collection=include_collection,
+            ),
+            content_type="text/csv",
+            headers={
+                "Content-Disposition": (f'attachment; filename="floppy_{now}.csv"'),
+            },
+        )
+        logger.info("User %s started CSV export via API", request.user.username)
+        return response
+
+
+# /api/v1/export/template/
+class ExportTemplateView(drf_views.APIView):
+    """Download the sample import-template CSV."""
+
+    def get(self, _request):
+        """Return the template CSV content."""
+        content = exports.generate_sample_template()
+        response = HttpResponse(content, content_type="text/csv")
+        response["Content-Disposition"] = (
+            'attachment; filename="floppy_import_template.csv"'
+        )
+        return response

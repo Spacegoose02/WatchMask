@@ -171,10 +171,15 @@ class ResolveColumnsTests(TestCase):
                 "runtime",
                 "time_watched",
                 "popularity",
+                "genres",
+                "tags",
                 "release_date",
                 "date_added",
                 "start_date",
                 "end_date",
+                "entry_source",
+                "notes",
+                "synopsis",
             ],
         )
 
@@ -206,9 +211,67 @@ class ResolveColumnsTests(TestCase):
                 "runtime",
                 "time_watched",
                 "popularity",
+                "genres",
+                "tags",
                 "release_date",
                 "date_added",
                 "start_date",
                 "end_date",
+                "entry_source",
+                "notes",
+                "synopsis",
             ],
         )
+
+    def test_notes_column_visible_for_all_media_types(self):
+        for media_type in (MediaTypes.BOOK.value, MediaTypes.MOVIE.value):
+            columns = resolve_columns(
+                media_type=media_type,
+                current_sort="score",
+                user=self.user,
+                table_type="media",
+            )
+            keys = [column.key for column in columns]
+
+            self.assertIn("notes", keys)
+
+    def test_notes_column_can_be_hidden(self):
+        self.user.table_column_prefs = {
+            MediaTypes.BOOK.value: {
+                "order": [],
+                "hidden": ["notes"],
+            },
+        }
+        self.user.save(update_fields=["table_column_prefs"])
+
+        columns = resolve_columns(
+            media_type=MediaTypes.BOOK.value,
+            current_sort="score",
+            user=self.user,
+            table_type="media",
+        )
+        keys = [column.key for column in columns]
+
+        self.assertNotIn("notes", keys)
+
+    def test_entry_source_column_visible_and_hideable(self):
+        for media_type in (MediaTypes.BOOK.value, MediaTypes.MOVIE.value):
+            columns = resolve_columns(
+                media_type=media_type,
+                current_sort="score",
+                user=self.user,
+                table_type="media",
+            )
+            self.assertIn("entry_source", [column.key for column in columns])
+
+        self.user.table_column_prefs = {
+            MediaTypes.MOVIE.value: {"order": [], "hidden": ["entry_source"]},
+        }
+        self.user.save(update_fields=["table_column_prefs"])
+        columns = resolve_columns(
+            media_type=MediaTypes.MOVIE.value,
+            current_sort="score",
+            user=self.user,
+            table_type="media",
+        )
+        self.assertNotIn("entry_source", [column.key for column in columns])

@@ -1,16 +1,29 @@
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import requests
+from django.core.cache import cache
 from django.test import TestCase, override_settings
 
-from app.models import Item, MediaTypes, Sources
+from app.models import (
+    Item,
+    MediaTypes,
+    Podcast,
+    PodcastEpisode,
+    PodcastShow,
+    Sources,
+    Status,
+)
 from app.providers import (
+    credentials,
     igdb,
     mal,
     services,
     tmdb,
 )
+from integrations.imports.helpers import encrypt
+from users.models import User
 
 mock_path = Path(__file__).resolve().parent.parent / "mock_data"
 
@@ -70,6 +83,81 @@ class ServicesTests(TestCase):
         self.assertEqual(kwargs["data"], {"form_data": "value"})
         self.assertIn("timeout", kwargs)
 
+    @patch("app.providers.services.session.put")
+    def test_api_request_put(self, mock_put):
+        """Test the api_request function with PUT method."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_put.return_value = mock_response
+
+        result = services.api_request(
+            "TEST",
+            "PUT",
+            "https://example.com/api",
+            data={"form_data": "value"},
+        )
+
+        self.assertEqual(result, {"data": "test"})
+        mock_put.assert_called_once()
+        _, kwargs = mock_put.call_args
+        self.assertEqual(kwargs["url"], "https://example.com/api")
+        self.assertEqual(kwargs["data"], {"form_data": "value"})
+        self.assertIn("timeout", kwargs)
+
+    def tearDown(self):
+        """Avoid leaking the tmdb proxy cache key between tests."""
+        cache.delete("tmdb_proxy_url")
+        super().tearDown()
+
+    @patch("app.providers.services.session.get")
+    def test_api_request_uses_configured_tmdb_proxy(self, mock_get):
+        """TMDB requests should route through a configured user's proxy URL."""
+        User.objects.create_user(
+            username="proxy-user",
+            password="testpass123",
+            tmdb_proxy_url=encrypt("socks5://127.0.0.1:1080"),
+        )
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_get.return_value = mock_response
+
+        services.api_request(Sources.TMDB.value, "GET", "https://example.com/api")
+
+        _, kwargs = mock_get.call_args
+        self.assertEqual(
+            kwargs["proxies"],
+            {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"},
+        )
+
+    @patch("app.providers.services.session.get")
+    def test_api_request_omits_proxies_when_not_configured(self, mock_get):
+        """No proxy should be applied when no user has one configured."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_get.return_value = mock_response
+
+        services.api_request(Sources.TMDB.value, "GET", "https://example.com/api")
+
+        _, kwargs = mock_get.call_args
+        self.assertNotIn("proxies", kwargs)
+
+    @patch("app.providers.services.session.get")
+    def test_api_request_only_proxies_tmdb_provider(self, mock_get):
+        """Non-TMDB providers should not pick up the TMDB proxy setting."""
+        User.objects.create_user(
+            username="proxy-user",
+            password="testpass123",
+            tmdb_proxy_url=encrypt("socks5://127.0.0.1:1080"),
+        )
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"data": "test"}
+        mock_get.return_value = mock_response
+
+        services.api_request(Sources.TVDB.value, "GET", "https://example.com/api")
+
+        _, kwargs = mock_get.call_args
+        self.assertNotIn("proxies", kwargs)
+
     @patch("app.providers.services.session.get")
     def test_api_request_wraps_connection_failures(self, mock_get):
         """Network failures should raise a provider error without crashing views."""
@@ -87,14 +175,16 @@ class ServicesTests(TestCase):
         self.assertIsNone(cm.exception.status_code)
         self.assertIn("Could not reach", str(cm.exception))
 
-    @patch("app.providers.services.time.sleep")
     @patch("app.providers.services.session.get")
-    def test_api_request_retries_transient_http_errors(
-        self,
-        mock_get,
-        mock_sleep,
-    ):
+    def test_api_request_retries_transient_http_errors(self, mock_get):
         """Transient upstream 5xx responses should be retried before failing."""
+        # Swap the module's own `time` name, not the process-wide time.sleep,
+        # so sleeps from background threads are not counted.
+        fake_time = MagicMock(wraps=time)
+        mock_sleep = fake_time.sleep
+        patcher = patch("app.providers.services.time", fake_time)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         failed_response = MagicMock()
         failed_response.status_code = 502
         failed_response.headers = {}
@@ -159,7 +249,10 @@ class ServicesTests(TestCase):
 
         result = igdb.handle_error(error)
 
-        mock_cache_delete.assert_called_once_with("igdb_access_token")
+        # The token cache is keyed by the credentials that minted it, so a
+        # personal key cannot invalidate (or serve) someone else's token.
+        suffix = credentials.cache_suffix("igdb", "client_id", "client_secret")
+        mock_cache_delete.assert_called_once_with(f"igdb_access_token_{suffix}")
 
         self.assertEqual(result, {"retry": True})
 
@@ -269,7 +362,9 @@ class ServicesTests(TestCase):
                     "name": "The Witcher 3: Wild Hunt",
                     "url": "https://www.igdb.com/games/the-witcher-3-wild-hunt",
                     "game_type": 0,
-                    "external_games": [{"url": "https://store.steampowered.com/app/292030"}],
+                    "external_games": [
+                        {"url": "https://store.steampowered.com/app/292030"}
+                    ],
                 },
             ]
 
@@ -319,13 +414,24 @@ class ServicesTests(TestCase):
                     "name": "",
                     "url": "https://www.igdb.com/games/the-witcher-3-wild-hunt",
                     "game_type": 0,
-                    "external_games": [{"url": "https://store.steampowered.com/app/292030"}],
+                    "external_games": [
+                        {"url": "https://store.steampowered.com/app/292030"}
+                    ],
                 },
             ]
 
             response = igdb.game("1942")
 
         self.assertNotIn("external_links", response)
+
+    def test_igdb_get_access_token_raises_not_configured_without_credentials(self):
+        """Missing IGDB credentials should raise a clear config error, not a raw Twitch error."""
+        with patch("app.providers.credentials.is_configured", return_value=False):
+            with self.assertRaises(services.ProviderNotConfiguredError) as cm:
+                igdb.get_access_token()
+
+        self.assertEqual(cm.exception.provider, Sources.IGDB.value)
+        self.assertIn("not configured", str(cm.exception))
 
     @patch("app.providers.mal.anime")
     def test_get_media_metadata_anime(self, mock_anime):
@@ -341,6 +447,20 @@ class ServicesTests(TestCase):
         self.assert_metadata_title_payload(result, "Test Anime")
 
         mock_anime.assert_called_once_with("1")
+
+    @patch("app.providers.mangabaka.manga")
+    def test_get_media_metadata_manga_mangabaka(self, mock_manga):
+        """Test the get_media_metadata function for manga from MangaBaka."""
+        mock_manga.return_value = {"title": "Test Manga"}
+
+        result = services.get_media_metadata(
+            MediaTypes.MANGA.value,
+            "1",
+            Sources.MANGABAKA.value,
+        )
+
+        self.assert_metadata_title_payload(result, "Test Manga")
+        mock_manga.assert_called_once_with("1")
 
     @patch("app.providers.mangaupdates.manga")
     def test_get_media_metadata_manga_mangaupdates(self, mock_manga):
@@ -385,7 +505,7 @@ class ServicesTests(TestCase):
 
         self.assert_metadata_title_payload(result, "Test TV")
 
-        mock_tv.assert_called_once_with("1")
+        mock_tv.assert_called_once_with("1", None)
 
     @patch("app.providers.tvdb.tv")
     def test_get_media_metadata_tv_tvdb(self, mock_tv):
@@ -399,7 +519,11 @@ class ServicesTests(TestCase):
         )
 
         self.assert_metadata_title_payload(result, "Test TVDB Show")
-        mock_tv.assert_called_once_with("81189", routed_media_type=MediaTypes.TV.value)
+        mock_tv.assert_called_once_with(
+            "81189",
+            routed_media_type=MediaTypes.TV.value,
+            language=None,
+        )
 
     @patch("app.providers.tmdb.tv_with_seasons")
     def test_get_media_metadata_tv_with_seasons(self, mock_tv_with_seasons):
@@ -415,7 +539,7 @@ class ServicesTests(TestCase):
 
         self.assert_metadata_title_payload(result, "Test TV with Seasons")
 
-        mock_tv_with_seasons.assert_called_once_with("1", [1, 2])
+        mock_tv_with_seasons.assert_called_once_with("1", [1, 2], None)
 
     @patch("app.providers.tvdb.tv_with_seasons")
     def test_get_media_metadata_tv_with_seasons_tvdb(self, mock_tv_with_seasons):
@@ -434,6 +558,7 @@ class ServicesTests(TestCase):
             "81189",
             [0, 1],
             routed_media_type=MediaTypes.TV.value,
+            language=None,
         )
 
     @patch("app.providers.tmdb.tv_with_seasons")
@@ -452,7 +577,9 @@ class ServicesTests(TestCase):
 
         self.assert_metadata_title_payload(result, "Test Season")
 
-        mock_tv_with_seasons.assert_called_once_with("1", [1])
+        mock_tv_with_seasons.assert_called_once_with(
+            "1", [1], None, missing_seasons=set()
+        )
 
     @patch("app.providers.tmdb.episode")
     def test_get_media_metadata_episode(self, mock_episode):
@@ -469,7 +596,7 @@ class ServicesTests(TestCase):
 
         self.assert_metadata_title_payload(result, "Test Episode")
 
-        mock_episode.assert_called_once_with("1", 1, "2")
+        mock_episode.assert_called_once_with("1", 1, "2", None)
 
     @patch("app.providers.tmdb.movie")
     def test_get_media_metadata_movie(self, mock_movie):
@@ -484,7 +611,7 @@ class ServicesTests(TestCase):
 
         self.assert_metadata_title_payload(result, "Test Movie")
 
-        mock_movie.assert_called_once_with("1")
+        mock_movie.assert_called_once_with("1", None)
 
     @patch("app.providers.igdb.game")
     def test_get_media_metadata_game(self, mock_game):
@@ -514,7 +641,7 @@ class ServicesTests(TestCase):
 
         self.assert_metadata_title_payload(result, "Test Comic")
 
-        mock_comic.assert_called_once_with("1")
+        mock_comic.assert_called_once_with("1", user=None)
 
     @patch("app.providers.openlibrary.book")
     def test_get_media_metadata_book(self, mock_book):
@@ -530,6 +657,20 @@ class ServicesTests(TestCase):
         self.assert_metadata_title_payload(result, "Test Book")
 
         mock_book.assert_called_once_with("1")
+
+    @patch("app.providers.googlebooks.book")
+    def test_get_media_metadata_googlebooks_book(self, mock_book):
+        """Test the Google Books metadata provider routing."""
+        mock_book.return_value = {"title": "Test Google Book"}
+
+        result = services.get_media_metadata(
+            MediaTypes.BOOK.value,
+            "volume-1",
+            Sources.GOOGLEBOOKS.value,
+        )
+
+        self.assert_metadata_title_payload(result, "Test Google Book")
+        mock_book.assert_called_once_with("volume-1", user=None)
 
     @patch("app.providers.manual.metadata")
     def test_get_media_metadata_manual(self, mock_metadata):
@@ -604,7 +745,243 @@ class ServicesTests(TestCase):
 
         self.assertEqual(cm.exception.provider, Sources.TMDB.value)
 
-        mock_episode.assert_called_once_with("1396", 1, "3")
+        mock_episode.assert_called_once_with("1396", 1, "3", None)
+
+    def test_get_media_metadata_podcast_episode(self):
+        """Podcast detail metadata should resolve from the local episode catalog."""
+        show = PodcastShow.objects.create(
+            podcast_uuid="podcast-show-services",
+            source=Sources.POCKETCASTS.value,
+            title="Services Show",
+            author="Services Author",
+            image="https://example.com/show.jpg",
+            description="A service-test show.",
+            genres=["Technology"],
+            language="en",
+        )
+        episode = PodcastEpisode.objects.create(
+            show=show,
+            episode_uuid="podcast-episode-services",
+            title="Services Episode",
+            duration=1800,
+            episode_number=4,
+            season_number=2,
+        )
+
+        result = services.get_media_metadata(
+            MediaTypes.PODCAST.value,
+            episode.episode_uuid,
+            Sources.POCKETCASTS.value,
+        )
+
+        self.assertEqual(result["media_id"], episode.episode_uuid)
+        self.assertEqual(result["source"], Sources.POCKETCASTS.value)
+        self.assertEqual(result["media_type"], MediaTypes.PODCAST.value)
+        self.assertEqual(result["title"], episode.title)
+        self.assertEqual(result["image"], show.image)
+        self.assertEqual(result["synopsis"], show.description)
+        self.assertEqual(result["genres"], show.genres)
+        self.assertEqual(result["details"]["show_title"], show.title)
+        self.assertEqual(result["details"]["duration"], episode.duration)
+
+    @patch("app.services.podcast_import.import_show_from_itunes_id")
+    def test_get_media_metadata_podcast_itunes_search_id_resolves_show(
+        self, mock_import
+    ):
+        """Search results carry an iTunes id; resolve it to the show catalog row."""
+        show = PodcastShow.objects.create(
+            podcast_uuid="itunes:1532744254",
+            source=Sources.POCKETCASTS.value,
+            title="Sternstunde Philosophie",
+            author="SRF",
+            image="https://example.com/show.jpg",
+        )
+        mock_import.return_value = show
+
+        result = services.get_media_metadata(
+            MediaTypes.PODCAST.value,
+            "1532744254",
+            Sources.POCKETCASTS.value,
+        )
+
+        self.assertEqual(result["media_id"], show.podcast_uuid)
+        self.assertEqual(result["title"], show.title)
+        self.assertEqual(result["details"]["show_uuid"], show.podcast_uuid)
+        mock_import.assert_called_once_with("1532744254")
+
+    @patch("app.services.podcast_import.import_show_from_feed_url")
+    def test_get_media_metadata_gpodder_feed_url_resolves_show(self, mock_import):
+        """GPodder search results carry a feed URL; resolve it to the show row."""
+        show = PodcastShow.objects.create(
+            podcast_uuid="gp_show",
+            source=Sources.GPODDER.value,
+            title="Linux Outlaws",
+            rss_feed_url="https://example.com/linux.xml",
+        )
+        mock_import.return_value = show
+
+        result = services.get_media_metadata(
+            MediaTypes.PODCAST.value,
+            "https://example.com/linux.xml",
+            Sources.GPODDER.value,
+        )
+
+        self.assertEqual(result["media_id"], show.podcast_uuid)
+        self.assertEqual(result["title"], show.title)
+        self.assertEqual(result["details"]["show_uuid"], show.podcast_uuid)
+        mock_import.assert_called_once_with("https://example.com/linux.xml")
+
+    def test_get_media_metadata_podcast_deleted_episode_is_not_found(self):
+        """Deleted podcast episodes should not resolve as generic media."""
+        show = PodcastShow.objects.create(
+            podcast_uuid="podcast-show-deleted",
+            source=Sources.POCKETCASTS.value,
+            title="Deleted Show",
+        )
+        episode = PodcastEpisode.objects.create(
+            show=show,
+            episode_uuid="podcast-episode-deleted",
+            title="Deleted Episode",
+            is_deleted=True,
+        )
+
+        with self.assertRaises(services.ProviderAPIError) as context:
+            services.get_media_metadata(
+                MediaTypes.PODCAST.value,
+                episode.episode_uuid,
+                Sources.POCKETCASTS.value,
+            )
+
+        self.assertEqual(context.exception.status_code, 404)
+
+    def test_get_media_metadata_podcast_source_mismatch_is_not_found(self):
+        """A podcast episode must belong to the requested provider source."""
+        show = PodcastShow.objects.create(
+            podcast_uuid="podcast-show-source-mismatch",
+            source=Sources.GPODDER.value,
+            title="GPodder Show",
+        )
+        episode = PodcastEpisode.objects.create(
+            show=show,
+            episode_uuid="podcast-episode-source-mismatch",
+            title="Source Mismatch Episode",
+        )
+
+        with self.assertRaises(services.ProviderAPIError) as context:
+            services.get_media_metadata(
+                MediaTypes.PODCAST.value,
+                episode.episode_uuid,
+                Sources.POCKETCASTS.value,
+            )
+
+        self.assertEqual(context.exception.status_code, 404)
+
+    def test_get_media_metadata_podcast_uses_tracked_item_fallback(self):
+        """Tracked legacy podcast items remain resolvable without catalog links."""
+        user = User.objects.create_user(username="podcast-services-user")
+        item = Item.objects.create(
+            media_id="podcast-legacy-item",
+            source=Sources.POCKETCASTS.value,
+            media_type=MediaTypes.PODCAST.value,
+            title="Cached Podcast Episode",
+            image="https://example.com/cached.jpg",
+        )
+        Podcast.objects.create(
+            user=user,
+            item=item,
+            status=Status.COMPLETED.value,
+        )
+
+        result = services.get_media_metadata(
+            MediaTypes.PODCAST.value,
+            item.media_id,
+            item.source,
+            user=user,
+        )
+
+        self.assertEqual(result["media_id"], item.media_id)
+        self.assertEqual(result["media_type"], MediaTypes.PODCAST.value)
+        self.assertEqual(result["title"], item.title)
+
+    @patch("app.providers.services.musicbrainz.recording")
+    def test_get_media_metadata_music_preserves_provider_identity(self, mock_recording):
+        """Music detail metadata should preserve MusicBrainz identity fields."""
+        mock_recording.return_value = {
+            "media_id": "11111111-1111-1111-1111-111111111111",
+            "source": Sources.MUSICBRAINZ.value,
+            "media_type": MediaTypes.MUSIC.value,
+            "title": "Test Song - Test Artist",
+            "image": "https://example.com/track.jpg",
+            "related": {},
+            "details": {"artist": "Test Artist"},
+        }
+
+        result = services.get_media_metadata(
+            MediaTypes.MUSIC.value,
+            "11111111-1111-1111-1111-111111111111",
+            Sources.MUSICBRAINZ.value,
+        )
+
+        self.assertEqual(result["media_id"], mock_recording.return_value["media_id"])
+        self.assertEqual(result["source"], Sources.MUSICBRAINZ.value)
+        self.assertEqual(result["media_type"], MediaTypes.MUSIC.value)
+        self.assertEqual(result["title"], "Test Song - Test Artist")
+        mock_recording.assert_called_once()
+
+    def test_get_media_metadata_music_invalid_id_is_not_found(self):
+        """Invalid MusicBrainz recording IDs should not produce empty metadata."""
+        with self.assertRaises(services.ProviderAPIError) as context:
+            services.get_media_metadata(
+                MediaTypes.MUSIC.value,
+                "invalid-recording-id",
+                Sources.MUSICBRAINZ.value,
+            )
+
+        self.assertEqual(context.exception.status_code, 404)
+
+    @patch("app.providers.services.musicbrainz.recording")
+    def test_get_media_metadata_music_title_slug_is_not_requested(self, mock_recording):
+        """A long title-like id passed the old length check and earned a 400."""
+        with self.assertRaises(services.ProviderAPIError) as context:
+            services.get_media_metadata(
+                MediaTypes.MUSIC.value,
+                "the-lord-of-the-rings-the-fellowship-of-the-ring",
+                Sources.MUSICBRAINZ.value,
+            )
+
+        self.assertEqual(context.exception.status_code, 404)
+        mock_recording.assert_not_called()
+
+    @patch("app.providers.services.musicbrainz.recording")
+    def test_get_media_metadata_music_provider_not_found_is_propagated(
+        self,
+        mock_recording,
+    ):
+        """MusicBrainz 404s should remain explicit not-found errors."""
+        response = type(
+            "Response",
+            (),
+            {
+                "status_code": 404,
+                "headers": {},
+                "text": "Recording not found",
+                "json": lambda self: {},
+            },
+        )()
+        mock_recording.side_effect = services.ProviderAPIError(
+            Sources.MUSICBRAINZ.value,
+            requests.exceptions.HTTPError(response=response),
+        )
+
+        with self.assertRaises(services.ProviderAPIError) as context:
+            services.get_media_metadata(
+                MediaTypes.MUSIC.value,
+                "11111111-1111-1111-1111-111111111111",
+                Sources.MUSICBRAINZ.value,
+            )
+
+        self.assertEqual(context.exception.status_code, 404)
+        mock_recording.assert_called_once()
 
     @patch("app.providers.hardcover.book")
     def test_get_media_metadata_hardcover_book(self, mock_book):
@@ -619,7 +996,7 @@ class ServicesTests(TestCase):
 
         self.assert_metadata_title_payload(result, "Test Hardcover Book")
 
-        mock_book.assert_called_once_with("1")
+        mock_book.assert_called_once_with("1", edition_id=None, user=None)
 
     @patch("app.providers.mal.search")
     def test_search_anime(self, mock_search):
@@ -646,7 +1023,22 @@ class ServicesTests(TestCase):
         )
 
         self.assertEqual(result, {"results": []})
-        mock_search.assert_called_once_with(MediaTypes.ANIME.value, "test", 1)
+        mock_search.assert_called_once_with(MediaTypes.ANIME.value, "test", 1, None)
+
+    @patch("app.providers.mangabaka.search")
+    def test_search_manga_mangabaka(self, mock_search):
+        """Test the search function for manga from MangaBaka."""
+        mock_search.return_value = [{"title": "Test Manga"}]
+
+        result = services.search(
+            MediaTypes.MANGA.value,
+            "test",
+            1,
+            source=Sources.MANGABAKA.value,
+        )
+
+        self.assertEqual(result, [{"title": "Test Manga"}])
+        mock_search.assert_called_once_with("test", 1)
 
     @patch("app.providers.mangaupdates.search")
     def test_search_manga_mangaupdates(self, mock_search):
@@ -684,7 +1076,7 @@ class ServicesTests(TestCase):
 
         self.assertEqual(result, [{"title": "Test TV"}])
 
-        mock_search.assert_called_once_with(MediaTypes.TV.value, "test", 1)
+        mock_search.assert_called_once_with(MediaTypes.TV.value, "test", 1, None)
 
     @patch("app.providers.tmdb.search")
     def test_search_movie(self, mock_search):
@@ -695,7 +1087,7 @@ class ServicesTests(TestCase):
 
         self.assertEqual(result, [{"title": "Test Movie"}])
 
-        mock_search.assert_called_once_with(MediaTypes.MOVIE.value, "test", 1)
+        mock_search.assert_called_once_with(MediaTypes.MOVIE.value, "test", 1, None)
 
     @patch("app.providers.igdb.search")
     def test_search_game(self, mock_search):
@@ -705,6 +1097,22 @@ class ServicesTests(TestCase):
         result = services.search(MediaTypes.GAME.value, "test", 1)
 
         self.assertEqual(result, [{"title": "Test Game"}])
+
+        mock_search.assert_called_once_with("test", 1, user=None)
+
+    @patch("app.providers.gpodder.search")
+    def test_search_podcast_gpodder(self, mock_search):
+        """Test that the GPodder source dispatches to the GPodder provider."""
+        mock_search.return_value = {"results": [{"title": "Test Podcast"}]}
+
+        result = services.search(
+            MediaTypes.PODCAST.value,
+            "test",
+            1,
+            source=Sources.GPODDER.value,
+        )
+
+        self.assertEqual(result, {"results": [{"title": "Test Podcast"}]})
 
         mock_search.assert_called_once_with("test", 1)
 
@@ -722,7 +1130,7 @@ class ServicesTests(TestCase):
 
         self.assertEqual(result, [{"title": "Test Hardcover Book"}])
 
-        mock_search.assert_called_once_with("test", 1)
+        mock_search.assert_called_once_with("test", 1, user=None)
 
     @patch("app.providers.openlibrary.search")
     def test_search_openlibrary_book(self, mock_search):
@@ -740,6 +1148,72 @@ class ServicesTests(TestCase):
 
         mock_search.assert_called_once_with("test", 1)
 
+    @override_settings(GOOGLE_BOOKS_API_KEY="test-google-key")
+    @patch("app.providers.googlebooks.search")
+    def test_search_googlebooks_book(self, mock_search):
+        """Test the Google Books search provider routing."""
+        mock_search.return_value = [{"title": "Test Google Book"}]
+
+        result = services.search(
+            MediaTypes.BOOK.value,
+            "test",
+            1,
+            source=Sources.GOOGLEBOOKS.value,
+            language="fr",
+        )
+
+        self.assertEqual(result, [{"title": "Test Google Book"}])
+        mock_search.assert_called_once_with("test", 1, language="fr", user=None)
+
+    @override_settings(GOOGLE_BOOKS_API_KEY="test-google-key")
+    @patch("app.providers.googlebooks.search")
+    @patch("app.providers.hardcover.search")
+    @patch("app.providers.services._resolve_hardcover_isbn_search")
+    def test_search_googlebooks_does_not_use_hardcover_isbn_bridge(
+        self,
+        mock_isbn_search,
+        mock_hardcover_search,
+        mock_google_search,
+    ):
+        """Google Books searches must not be replaced by Hardcover ISBN lookup."""
+        mock_google_search.return_value = [{"title": "Google result"}]
+
+        result = services.search(
+            MediaTypes.BOOK.value,
+            "9780123456789",
+            1,
+            source=Sources.GOOGLEBOOKS.value,
+        )
+
+        self.assertEqual(result, [{"title": "Google result"}])
+        mock_google_search.assert_called_once_with(
+            "9780123456789", 1, language=None, user=None
+        )
+        mock_hardcover_search.assert_not_called()
+        mock_isbn_search.assert_not_called()
+
+    @override_settings(GOOGLE_BOOKS_API_KEY="")
+    @patch("app.providers.googlebooks.search")
+    @patch("app.providers.hardcover.search")
+    def test_removed_googlebooks_key_falls_back_to_hardcover(
+        self,
+        mock_hardcover_search,
+        mock_google_search,
+    ):
+        """A stale Google Books selection should fall back after key removal."""
+        mock_hardcover_search.return_value = [{"title": "Hardcover result"}]
+
+        result = services.search(
+            MediaTypes.BOOK.value,
+            "book",
+            1,
+            source=Sources.GOOGLEBOOKS.value,
+        )
+
+        self.assertEqual(result, [{"title": "Hardcover result"}])
+        mock_hardcover_search.assert_called_once_with("book", 1, user=None)
+        mock_google_search.assert_not_called()
+
     @patch("app.providers.comicvine.search")
     def test_search_comic(self, mock_search):
         """Test the search function for comics."""
@@ -749,7 +1223,7 @@ class ServicesTests(TestCase):
 
         self.assertEqual(result, [{"title": "Test Comic"}])
 
-        mock_search.assert_called_once_with("test", 1)
+        mock_search.assert_called_once_with("test", 1, user=None)
 
     def test_get_media_metadata_returns_local_payload_for_audiobookshelf_books(self):
         """Audiobookshelf books should use local Item metadata, not Open Library."""

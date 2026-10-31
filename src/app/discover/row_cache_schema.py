@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from app.discover import tab_cache
 from app.discover.artwork import (
     PROVIDER_ARTWORK_HYDRATION_ROW_KEYS,
     _is_missing_image,
     _supports_provider_artwork_hydration,
 )
-from app.discover.schemas import RowDefinition, RowResult
 from app.discover.service_helpers import MAX_ITEMS_PER_ROW
 from app.discover.trakt_candidates import (
     MOVIE_CANON_ROW_SCHEMA_VERSION,
@@ -17,10 +18,14 @@ from app.discover.trakt_candidates import (
 )
 from app.models import MediaTypes
 
+if TYPE_CHECKING:
+    from app.discover.schemas import RowDefinition, RowResult
+
 ROW_CACHE_ACTIVITY_VERSION_META_KEY = "activity_version"
 
 MOVIE_PERSONALIZED_ROW_SCHEMA_VERSION = 8
 TV_ANIME_TRAKT_ROW_SCHEMA_VERSION = 1
+ANIME_TRAKT_ROW_SCHEMA_VERSION = 2
 TV_ANIME_PERSONALIZED_ROW_SCHEMA_VERSION = 4
 
 MOVIE_PERSONALIZED_ROW_KEYS = {
@@ -52,14 +57,21 @@ def _row_requires_artwork_rebuild(
     row_definition: RowDefinition,
     row: RowResult,
 ) -> bool:
-    if media_type in {MediaTypes.MOVIE.value, MediaTypes.TV.value, MediaTypes.ANIME.value} and row_definition.key in {
+    if media_type in {
+        MediaTypes.MOVIE.value,
+        MediaTypes.TV.value,
+        MediaTypes.ANIME.value,
+    } and row_definition.key in {
         "trending_right_now",
         "all_time_greats_unseen",
         "coming_soon",
     }:
         return any(_is_missing_image(item) for item in row.items[:MAX_ITEMS_PER_ROW])
 
-    if row_definition.source == "provider" and row_definition.key in PROVIDER_ARTWORK_HYDRATION_ROW_KEYS:
+    if (
+        row_definition.source == "provider"
+        and row_definition.key in PROVIDER_ARTWORK_HYDRATION_ROW_KEYS
+    ):
         return any(
             _supports_provider_artwork_hydration(item) and _is_missing_image(item)
             for item in row.items[:MAX_ITEMS_PER_ROW]
@@ -82,7 +94,11 @@ def _required_row_cache_schema_version(media_type: str, row_key: str) -> int | N
             "all_time_greats_unseen",
             "coming_soon",
         }:
-            return TV_ANIME_TRAKT_ROW_SCHEMA_VERSION
+            return (
+                ANIME_TRAKT_ROW_SCHEMA_VERSION
+                if media_type == MediaTypes.ANIME.value
+                else TV_ANIME_TRAKT_ROW_SCHEMA_VERSION
+            )
         if row_key in TV_ANIME_PERSONALIZED_ROW_KEYS:
             return TV_ANIME_PERSONALIZED_ROW_SCHEMA_VERSION
     return None
@@ -93,7 +109,9 @@ def _is_row_cache_compatible(
     row_definition: RowDefinition,
     cached_payload: dict,
 ) -> bool:
-    required_schema_version = _required_row_cache_schema_version(media_type, row_definition.key)
+    required_schema_version = _required_row_cache_schema_version(
+        media_type, row_definition.key
+    )
     if required_schema_version is None:
         return True
 
@@ -120,4 +138,6 @@ def _row_cache_matches_activity_version(
     if not cached_activity_version:
         return True
 
-    return cached_activity_version == tab_cache.get_activity_version(user_id, media_type)
+    return cached_activity_version == tab_cache.get_activity_version(
+        user_id, media_type
+    )

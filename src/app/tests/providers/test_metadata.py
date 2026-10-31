@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import requests
 from django.conf import settings
 from django.core.cache import cache
-from django.test import TestCase, override_settings
+from django.test import TestCase, override_settings, tag
 
 from app.credits import _normalize_credit_rows
 from app.models import Episode, Item, MediaTypes, Sources
@@ -30,6 +30,7 @@ mock_path = Path(__file__).resolve().parent.parent / "mock_data"
 class Metadata(TestCase):
     """Test the external API calls for media details."""
 
+    @tag("network")
     def test_anime(self):
         """Test the metadata method for anime."""
         response = mal.anime("1")
@@ -54,6 +55,7 @@ class Metadata(TestCase):
         self.assertEqual(response["details"]["episodes"], None)
         self.assertEqual(response["details"]["runtime"], None)
 
+    @tag("network")
     def test_manga(self):
         """Test the metadata method for manga."""
         response = mal.manga("1")
@@ -62,6 +64,7 @@ class Metadata(TestCase):
         self.assertEqual(response["details"]["status"], "Finished")
         self.assertEqual(response["details"]["number_of_chapters"], 162)
 
+    @tag("network")
     def test_mangaupdates(self):
         """Test the metadata method for manga from mangaupdates."""
         response = mangaupdates.manga("72274276213")
@@ -69,15 +72,20 @@ class Metadata(TestCase):
         self.assertEqual(response["details"]["year"], "1994")
         self.assertEqual(response["details"]["format"], "Manga")
 
+    @tag("network")
     def test_tv(self):
         """Test the metadata method for TV shows."""
         response = tmdb.tv("1396")
         self.assertEqual(response["title"], "Breaking Bad")
-        self.assertEqual(response["details"]["first_air_date"].date().isoformat(), "2008-01-20")
+        self.assertEqual(
+            response["details"]["first_air_date"].date().isoformat(), "2008-01-20"
+        )
         self.assertEqual(response["details"]["status"], "Ended")
         self.assertEqual(response["details"]["episodes"], 62)
 
-    def test_tmdb_original_title_does_not_backfill_from_random_alternative_when_original_exists(self):
+    def test_tmdb_original_title_does_not_backfill_from_random_alternative_when_original_exists(
+        self,
+    ):
         response = {
             "title": "The Sound of Music",
             "original_title": "The Sound of Music",
@@ -143,7 +151,7 @@ class Metadata(TestCase):
             url,
             params=None,
             headers=None,
-        ):  # noqa: ARG001
+        ):
             if source == Sources.TMDB.value and url.endswith("/tv/114410"):
                 return {
                     "id": 114410,
@@ -220,7 +228,7 @@ class Metadata(TestCase):
         """TMDB TV details should not invoke TVDB specials fallback when disabled."""
         tmdb.cache.clear()
 
-        def _mock_api_request(source, _method, url, params=None):  # noqa: ARG001
+        def _mock_api_request(source, _method, url, params=None):
             if source == Sources.TMDB.value and url.endswith("/tv/114410"):
                 return {
                     "id": 114410,
@@ -338,6 +346,44 @@ class Metadata(TestCase):
         )
 
     @patch("app.helpers.get_tmdb_backdrop_image")
+    @patch("app.providers.tmdb.get_tvdb_episode_image_map")
+    def test_process_episodes_keeps_season_source(
+        self,
+        mock_get_tvdb_episode_image_map,
+        mock_get_tmdb_backdrop_image,
+    ):
+        """TVDB season payloads must not be relabelled as TMDB episodes.
+
+        Stamping TMDB on them points episode track/detail routes at
+        /tmdb/<tvdb_id>, which 404s at TMDB.
+        """
+        mock_get_tvdb_episode_image_map.return_value = {}
+        mock_get_tmdb_backdrop_image.return_value = None
+
+        season_metadata = {
+            "media_id": "480759",
+            "source": Sources.TVDB.value,
+            "season_number": 1,
+            "episodes": [
+                {
+                    "episode_number": 1,
+                    "name": "Episode 1",
+                    "overview": "",
+                    "runtime": None,
+                    "still_path": None,
+                },
+            ],
+        }
+
+        result = tmdb.process_episodes(season_metadata, [])
+        self.assertEqual(result[0]["source"], Sources.TVDB.value)
+
+        # A payload without an explicit source still defaults to TMDB.
+        del season_metadata["source"]
+        result = tmdb.process_episodes(season_metadata, [])
+        self.assertEqual(result[0]["source"], Sources.TMDB.value)
+
+    @patch("app.helpers.get_tmdb_backdrop_image")
     def test_process_episodes_uses_show_backdrop_when_still_missing(
         self,
         mock_get_tmdb_backdrop_image,
@@ -403,7 +449,7 @@ class Metadata(TestCase):
         tmdb.cache.clear()
         mock_build_specials_season.return_value = None
 
-        def _mock_api_request(source, _method, url, params=None):  # noqa: ARG001
+        def _mock_api_request(source, _method, url, params=None):
             if source == Sources.TMDB.value and url.endswith("/tv/114410"):
                 return {
                     "id": 114410,
@@ -491,7 +537,7 @@ class Metadata(TestCase):
             },
         }
 
-        def _mock_api_request(source, _method, url, params=None):  # noqa: ARG001
+        def _mock_api_request(source, _method, url, params=None):
             if source == Sources.TMDB.value and url.endswith("/tv/114410"):
                 return {
                     "id": 114410,
@@ -536,6 +582,71 @@ class Metadata(TestCase):
         self.assertEqual(result["season/0"]["season_title"], "Specials")
         self.assertEqual(result["season/0"]["max_progress"], 1)
         mock_build_specials_season.assert_called_once()
+
+    @patch("app.providers.tmdb.services.api_request")
+    def test_tv_with_seasons_handles_missing_season_watch_providers(
+        self,
+        mock_api_request,
+    ):
+        """A season without TMDB provider data should still be cached."""
+        tmdb.cache.clear()
+        mock_api_request.return_value = {
+            "id": 330881,
+            "name": "Monster",
+            "original_name": "Monster",
+            "poster_path": None,
+            "overview": "A test show.",
+            "genres": [],
+            "vote_average": 8.0,
+            "vote_count": 10,
+            "production_companies": [],
+            "production_countries": [],
+            "spoken_languages": [],
+            "recommendations": {"results": []},
+            "external_ids": {"tvdb_id": "12345"},
+            "watch/providers": {"results": {}},
+            "aggregate_credits": {"cast": [], "crew": []},
+            "alternative_titles": {"results": []},
+            "episode_run_time": [24],
+            "first_air_date": "2004-04-07",
+            "last_air_date": "2005-09-28",
+            "status": "Ended",
+            "number_of_seasons": 2,
+            "number_of_episodes": 74,
+            "seasons": [
+                {
+                    "season_number": 2,
+                    "name": "Season 2",
+                    "air_date": "2005-01-01",
+                    "episode_count": 1,
+                    "poster_path": None,
+                },
+            ],
+            "season/2": {
+                "name": "Season 2",
+                "overview": "Season overview",
+                "season_number": 2,
+                "poster_path": None,
+                "air_date": "2005-01-01",
+                "vote_average": 8.0,
+                "episodes": [
+                    {
+                        "episode_number": 1,
+                        "name": "Episode 1",
+                        "overview": "Episode overview",
+                        "still_path": None,
+                        "runtime": 24,
+                        "vote_count": 10,
+                        "air_date": "2005-01-01",
+                    },
+                ],
+            },
+        }
+
+        result = tmdb.tv_with_seasons("330881", [2])
+
+        self.assertEqual(result["season/2"]["season_number"], 2)
+        self.assertEqual(result["season/2"]["providers"], {})
 
     @patch("app.providers.tvdb._request")
     def test_tvdb_episode_map_normalizes_precise_airstamps(
@@ -641,7 +752,9 @@ class Metadata(TestCase):
         self.assertEqual(result["tvdb_id"], "468632")
         self.assertEqual(result["season/1"]["tvdb_id"], "468632")
         self.assertEqual(
-            tmdb.cache.get(f"{Sources.TMDB.value}_{MediaTypes.TV.value}_294737")["tvdb_id"],
+            tmdb.cache.get(f"{Sources.TMDB.value}_{MediaTypes.TV.value}_294737")[
+                "tvdb_id"
+            ],
             "468632",
         )
 
@@ -917,6 +1030,25 @@ class Metadata(TestCase):
         self.assertIn("season/8", result)
         self.assertEqual(result["season/8"]["season_number"], 8)
 
+        # The base show fields (recommendations, external_ids,
+        # aggregate_credits, alternative_titles, watch/providers) don't
+        # change between batches for the same show, so they should only be
+        # requested on the first batch and reused for the rest (#512).
+        # Compare exact comma-separated tokens (not substrings), since
+        # "watch/providers" is also a suffix of the per-season
+        # "season/N/watch/providers" append token.
+        base_fields = set(tmdb.TV_DETAIL_APPEND_RESPONSES.split(","))
+        first_batch_fields = set(append_requests[0].split(","))
+        second_batch_fields = set(append_requests[1].split(","))
+        self.assertTrue(
+            base_fields.issubset(first_batch_fields),
+            "First batch should request the base show fields.",
+        )
+        self.assertFalse(
+            base_fields & second_batch_fields,
+            "Subsequent batches should not re-request the base show fields.",
+        )
+
     @patch("app.providers.tvdb.search")
     @patch("app.providers.tmdb.services.api_request")
     @override_settings(TVDB_API_KEY="test-tvdb-key")
@@ -996,7 +1128,9 @@ class Metadata(TestCase):
         self.assertEqual(result["season/1"]["tvdb_id"], "468632")
         self.assertEqual(tmdb.get_tvdb_id_override("294737"), "468632")
         self.assertEqual(
-            tmdb.cache.get(f"{Sources.TMDB.value}_{MediaTypes.TV.value}_294737")["tvdb_id"],
+            tmdb.cache.get(f"{Sources.TMDB.value}_{MediaTypes.TV.value}_294737")[
+                "tvdb_id"
+            ],
             "468632",
         )
         mock_tvdb_search.assert_called_once_with(
@@ -1062,6 +1196,9 @@ class Metadata(TestCase):
     @patch("app.providers.tmdb.services.api_request")
     def test_tv_changes(self, mock_api_request, mock_localdate):
         """Test fetching changed TV ids from TMDB."""
+        # get_changed_ids caches per media_type per day (#521), and every
+        # test here pins localdate to the same date.
+        tmdb.cache.clear()
         mock_localdate.return_value = date(2026, 4, 5)
         mock_api_request.return_value = {
             "results": [{"id": 1}, {"id": 2}],
@@ -1080,6 +1217,9 @@ class Metadata(TestCase):
     @patch("app.providers.tmdb.services.api_request")
     def test_tv_changes_across_pages(self, mock_api_request, mock_localdate):
         """Test TMDB TV changes pagination and deduplication."""
+        # get_changed_ids caches per media_type per day (#521), and every
+        # test here pins localdate to the same date.
+        tmdb.cache.clear()
         mock_localdate.return_value = date(2026, 4, 5)
         mock_api_request.side_effect = [
             {
@@ -1099,8 +1239,48 @@ class Metadata(TestCase):
 
     @patch("app.providers.tmdb.timezone.localdate")
     @patch("app.providers.tmdb.services.api_request")
+    def test_changes_pagination_is_capped(self, mock_api_request, mock_localdate):
+        """An unbounded loop over /changes could make hundreds of calls (#521).
+
+        TMDB's changes endpoint reports every title changed globally in the
+        window, so total_pages can run into the hundreds - all sequential, all
+        through a 3/s rate limiter.
+        """
+        tmdb.cache.clear()
+        mock_localdate.return_value = date(2026, 4, 5)
+        mock_api_request.return_value = {
+            "results": [{"id": 1}],
+            "total_pages": 500,
+        }
+
+        tmdb.get_changed_ids(MediaTypes.TV.value, max_pages=3)
+
+        self.assertEqual(mock_api_request.call_count, 3)
+
+    @patch("app.providers.tmdb.timezone.localdate")
+    @patch("app.providers.tmdb.services.api_request")
+    def test_changes_are_cached_per_day(self, mock_api_request, mock_localdate):
+        """The result for a given day doesn't change once fetched."""
+        tmdb.cache.clear()
+        mock_localdate.return_value = date(2026, 4, 5)
+        mock_api_request.return_value = {
+            "results": [{"id": 7}],
+            "total_pages": 1,
+        }
+
+        first = tmdb.get_changed_ids(MediaTypes.TV.value)
+        second = tmdb.get_changed_ids(MediaTypes.TV.value)
+
+        self.assertEqual(first, second)
+        self.assertEqual(mock_api_request.call_count, 1)
+
+    @patch("app.providers.tmdb.timezone.localdate")
+    @patch("app.providers.tmdb.services.api_request")
     def test_movie_changes(self, mock_api_request, mock_localdate):
         """Test fetching changed movie ids from TMDB."""
+        # get_changed_ids caches per media_type per day (#521), and every
+        # test here pins localdate to the same date.
+        tmdb.cache.clear()
         mock_localdate.return_value = date(2026, 4, 5)
         mock_api_request.return_value = {
             "results": [{"id": 10}, {"id": 20}],
@@ -1119,6 +1299,9 @@ class Metadata(TestCase):
     @patch("app.providers.tmdb.services.api_request")
     def test_movie_changes_across_pages(self, mock_api_request, mock_localdate):
         """Test TMDB movie changes pagination and deduplication."""
+        # get_changed_ids caches per media_type per day (#521), and every
+        # test here pins localdate to the same date.
+        tmdb.cache.clear()
         mock_localdate.return_value = date(2026, 4, 5)
         mock_api_request.side_effect = [
             {
@@ -1262,7 +1445,8 @@ class Metadata(TestCase):
                 ],
             },
         }
-        def _mock_episode_request(_source, _method, url, params=None):  # noqa: ARG001
+
+        def _mock_episode_request(_source, _method, url, params=None):
             if url.endswith("/episode/1"):
                 return {
                     "name": "Pilot",
@@ -1301,7 +1485,7 @@ class Metadata(TestCase):
             str(cm.exception),
         )
 
-        mock_tv_with_seasons.assert_called_with("1396", ["1"])
+        mock_tv_with_seasons.assert_called_with("1396", ["1"], None)
 
     @patch("app.providers.tmdb.tv_with_seasons")
     @patch("app.providers.tmdb.get_tvdb_episode_image_map")
@@ -1318,9 +1502,7 @@ class Metadata(TestCase):
         media_id = "1396"
         season_number = "1"
         episode_number = "1"
-        cache_key = (
-            f"{Sources.TMDB.value}_{MediaTypes.EPISODE.value}_{media_id}_{season_number}_{episode_number}"
-        )
+        cache_key = f"{Sources.TMDB.value}_{MediaTypes.EPISODE.value}_{media_id}_{season_number}_{episode_number}"
         tmdb.cache.delete(cache_key)
 
         mock_tv_with_seasons.return_value = {
@@ -1359,9 +1541,7 @@ class Metadata(TestCase):
         media_id = "episode-cast-priority"
         season_number = "1"
         episode_number = "1"
-        cache_key = (
-            f"{Sources.TMDB.value}_{MediaTypes.EPISODE.value}_{media_id}_{season_number}_{episode_number}"
-        )
+        cache_key = f"{Sources.TMDB.value}_{MediaTypes.EPISODE.value}_{media_id}_{season_number}_{episode_number}"
         tmdb.cache.delete(cache_key)
 
         mock_tv_with_seasons.return_value = {
@@ -1422,15 +1602,20 @@ class Metadata(TestCase):
         next_episode = tmdb.find_next_episode(5, episodes_metadata)
         self.assertIsNone(next_episode)
 
+    @tag("network")
     def test_movie(self):
         """Test the metadata method for movies."""
         response = tmdb.movie("10494")
         self.assertEqual(response["title"], "Perfect Blue")
-        self.assertEqual(response["details"]["release_date"].date().isoformat(), "1998-02-28")
+        self.assertEqual(
+            response["details"]["release_date"].date().isoformat(), "1998-02-28"
+        )
         self.assertEqual(response["details"]["status"], "Released")
 
     @patch("app.providers.tmdb.services.api_request")
-    def test_movie_includes_keywords_certification_and_collection_metadata(self, mock_api_request):
+    def test_movie_includes_keywords_certification_and_collection_metadata(
+        self, mock_api_request
+    ):
         cache_key = f"{Sources.TMDB.value}_{MediaTypes.MOVIE.value}_999"
         tmdb.cache.delete(cache_key)
         mock_api_request.side_effect = [
@@ -1446,8 +1631,12 @@ class Metadata(TestCase):
                 "vote_count": 1200,
                 "status": "Released",
                 "runtime": 102,
-                "production_companies": [{"id": 44, "name": "Pixar Animation Studios", "logo_path": None}],
-                "production_countries": [{"iso_3166_1": "US", "name": "United States of America"}],
+                "production_companies": [
+                    {"id": 44, "name": "Pixar Animation Studios", "logo_path": None}
+                ],
+                "production_countries": [
+                    {"iso_3166_1": "US", "name": "United States of America"}
+                ],
                 "spoken_languages": [{"english_name": "English"}],
                 "credits": {"cast": [], "crew": []},
                 "recommendations": {"results": []},
@@ -1534,6 +1723,9 @@ class Metadata(TestCase):
                     {"name": "Open world"},
                 ],
                 "platforms": [{"name": "PC"}],
+                "franchise": {"id": 10, "name": "The Witcher"},
+                "franchises": [{"id": 10, "name": "The Witcher"}],
+                "collections": [{"id": 20, "name": "The Witcher Series"}],
                 "involved_companies": [
                     {
                         "company": {
@@ -1565,6 +1757,12 @@ class Metadata(TestCase):
         self.assertEqual(response["details"]["format"], "Main game")
         self.assertEqual(response["details"]["release_date"], "2015-05-19")
         self.assertEqual(response["details"]["companies"], "CD Projekt Red")
+        self.assertEqual(response["provider_franchise_id"], "10")
+        self.assertEqual(response["provider_franchise_name"], "The Witcher")
+        self.assertEqual(response["provider_collection_id"], "20")
+        self.assertEqual(
+            response["provider_collection_name"], "The Witcher Series"
+        )
         self.assertEqual(
             response["details"]["themes"],
             ["Action", "Fantasy", "Open world"],
@@ -1587,7 +1785,9 @@ class Metadata(TestCase):
         """Test the IGDB company profile metadata helper."""
         igdb.cache.clear()
 
-        def _mock_api_request(source, _method, url, data=None, params=None, headers=None):  # noqa: ARG001
+        def _mock_api_request(
+            source, _method, url, data=None, params=None, headers=None
+        ):
             if source == Sources.IGDB.value and url.endswith("/companies"):
                 self.assertIn(
                     "fields name,description,developed,published,logo.image_id,",
@@ -1651,40 +1851,214 @@ class Metadata(TestCase):
         with self.assertRaises(ValueError, msg="IGDB game IDs must be numeric"):
             igdb.game("game-123")
 
+    @tag("network")
     def test_external_game_steam(self):
         """Test the external_game method for Steam games."""
         igdb_game_id = igdb.external_game("292030", igdb.ExternalGameSource.STEAM)
 
         self.assertEqual(igdb_game_id, 1942)
 
+    @tag("network")
     def test_external_game_not_found(self):
         """Test the external_game method with non-existent Steam ID."""
         igdb_game_id = igdb.external_game("999999999", igdb.ExternalGameSource.STEAM)
 
         self.assertIsNone(igdb_game_id)
 
+    @tag("network")
     def test_book(self):
         """Test the metadata method for books."""
         response = openlibrary.book("OL21733390M")
         self.assertEqual(response["title"], "Nineteen Eighty-Four")
         self.assertEqual(response["details"]["author"], ["George Orwell"])
 
+    @tag("network")
     def test_comic(self):
         """Test the metadata method for comics."""
         response = comicvine.comic("155969")
         self.assertEqual(response["title"], "Ultimate Spider-Man")
 
+    @patch("app.providers.comicvine.services.api_request")
+    def test_comic_survives_issues_provider_error(self, mock_api_request):
+        """A failing issues/recommendations call shouldn't discard volume details."""
+        media_id = "provider-error-test"
+        cache_key = f"{Sources.COMICVINE.value}_{MediaTypes.COMIC.value}_{media_id}"
+        comicvine.cache.delete(cache_key)
+        self.addCleanup(comicvine.cache.delete, cache_key)
+
+        def side_effect(_source, _method, url, **_kwargs):
+            if url.endswith("/issues/"):
+                raise services.ProviderAPIError(Sources.COMICVINE.value, Exception())
+            return {
+                "results": {
+                    "site_detail_url": "https://example.com/volume",
+                    "name": "Test Volume",
+                    "last_issue": {"issue_number": "5", "id": 5},
+                    "description": "",
+                    "publisher": {"id": None, "name": "Test Publisher"},
+                    "start_year": "2020",
+                    "count_of_issues": 5,
+                    "people": [],
+                    "date_last_updated": "2024-01-01 00:00:00",
+                },
+            }
+
+        mock_api_request.side_effect = side_effect
+
+        response = comicvine.comic(media_id)
+
+        self.assertEqual(response["title"], "Test Volume")
+        self.assertEqual(response["details"]["publisher"], "Test Publisher")
+        self.assertEqual(response["issues"], [])
+
+    @patch("app.providers.comicvine.services.api_request")
+    def test_comic_volume_issues_sort_numerically(self, mock_api_request):
+        """Comic volume issues should use numeric rather than lexical ordering."""
+        volume_id = "numeric-order-test"
+        cache_key = f"{Sources.COMICVINE.value}_volume_{volume_id}_issues"
+        comicvine.cache.delete(cache_key)
+        self.addCleanup(comicvine.cache.delete, cache_key)
+        mock_api_request.return_value = {
+            "results": [
+                {
+                    "id": 1,
+                    "name": "Issue One",
+                    "issue_number": "1",
+                    "image": {"medium_url": "https://example.com/1.jpg"},
+                    "cover_date": "2024-01-01",
+                    "site_detail_url": "https://example.com/1",
+                },
+                {
+                    "id": 10,
+                    "name": "Issue Ten",
+                    "issue_number": "10",
+                    "image": {"medium_url": "https://example.com/10.jpg"},
+                    "cover_date": "2024-10-01",
+                    "site_detail_url": "https://example.com/10",
+                },
+                {
+                    "id": 11,
+                    "name": "Issue Eleven",
+                    "issue_number": "11",
+                    "image": {"medium_url": "https://example.com/11.jpg"},
+                    "cover_date": "2024-11-01",
+                    "site_detail_url": "https://example.com/11",
+                },
+                {
+                    "id": 2,
+                    "name": "Issue Two",
+                    "issue_number": "2",
+                    "image": {"medium_url": "https://example.com/2.jpg"},
+                    "cover_date": "2024-02-01",
+                    "site_detail_url": "https://example.com/2",
+                },
+                {
+                    "id": 23,
+                    "name": "Issue Two-Three",
+                    "issue_number": "2-3",
+                    "image": {"medium_url": "https://example.com/2-3.jpg"},
+                    "cover_date": "2024-03-01",
+                    "site_detail_url": "https://example.com/2-3",
+                },
+                {
+                    "id": 90,
+                    "name": "Annual",
+                    "issue_number": "Annual",
+                    "image": {"medium_url": "https://example.com/annual.jpg"},
+                    "cover_date": "2024-12-01",
+                    "site_detail_url": "https://example.com/annual",
+                },
+                {
+                    "id": 91,
+                    "name": "Special",
+                    "issue_number": "Special",
+                    "image": {"medium_url": "https://example.com/special.jpg"},
+                    "cover_date": "2024-12-02",
+                    "site_detail_url": "https://example.com/special",
+                },
+                {
+                    "id": 92,
+                    "name": "Unknown Issue",
+                    "issue_number": None,
+                    "image": {"medium_url": "https://example.com/unknown.jpg"},
+                    "cover_date": None,
+                    "site_detail_url": "https://example.com/unknown",
+                },
+            ],
+        }
+
+        result = comicvine.get_volume_issues(volume_id)
+
+        self.assertEqual(
+            [issue["issue_number"] for issue in result],
+            ["1", "2", "2-3", "10", "11", "Annual", "Special", ""],
+        )
+        self.assertEqual(result[0]["media_id"], "1")
+        self.assertEqual(result[0]["source"], Sources.COMICVINE.value)
+        self.assertEqual(result[0]["media_type"], MediaTypes.COMIC_ISSUE.value)
+        self.assertEqual(result[0]["title"], "Issue One")
+        self.assertEqual(result[0]["image"], "https://example.com/1.jpg")
+        self.assertEqual(result[0]["cover_date"], "2024-01-01")
+        self.assertEqual(
+            result[0]["site_detail_url"], "https://example.com/1"
+        )
+        self.assertEqual(result[0]["history"], [])
+        self.assertEqual(
+            mock_api_request.call_args.kwargs["params"]["sort"],
+            "issue_number:asc",
+        )
+
+    @patch("app.providers.comicvine.services.api_request")
+    def test_comic_volume_issues_request_a_later_page(self, mock_api_request):
+        """A later page sends its offset and does not reuse the first page's cache."""
+        volume_id = "paged-volume-test"
+        first_key = f"{Sources.COMICVINE.value}_volume_{volume_id}_issues"
+        second_key = f"{first_key}_offset_100"
+        comicvine.cache.set(first_key, [{"issue_number": "1"}])
+        self.addCleanup(comicvine.cache.delete, first_key)
+        self.addCleanup(comicvine.cache.delete, second_key)
+        mock_api_request.return_value = {
+            "results": [{"id": 101, "name": "Issue 101", "issue_number": "101"}],
+        }
+
+        result = comicvine.get_volume_issues(volume_id, offset=100)
+
+        self.assertEqual([issue["issue_number"] for issue in result], ["101"])
+        self.assertEqual(mock_api_request.call_args.kwargs["params"]["offset"], 100)
+
+    @patch("app.providers.comicvine.services.api_request")
+    def test_comic_volume_issues_sort_cached_data(self, mock_api_request):
+        """Cached volume issues should be corrected without a provider request."""
+        volume_id = "cached-order-test"
+        cache_key = f"{Sources.COMICVINE.value}_volume_{volume_id}_issues"
+        cached_issues = [
+            {"issue_number": "1"},
+            {"issue_number": "10"},
+            {"issue_number": "2"},
+        ]
+        comicvine.cache.set(cache_key, cached_issues)
+        self.addCleanup(comicvine.cache.delete, cache_key)
+
+        result = comicvine.get_volume_issues(volume_id)
+
+        self.assertEqual(
+            [issue["issue_number"] for issue in result],
+            ["1", "2", "10"],
+        )
+        mock_api_request.assert_not_called()
+
+    @tag("network")
     def test_hardcover_book(self):
         """Test the metadata method for books from Hardcover."""
         response = hardcover.book("377193")
         self.assertEqual(response["title"], "The Great Gatsby")
-        # Live Hardcover data; later editions list extra contributors
-        self.assertTrue(response["details"]["author"].startswith("F. Scott Fitzgerald"))
-        self.assertTrue(any("Fiction" in genre for genre in response["genres"]))
+        self.assertEqual(response["details"]["author"], "F. Scott Fitzgerald")
+        self.assertIn("Fiction", response["genres"])
         self.assertIn("Young Adult", response["genres"])
         self.assertIn("Classics", response["genres"])
         self.assertAlmostEqual(response["score"], 7.4, delta=0.1)
 
+    @tag("network")
     def test_hardcover_book_unknown(self):
         """Test the metadata method for books from Hardcover with minimal data."""
         response = hardcover.book("1265528")
@@ -1757,7 +2131,9 @@ class Metadata(TestCase):
         self.assertEqual(response["name"], "Hardcover Author")
         self.assertEqual(response["known_for_department"], "Author")
         self.assertEqual(response["bibliography"][0]["media_id"], "7001")
-        self.assertEqual(response["bibliography"][0]["media_type"], MediaTypes.BOOK.value)
+        self.assertEqual(
+            response["bibliography"][0]["media_type"], MediaTypes.BOOK.value
+        )
 
     @patch("app.providers.openlibrary.fetch_author_data")
     def test_openlibrary_get_authors_full(self, mock_fetch_author_data):
@@ -1785,7 +2161,7 @@ class Metadata(TestCase):
     def test_openlibrary_author_profile_normalization(self, mock_api_request):
         openlibrary.cache.delete(f"{Sources.OPENLIBRARY.value}_person_OL1A")
 
-        def _mock_api_request(_source, _method, url, params=None, **kwargs):  # noqa: ARG001
+        def _mock_api_request(_source, _method, url, params=None, **kwargs):
             if url.endswith("/authors/OL1A.json"):
                 return {
                     "name": "Open Author",
@@ -1823,7 +2199,9 @@ class Metadata(TestCase):
         self.assertEqual(response["biography"], "Open bio")
         self.assertEqual(len(response["bibliography"]), 1)
         self.assertEqual(response["bibliography"][0]["media_id"], "OL123M")
-        self.assertEqual(response["bibliography"][0]["media_type"], MediaTypes.BOOK.value)
+        self.assertEqual(
+            response["bibliography"][0]["media_type"], MediaTypes.BOOK.value
+        )
 
     def test_comicvine_get_people_full_writer_only(self):
         people = comicvine.get_people_full(
@@ -1894,7 +2272,9 @@ class Metadata(TestCase):
         self.assertEqual(response["name"], "Manga Author")
         self.assertEqual(response["known_for_department"], "Author")
         self.assertEqual(response["bibliography"][0]["media_id"], "777")
-        self.assertEqual(response["bibliography"][0]["media_type"], MediaTypes.MANGA.value)
+        self.assertEqual(
+            response["bibliography"][0]["media_type"], MediaTypes.MANGA.value
+        )
 
     def test_manual_tv(self):
         """Test the metadata method for manually created TV shows."""
@@ -2308,7 +2688,134 @@ class Metadata(TestCase):
 
 
 class CastOrderRegressionTests(TestCase):
-    """Regression tests for issue #92 — first cast member (order=0) being dropped."""
+    """Regression tests for cast ordering (issue #92) and TMDB aggregate role shapes."""
+
+    def test_get_cast_credits_selects_top_role_across_wrapped_and_plain(self):
+        """List-wrapped aggregate roles are a valid TMDB shape, not malformed.
+
+        get_cast_credits flattens single-element list-wrapped role dicts and
+        plain dicts into one list, then picks the highest-episode_count role
+        across both shapes. The list-wrapped role here wins because it has the
+        higher episode_count.
+        """
+        credits_data = {
+            "cast": [
+                {
+                    "id": 1,
+                    "name": "Actor",
+                    "roles": [
+                        [{"character": "Nested Role", "episode_count": 10}],
+                        {"character": "Valid Role", "episode_count": 3},
+                    ],
+                    "known_for_department": "Acting",
+                    "gender": 2,
+                    "profile_path": None,
+                },
+            ],
+        }
+
+        result = tmdb.get_cast_credits(credits_data, is_aggregate=True)
+
+        self.assertEqual(result[0]["role"], "Nested Role")
+        self.assertEqual(result[0]["episode_count"], 13)
+
+    def test_all_list_wrapped_roles_not_empty(self):
+        """A cast whose roles are all single-wrapped lists must still resolve a role.
+
+        Matches the real TMDB shape for shows like The Good Doctor where every
+        aggregate role element is a single-element list wrapping a dict.
+        """
+        credits_data = {
+            "cast": [
+                {
+                    "id": 1,
+                    "name": "Actor",
+                    "roles": [
+                        [{"character": "Wrapped Role", "episode_count": 4}],
+                        [{"character": "Another Role", "episode_count": 2}],
+                    ],
+                    "known_for_department": "Acting",
+                    "gender": 2,
+                    "profile_path": None,
+                },
+            ],
+        }
+
+        result = tmdb.get_cast_credits(credits_data, is_aggregate=True)
+
+        self.assertEqual(result[0]["role"], "Wrapped Role")
+        self.assertEqual(result[0]["episode_count"], 6)
+
+    def test_get_cast_credits_flat_dict_roles_unchanged(self):
+        """The canonical flat-dict aggregate shape must be unaffected by flattening.
+
+        Regression guard: the list-wrapping normalization must not change the
+        output for the documented TMDB shape where every role element is a
+        plain dict. Top role by episode_count and summed episode_count must
+        match the pre-flattening behavior.
+        """
+        credits_data = {
+            "cast": [
+                {
+                    "id": 1,
+                    "name": "Actor",
+                    "roles": [
+                        {"character": "Main Role", "episode_count": 8},
+                        {"character": "Recurring Role", "episode_count": 3},
+                    ],
+                    "known_for_department": "Acting",
+                    "gender": 2,
+                    "profile_path": None,
+                },
+            ],
+        }
+
+        result = tmdb.get_cast_credits(credits_data, is_aggregate=True)
+
+        self.assertEqual(result[0]["role"], "Main Role")
+        self.assertEqual(result[0]["episode_count"], 11)
+
+    def test_get_cast_credits_roles_missing_or_empty(self):
+        """A cast member with no roles must not crash and must fall back cleanly.
+
+        Covers roles absent, roles=None, and roles=[] — the aggregate branch
+        must produce a cast entry with the outer character and no episode count
+        rather than raising.
+        """
+        for roles in (None, []):
+            credits_data = {
+                "cast": [
+                    {
+                        "id": 1,
+                        "name": "Actor",
+                        "character": "Fallback Role",
+                        "roles": roles,
+                        "known_for_department": "Acting",
+                        "gender": 2,
+                        "profile_path": None,
+                    },
+                ],
+            }
+            result = tmdb.get_cast_credits(credits_data, is_aggregate=True)
+            self.assertEqual(result[0]["role"], "Fallback Role")
+            self.assertIsNone(result[0]["episode_count"])
+
+        # roles key absent entirely — must behave the same as None/[].
+        credits_data = {
+            "cast": [
+                {
+                    "id": 1,
+                    "name": "Actor",
+                    "character": "Fallback Role",
+                    "known_for_department": "Acting",
+                    "gender": 2,
+                    "profile_path": None,
+                },
+            ],
+        }
+        result = tmdb.get_cast_credits(credits_data, is_aggregate=True)
+        self.assertEqual(result[0]["role"], "Fallback Role")
+        self.assertIsNone(result[0]["episode_count"])
 
     def test_get_cast_credits_order_zero_is_first(self):
         """Cast member with order=0 must sort before members with higher orders."""
@@ -2386,6 +2893,82 @@ class CastOrderRegressionTests(TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["sort_order"], 0)
 
+    def test_normalize_credit_rows_coerces_non_string_text_fields(self):
+        """Provider numeric text fields must not crash credit normalization."""
+        result = _normalize_credit_rows(
+            [
+                {
+                    "person_id": 42,
+                    "name": 123,
+                    "image": 456,
+                    "known_for_department": 789,
+                    "role": 101,
+                    "department": 112,
+                },
+            ],
+        )
+
+        self.assertEqual(result[0]["name"], "123")
+        self.assertEqual(result[0]["known_for_department"], "789")
+        self.assertEqual(result[0]["role"], "101")
+
+    def test_get_cast_credits_aggregate_roles_wrapped_in_list(self):
+        """Roles may ship as a list of lists when a credit repeats per episode.
+
+        Real TMDB aggregate_credits for the-good-doctor (71712) returns each
+        role element as a single-element list of a dict, e.g.
+        {"roles": [{"credit_id": "...", "character": "Dr. Shaun Murphy",
+                    "episode_count": 126}]}. get_cast_credits must not crash
+        on the list element and must still pick the top role by episode_count.
+        """
+        credits_data = {
+            "cast": [
+                {
+                    "id": 1,
+                    "name": "Lead",
+                    "character": "Dr. Main",
+                    "order": 0,
+                    "known_for_department": "Acting",
+                    "gender": 2,
+                    "profile_path": None,
+                    "roles": [
+                        [
+                            {
+                                "credit_id": "x1",
+                                "character": "Dr. Main",
+                                "episode_count": 126,
+                            }
+                        ]
+                    ],
+                },
+                {
+                    "id": 2,
+                    "name": "Supporting",
+                    "character": "Side Role",
+                    "order": 1,
+                    "known_for_department": "Acting",
+                    "gender": 2,
+                    "profile_path": None,
+                    "roles": [
+                        [
+                            {
+                                "credit_id": "x2",
+                                "character": "Side Role",
+                                "episode_count": 12,
+                            }
+                        ]
+                    ],
+                },
+            ]
+        }
+        result = tmdb.get_cast_credits(credits_data, is_aggregate=True)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["name"], "Lead")
+        self.assertEqual(result[0]["episode_count"], 126)
+        self.assertEqual(result[0]["role"], "Dr. Main")
+        self.assertEqual(result[1]["name"], "Supporting")
+        self.assertEqual(result[1]["episode_count"], 12)
+
 
 class OpenLibraryPublishDateTests(TestCase):
     """Cover the free-form publish_date formats OpenLibrary returns."""
@@ -2430,3 +3013,47 @@ class OpenLibraryPublishDateTests(TestCase):
 
     def test_missing_publish_date_returns_none(self):
         self.assertIsNone(openlibrary.get_publish_date({}))
+
+
+class GetTvdbEpisodeImageMapErrorLogging(TestCase):
+    """A TVDB 404 means the TMDB season/episode doesn't exist under TVDB's own
+    numbering (common for grouped-anime shows) - expected, not a warning.
+    """
+
+    def setUp(self):
+        cache.clear()
+
+    @staticmethod
+    def _provider_error(status_code):
+        error = Exception("boom")
+        error.response = MagicMock(status_code=status_code, headers={})
+        return services.ProviderAPIError(Sources.TVDB.value, error)
+
+    @patch("app.providers.tvdb.tv_with_seasons")
+    @patch("app.providers.tvdb.enabled", return_value=True)
+    def test_404_logs_at_info(self, _mock_enabled, mock_tv_with_seasons):
+        mock_tv_with_seasons.side_effect = self._provider_error(404)
+
+        with self.assertLogs("app.providers.tmdb", level="INFO") as captured:
+            result = tmdb.get_tvdb_episode_image_map("352408", 1, tmdb_media_id="82684")
+
+        self.assertEqual(result, {})
+        self.assertTrue(
+            any(record.levelname == "INFO" for record in captured.records),
+        )
+        self.assertFalse(
+            any(record.levelname == "WARNING" for record in captured.records),
+        )
+
+    @patch("app.providers.tvdb.tv_with_seasons")
+    @patch("app.providers.tvdb.enabled", return_value=True)
+    def test_non_404_still_logs_at_warning(self, _mock_enabled, mock_tv_with_seasons):
+        mock_tv_with_seasons.side_effect = self._provider_error(500)
+
+        with self.assertLogs("app.providers.tmdb", level="INFO") as captured:
+            result = tmdb.get_tvdb_episode_image_map("352408", 1, tmdb_media_id="82684")
+
+        self.assertEqual(result, {})
+        self.assertTrue(
+            any(record.levelname == "WARNING" for record in captured.records),
+        )

@@ -1,11 +1,87 @@
+import time
+from unittest.mock import MagicMock, patch
+
+from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.middleware import AuthenticationMiddleware
+from django.contrib.sessions.backends.cached_db import SessionStore
+from django.contrib.sessions.exceptions import SessionInterrupted
 from django.contrib.sessions.middleware import SessionMiddleware
-from django.test import RequestFactory, TestCase, override_settings
+from django.db import OperationalError
+from django.http import HttpResponse
+from django.test import Client, RequestFactory, TestCase, override_settings
+from django.urls import reverse
 
-from app.middleware import AutoLoginMiddleware
+from app.db_retry import is_contention_error
+from app.middleware import (
+    AutoLoginMiddleware,
+    DatabaseRetryMiddleware,
+    NoStoreHtmlMiddleware,
+    SessionInterruptedMiddleware,
+)
 
 UserModel = get_user_model()
+
+
+class DatabaseContentionMiddlewareTest(TestCase):
+    def setUp(self):
+        self.middleware = DatabaseRetryMiddleware(lambda _request: HttpResponse("ok"))
+        self.factory = RequestFactory()
+
+    def test_htmx_get_receives_retry_signal_without_error_page(self):
+        request = self.factory.get(
+            "/track_modal/tmdb/tv/1396?instance_id=7", HTTP_HX_REQUEST="true"
+        )
+        response = self.middleware.process_exception(
+            request, OperationalError("database is locked")
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response["X-Floppy-Transient-DB"], "contention")
+        self.assertEqual(response.content, b"")
+
+    def test_page_get_retries_automatically(self):
+        request = self.factory.get("/medialist/tv?page=2")
+        response = self.middleware.process_exception(
+            request, OperationalError("database is locked")
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response["X-Floppy-Transient-DB"], "contention")
+        self.assertIn(b"location.replace(location.href)", response.content)
+        self.assertNotIn(b"Service Unavailable", response.content)
+
+    def test_middleware_lock_retries_end_in_automatic_page_reload(self):
+        # Patch the module's own `time` name so other threads' sleeps are not counted.
+        fake_time = MagicMock(wraps=time)
+        _sleep = fake_time.sleep
+        patcher = patch("app.middleware.time", fake_time)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def locked(_request):
+            raise OperationalError("database is locked")
+
+        response = DatabaseRetryMiddleware(locked)(self.factory.get("/medialist/tv"))
+        self.assertEqual(response["X-Floppy-Transient-DB"], "contention")
+        # Each SQLite lock error already waited out busy_timeout, so the
+        # server retries once and then hands over to the page's own reload.
+        self.assertEqual(_sleep.call_count, 1)
+
+    def test_post_does_not_receive_automatic_retry(self):
+        request = self.factory.post("/media_save")
+        response = self.middleware.process_exception(
+            request, OperationalError("database is locked")
+        )
+        self.assertNotIn("X-Floppy-Transient-DB", response)
+
+    def test_postgres_transaction_conflicts_are_transient(self):
+        for state in ("40P01", "40001", "55P03"):
+            with self.subTest(state=state):
+                error = OperationalError("transaction conflict")
+                cause = Exception("postgres conflict")
+                cause.sqlstate = state
+                error.__cause__ = cause
+                self.assertTrue(is_contention_error(error))
+        self.assertFalse(is_contention_error(OperationalError("disk I/O error")))
 
 
 class AutoLoginMiddlewareTest(TestCase):
@@ -16,12 +92,12 @@ class AutoLoginMiddlewareTest(TestCase):
         self.factory = RequestFactory()
         self.existing_active_user = UserModel.objects.create_user(
             username="active_user",
-            password="active_user_password",  # noqa: S106
+            password="active_user_password",
             is_active=True,
         )
         self.existing_inactive_user = UserModel.objects.create_user(
             username="inactive_user",
-            password="inactive_user_password",  # noqa: S106
+            password="inactive_user_password",
             is_active=False,
         )
 
@@ -37,16 +113,16 @@ class AutoLoginMiddlewareTest(TestCase):
         middleware = AutoLoginMiddleware(lambda _request: None)
         middleware(request)
 
-    @override_settings(YAMTRACK_AUTO_LOGIN_USERNAME=None)
+    @override_settings(FLOPPY_AUTO_LOGIN_USERNAME=None)
     def test_env_var_unset(self):
-        """Test that no auto-login occurs when YAMTRACK_AUTO_LOGIN_USERNAME is unset."""
+        """Test that no auto-login occurs when FLOPPY_AUTO_LOGIN_USERNAME is unset."""
         request = self.get_request()
 
         self.run_middleware(request)
 
         self.assertFalse(request.user.is_authenticated)
 
-    @override_settings(YAMTRACK_AUTO_LOGIN_USERNAME="active_user")
+    @override_settings(FLOPPY_AUTO_LOGIN_USERNAME="active_user")
     def test_existing_active_user(self):
         """Test that auto-login works with an existing active user."""
         request = self.get_request()
@@ -56,7 +132,7 @@ class AutoLoginMiddlewareTest(TestCase):
         self.assertTrue(request.user.is_authenticated)
         self.assertEqual(request.user, self.existing_active_user)
 
-    @override_settings(YAMTRACK_AUTO_LOGIN_USERNAME="missing_user")
+    @override_settings(FLOPPY_AUTO_LOGIN_USERNAME="missing_user")
     def test_missing_user(self):
         """Test that no auto-login occurs with a missing user."""
         request = self.get_request()
@@ -65,7 +141,7 @@ class AutoLoginMiddlewareTest(TestCase):
 
         self.assertFalse(request.user.is_authenticated)
 
-    @override_settings(YAMTRACK_AUTO_LOGIN_USERNAME="inactive_user")
+    @override_settings(FLOPPY_AUTO_LOGIN_USERNAME="inactive_user")
     def test_inactive_user(self):
         """Test that no auto-login occurs with an inactive user."""
         request = self.get_request()
@@ -73,3 +149,191 @@ class AutoLoginMiddlewareTest(TestCase):
         self.run_middleware(request)
 
         self.assertFalse(request.user.is_authenticated)
+
+
+class HtmxAuthRedirectMiddlewareTest(TestCase):
+    """Test cases for HtmxAuthRedirectMiddleware (#386)."""
+
+    def setUp(self):
+        """Use a logged-out client against a login-required fragment."""
+        self.client = Client()
+        self.url = reverse("active_playback_fragment")
+
+    def test_htmx_request_gets_hx_redirect(self):
+        """An htmx request must get 204 + HX-Redirect, not a followable 302.
+
+        Following the 302 returns the whole login page with a 200, which htmx
+        would happily swap into the fragment slot that made the request.
+        """
+        response = self.client.get(self.url, HTTP_HX_REQUEST="true")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertIn(
+            reverse("account_login"),
+            response.headers["HX-Redirect"],
+        )
+        self.assertEqual(response.content, b"")
+
+    def test_plain_request_still_redirects(self):
+        """A non-htmx request keeps the normal 302 to the login page."""
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("HX-Redirect", response.headers)
+        self.assertIn(reverse("account_login"), response.headers["Location"])
+
+    def test_non_login_redirect_is_untouched(self):
+        """Redirects that aren't to the login page pass through unchanged."""
+        user = UserModel.objects.create_user(
+            username="htmx_user",
+            password="htmx_user_password",
+        )
+        self.client.force_login(user)
+
+        response = self.client.get(self.url, HTTP_HX_REQUEST="true")
+
+        self.assertNotEqual(response.status_code, 204)
+
+
+class SessionInterruptedMiddlewareTest(TestCase):
+    """A session row deleted mid-request must redirect, not 400 (#622)."""
+
+    def setUp(self):
+        """Use a request factory to drive the middleware directly."""
+        self.factory = RequestFactory()
+
+    def test_session_interrupted_redirects_instead_of_500(self):
+        """A stale tab's session race is recovered instead of propagating."""
+
+        def get_response(_request):
+            raise SessionInterrupted("The request's session was deleted.")
+
+        middleware = SessionInterruptedMiddleware(get_response)
+        request = self.factory.post("/import/simkl-oauth")
+
+        response = middleware(request)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            reverse(django_settings.LOGIN_REDIRECT_URL),
+            response.headers["Location"],
+        )
+
+    @override_settings(SESSION_ENGINE="django.contrib.sessions.backends.cached_db")
+    def test_cached_db_session_save_race_redirects_without_logging_secret(self):
+        """The real session middleware save path is recovered safely."""
+
+        def view(request):
+            request.session["oauth_state"] = "super-secret-state"
+            return HttpResponse("ok")
+
+        request = self.factory.post("/import/simkl-oauth")
+        session_middleware = SessionMiddleware(view)
+
+        middleware = SessionInterruptedMiddleware(session_middleware)
+        with (
+            patch.object(
+                SessionStore,
+                "save",
+                side_effect=SessionInterrupted(
+                    "The request's session was deleted before the request completed."
+                ),
+            ),
+            self.assertLogs("app.middleware", level="WARNING") as logs,
+        ):
+            response = middleware(request)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse(django_settings.LOGIN_REDIRECT_URL), response.url)
+        log_output = "\n".join(logs.output)
+        self.assertIn("POST /import/simkl-oauth", log_output)
+        self.assertNotIn("super-secret-state", log_output)
+
+    def test_unaffected_requests_pass_through(self):
+        """Requests that don't hit the race are untouched."""
+
+        def get_response(_request):
+            return HttpResponse("ok")
+
+        middleware = SessionInterruptedMiddleware(get_response)
+        request = self.factory.get("/")
+
+        response = middleware(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"ok")
+
+
+class SessionDurabilityTest(TestCase):
+    """A cache loss must not log the user out (#386)."""
+
+    def test_session_survives_cache_flush(self):
+        """Redis restart/eviction falls back to the database session row."""
+        from django.core.cache import cache
+
+        user = UserModel.objects.create_user(
+            username="session_user",
+            password="session_user_password",
+        )
+        self.client.force_login(user)
+        self.assertEqual(self.client.get("/").status_code, 200)
+
+        cache.clear()
+
+        self.assertEqual(self.client.get("/").status_code, 200)
+
+
+class NoStoreHtmlMiddlewareTest(TestCase):
+    """HTML must not be heuristically cacheable by iOS Safari (#442)."""
+
+    def setUp(self):
+        """Create a logged-in client and a bare request factory."""
+        self.factory = RequestFactory()
+        self.user = UserModel.objects.create_user(
+            username="no_store_user",
+            password="no_store_password",
+        )
+        self.client = Client()
+        self.client.force_login(self.user)
+
+    def _apply(self, response, path="/"):
+        middleware = NoStoreHtmlMiddleware(lambda _request: response)
+        return middleware(self.factory.get(path))
+
+    def test_html_response_is_marked_no_store(self):
+        """A rendered page tells the browser never to reuse the markup."""
+        response = self._apply(HttpResponse("<html></html>"))
+
+        self.assertEqual(response["Cache-Control"], "no-store, must-revalidate")
+
+    def test_static_assets_keep_their_cache_headers(self):
+        """Cache-busted static files stay cacheable."""
+        response = self._apply(
+            HttpResponse("<html></html>"),
+            path="/static/css/main.css",
+        )
+
+        self.assertFalse(response.has_header("Cache-Control"))
+
+    def test_non_html_responses_are_untouched(self):
+        """JSON API responses are left alone."""
+        response = self._apply(HttpResponse("{}", content_type="application/json"))
+
+        self.assertFalse(response.has_header("Cache-Control"))
+
+    def test_existing_cache_control_is_preserved(self):
+        """A view that set its own policy wins."""
+        existing = HttpResponse("<html></html>")
+        existing.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+
+        self.assertEqual(
+            self._apply(existing)["Cache-Control"],
+            "no-cache, no-store, must-revalidate",
+        )
+
+    def test_rendered_page_is_no_store_end_to_end(self):
+        """The header survives the real middleware stack."""
+        response = self.client.get(reverse("home"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "no-store, must-revalidate")

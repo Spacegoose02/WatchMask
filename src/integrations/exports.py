@@ -1,21 +1,31 @@
 import csv
 import json
 import logging
+from collections import defaultdict
 from io import StringIO
+from pathlib import Path
 
 from django.apps import apps
 from django.conf import settings
-from django.db.models import Field, Prefetch
+from django.db.models import Field
+from django.utils import timezone
 
 from app import helpers
 from app.models import (
     AlbumTracker,
     ArtistTracker,
-    Episode,
+    CollectionEntry,
+    CollectionEntrySource,
+    CollectionField,
+    CollectionFieldGroup,
+    CollectionFieldSource,
     Item,
+    ItemTag,
     MediaTypes,
-    Season,
+    Movie,
+    MoviePlay,
     Sources,
+    Status,
 )
 from lists.models import CustomList
 
@@ -38,7 +48,7 @@ def _get_media_types_to_export(media_types=None):
     children (season → episode, tv → season+episode) are returned.
     """
     if media_types is None:
-        return list(MediaTypes.values) + ["music_artist", "music_album"]
+        return [*list(MediaTypes.values), "music_artist", "music_album"]
 
     out = list(media_types)
     # If TV is selected, ensure season & episode are included
@@ -58,7 +68,7 @@ def _get_media_types_to_export(media_types=None):
     return out
 
 
-def generate_rows(user, media_types=None, include_lists=True):
+def generate_rows(user, media_types=None, include_lists=True, include_collection=True):
     """Generate CSV rows.
 
     Parameters
@@ -67,37 +77,39 @@ def generate_rows(user, media_types=None, include_lists=True):
         The user whose data is being exported.
     media_types : list[str] | None
         Restrict export to these media types.  ``None`` means *all*.
+        An empty list exports no media rows but, mirroring lists, still
+        exports all collection entries when *include_collection* is on
+        (enables a collection-only export).
     include_lists : bool
         Whether to include custom lists in the export.
+    include_collection : bool
+        Whether to include collection (owned media) entries in the export.
     """
     pseudo_buffer = Echo()
     writer = csv.writer(pseudo_buffer, quoting=csv.QUOTE_ALL)
 
     # Get fields
     fields = {
-        "item": get_model_fields(Item),
-        "track": get_track_fields(),
+        # watch_providers scales with ~60 TMDB regions, is never read back on
+        # import, and is fully re-fetchable via the provider backfill task.
+        "item": [*get_model_fields(Item, exclude={"watch_providers"}), "episode_order_data"],
+        "track": [*get_track_fields(), "active_episode_order_data", "episode_order_history"],
         "list": get_list_fields(),
+        "collection": get_collection_fields(),
+        "tags": get_tag_fields(),
     }
 
     # Yield header row
-    yield writer.writerow(["row_type"] + fields["item"] + fields["track"] + fields["list"])
+    yield writer.writerow(
+        ["row_type"]
+        + fields["item"]
+        + fields["track"]
+        + fields["list"]
+        + fields["collection"]
+        + fields["tags"],
+    )
 
-    prefetch_config = {
-        MediaTypes.TV.value: Prefetch(
-            "seasons",
-            queryset=Season.objects.select_related("item").prefetch_related(
-                Prefetch(
-                    "episodes",
-                    queryset=Episode.objects.select_related("item"),
-                ),
-            ),
-        ),
-        MediaTypes.SEASON.value: Prefetch(
-            "episodes",
-            queryset=Episode.objects.select_related("item"),
-        ),
-    }
+    item_tags_map = _build_item_tags_map(user)
 
     types_to_export = _get_media_types_to_export(media_types)
 
@@ -114,20 +126,67 @@ def generate_rows(user, media_types=None, include_lists=True):
             else {"user": user}
         )
 
-        queryset = model.objects.filter(**filter_kwargs).select_related("item")
-
-        if media_type in prefetch_config:
-            queryset = queryset.prefetch_related(prefetch_config[media_type])
+        # Only ``item`` is read per row below - no season/episode nesting is
+        # ever touched here, so no further select_related/prefetch_related is
+        # needed. A prior version eagerly prefetched every season and episode
+        # for each tv/season row despite never using them, tripling the
+        # episode load for large libraries and causing exports to time out
+        # partway through (issue #618).
+        manager = model.all_objects if media_type == MediaTypes.EPISODE.value else model.objects
+        # watch_providers is ~146 KiB a title and never exported (excluded from
+        # the item fields above), so keep it out of the streamed rows.
+        queryset = (
+            manager.filter(**filter_kwargs)
+            .select_related("item", "item__episode_order__show")
+            .defer("item__watch_providers")
+        )
 
         logger.debug("Streaming %ss to CSV", media_type)
 
+        row_count = 0
         for media in queryset.iterator(chunk_size=500):
+            if media.item is None:
+                logger.warning(
+                    "Skipping %s id=%s for user %s: no linked item",
+                    media_type,
+                    media.pk,
+                    user.username,
+                )
+                continue
+            row_count += 1
             row = (
                 ["media"]
                 + [getattr(media.item, field, "") for field in fields["item"]]
                 + [getattr(media, field, "") for field in fields["track"]]
                 + [""] * len(fields["list"])
+                + [""] * len(fields["collection"])
+                + [json.dumps(item_tags_map.get(media.item_id, []))]
             )
+
+            from integrations.episode_orders import portable_order
+
+            if media.item.episode_order_id:
+                row[1 + fields["item"].index("media_id")] = media.item.episode_order.show.media_id
+                row[1 + fields["item"].index("episode_order_data")] = json.dumps(
+                    portable_order(media.item.episode_order),
+                )
+            if media_type == MediaTypes.TV.value:
+                from app.models import EpisodeOrderChange
+
+                track_offset = 1 + len(fields["item"])
+                row[track_offset + fields["track"].index("active_episode_order_data")] = (
+                    json.dumps(portable_order(media.active_episode_order))
+                    if media.active_episode_order_id else ""
+                )
+                history = [
+                    {"order": portable_order(change.order), "mappings": change.mappings,
+                     "before_state": change.before_state, "created_at": change.created_at.isoformat()}
+                    for change in EpisodeOrderChange.objects.filter(tv=media, user=user)
+                    .select_related("order__show").order_by("created_at", "pk")
+                ]
+                row[track_offset + fields["track"].index("episode_order_history")] = (
+                    json.dumps(history) if history else ""
+                )
 
             if media_type == MediaTypes.GAME.value:
                 # calculate index of progress field
@@ -136,9 +195,22 @@ def generate_rows(user, media_types=None, include_lists=True):
                     media.progress,
                 )
 
+            if media_type in (
+                MediaTypes.BOOK.value,
+                MediaTypes.COMIC.value,
+                MediaTypes.MANGA.value,
+            ):
+                # The importer reads a bare number as hours, so write hh:mm.
+                reading_index = fields["track"].index("reading_time")
+                row[reading_index + 1 + len(fields["item"])] = (
+                    helpers.minutes_to_hhmm(media.reading_time)
+                    if media.reading_time
+                    else ""
+                )
+
             yield writer.writerow(row)
 
-        logger.debug("Finished streaming %ss to CSV", media_type)
+        logger.debug("Finished streaming %d %s row(s) to CSV", row_count, media_type)
 
     if "music_artist" in types_to_export:
         logger.debug("Streaming music_artists to CSV")
@@ -158,15 +230,21 @@ def generate_rows(user, media_types=None, include_lists=True):
                 "status": tracker.status,
                 "score": tracker.score if tracker.score is not None else "",
                 "notes": tracker.notes,
-                "start_date": tracker.start_date.isoformat() if tracker.start_date else "",
+                "start_date": tracker.start_date.isoformat()
+                if tracker.start_date
+                else "",
                 "end_date": tracker.end_date.isoformat() if tracker.end_date else "",
-                "created_at": tracker.created_at.isoformat() if tracker.created_at else "",
+                "created_at": tracker.created_at.isoformat()
+                if tracker.created_at
+                else "",
             }
             row = (
                 ["media"]
                 + [item_vals.get(f, "") for f in fields["item"]]
                 + [track_vals.get(f, "") for f in fields["track"]]
                 + [""] * len(fields["list"])
+                + [""] * len(fields["collection"])
+                + [""] * len(fields["tags"])
             )
             yield writer.writerow(row)
         logger.debug("Finished streaming music_artists to CSV")
@@ -189,107 +267,383 @@ def generate_rows(user, media_types=None, include_lists=True):
                 "status": tracker.status,
                 "score": tracker.score if tracker.score is not None else "",
                 "notes": tracker.notes,
-                "start_date": tracker.start_date.isoformat() if tracker.start_date else "",
+                "start_date": tracker.start_date.isoformat()
+                if tracker.start_date
+                else "",
                 "end_date": tracker.end_date.isoformat() if tracker.end_date else "",
-                "created_at": tracker.created_at.isoformat() if tracker.created_at else "",
+                "created_at": tracker.created_at.isoformat()
+                if tracker.created_at
+                else "",
             }
             row = (
                 ["media"]
                 + [item_vals.get(f, "") for f in fields["item"]]
                 + [track_vals.get(f, "") for f in fields["track"]]
                 + [""] * len(fields["list"])
+                + [""] * len(fields["collection"])
+                + [""] * len(fields["tags"])
             )
             yield writer.writerow(row)
         logger.debug("Finished streaming music_albums to CSV")
 
-    if not include_lists:
-        return
+    if include_lists:
+        yield from _generate_list_rows(user, writer, fields, item_tags_map)
 
-    # Export custom lists owned by the user
+    if include_collection:
+        yield from _generate_collection_rows(
+            user, writer, fields, media_types, item_tags_map
+        )
+
+
+def _generate_list_rows(user, writer, fields, item_tags_map):
+    """Yield ``list`` and ``list_item`` rows for the user's custom lists."""
     custom_lists = CustomList.objects.filter(owner=user).order_by("name")
 
     for custom_list in custom_lists:
-        list_row = (
-            ["list"]
-            + [""] * len(fields["item"])
+        yield from _generate_single_list_rows(
+            custom_list, writer, fields, item_tags_map
+        )
+
+
+def _generate_single_list_rows(custom_list, writer, fields, item_tags_map):
+    """Yield the ``list`` row and its ``list_item`` rows for one custom list."""
+    list_row = (
+        ["list"]
+        + [""] * len(fields["item"])
+        + [""] * len(fields["track"])
+        + [
+            custom_list.id,
+            custom_list.name,
+            custom_list.description,
+            json.dumps(custom_list.tags or []),
+            custom_list.visibility,
+            custom_list.allow_recommendations,
+            custom_list.include_notes,
+            custom_list.source,
+            custom_list.source_id,
+            custom_list.is_smart,
+            json.dumps(custom_list.smart_media_types or []),
+            json.dumps(custom_list.smart_excluded_media_types or []),
+            json.dumps(custom_list.smart_filters or {}),
+            "",
+        ]
+        + [""] * len(fields["collection"])
+        + [""] * len(fields["tags"])
+    )
+    yield writer.writerow(list_row)
+
+    list_items = custom_list.customlistitem_set.select_related("item").order_by(
+        "date_added", "pk"
+    )
+    for list_item in list_items:
+        item = list_item.item
+        list_item_row = (
+            ["list_item"]
+            + [getattr(item, field, "") for field in fields["item"]]
             + [""] * len(fields["track"])
             + [
                 custom_list.id,
                 custom_list.name,
-                custom_list.description,
-                json.dumps(custom_list.tags or []),
-                custom_list.visibility,
-                custom_list.allow_recommendations,
-                custom_list.source,
-                custom_list.source_id,
-                custom_list.is_smart,
-                json.dumps(custom_list.smart_media_types or []),
-                json.dumps(custom_list.smart_excluded_media_types or []),
-                json.dumps(custom_list.smart_filters or {}),
                 "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                list_item.date_added.isoformat() if list_item.date_added else "",
             ]
+            + [""] * len(fields["collection"])
+            + [json.dumps(item_tags_map.get(item.id, []))]
         )
-        yield writer.writerow(list_row)
+        yield writer.writerow(list_item_row)
 
-        list_items = (
-            custom_list.customlistitem_set.select_related("item")
-            .order_by("date_added", "pk")
+
+def generate_list_csv(custom_list):
+    """Generate CSV rows for a single custom list (definition + item snapshot).
+
+    Uses the same header/column layout as ``generate_rows`` so the output is
+    directly importable via the full-backup ``YamtrackImporter``.
+    """
+    pseudo_buffer = Echo()
+    writer = csv.writer(pseudo_buffer, quoting=csv.QUOTE_ALL)
+
+    fields = {
+        # watch_providers scales with ~60 TMDB regions, is never read back on
+        # import, and is fully re-fetchable via the provider backfill task.
+        "item": get_model_fields(Item, exclude={"watch_providers"}),
+        "track": get_track_fields(),
+        "list": get_list_fields(),
+        "collection": get_collection_fields(),
+        "tags": get_tag_fields(),
+    }
+
+    yield writer.writerow(
+        ["row_type"]
+        + fields["item"]
+        + fields["track"]
+        + fields["list"]
+        + fields["collection"]
+        + fields["tags"],
+    )
+
+    item_tags_map = _build_item_tags_map(custom_list.owner)
+    yield from _generate_single_list_rows(custom_list, writer, fields, item_tags_map)
+
+
+LETTERBOXD_HEADER = [
+    "tmdbID",
+    "imdbID",
+    "Title",
+    "Year",
+    "WatchedDate",
+    "Rating",
+    "Rewatch",
+    "Tags",
+    "Review",
+]
+
+
+def generate_letterboxd_rows(user):
+    """Generate a Letterboxd-import-compatible CSV of the user's watched movies.
+
+    Combines two watch representations into one per-item timeline: individual
+    ``MoviePlay`` rows (the play-tracking feature), and legacy/imported
+    completions recorded as a standalone ``Movie`` row with no ``MoviePlay``
+    -- including repeat watches stored as separate ``Movie`` rows sharing the
+    same ``Item`` (see ``test_repeated_completed_plays_remain_separate``).
+    Watches are grouped by underlying ``Item`` rather than ``Movie`` row, so a
+    legacy repeat-watch row still rewatch-flags correctly, and ordered
+    chronologically (undated watches sorted last) to pick the first watch per
+    item. A ``Movie`` with neither a ``MoviePlay`` nor ``Status.COMPLETED`` was
+    never watched and is excluded; a ``Completed`` movie with no watch date
+    still exports with a blank ``WatchedDate`` rather than being dropped.
+    """
+    pseudo_buffer = Echo()
+    writer = csv.writer(pseudo_buffer, quoting=csv.QUOTE_MINIMAL)
+
+    yield writer.writerow(LETTERBOXD_HEADER)
+
+    item_tags_map = _build_item_tags_map(user)
+
+    # (item_id, watched_at, movie) for every discrete watch event, from both
+    # representations. Small enough to hold in memory per user (bounded by
+    # movie count, not episode-scale) so watches can be grouped and ordered
+    # by underlying item before rewatch flags are assigned.
+    events = []
+
+    plays = MoviePlay.objects.filter(
+        movie__user=user,
+        end_date__isnull=False,
+    ).select_related("movie", "movie__item")
+    for play in plays:
+        movie = play.movie
+        if movie.item is None:
+            continue
+        events.append((movie.item_id, play.end_date, movie))
+
+    movie_ids_with_plays = MoviePlay.objects.filter(movie__user=user).values_list(
+        "movie_id",
+        flat=True,
+    ).distinct()
+    fallback_movies = (
+        Movie.objects.filter(user=user, status=Status.COMPLETED.value)
+        .exclude(id__in=movie_ids_with_plays)
+        .select_related("item")
+    )
+    for movie in fallback_movies:
+        if movie.item is None:
+            continue
+        events.append((movie.item_id, movie.end_date, movie))
+
+    events.sort(key=lambda event: (event[0], event[1] is None, event[1]))
+
+    seen_item_ids = set()
+    for item_id, watched_at, movie in events:
+        is_rewatch = item_id in seen_item_ids
+        seen_item_ids.add(item_id)
+        yield writer.writerow(
+            _letterboxd_row(movie, watched_at, is_rewatch, item_tags_map),
         )
-        for list_item in list_items:
-            item = list_item.item
-            list_item_row = (
-                ["list_item"]
-                + [getattr(item, field, "") for field in fields["item"]]
-                + [""] * len(fields["track"])
-                + [
-                    custom_list.id,
-                    custom_list.name,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    list_item.date_added.isoformat() if list_item.date_added else "",
-                ]
-            )
-            yield writer.writerow(list_item_row)
 
 
-def write_backup(user, media_types=None, include_lists=True):
+def _letterboxd_score_to_rating(score):
+    """Convert a Floppy 0.0-10.0 score to Letterboxd's 0.5-5 star rating."""
+    if score is None:
+        return ""
+    rating = round(float(score) / 2 * 2) / 2
+    if rating <= 0:
+        return ""
+    return rating
+
+
+def _letterboxd_row(movie, watched_at, is_rewatch, item_tags_map):
+    """Build a single Letterboxd CSV row for one watch of a movie."""
+    item = movie.item
+    tmdb_id = item.media_id if item.source == Sources.TMDB.value else ""
+    if item.source == Sources.IMDB.value:
+        imdb_id = item.media_id
+    else:
+        imdb_id = (item.provider_external_ids or {}).get("imdb_id", "")
+    year = item.release_datetime.year if item.release_datetime else ""
+    watched_date = (
+        timezone.localtime(watched_at).date().isoformat() if watched_at else ""
+    )
+    tags = ", ".join(item_tags_map.get(item.id, []))
+
+    return [
+        tmdb_id,
+        imdb_id,
+        item.title,
+        year,
+        watched_date,
+        _letterboxd_score_to_rating(movie.score),
+        "true" if is_rewatch else "",
+        tags,
+        movie.notes or "",
+    ]
+
+
+def _generate_collection_rows(user, writer, fields, media_types, item_tags_map):
+    """Yield ``collection`` rows for the user's collection entries.
+
+    When *media_types* is a non-empty list, only entries whose item matches
+    the requested types (plus implicit children) are exported; ``None`` and
+    ``[]`` both export every entry.
+    """
+    logger.debug("Streaming collection entries to CSV")
+
+    # The schema row precedes the entries so the importer can build its
+    # uid -> field map before it meets the first stored value.
+    schema = _collection_schema_payload(user)
+    if schema["groups"]:
+        schema_row = (
+            ["collection_schema"]
+            + [""] * len(fields["item"])
+            + [""] * len(fields["track"])
+            + [""] * len(fields["list"])
+            + [""] * len(COLLECTION_EXPORT_FIELDS)
+            + [json.dumps(schema), ""]
+            + [""] * len(fields["tags"])
+        )
+        yield writer.writerow(schema_row)
+
+    uid_map = _collection_field_uid_map(user)
+    identity_map = _collection_identity_map(user)
+
+    queryset = CollectionEntry.objects.filter(user=user).select_related("item")
+    if media_types:
+        types_to_export = _get_media_types_to_export(media_types)
+        queryset = queryset.filter(item__media_type__in=types_to_export)
+    queryset = queryset.order_by("item__media_type", "collected_at", "pk")
+
+    for entry in queryset.iterator(chunk_size=500):
+        collection_vals = []
+        for attr in COLLECTION_EXPORT_FIELDS.values():
+            value = getattr(entry, attr)
+            if attr == "collected_at":
+                value = value.isoformat() if value else ""
+            elif value is None:
+                value = ""
+            collection_vals.append(value)
+        collection_vals.append(_portable_custom_values(entry, uid_map))
+        collection_vals.append(identity_map.get(entry.id, ""))
+        row = (
+            ["collection"]
+            + [getattr(entry.item, field, "") for field in fields["item"]]
+            + [""] * len(fields["track"])
+            + [""] * len(fields["list"])
+            + collection_vals
+            + [json.dumps(item_tags_map.get(entry.item_id, []))]
+        )
+        yield writer.writerow(row)
+    logger.debug("Finished streaming collection entries to CSV")
+
+
+def _portable_custom_values(entry, uid_map):
+    """Return the entry's custom values re-keyed by portable field uid."""
+    values = entry.custom_field_values or {}
+    if not values:
+        return ""
+    portable = {}
+    for raw_id, value in values.items():
+        try:
+            uid = uid_map[int(raw_id)]
+        except (KeyError, TypeError, ValueError):
+            # A value whose field was deleted. Keep it under its raw key so
+            # the export stays lossless rather than dropping it.
+            portable[str(raw_id)] = value
+            continue
+        portable[uid] = value
+    return json.dumps(portable)
+
+
+def _collection_identity_map(user):
+    """Map entry id -> serialized source identity, for source-linked copies."""
+    identity = {}
+    for link in CollectionEntrySource.objects.filter(user=user):
+        identity[link.entry_id] = json.dumps(
+            {
+                "source": link.source,
+                "record_id": link.source_record_id,
+                "occurrence": link.occurrence,
+                "derived": link.derived_identity,
+            },
+        )
+    return identity
+
+
+def backup_directory(user):
+    """Keep user-controlled names within the configured backup directory."""
+    username = str(user.username)
+    # Django permits dot-only usernames. Legacy/admin-created usernames may
+    # also contain separators; none may become filesystem paths. A colon is
+    # forbidden in normal usernames, avoiding collisions with this fallback.
+    if username in {"", ".", ".."} or Path(username).name != username:
+        username = f"user:{user.pk}"
+    directory = Path(settings.BACKUP_DIR) / username
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory
+
+
+def write_backup(user, media_types=None, include_lists=True, include_collection=True):
     """Write a CSV backup to the configured backup directory.
 
     Returns the path to the created file.
     """
-    from pathlib import Path
-
-    from django.conf import settings
-    from django.utils import timezone
-
-    backup_dir = Path(settings.BACKUP_DIR) / str(user.username)
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir = backup_directory(user)
 
     now = timezone.localtime()
-    filename = f"watchmask_{now.strftime('%Y-%m-%d_%H%M%S')}.csv"
+    filename = f"floppy_{now.strftime('%Y-%m-%d_%H%M%S')}.csv"
     filepath = backup_dir / filename
 
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        f.writelines(generate_rows(user, media_types=media_types, include_lists=include_lists))
+    with filepath.open("w", newline="", encoding="utf-8") as f:
+        f.writelines(
+            generate_rows(
+                user,
+                media_types=media_types,
+                include_lists=include_lists,
+                include_collection=include_collection,
+            )
+        )
 
     logger.info("Backup written to %s for user %s", filepath, user.username)
     return str(filepath)
 
 
-def get_model_fields(model):
+def get_model_fields(model, exclude=frozenset()):
     """Get a list of fields names from a model."""
     return [
         field.name
         for field in model._meta.get_fields()
-        if isinstance(field, Field) and not field.auto_created and not field.is_relation
+        if isinstance(field, Field)
+        and not field.auto_created
+        and not field.is_relation
+        and field.name not in exclude
     ]
 
 
@@ -299,12 +653,14 @@ def get_track_fields():
 
     for media_type in MediaTypes.values:
         model = apps.get_model("app", media_type)
-        for field in get_model_fields(model):
+        for field in get_model_fields(
+            model,
+            exclude={"watch_operation_id", "external_id"},
+        ):
             if field not in all_fields:
                 all_fields.append(field)
 
-    # Put start_date and end_date next to each other
-    # happens because Episode has end_date but not start_date
+    # Put start_date and end_date next to each other.
     if "start_date" in all_fields and "end_date" in all_fields:
         end_idx = all_fields.index("end_date")
 
@@ -315,7 +671,7 @@ def get_track_fields():
         all_fields.insert(end_idx, "end_date")
         all_fields.insert(end_idx, "start_date")
 
-    for timestamp_field in ("created_at", "progressed_at"):
+    for timestamp_field in ("created_at", "progressed_at", "scored_at"):
         if timestamp_field in all_fields:
             all_fields.remove(timestamp_field)
             all_fields.append(timestamp_field)
@@ -332,6 +688,7 @@ def get_list_fields():
         "list_tags",
         "list_visibility",
         "list_allow_recommendations",
+        "list_include_notes",
         "list_source",
         "list_source_id",
         "list_is_smart",
@@ -340,6 +697,119 @@ def get_list_fields():
         "list_smart_filters",
         "list_item_date_added",
     ]
+
+
+# CSV column name -> CollectionEntry attribute. ``collection_format`` maps to
+# CollectionEntry.media_type, renamed to avoid clashing with the Item
+# media_type column. Plex cache fields and updated_at are deliberately
+# excluded (instance-local state).
+COLLECTION_EXPORT_FIELDS = {
+    "collection_format": "media_type",
+    "collection_resolution": "resolution",
+    "collection_hdr": "hdr",
+    "collection_is_3d": "is_3d",
+    "collection_audio_codec": "audio_codec",
+    "collection_audio_channels": "audio_channels",
+    "collection_bitrate": "bitrate",
+    "collection_collected_at": "collected_at",
+    "collection_purchase_price": "purchase_price",
+    "collection_purchase_location": "purchase_location",
+}
+
+# Columns that are computed rather than read straight off the entry. They
+# are appended, so an export written by this version still loads in an
+# older one (which simply ignores the extra columns).
+COLLECTION_CUSTOM_FIELDS_COLUMN = "collection_custom_fields"
+COLLECTION_SOURCE_IDENTITY_COLUMN = "collection_source_identity"
+
+# Bumped when the shape of the collection_schema payload changes.
+COLLECTION_SCHEMA_VERSION = 1
+
+
+def collection_field_uid(group_name, label):
+    """Return the portable identity of a custom field.
+
+    Database ids are per-user and not portable, so exports address fields by
+    group name plus label and the importer remaps them to the destination
+    user's own ids.
+    """
+    return f"{group_name}\u001f{label}"
+
+
+def _collection_schema_payload(user):
+    """Return the user's custom-field schema as a portable dict."""
+    sources = defaultdict(list)
+    for mapping in CollectionFieldSource.objects.filter(user=user).order_by(
+        "source",
+        "source_key",
+    ):
+        sources[mapping.field_id].append(
+            {
+                "source": mapping.source,
+                "source_key": mapping.source_key,
+                "source_label": mapping.source_label,
+                "created_field": mapping.created_field,
+            },
+        )
+
+    groups = CollectionFieldGroup.objects.filter(user=user).prefetch_related("fields")
+    return {
+        "version": COLLECTION_SCHEMA_VERSION,
+        "groups": [
+            {
+                "name": group.name,
+                "position": group.position,
+                "fields": [
+                    {
+                        "uid": collection_field_uid(group.name, field.label),
+                        "label": field.label,
+                        "field_type": field.field_type,
+                        "options": field.options,
+                        "media_types": field.media_types,
+                        "position": field.position,
+                        "sources": sources.get(field.id, []),
+                    }
+                    for field in group.fields.all()
+                ],
+            }
+            for group in groups
+        ],
+    }
+
+
+def _collection_field_uid_map(user):
+    """Map field id -> portable uid, for translating stored values."""
+    return {
+        field.id: collection_field_uid(field.group.name, field.label)
+        for field in CollectionField.objects.filter(
+            group__user=user,
+        ).select_related("group")
+    }
+
+
+def get_collection_fields():
+    """Get collection-specific export fields."""
+    return [
+        *COLLECTION_EXPORT_FIELDS,
+        COLLECTION_CUSTOM_FIELDS_COLUMN,
+        COLLECTION_SOURCE_IDENTITY_COLUMN,
+    ]
+
+
+def get_tag_fields():
+    """Get item-tag export fields."""
+    return ["item_tags"]
+
+
+def _build_item_tags_map(user):
+    """Map Item id -> tag names, for the CSV item_tags column."""
+    tag_map = defaultdict(list)
+    for item_id, tag_name in ItemTag.objects.filter(tag__user=user).values_list(
+        "item_id",
+        "tag__name",
+    ):
+        tag_map[item_id].append(tag_name)
+    return tag_map
 
 
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500/"
@@ -354,16 +824,45 @@ SAMPLE_MOVIES = [
 
 # (media_id, title, show poster path, season poster path)
 SAMPLE_TV_SHOWS = [
-    ("1668", "Friends", "2koX1xLkpTQM4IZebYvKysFW1Nh.jpg", "odCW88Cq5hAF0ZFVOkeJmeQv1nV.jpg"),
-    ("1396", "Breaking Bad", "ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg", "ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg"),
-    ("1399", "Game of Thrones", "1XS1oqL89opfnbLl8WnZY1O1uJx.jpg", "1XS1oqL89opfnbLl8WnZY1O1uJx.jpg"),
-    ("2316", "The Office", "7DJKHzAi83BmQrWLrYYOqcoKfhR.jpg", "7DJKHzAi83BmQrWLrYYOqcoKfhR.jpg"),
-    ("60625", "Rick and Morty", "owhkU6KRqdXoUQpjV8uyZGPtX58.jpg", "owhkU6KRqdXoUQpjV8uyZGPtX58.jpg"),
+    (
+        "1668",
+        "Friends",
+        "2koX1xLkpTQM4IZebYvKysFW1Nh.jpg",
+        "odCW88Cq5hAF0ZFVOkeJmeQv1nV.jpg",
+    ),
+    (
+        "1396",
+        "Breaking Bad",
+        "ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg",
+        "ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg",
+    ),
+    (
+        "1399",
+        "Game of Thrones",
+        "1XS1oqL89opfnbLl8WnZY1O1uJx.jpg",
+        "1XS1oqL89opfnbLl8WnZY1O1uJx.jpg",
+    ),
+    (
+        "2316",
+        "The Office",
+        "7DJKHzAi83BmQrWLrYYOqcoKfhR.jpg",
+        "7DJKHzAi83BmQrWLrYYOqcoKfhR.jpg",
+    ),
+    (
+        "60625",
+        "Rick and Morty",
+        "owhkU6KRqdXoUQpjV8uyZGPtX58.jpg",
+        "owhkU6KRqdXoUQpjV8uyZGPtX58.jpg",
+    ),
 ]
 
 SAMPLE_ANIME = [
     ("227", "FLCL", "https://cdn.myanimelist.net/images/anime/7/77356l.jpg"),
-    ("44511", "Chainsaw Man", "https://cdn.myanimelist.net/images/anime/1806/126216l.jpg"),
+    (
+        "44511",
+        "Chainsaw Man",
+        "https://cdn.myanimelist.net/images/anime/1806/126216l.jpg",
+    ),
     ("12189", "Hyouka", "https://cdn.myanimelist.net/images/anime/13/50521l.jpg"),
     ("31043", "Erased", "https://cdn.myanimelist.net/images/anime/1555/106759l.jpg"),
     ("1535", "Death Note", "https://cdn.myanimelist.net/images/anime/1079/138100.jpg"),
@@ -378,7 +877,11 @@ SAMPLE_MANGA = [
 ]
 
 SAMPLE_GAMES = [
-    ("19562", "Resident Evil 7: Biohazard", "https://images.igdb.com/igdb/image/upload/t_original/co545w.jpg"),
+    (
+        "19562",
+        "Resident Evil 7: Biohazard",
+        "https://images.igdb.com/igdb/image/upload/t_original/co545w.jpg",
+    ),
     ("72", "Portal 2", ""),
     ("233", "Half-Life 2", ""),
     ("7346", "The Legend of Zelda: Breath of the Wild", ""),
@@ -386,11 +889,23 @@ SAMPLE_GAMES = [
 ]
 
 SAMPLE_BOOKS = [
-    ("OL21733390M", "Nineteen Eighty-Four", "https://covers.openlibrary.org/b/id/9267242-L.jpg"),
+    (
+        "OL21733390M",
+        "Nineteen Eighty-Four",
+        "https://covers.openlibrary.org/b/id/9267242-L.jpg",
+    ),
     ("OL51711263M", "The Hobbit", "https://covers.openlibrary.org/b/id/14627509-L.jpg"),
-    ("OL40236195M", "Fahrenheit 451", "https://covers.openlibrary.org/b/id/12993656-L.jpg"),
+    (
+        "OL40236195M",
+        "Fahrenheit 451",
+        "https://covers.openlibrary.org/b/id/12993656-L.jpg",
+    ),
     ("OL32848840M", "Dune", "https://covers.openlibrary.org/b/id/11481354-L.jpg"),
-    ("OL22570129M", "The Great Gatsby", "https://covers.openlibrary.org/b/id/10590366-L.jpg"),
+    (
+        "OL22570129M",
+        "The Great Gatsby",
+        "https://covers.openlibrary.org/b/id/10590366-L.jpg",
+    ),
 ]
 
 SAMPLE_COMICS = [
@@ -478,7 +993,7 @@ SAMPLE_MUSIC = [
 
 
 def generate_sample_template():
-    """Build a sample CSV demonstrating the Yamtrack import format.
+    """Build a sample CSV demonstrating the Floppy/Yamtrack CSV format.
 
     Uses real, verifiable catalog entries (real TMDB/MAL/IGDB/OpenLibrary/
     ComicVine/BGG/Pocket Casts/MusicBrainz IDs) instead of placeholder data,
@@ -491,22 +1006,39 @@ def generate_sample_template():
     writer = csv.writer(output, quoting=csv.QUOTE_ALL)
 
     fields = {
-        "item": get_model_fields(Item),
+        # watch_providers scales with ~60 TMDB regions, is never read back on
+        # import, and is fully re-fetchable via the provider backfill task.
+        "item": get_model_fields(Item, exclude={"watch_providers"}),
         "track": get_track_fields(),
         "list": get_list_fields(),
+        "collection": get_collection_fields(),
+        "tags": get_tag_fields(),
     }
-    writer.writerow(["row_type"] + fields["item"] + fields["track"] + fields["list"])
+    writer.writerow(
+        ["row_type"]
+        + fields["item"]
+        + fields["track"]
+        + fields["list"]
+        + fields["collection"]
+        + fields["tags"],
+    )
 
     placeholder_image = settings.IMG_NONE
 
     def write_media_row(item_vals, track_vals=None):
-        item_vals = {"source": Sources.MANUAL.value, "image": placeholder_image, **item_vals}
+        item_vals = {
+            "source": Sources.MANUAL.value,
+            "image": placeholder_image,
+            **item_vals,
+        }
         track_vals = track_vals or {}
         writer.writerow(
             ["media"]
             + [item_vals.get(field, "") for field in fields["item"]]
             + [track_vals.get(field, "") for field in fields["track"]]
-            + [""] * len(fields["list"]),
+            + [""] * len(fields["list"])
+            + [""] * len(fields["collection"])
+            + [""] * len(fields["tags"]),
         )
 
     def write_list_row(list_vals):
@@ -514,16 +1046,39 @@ def generate_sample_template():
             ["list"]
             + [""] * len(fields["item"])
             + [""] * len(fields["track"])
-            + [list_vals.get(field, "") for field in fields["list"]],
+            + [list_vals.get(field, "") for field in fields["list"]]
+            + [""] * len(fields["collection"])
+            + [""] * len(fields["tags"]),
         )
 
     def write_list_item_row(item_vals, list_vals):
-        item_vals = {"source": Sources.MANUAL.value, "image": placeholder_image, **item_vals}
+        item_vals = {
+            "source": Sources.MANUAL.value,
+            "image": placeholder_image,
+            **item_vals,
+        }
         writer.writerow(
             ["list_item"]
             + [item_vals.get(field, "") for field in fields["item"]]
             + [""] * len(fields["track"])
-            + [list_vals.get(field, "") for field in fields["list"]],
+            + [list_vals.get(field, "") for field in fields["list"]]
+            + [""] * len(fields["collection"])
+            + [""] * len(fields["tags"]),
+        )
+
+    def write_collection_row(item_vals, collection_vals):
+        item_vals = {
+            "source": Sources.MANUAL.value,
+            "image": placeholder_image,
+            **item_vals,
+        }
+        writer.writerow(
+            ["collection"]
+            + [item_vals.get(field, "") for field in fields["item"]]
+            + [""] * len(fields["track"])
+            + [""] * len(fields["list"])
+            + [collection_vals.get(field, "") for field in fields["collection"]]
+            + [""] * len(fields["tags"]),
         )
 
     # Every category gets the same 5-item status/score spread, so each one
@@ -540,7 +1095,9 @@ def generate_sample_template():
     def tmdb_image(path):
         return f"{TMDB_IMAGE_BASE}{path}" if path else ""
 
-    def write_category_list(media_type, source, list_name, entries, image_fn=lambda x: x):
+    def write_category_list(
+        media_type, source, list_name, entries, image_fn=lambda x: x
+    ):
         list_uid = f"sample-list-{media_type}"
         write_list_row(
             {
@@ -550,7 +1107,9 @@ def generate_sample_template():
                 "list_visibility": "private",
             },
         )
-        for (media_id, title, *rest), (status, score) in zip(entries, status_score_sequence):
+        for (media_id, title, *rest), (status, score) in zip(
+            entries, status_score_sequence, strict=False
+        ):
             track_vals = {"status": status}
             if score:
                 track_vals["score"] = score
@@ -565,16 +1124,42 @@ def generate_sample_template():
                 "image": image,
             }
             write_media_row(item_vals, track_vals)
-            write_list_item_row(item_vals, {"list_uid": list_uid, "list_name": list_name})
+            write_list_item_row(
+                item_vals, {"list_uid": list_uid, "list_name": list_name}
+            )
 
     write_category_list("movie", "tmdb", "Sample Movies", SAMPLE_MOVIES, tmdb_image)
+
+    # One owned copy of the first sample movie, demonstrating the
+    # collection row format.
+    sample_movie_id, sample_movie_title, sample_movie_poster = SAMPLE_MOVIES[0]
+    write_collection_row(
+        {
+            "media_id": sample_movie_id,
+            "source": "tmdb",
+            "media_type": "movie",
+            "title": sample_movie_title,
+            "image": tmdb_image(sample_movie_poster),
+        },
+        {
+            "collection_format": "4K Blu-ray",
+            "collection_resolution": "4K",
+            "collection_hdr": "Dolby Vision",
+            "collection_audio_codec": "Dolby Atmos",
+            "collection_audio_channels": "7.1",
+        },
+    )
     write_category_list("anime", "mal", "Sample Anime", SAMPLE_ANIME, lambda url: url)
     write_category_list("manga", "mal", "Sample Manga", SAMPLE_MANGA, lambda url: url)
     write_category_list("game", "igdb", "Sample Games", SAMPLE_GAMES, lambda url: url)
-    write_category_list("book", "openlibrary", "Sample Books", SAMPLE_BOOKS, lambda url: url)
+    write_category_list(
+        "book", "openlibrary", "Sample Books", SAMPLE_BOOKS, lambda url: url
+    )
     write_category_list("comic", "comicvine", "Sample Comics", SAMPLE_COMICS)
     write_category_list("boardgame", "bgg", "Sample Board Games", SAMPLE_BOARDGAMES)
-    write_category_list("podcast", "pocketcasts", "Sample Podcasts", SAMPLE_PODCASTS, lambda url: url)
+    write_category_list(
+        "podcast", "pocketcasts", "Sample Podcasts", SAMPLE_PODCASTS, lambda url: url
+    )
 
     # TV shows also get a linked season (season_number=1) per show.
     tv_list_uid = "sample-list-tv"
@@ -600,6 +1185,7 @@ def generate_sample_template():
     for (media_id, title, show_path, season_path), (status, score) in zip(
         SAMPLE_TV_SHOWS,
         status_score_sequence,
+        strict=False,
     ):
         tv_track_vals = {"status": status}
         if score:
@@ -619,7 +1205,9 @@ def generate_sample_template():
         }
         write_media_row(tv_item_vals, tv_track_vals)
         write_media_row(season_item_vals, tv_track_vals)
-        write_list_item_row(tv_item_vals, {"list_uid": tv_list_uid, "list_name": tv_list_name})
+        write_list_item_row(
+            tv_item_vals, {"list_uid": tv_list_uid, "list_name": tv_list_name}
+        )
         write_list_item_row(
             season_item_vals,
             {"list_uid": season_list_uid, "list_name": season_list_name},
@@ -629,9 +1217,13 @@ def generate_sample_template():
     # aren't Item-backed, so they can't belong to a CustomList or the smart
     # list below -- that's a structural constraint of the data model, not an
     # omission.
-    for (artist_mbid, artist_name, release_group_id, album_title), (status, score) in zip(
+    for (artist_mbid, artist_name, release_group_id, album_title), (
+        status,
+        score,
+    ) in zip(
         SAMPLE_MUSIC,
         status_score_sequence,
+        strict=False,
     ):
         track_vals = {"status": status}
         if score:
@@ -668,7 +1260,9 @@ def generate_sample_template():
             ),
             "list_visibility": "private",
             "list_is_smart": "true",
-            "list_smart_filters": json.dumps({"status": "Completed", "rating_min": "8"}),
+            "list_smart_filters": json.dumps(
+                {"status": "Completed", "rating_min": "8"}
+            ),
         },
     )
 

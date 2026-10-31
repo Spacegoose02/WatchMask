@@ -21,7 +21,7 @@ from app.models import (
     Sources,
     Status,
 )
-from app.providers import services
+from app.providers import credentials, services
 from integrations import anime_mapping
 
 GROUPED_ANIME_PROVIDERS = {
@@ -38,6 +38,9 @@ PROVIDER_EXTERNAL_ID_KEYS = {
     Sources.TMDB.value: "tmdb_id",
     Sources.TVDB.value: "tvdb_id",
     Sources.MAL.value: "mal_id",
+}
+EXTERNAL_ID_KEY_PROVIDERS = {
+    key: provider for provider, key in PROVIDER_EXTERNAL_ID_KEYS.items()
 }
 
 
@@ -63,19 +66,34 @@ class MetadataProviderOption:
     label: str
 
 
-def provider_is_enabled(provider: str) -> bool:
-    """Return whether a provider is configured for live use."""
-    if provider == Sources.TVDB.value:
-        return bool(settings.TVDB_API_KEY)
-    return True
+@dataclass(frozen=True, slots=True)
+class AnimeTMDBIdentity:
+    """One exact TMDB identity resolved from a MAL title."""
+
+    media_id: str
+    media_type: str
+    tvdb_id: str | None = None
+    imdb_id: str | None = None
 
 
-def available_metadata_sources(media_type: str) -> list[Sources]:
+def provider_is_enabled(provider: str, user=None) -> bool:
+    """Return whether a provider is configured for live use.
+
+    ``user`` opts a provider back in when the credential can be personal rather
+    than instance-wide; callers with no user get the instance-level answer.
+    """
+    spec = credentials.get_spec(provider)
+    if spec is None:
+        return True
+    return credentials.is_configured(provider, user)
+
+
+def available_metadata_sources(media_type: str, user=None) -> list[Sources]:
     """Return configured metadata sources for a route media type."""
     candidates = []
     for source in config.get_sources(media_type) or []:
         provider = source.value if isinstance(source, Sources) else str(source)
-        if provider_is_enabled(provider):
+        if provider_is_enabled(provider, user):
             candidates.append(
                 source if isinstance(source, Sources) else Sources(provider),
             )
@@ -98,7 +116,7 @@ def available_metadata_provider_values(
     identity_provider: str | None = None,
 ) -> list[str]:
     """Return the supported metadata-provider values for an item route."""
-    from app import custom_metadata  # noqa: PLC0415
+    from app import custom_metadata
 
     values: list[str] = []
     if media_type in {MediaTypes.TV.value, MediaTypes.ANIME.value}:
@@ -142,13 +160,51 @@ def metadata_default_source(user, media_type: str) -> str:
             provider = getattr(user, "tv_metadata_source_default", None)
         elif media_type == MediaTypes.ANIME.value:
             provider = getattr(user, "anime_metadata_source_default", None)
+        elif media_type == MediaTypes.BOOK.value:
+            provider = getattr(user, "book_metadata_source_default", None)
+        elif media_type in (MediaTypes.COMIC.value, MediaTypes.COMIC_ISSUE.value):
+            provider = getattr(user, "comic_metadata_source_default", None)
 
     provider = provider or config.get_default_source_name(media_type).value
-    if provider_is_enabled(provider):
+    if provider_is_enabled(provider, user):
         return provider
 
-    available = available_metadata_sources(media_type)
+    available = available_metadata_sources(media_type, user)
+
+    if media_type == MediaTypes.ANIME.value and provider in GROUPED_ANIME_PROVIDERS:
+        # For anime the provider decides the library's storage shape, not just
+        # which API supplies the metadata. Anime's source order is
+        # [MAL, TMDB, TVDB], so the generic "first available" fallback below
+        # would send a user who picked TVDB-but-has-no-API-key to flat MAL
+        # rows, silently changing the shape of their library. Keep them on a
+        # grouped provider whenever one is usable.
+        grouped = [
+            source for source in available if source.value in GROUPED_ANIME_PROVIDERS
+        ]
+        if grouped:
+            return grouped[0].value
+
     return available[0].value if available else provider
+
+
+def metadata_language_default(user, item: Item | None = None) -> str:
+    """Return the effective preferred metadata language for a user/item."""
+    if item is not None and user and getattr(user, "is_authenticated", False):
+        preference = (
+            MetadataProviderPreference.objects.filter(
+                user=user,
+                item=item,
+            )
+            .only("language")
+            .first()
+        )
+        if preference and preference.language:
+            return preference.language
+
+    language = None
+    if user and getattr(user, "is_authenticated", False):
+        language = getattr(user, "metadata_language", None) or None
+    return language or settings.TMDB_LANG
 
 
 def get_tracking_media_type(
@@ -158,12 +214,8 @@ def get_tracking_media_type(
     identity_media_type: str | None = None,
 ) -> str:
     """Return the persisted Item/media model type for a route."""
-    if (
-        media_type == MediaTypes.ANIME.value
-        and (
-            identity_media_type == MediaTypes.TV.value
-            or source in GROUPED_ANIME_PROVIDERS
-        )
+    if media_type == MediaTypes.ANIME.value and (
+        identity_media_type == MediaTypes.TV.value or source in GROUPED_ANIME_PROVIDERS
     ):
         return MediaTypes.TV.value
     return media_type
@@ -200,6 +252,105 @@ def is_grouped_anime_route(
         )
         == MediaTypes.ANIME.value
     )
+
+
+def anime_library_visibility(user) -> tuple[bool, bool]:
+    """Return whether grouped anime shows in the Anime and TV libraries.
+
+    Grouped anime is one Item (a TV row in the anime bucket). ``anime_library_mode``
+    decides which library surfaces it, so every list, search and filter path must
+    read it the same way or the same query returns different rows depending on
+    which code path served it.
+
+    Returns ``(include_in_anime, include_in_tv)``.
+    """
+    mode = getattr(user, "anime_library_mode", MediaTypes.ANIME.value)
+    return (
+        mode in {MediaTypes.ANIME.value, "both"},
+        mode in {MediaTypes.TV.value, "both"},
+    )
+
+
+def prefers_grouped_anime(user) -> bool:
+    """Return whether this user's Anime library stores TV-shaped grouped rows.
+
+    The Anime library's storage shape follows the provider the user chose for
+    it: MAL keeps flat per-cour Anime rows, TMDB/TVDB keep TV-shaped grouped
+    rows. Read through `metadata_default_source`, which falls back when the
+    chosen provider is disabled (e.g. TVDB with no API key).
+    """
+    if not getattr(user, "anime_enabled", False):
+        return False
+    return (
+        metadata_default_source(user, MediaTypes.ANIME.value) in GROUPED_ANIME_PROVIDERS
+    )
+
+
+def find_existing_anime_home(user, tmdb_id=None, tvdb_id=None):
+    """Return the user's existing Anime-library home for this show.
+
+    Routing must be sticky. Once a show lives in the Anime library, every later
+    episode belongs there too - whether or not the grouped-anime snapshot
+    happened to load on this request, and whether or not the per-season mapping
+    covers this particular episode. Without this the same show oscillates
+    between libraries and accrues progress in both (discussion #967).
+
+    The `ItemProviderLink` table is global by design - it caches a content fact,
+    not user state - so the link lookup is unscoped while the Item queries are
+    scoped to this user's tracking rows.
+
+    Returns ``("grouped", item)`` for anime stored on TV rows, ``("flat", item)``
+    for a MAL-sourced Anime row, or ``None``.
+    """
+    from django.db.models import Q
+
+    identities = []
+    if tmdb_id:
+        identities.append((Sources.TMDB.value, str(tmdb_id)))
+    if tvdb_id:
+        identities.append((Sources.TVDB.value, str(tvdb_id)))
+    if not identities:
+        return None
+
+    link_filter = Q()
+    direct_filter = Q()
+    for provider, provider_media_id in identities:
+        link_filter |= Q(provider=provider, provider_media_id=provider_media_id)
+        direct_filter |= Q(source=provider, media_id=provider_media_id)
+
+    linked_item_ids = ItemProviderLink.objects.filter(
+        link_filter,
+        provider_media_type=MediaTypes.TV.value,
+    ).values("item_id")
+
+    # Grouped anime: a TV row this user tracks, sitting in the anime bucket.
+    grouped = (
+        Item.objects.filter(
+            Q(id__in=linked_item_ids) | direct_filter,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.ANIME.value,
+            tv__user=user,
+        )
+        .order_by("id")
+        .first()
+    )
+    if grouped:
+        return "grouped", grouped
+
+    # Flat MAL: an Anime row this user tracks that is linked to this show.
+    flat = (
+        Item.objects.filter(
+            media_type=MediaTypes.ANIME.value,
+            anime__user=user,
+            id__in=linked_item_ids,
+        )
+        .order_by("id")
+        .first()
+    )
+    if flat:
+        return "flat", flat
+
+    return None
 
 
 def item_uses_grouped_anime(item: Item | None) -> bool:
@@ -254,11 +405,7 @@ def get_preferred_provider(
         allowed_set.add(identity_provider)
 
     preference = None
-    if (
-        user
-        and getattr(user, "is_authenticated", False)
-        and item is not None
-    ):
+    if user and getattr(user, "is_authenticated", False) and item is not None:
         preference = MetadataProviderPreference.objects.filter(
             user=user,
             item=item,
@@ -312,6 +459,60 @@ def _normalize_external_ids(
     }
 
 
+def _upsert_provider_link(*, defaults: dict, **lookup):
+    """Upsert one provider link, skipping the write when nothing changed.
+
+    Detail pages and the track modal call this on GET. update_or_create saves
+    an existing row even when every field matches, and on SQLite that write
+    queues behind any background writer; a matching row needs no write.
+    """
+    existing = ItemProviderLink.objects.filter(**lookup).first()
+    if existing is not None and all(
+        getattr(existing, field) == value for field, value in defaults.items()
+    ):
+        return existing, False
+    return update_or_create_race_safe(
+        ItemProviderLink.objects,
+        defaults=defaults,
+        **lookup,
+    )
+
+
+def _contradicts_item_identity(
+    item: Item,
+    provider: str | None,
+    provider_media_id,
+    provider_media_type: str | None,
+    season_number: int | None,
+) -> bool:
+    """Return whether a show-level ID would contradict the item's own identity.
+
+    The item's media_id belongs to its source: a link to that source must carry
+    it, and a link to any other provider must not. Either write means an ID was
+    read under the wrong provider - D.Gray-man Hallow, a TVDB show, got its own
+    TVDB id stored as its TMDB link and its TVDB link replaced, after which no
+    import could match it and Plex created a duplicate.
+    """
+    if (
+        not provider
+        or season_number is not None
+        or provider_media_type != item.media_type
+    ):
+        return False
+    carries_own_id = str(provider_media_id) == str(item.media_id)
+    if carries_own_id == (provider == item.source):
+        return False
+    logger.warning(
+        "provider_link_refused item_id=%s item=%s:%s provider=%s provider_media_id=%s",
+        item.id,
+        item.source,
+        item.media_id,
+        provider,
+        provider_media_id,
+    )
+    return True
+
+
 def upsert_provider_links(
     item: Item | None,
     metadata: dict | None,
@@ -338,14 +539,33 @@ def upsert_provider_links(
     )
 
     external_ids = _normalize_external_ids(metadata, provider=normalized_provider)
+    external_ids = {
+        key: value
+        for key, value in external_ids.items()
+        if not _contradicts_item_identity(
+            item,
+            EXTERNAL_ID_KEY_PROVIDERS.get(key),
+            value,
+            normalized_media_type,
+            season_number,
+        )
+    }
     metadata_payload = dict(extra_metadata) if extra_metadata else {}
     retry_kwargs = (
-        {"max_retries": retry_max_retries}
-        if retry_max_retries is not None
-        else {}
+        {"max_retries": retry_max_retries} if retry_max_retries is not None else {}
     )
 
-    if normalized_provider and metadata.get("media_id"):
+    if (
+        normalized_provider
+        and metadata.get("media_id")
+        and not _contradicts_item_identity(
+            item,
+            normalized_provider,
+            metadata["media_id"],
+            normalized_media_type,
+            season_number,
+        )
+    ):
         link_defaults = {
             "provider_media_id": str(metadata["media_id"]),
             "metadata": metadata_payload,
@@ -353,8 +573,7 @@ def upsert_provider_links(
         if episode_offset is not None:
             link_defaults["episode_offset"] = episode_offset
         provider_link_outcome = run_retryable_db_operation(
-            lambda: update_or_create_race_safe(
-                ItemProviderLink.objects,
+            lambda: _upsert_provider_link(
                 item=item,
                 provider=normalized_provider,
                 provider_media_type=normalized_media_type,
@@ -381,12 +600,12 @@ def upsert_provider_links(
         external_id = external_ids.get(external_key)
         if not external_id:
             continue
+
         def _upsert_external_provider_link(
             candidate_provider=candidate_provider,
             external_id=external_id,
         ):
-            return update_or_create_race_safe(
-                ItemProviderLink.objects,
+            return _upsert_provider_link(
                 item=item,
                 provider=candidate_provider,
                 provider_media_type=normalized_media_type,
@@ -423,6 +642,47 @@ def upsert_provider_links(
     return external_ids
 
 
+def find_tracked_season(
+    user,
+    media_id: str,
+    source: str,
+    season_number: int,
+    *,
+    library_media_type: str | None = None,
+) -> Season | None:
+    """Return the user's existing tracked Season for this show/season, if any.
+
+    A given (user, show, season) can only be tracked once in practice, even
+    though grouped-anime shows expose it under two Item buckets (anime vs.
+    TV identity) — see #623, where the anime-bucket page and the TV-identity
+    `related_tv` link disagreed and a duplicate row was inserted. This looks
+    across buckets so read and write paths agree on "the" tracked season
+    instead of missing it. Prefers `library_media_type` when given, but
+    falls back to any bucket. Never creates — see
+    `get_or_create_tracked_season_item` / `fork_services_episode.
+    resolve_or_create_season` for get-or-create semantics.
+    """
+    queryset = Season.objects.filter(
+        item__media_id=media_id,
+        item__source=source,
+        item__media_type=MediaTypes.SEASON.value,
+        item__season_number=season_number,
+        item__episode_number=None,
+        user=user,
+    ).select_related("item", "related_tv", "related_tv__item")
+
+    if library_media_type:
+        match = (
+            queryset.filter(item__library_media_type=library_media_type)
+            .order_by("id")
+            .first()
+        )
+        if match is not None:
+            return match
+
+    return queryset.order_by("id").first()
+
+
 def get_or_create_tracked_season_item(
     media_id: str,
     source: str,
@@ -447,6 +707,22 @@ def get_or_create_tracked_season_item(
     of) the resolved item, so corruption repairs itself the next time any
     caller touches that show/season, with no manual command required.
     """
+    from app.services.order_resolution import order_from_media_id
+
+    order = order_from_media_id(media_id, source)
+    if order is not None:
+        item, _ = Item.objects.get_or_create(
+            episode_order=order,
+            media_id=order.media_id,
+            source=order.provider,
+            media_type=MediaTypes.SEASON.value,
+            season_number=season_number,
+            episode_number=None,
+            library_media_type=library_media_type,
+            defaults=defaults or {},
+        )
+        return item
+
     link = (
         ItemProviderLink.objects.filter(
             provider=provider,
@@ -514,8 +790,7 @@ def _heal_stray_season_duplicates(
         )
     except Exception:  # self-heal must never break the caller
         logger.exception(
-            "Season-item self-heal lookup failed for media_id=%s source=%s "
-            "season=%s",
+            "Season-item self-heal lookup failed for media_id=%s source=%s season=%s",
             media_id,
             source,
             season_number,
@@ -599,8 +874,21 @@ def _reconcile_competing_seasons(canonical_season, stray_season) -> None:
             existing.end_date is None or stray_ep.end_date > existing.end_date
         ):
             existing.end_date = stray_ep.end_date
+            existing.start_date = stray_ep.start_date
+            existing.status = stray_ep.status
+            existing.notes = stray_ep.notes
+            existing.score = stray_ep.score
             existing.dropped = stray_ep.dropped
-            existing.save(update_fields=["end_date", "dropped"])
+            existing.save(
+                update_fields=[
+                    "end_date",
+                    "start_date",
+                    "status",
+                    "notes",
+                    "score",
+                    "dropped",
+                ],
+            )
             stray_ep.delete()
         else:
             stray_ep.delete()
@@ -617,6 +905,119 @@ def _reconcile_competing_seasons(canonical_season, stray_season) -> None:
     canonical_season.save(update_fields=["status", "score", "notes"])
 
 
+def _tmdb_identity_from_external_id(
+    external_id: str,
+    external_source: str,
+    *,
+    allowed_media_types: tuple[str, ...],
+) -> AnimeTMDBIdentity | None:
+    """Return one exact TMDB result for an external provider ID."""
+    from app.providers import tmdb
+
+    find_response = tmdb.find(external_id, external_source)
+
+    if not isinstance(find_response, dict):
+        return None
+
+    result_keys = {
+        MediaTypes.TV.value: "tv_results",
+        MediaTypes.MOVIE.value: "movie_results",
+    }
+    identities = {
+        (str(result["id"]), media_type)
+        for media_type in allowed_media_types
+        for result in find_response.get(result_keys[media_type], [])
+        if isinstance(result, dict) and result.get("id") not in (None, "")
+    }
+    if len(identities) != 1:
+        return None
+
+    media_id, media_type = identities.pop()
+    return AnimeTMDBIdentity(media_id=media_id, media_type=media_type)
+
+
+def resolve_mal_tmdb_identity(mal_id: str | int) -> AnimeTMDBIdentity | None:
+    """Resolve one exact TMDB movie or TV identity for a MAL title."""
+    direct_tv_id = anime_mapping.resolve_provider_id(
+        mal_id,
+        Sources.TMDB.value,
+        media_type=MediaTypes.TV.value,
+    )
+    direct_movie_id = anime_mapping.resolve_provider_id(
+        mal_id,
+        Sources.TMDB.value,
+        media_type=MediaTypes.MOVIE.value,
+    )
+    direct_identities = {
+        (direct_tv_id, MediaTypes.TV.value) if direct_tv_id else None,
+        (direct_movie_id, MediaTypes.MOVIE.value) if direct_movie_id else None,
+    } - {None}
+    if len(direct_identities) == 1:
+        media_id, media_type = direct_identities.pop()
+        return AnimeTMDBIdentity(media_id=media_id, media_type=media_type)
+    if len(direct_identities) > 1:
+        return None
+
+    tvdb_id = anime_mapping.resolve_provider_id(mal_id, Sources.TVDB.value)
+    if tvdb_id:
+        identity = _tmdb_identity_from_external_id(
+            tvdb_id,
+            "tvdb_id",
+            allowed_media_types=(MediaTypes.TV.value,),
+        )
+        if identity:
+            return AnimeTMDBIdentity(
+                media_id=identity.media_id,
+                media_type=identity.media_type,
+                tvdb_id=tvdb_id,
+            )
+
+    imdb_id = anime_mapping.resolve_provider_id(mal_id, Sources.IMDB.value)
+    if not imdb_id:
+        return None
+    identity = _tmdb_identity_from_external_id(
+        imdb_id,
+        "imdb_id",
+        allowed_media_types=(MediaTypes.TV.value, MediaTypes.MOVIE.value),
+    )
+    if not identity:
+        return None
+    return AnimeTMDBIdentity(
+        media_id=identity.media_id,
+        media_type=identity.media_type,
+        tvdb_id=tvdb_id,
+        imdb_id=imdb_id,
+    )
+
+
+def persist_mal_tmdb_identity(
+    item: Item,
+    identity: AnimeTMDBIdentity,
+    *,
+    persistence_mode: str = "required",
+    retry_max_retries: int | None = None,
+    on_deferred: Callable[[Exception], None] | None = None,
+) -> None:
+    """Persist an exact MAL-to-TMDB identity through existing provider links."""
+    external_ids = {"tmdb_id": identity.media_id}
+    if identity.tvdb_id:
+        external_ids["tvdb_id"] = identity.tvdb_id
+    if identity.imdb_id:
+        external_ids["imdb_id"] = identity.imdb_id
+    upsert_provider_links(
+        item,
+        {
+            "media_id": identity.media_id,
+            "provider_external_ids": external_ids,
+        },
+        provider=Sources.TMDB.value,
+        provider_media_type=identity.media_type,
+        persistence_mode=persistence_mode,
+        retry_max_retries=retry_max_retries,
+        on_deferred=on_deferred,
+    )
+
+
 def resolve_provider_media_id(
     item: Item | None,
     provider: str,
@@ -626,6 +1027,7 @@ def resolve_provider_media_id(
     persistence_mode: str = "required",
     retry_max_retries: int | None = None,
     on_deferred: Callable[[Exception], None] | None = None,
+    persist_links: bool = True,
 ) -> str | None:
     """Return the mapped provider ID for a tracked item."""
     if item is None:
@@ -640,9 +1042,7 @@ def resolve_provider_media_id(
         return str(item.media_id)
 
     retry_kwargs = (
-        {"max_retries": retry_max_retries}
-        if retry_max_retries is not None
-        else {}
+        {"max_retries": retry_max_retries} if retry_max_retries is not None else {}
     )
 
     provider_link = (
@@ -659,7 +1059,17 @@ def resolve_provider_media_id(
         return provider_link.provider_media_id
 
     external_key = PROVIDER_EXTERNAL_ID_KEYS.get(provider)
-    if external_key:
+    tmdb_id_is_known_movie = (
+        item.source == Sources.MAL.value
+        and route_media_type == MediaTypes.ANIME.value
+        and provider == Sources.TMDB.value
+        and ItemProviderLink.objects.filter(
+            item=item,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.MOVIE.value,
+        ).exists()
+    )
+    if external_key and not tmdb_id_is_known_movie:
         external_ids = item.provider_external_ids or {}
         if external_ids.get(external_key):
             return str(external_ids[external_key])
@@ -669,27 +1079,51 @@ def resolve_provider_media_id(
         and route_media_type == MediaTypes.ANIME.value
         and provider in GROUPED_ANIME_PROVIDERS
     ):
+        if provider == Sources.TMDB.value:
+            try:
+                identity = resolve_mal_tmdb_identity(item.media_id)
+            except services.ProviderAPIError:
+                logger.warning(
+                    "Skipping TMDB resolution for MAL anime media_id=%s: "
+                    "provider request failed",
+                    item.media_id,
+                )
+                return None
+            if not identity or identity.media_type != MediaTypes.TV.value:
+                return None
+            if persist_links:
+                persist_mal_tmdb_identity(
+                    item,
+                    identity,
+                    persistence_mode=persistence_mode,
+                    retry_max_retries=retry_max_retries,
+                    on_deferred=on_deferred,
+                )
+            return identity.media_id
+
         mapped_series_id = anime_mapping.resolve_provider_series_id(
             item.media_id,
             provider,
         )
+
         if mapped_series_id:
-            run_retryable_db_operation(
-                lambda: update_or_create_race_safe(
-                    ItemProviderLink.objects,
-                    item=item,
-                    provider=provider,
-                    provider_media_type=provider_media_type,
-                    season_number=season_number,
-                    defaults={"provider_media_id": str(mapped_series_id)},
-                ),
-                mode=persistence_mode,
-                fallback=lambda: (None, False),
-                operation_name="grouped-anime provider-link upsert",
-                operation_logger=logger,
-                on_deferred=on_deferred,
-                **retry_kwargs,
-            )
+            if persist_links:
+                run_retryable_db_operation(
+                    lambda: update_or_create_race_safe(
+                        ItemProviderLink.objects,
+                        item=item,
+                        provider=provider,
+                        provider_media_type=provider_media_type,
+                        season_number=season_number,
+                        defaults={"provider_media_id": str(mapped_series_id)},
+                    ),
+                    mode=persistence_mode,
+                    fallback=lambda: (None, False),
+                    operation_name="grouped-anime provider-link upsert",
+                    operation_logger=logger,
+                    on_deferred=on_deferred,
+                    **retry_kwargs,
+                )
             return str(mapped_series_id)
 
     return None
@@ -709,11 +1143,7 @@ def _overlay_header_metadata(
     display_external_links = dict(overlay_metadata.get("external_links") or {})
     merged_external_links = dict(tracking_external_links)
     merged_external_links.update(
-        {
-            name: url
-            for name, url in display_external_links.items()
-            if name and url
-        },
+        {name: url for name, url in display_external_links.items() if name and url},
     )
 
     merged = dict(base_metadata)
@@ -760,11 +1190,15 @@ def _provider_series_id(entry: dict, provider: str) -> str | None:
 
 def _provider_season_number(entry: dict, provider: str) -> int | None:
     """Return the mapped grouped-season number for a mapping entry."""
-    keys = ["tvdb_season"] if provider == Sources.TVDB.value else [
-        "tmdb_season",
-        "tvdb_season",
-        "season",
-    ]
+    keys = (
+        ["tvdb_season"]
+        if provider == Sources.TVDB.value
+        else [
+            "tmdb_season",
+            "tvdb_season",
+            "season",
+        ]
+    )
     for key in keys:
         value = entry.get(key)
         if value in (None, ""):
@@ -778,10 +1212,14 @@ def _provider_season_number(entry: dict, provider: str) -> int | None:
 
 def _provider_episode_offset(entry: dict, provider: str) -> int:
     """Return the mapped grouped-season episode offset for a mapping entry."""
-    keys = ["tvdb_epoffset"] if provider == Sources.TVDB.value else [
-        "tmdb_epoffset",
-        "tvdb_epoffset",
-    ]
+    keys = (
+        ["tvdb_epoffset"]
+        if provider == Sources.TVDB.value
+        else [
+            "tmdb_epoffset",
+            "tvdb_epoffset",
+        ]
+    )
     for key in keys:
         value = entry.get(key)
         if value in (None, ""):
@@ -840,10 +1278,9 @@ def _enrich_grouped_preview(grouped_preview: dict | None) -> dict | None:
                     or season_payload.get("max_progress")
                 )
             if merged.get("first_air_date") in (None, ""):
-                merged["first_air_date"] = (
-                    merged_details.get("first_air_date")
-                    or payload_details.get("first_air_date")
-                )
+                merged["first_air_date"] = merged_details.get(
+                    "first_air_date"
+                ) or payload_details.get("first_air_date")
             merged["details"] = merged_details
 
         enriched_seasons.append(merged)
@@ -875,11 +1312,17 @@ def _grouped_preview_target(
     ):
         return None
 
+    # Community mapping entries are TVDB-first: most carry a tvdb_id but no
+    # tmdb_*id field at all. Require an exact match when the entry *does*
+    # carry this provider's ID (a real conflict), but don't reject an entry
+    # just because it's silent on this provider - its season/episode-offset
+    # data is still valid, since _provider_season_number/_episode_offset
+    # already fall back to the TVDB fields for TMDB.
     mapping_entries = anime_mapping.find_entries_for_mal_id(media_id)
     matching_entries = [
         entry
         for entry in mapping_entries
-        if _provider_series_id(entry, provider) == str(provider_media_id)
+        if _provider_series_id(entry, provider) in (None, str(provider_media_id))
     ]
     if not matching_entries:
         return None
@@ -920,19 +1363,17 @@ def _grouped_preview_target(
 
     if isinstance(season_payload, dict):
         payload_details = season_payload.get("details") or {}
-        target["season_title"] = (
-            season_payload.get("season_title")
-            or ("Specials" if season_number == 0 else f"Season {season_number}")
+        target["season_title"] = season_payload.get("season_title") or (
+            "Specials" if season_number == 0 else f"Season {season_number}"
         )
         target["season_episode_count"] = (
             _safe_int(season_payload.get("episode_count"))
             or _safe_int(payload_details.get("episodes"))
             or _safe_int(season_payload.get("max_progress"))
         )
-        target["first_air_date"] = (
-            season_payload.get("first_air_date")
-            or payload_details.get("first_air_date")
-        )
+        target["first_air_date"] = season_payload.get(
+            "first_air_date"
+        ) or payload_details.get("first_air_date")
     else:
         target["season_title"] = (
             "Specials" if season_number == 0 else f"Season {season_number}"
@@ -989,6 +1430,7 @@ def resolve_detail_metadata(
     persistence_mode: str = "required",
     retry_max_retries: int | None = None,
     on_persistence_deferred: Callable[[Exception], None] | None = None,
+    persist_links: bool = True,
 ) -> MetadataResolutionResult:
     """Resolve the detail-page display provider and overlay metadata when mapped."""
     provider = get_preferred_provider(
@@ -1012,7 +1454,7 @@ def resolve_detail_metadata(
     grouped_preview_target = None
 
     if provider == Sources.MANUAL.value and item is not None:
-        from app import custom_metadata  # noqa: PLC0415
+        from app import custom_metadata
 
         provider_media_id = f"item:{item.id}"
         header_metadata = custom_metadata.build_custom_overlay_metadata(
@@ -1020,9 +1462,7 @@ def resolve_detail_metadata(
             item,
         )
         mapping_status = (
-            "identity"
-            if identity_provider == Sources.MANUAL.value
-            else "custom"
+            "identity" if identity_provider == Sources.MANUAL.value else "custom"
         )
     elif provider != identity_provider:
         provider_media_id = resolve_provider_media_id(
@@ -1032,12 +1472,14 @@ def resolve_detail_metadata(
             persistence_mode=persistence_mode,
             retry_max_retries=retry_max_retries,
             on_deferred=on_persistence_deferred,
+            persist_links=persist_links,
         )
         if provider_media_id:
             overlay_metadata = services.get_media_metadata(
                 provider_route_media_type(route_media_type, provider),
                 provider_media_id,
                 provider,
+                language=metadata_language_default(user, item),
             )
             header_metadata = _overlay_header_metadata(
                 base_metadata,
@@ -1049,9 +1491,9 @@ def resolve_detail_metadata(
                 route_media_type == MediaTypes.ANIME.value
                 and provider in GROUPED_ANIME_PROVIDERS
             ):
-                related_seasons = (
-                    overlay_metadata.get("related", {}) or {}
-                ).get("seasons", [])
+                related_seasons = (overlay_metadata.get("related", {}) or {}).get(
+                    "seasons", []
+                )
                 grouped_preview = services.get_media_metadata(
                     "tv_with_seasons",
                     provider_media_id,
@@ -1061,6 +1503,7 @@ def resolve_detail_metadata(
                         for season in related_seasons
                         if season.get("season_number") is not None
                     ],
+                    language=metadata_language_default(user, item),
                 )
                 grouped_preview = _enrich_grouped_preview(grouped_preview)
                 grouped_preview_target = _grouped_preview_target(
@@ -1077,7 +1520,7 @@ def resolve_detail_metadata(
                 )
         else:
             mapping_status = "missing"
-    elif item is not None and isinstance(base_metadata, dict):
+    elif persist_links and item is not None and isinstance(base_metadata, dict):
         upsert_provider_links(
             item,
             base_metadata,

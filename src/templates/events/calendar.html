@@ -1,37 +1,46 @@
 {% extends "base.html" %}
+{% load i18n %}
+
 {% load static %}
 {% load user_tags %}
 {% load app_tags %}
+{% load events_tags %}
 
 {% block title %}
-  Calendar - Watchmask
+  {% translate "Calendar - Watchmask" %}
 {% endblock title %}
 
 {% block content %}
   <div class="mb-8">
-    <h1 class="text-3xl font-bold mb-2">Calendar</h1>
-    <p class="text-gray-400">Track upcoming releases from your list.</p>
+    <h1 class="text-3xl font-bold mb-2">{% translate "Calendar" %}</h1>
+    <p class="text-[var(--color-text-muted)]">
+      {% url 'history' as history_url %}
+      {% blocktranslate trimmed %}Upcoming episodes and releases for everything you're tracking, unless it's paused or dropped. What you've already watched, read or played is in <a href="{{ history_url }}" class="underline hover:text-[var(--color-link)]">History</a>.{% endblocktranslate %}
+    </p>
+    {% if not release_dict %}
+      <p class="mt-1 text-sm text-[var(--color-text-muted)]">{% translate "Nothing this month. Add a show, movie, book or game to your library and its upcoming dates appear here." %}</p>
+    {% endif %}
   </div>
 
-  <div class="bg-[#2a2f35] rounded-lg p-6 mb-6" x-data="calendarFilters()">
+  <div class="bg-[var(--color-surface)] rounded-lg p-6 mb-6" x-data="calendarFilters()">
     <div class="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4">
       <div class="flex items-center gap-4">
-        <div class="flex items-center bg-[#39404b] rounded-md p-1">
-          <a class="p-2 hover:bg-[#454d5a] rounded-md transition-colors"
+        <div class="flex items-center bg-[var(--color-surface-strong)] rounded-md p-1">
+          <a class="p-2 hover:bg-[var(--color-surface-hover)] rounded-md transition-colors"
              href="{% url 'calendar' %}?month={{ prev_month }}&year={{ prev_year }}&view={{ view_type }}">
             {% include "app/icons/chevron-left.svg" with classes="w-5 h-5" %}
           </a>
           <h2 class="px-4 text-lg font-semibold min-w-40 text-center">{{ month_name }} {{ year }}</h2>
-          <a class="p-2 hover:bg-[#454d5a] rounded-md transition-colors"
+          <a class="p-2 hover:bg-[var(--color-surface-hover)] rounded-md transition-colors"
              href="{% url 'calendar' %}?month={{ next_month }}&year={{ next_year }}&view={{ view_type }}">
             {% include "app/icons/chevron-right.svg" with classes="w-5 h-5" %}
           </a>
         </div>
-        <a class="hidden sm:flex w-10 h-10 bg-[#39404b] hover:bg-[#454d5a] rounded-md transition-colors flex-col items-center justify-center leading-none"
+        <a class="hidden sm:flex w-10 h-10 bg-[var(--color-surface-strong)] hover:bg-[var(--color-surface-hover)] rounded-md transition-colors flex-col items-center justify-center leading-none"
            href="{% url 'calendar' %}?month={{ today.month }}&year={{ today.year }}&view={{ view_type }}"
-           aria-label="Go to Today">
+           aria-label="{% translate "Go to Today" %}">
           <span class="text-xl font-bold leading-none">{{ today|date:"j" }}</span>
-          <span class="uppercase text-gray-300/90 mt-0.5"
+          <span class="uppercase text-[var(--color-text-secondary)]/90 mt-0.5"
                 style="font-size: 9px; font-weight: 400; letter-spacing: 0.04em; line-height: 1;">
             {{ today|date:"M" }}
           </span>
@@ -39,69 +48,27 @@
       </div>
 
       <div class="flex items-center gap-2 flex-wrap justify-end">
-        <a class="sm:hidden w-10 h-10 bg-[#39404b] hover:bg-[#454d5a] rounded-md transition-colors flex flex-col items-center justify-center leading-none shrink-0"
+        <a class="sm:hidden w-10 h-10 bg-[var(--color-surface-strong)] hover:bg-[var(--color-surface-hover)] rounded-md transition-colors flex flex-col items-center justify-center leading-none shrink-0"
            href="{% url 'calendar' %}?month={{ today.month }}&year={{ today.year }}&view={{ view_type }}"
-           aria-label="Go to Today">
+           aria-label="{% translate "Go to Today" %}">
           <span class="text-xl font-bold leading-none">{{ today|date:"j" }}</span>
-          <span class="uppercase text-gray-300/90 mt-0.5"
+          <span class="uppercase text-[var(--color-text-secondary)]/90 mt-0.5"
                 style="font-size: 9px; font-weight: 400; letter-spacing: 0.04em; line-height: 1;">
             {{ today|date:"M" }}
           </span>
         </a>
 
-        <div class="relative" @click.outside="dropdownOpen = false">
-          <button type="button"
-                  class="h-10 px-3 text-sm bg-[#39404b] hover:bg-[#454d5a] rounded-md transition-colors flex items-center gap-2 cursor-pointer"
-                  @click="actionsOpen = false; dropdownOpen = !dropdownOpen"
-                  :aria-expanded="dropdownOpen">
-            {% include "app/icons/funnel.svg" with classes="w-4 h-4" %}
-            <span class="block min-w-0 truncate max-w-[10rem] sm:max-w-[14rem]"
-                  x-text="dropdownLabel()"></span>
-            <svg xmlns="http://www.w3.org/2000/svg"
-                 viewBox="0 0 20 20"
-                 class="w-4 h-4 ml-1"
-                 aria-hidden="true">
-              <path d="M10 14 L4.5 7 H15.5 Z" fill="currentColor"></path>
-            </svg>
-          </button>
-
-          <div x-cloak
-               x-show="dropdownOpen"
-               x-transition:enter="transition ease-out duration-100"
-               x-transition:enter-start="transform opacity-0 scale-95"
-               x-transition:enter-end="transform opacity-100 scale-100"
-               x-transition:leave="transition ease-in duration-75"
-               x-transition:leave-start="transform opacity-100 scale-100"
-               x-transition:leave-end="transform opacity-0 scale-95"
-               class="absolute right-0 mt-2 w-64 rounded-md bg-[#39404b] border border-gray-700 shadow-lg overflow-hidden z-40">
-            <div class="flex items-center justify-between gap-2 px-3 py-2 border-b border-gray-700">
-              <div class="text-xs uppercase tracking-wide text-gray-300">Media Types</div>
-              <button type="button"
-                      class="text-xs text-gray-300 hover:text-white transition-colors"
-                      @click="toggleAllTypes()"
-                      x-text="allTypesSelected() ? 'Hide all' : 'Show all'"></button>
-            </div>
-            <div class="max-h-64 overflow-y-auto">
-              <template x-for="type in availableMediaTypes" :key="type.value">
-                <button type="button"
-                        class="flex items-center w-full px-4 py-2 text-left text-sm transition-colors cursor-pointer text-gray-300 hover:bg-[#454d5a] hover:text-white"
-                        @click="toggleMediaType(type.value)">
-                  <span x-text="type.label"></span>
-                  <span class="ml-auto" x-show="isTypeSelected(type.value)">
-                    {% include "app/icons/checkmark.svg" with classes="w-4 h-4 text-green-400" %}
-                  </span>
-                </button>
-              </template>
-            </div>
-          </div>
+        <div class="h-10 flex items-center bg-[var(--color-surface-strong)] hover:bg-[var(--color-surface-hover)] rounded-md px-1 transition-colors"
+             @click="actionsOpen = false">
+          {% include "app/components/filter_menu.html" with filter_data_id="calendar-filter-data" filter_show_media_types=True filter_media_types_only=True filter_type_statuses=True filter_release_types=True %}
         </div>
 
         <div class="relative" @click.outside="actionsOpen = false">
           <button type="button"
-                  aria-label="Calendar Actions"
-                  title="Calendar Actions"
-                  class="w-10 h-10 text-sm bg-[#39404b] hover:bg-[#454d5a] rounded-md transition-colors flex items-center justify-center cursor-pointer"
-                  @click="dropdownOpen = false; actionsOpen = !actionsOpen"
+                  aria-label="{% translate "Calendar Actions" %}"
+                  title="{% translate "Calendar Actions" %}"
+                  class="w-10 h-10 text-sm bg-[var(--color-surface-strong)] hover:bg-[var(--color-surface-hover)] rounded-md transition-colors flex items-center justify-center cursor-pointer"
+                  @click="actionsOpen = !actionsOpen"
                   :aria-expanded="actionsOpen">
             {% include "app/icons/settings.svg" with classes="w-4 h-4" %}
           </button>
@@ -114,31 +81,31 @@
                x-transition:leave="transition ease-in duration-75"
                x-transition:leave-start="transform opacity-100 scale-100"
                x-transition:leave-end="transform opacity-0 scale-95"
-               class="absolute right-0 mt-2 w-60 rounded-md bg-[#39404b] border border-gray-700 shadow-lg overflow-hidden z-40">
+               class="absolute right-0 mt-2 w-60 rounded-md bg-[var(--color-surface-strong)] border border-[var(--color-border)] shadow-lg overflow-hidden z-40">
             <form method="post" action="{% url 'reload_calendar' %}">
               {% csrf_token %}
               <button type="submit"
-                      class="flex items-center w-full px-4 py-2 text-left text-sm transition-colors cursor-pointer text-gray-300 hover:bg-[#454d5a] hover:text-white"
+                      class="flex items-center w-full px-4 py-2 text-left text-sm transition-colors cursor-pointer text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]"
                       @click="actionsOpen = false">
                 {% include "app/icons/circle-spinning-clockwise.svg" with classes="w-4 h-4 mr-3" %}
-                <span>Fetch New Releases</span>
+                <span>{% translate "Fetch New Releases" %}</span>
               </button>
             </form>
-            <a class="flex items-center w-full px-4 py-2 text-left text-sm transition-colors cursor-pointer text-gray-300 hover:bg-[#454d5a] hover:text-white border-t border-gray-700"
+            <a class="flex items-center w-full px-4 py-2 text-left text-sm transition-colors cursor-pointer text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)] border-t border-[var(--color-border)]"
                href="{% url 'download_calendar' token=user.token %}"
                @click="actionsOpen = false">
               {% include "app/icons/download.svg" with classes="w-4 h-4 mr-3" %}
-              <span>Download Calendar</span>
+              <span>{% translate "Download Calendar" %}</span>
             </a>
           </div>
         </div>
 
-        <div class="bg-[#39404b] rounded-md p-1 space-x-0.5 flex">
-          <a class="p-2 rounded-md transition-colors cursor-pointer {% if view_type == 'grid' %}bg-indigo-600 text-white{% else %}hover:bg-[#454d5a]{% endif %}"
+        <div class="bg-[var(--color-surface-strong)] rounded-md p-1 space-x-0.5 flex">
+          <a class="p-2 rounded-md transition-colors cursor-pointer {% if view_type == 'grid' %}bg-indigo-600 text-white{% else %}hover:bg-[var(--color-surface-hover)]{% endif %}"
              href="{% url 'calendar' %}?month={{ month }}&year={{ year }}&view=grid">
             {% include "app/icons/grid.svg" with classes="w-4 h-4" %}
           </a>
-          <a class="p-2 rounded-md transition-colors cursor-pointer {% if view_type == 'list' %}bg-indigo-600 text-white{% else %}hover:bg-[#454d5a]{% endif %}"
+          <a class="p-2 rounded-md transition-colors cursor-pointer {% if view_type == 'list' %}bg-indigo-600 text-white{% else %}hover:bg-[var(--color-surface-hover)]{% endif %}"
              href="{% url 'calendar' %}?month={{ month }}&year={{ year }}&view=list">
             {% include "app/icons/list.svg" with classes="w-4 h-4" %}
           </a>
@@ -160,7 +127,7 @@
     {% endif %}
   </div>
 
-  <div class="bg-[#2a2f35] p-5 rounded-lg mb-6"
+  <div class="bg-[var(--color-surface)] p-5 rounded-lg mb-6"
        x-data="{
          selectedMediaTypes: [
            {% for media_type in media_types %}
@@ -169,38 +136,131 @@
              {% endwith %}
            {% endfor %}
          ],
+         selectedStatuses: [
+           {% for status in event_statuses %}
+             '{{ status }}',
+           {% endfor %}
+         ],
+         selectedReleaseTypes: [
+           {% for value, label in release_type_choices %}
+             '{{ value }}',
+           {% endfor %}
+         ],
+         releaseTypeCount: {{ release_type_choices|length }},
+         feed: 'releases',
+         historyMediaTypes: [
+           {% for media_type in history_default_media_types %}'{{ media_type }}',{% endfor %}
+         ],
          calendarBaseUrl: '{{ request.scheme }}://{{ request.get_host }}{% url 'download_calendar' token=user.token %}',
+         historyBaseUrl: '{{ request.scheme }}://{{ request.get_host }}{% url 'download_history_calendar' token=user.token %}',
          get calendarExportUrl() {
+           if (this.feed === 'history') {
+             const historyParams = new URLSearchParams();
+             this.historyMediaTypes.forEach((mediaType) => {
+               historyParams.append('media_types', mediaType);
+             });
+             // Sent when every switch is off, so the link stays empty instead of using the defaults.
+             if (!this.historyMediaTypes.length) {
+               historyParams.append('media_types', 'none');
+             }
+             return `${this.historyBaseUrl}?${historyParams.toString()}`;
+           }
            const params = new URLSearchParams();
            this.selectedMediaTypes.forEach((mediaType) => {
              params.append('media_types', mediaType);
            });
+           this.selectedStatuses.forEach((status) => {
+             params.append('status', status);
+           });
+           // Left out when every release date is shown, the feed's default.
+           if (this.selectedReleaseTypes.length < this.releaseTypeCount) {
+             this.selectedReleaseTypes.forEach((releaseType) => {
+               params.append('release_types', releaseType);
+             });
+             if (!this.selectedReleaseTypes.length) {
+               params.append('release_types', 'none');
+             }
+           }
            const query = params.toString();
            return query ? `${this.calendarBaseUrl}?${query}` : this.calendarBaseUrl;
          }
        }">
     <div class="flex items-center mb-3">
-      {% include "app/icons/link.svg" with classes="w-5 h-5 text-indigo-400 mr-2" %}
-      <h3 class="text-base font-medium">Export link</h3>
+      {% include "app/icons/link.svg" with classes="w-5 h-5 text-[var(--color-link)] mr-2" %}
+      <h3 class="text-base font-medium">{% translate "Calendar links" %}</h3>
     </div>
-    <p class="text-gray-400 mb-4 text-sm">
-      This link can be used to integrate your calendar into any of your calendar applications.
+    <p class="text-[var(--color-text-muted)] mb-3 text-sm" x-show="feed === 'releases'">
+      {% translate "Add this link to any calendar app to see upcoming releases there." %}
     </p>
+    <p class="text-[var(--color-text-muted)] mb-3 text-sm" x-cloak x-show="feed === 'history'">
+      {% translate "Add this link to any calendar app to see what you watched, read and played, on the day you logged it." %}
+    </p>
+
+    <div class="inline-flex bg-[var(--color-surface-strong)] rounded-md p-1 mb-4 text-sm" role="tablist">
+      <button type="button"
+              role="tab"
+              :aria-selected="feed === 'releases'"
+              class="px-3 py-1.5 rounded-md transition-colors cursor-pointer"
+              :class="feed === 'releases' ? 'bg-indigo-600 text-white' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'"
+              @click="feed = 'releases'">
+        {% translate "Upcoming releases" %}
+      </button>
+      <button type="button"
+              role="tab"
+              :aria-selected="feed === 'history'"
+              class="px-3 py-1.5 rounded-md transition-colors cursor-pointer"
+              :class="feed === 'history' ? 'bg-indigo-600 text-white' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'"
+              @click="feed = 'history'">
+        {% translate "Watch history" %}
+      </button>
+    </div>
+
+    <div x-cloak x-show="feed === 'history'">
+      <div class="mb-4">
+        <div class="flex items-center mb-3">
+          {% include "app/icons/four-square.svg" with classes="w-5 h-5 text-[var(--color-link)] mr-2" %}
+          <h4 class="text-sm font-semibold">{% translate "Media Types" %}</h4>
+        </div>
+        <p class="text-[var(--color-text-muted)] mb-3 text-xs">
+          {% translate "Music, podcasts and videos start off because they add many entries." %}
+        </p>
+        <div class="grid gap-3 md:grid-cols-3">
+          {% for media_type in history_media_types %}
+            <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md">
+              <div class="flex items-center text-[var(--color-text-muted)]">
+                {% icon media_type is_active=False %}
+                <span class="text-[var(--color-text-secondary)] text-sm ml-2">{{ media_type|media_type_readable_plural }}</span>
+              </div>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input class="sr-only peer"
+                       type="checkbox"
+                       value="{{ media_type }}"
+                       x-model="historyMediaTypes">
+                <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600">
+                </div>
+              </label>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div x-show="feed === 'releases'">
 
     <div class="mb-4">
       <div class="flex items-center mb-3">
-        {% include "app/icons/four-square.svg" with classes="w-5 h-5 text-indigo-400 mr-2" %}
-        <h4 class="text-sm font-semibold">Media Types</h4>
+        {% include "app/icons/four-square.svg" with classes="w-5 h-5 text-[var(--color-link)] mr-2" %}
+        <h4 class="text-sm font-semibold">{% translate "Media Types" %}</h4>
       </div>
-      <p class="text-gray-400 mb-3 text-xs">
-        Choose which media types to include in this calendar URL.
+      <p class="text-[var(--color-text-muted)] mb-3 text-xs">
+        {% translate "Choose which media types to include in this calendar URL." %}
       </p>
       <div class="grid gap-3 md:grid-cols-3">
         {% for media_type in media_types %}
-          <div class="flex items-center justify-between p-3 bg-[#39404b] rounded-md">
-            <div class="flex items-center text-gray-400">
+          <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md">
+            <div class="flex items-center text-[var(--color-text-muted)]">
               {% icon media_type is_active=False %}
-              <span class="text-gray-200 text-sm ml-2">{{ media_type|media_type_readable_plural }}</span>
+              <span class="text-[var(--color-text-secondary)] text-sm ml-2">{{ media_type|media_type_readable_plural }}</span>
             </div>
             <label class="relative inline-flex items-center cursor-pointer">
               {% with enabled_field=media_type|add:"_enabled" %}
@@ -218,9 +278,63 @@
       </div>
     </div>
 
-    <div class="bg-[#262a2f] p-3 rounded-md mb-4">
+    <div class="mb-4">
+      <div class="flex items-center mb-3">
+        {% include "app/icons/circle-check.svg" with classes="w-5 h-5 text-[var(--color-link)] mr-2" %}
+        <h4 class="text-sm font-semibold">{% translate "Status" %}</h4>
+      </div>
+      <p class="text-[var(--color-text-muted)] mb-3 text-xs">
+        {% translate "Choose which statuses to include in this calendar URL." %}
+      </p>
+      <div class="grid gap-3 md:grid-cols-3">
+        {% for status in event_statuses %}
+          <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md">
+            <span class="text-[var(--color-text-secondary)] text-sm">{{ status|media_status_readable }}</span>
+            <label class="relative inline-flex items-center cursor-pointer">
+              <input class="sr-only peer"
+                     type="checkbox"
+                     value="{{ status }}"
+                     x-model="selectedStatuses"
+                     checked>
+              <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600">
+              </div>
+            </label>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="mb-4">
+      <div class="flex items-center mb-3">
+        {% include "app/icons/calendar.svg" with classes="w-5 h-5 text-[var(--color-link)] mr-2" %}
+        <h4 class="text-sm font-semibold">{% translate "Movie Release Dates" %}</h4>
+      </div>
+      <p class="text-[var(--color-text-muted)] mb-3 text-xs">
+        {% translate "Choose which digital and physical release dates to include in this calendar URL." %}
+      </p>
+      <div class="grid gap-3 md:grid-cols-3">
+        {% for value, label in release_type_choices %}
+          <div class="flex items-center justify-between p-3 bg-[var(--color-surface-strong)] rounded-md">
+            <span class="text-[var(--color-text-secondary)] text-sm">{{ label }}</span>
+            <label class="relative inline-flex items-center cursor-pointer">
+              <input class="sr-only peer"
+                     type="checkbox"
+                     value="{{ value }}"
+                     x-model="selectedReleaseTypes"
+                     checked>
+              <div class="w-9 h-5 bg-gray-600 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-px after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4.5 after:w-4.5 after:transition-all peer-checked:bg-indigo-600">
+              </div>
+            </label>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    </div>
+
+    <div class="bg-[var(--color-surface-dim)] p-3 rounded-md mb-4">
       <input readonly=""
-             class="w-full py-2 px-3 bg-[#262a2f] rounded-md text-gray-300 text-sm border-0 focus:ring-0 outline-none font-mono"
+             class="w-full py-2 px-3 bg-[var(--color-surface-dim)] rounded-md text-[var(--color-text-secondary)] text-sm border-0 focus:ring-0 outline-none font-mono"
              type="text"
              x-bind:value="calendarExportUrl">
     </div>
@@ -228,77 +342,249 @@
 {% endblock content %}
 
 {% block js %}
+  {% include "app/components/filter_toolbar_scripts.html" %}
   {{ block.super }}
   <script>
     function calendarFilters() {
+      // The filter menu is the shared media list one (filter_menu.html), so the
+      // media type state comes from libraryFilterState; filtering is client side.
+      const mediaTypes = [
+        {% for media_type in filter_media_types %}
+          {
+            value: '{{ media_type }}',
+            label: '{{ media_type|media_type_readable|escapejs }}',
+            inMonth: {% if media_type in available_media_types %}true{% else %}false{% endif %},
+          }{% if not forloop.last %},{% endif %}
+        {% endfor %}
+      ];
       return {
-        dropdownOpen: false,
+        ...libraryFilterState({}, {}, { available: mediaTypes }),
         actionsOpen: false,
-        availableMediaTypes: [
-          {% for media_type in available_media_types %}
-            { value: '{{ media_type }}', label: '{{ media_type|media_type_readable|escapejs }}' }{% if not forloop.last %},{% endif %}
+        statusType: null,
+        storageKey: 'yamtrack.calendar.filters.{{ user.id }}',
+        releaseTypeOptions: [
+          {% for value, label in release_type_choices %}
+            {
+              value: '{{ value }}',
+              label: '{{ label|escapejs }}',
+              inMonth: {% if value in available_release_types %}true{% else %}false{% endif %},
+            }{% if not forloop.last %},{% endif %}
           {% endfor %}
         ],
-        selectedMediaTypes: [
-          {% for media_type in available_media_types %}
-            '{{ media_type }}'{% if not forloop.last %},{% endif %}
+        selectedReleaseTypes: [
+          {% for value, label in release_type_choices %}
+            '{{ value }}'{% if not forloop.last %},{% endif %}
           {% endfor %}
         ],
+        availableStatusesByType: {
+          {% for media_type, statuses in filter_statuses_by_type.items %}
+            '{{ media_type }}': [
+              {% for status in statuses %}
+                {% with month_statuses=available_statuses_by_type|get_item:media_type %}
+                {
+                  value: '{{ status }}',
+                  label: '{{ status|media_status_readable|escapejs }}',
+                  inMonth: {% if month_statuses and status in month_statuses %}true{% else %}false{% endif %},
+                }{% if not forloop.last %},{% endif %}
+                {% endwith %}
+              {% endfor %}
+            ]{% if not forloop.last %},{% endif %}
+          {% endfor %}
+        },
+        selectedStatusesByType: {
+          {% for media_type, statuses in filter_statuses_by_type.items %}
+            '{{ media_type }}': [
+              {% for status in statuses %}
+                '{{ status }}'{% if not forloop.last %},{% endif %}
+              {% endfor %}
+            ]{% if not forloop.last %},{% endif %}
+          {% endfor %}
+        },
         mobileSelectedDay: null,
         filteredGridHtml: '',
         filteredListHtml: '',
         init() {
-          this.$watch('selectedMediaTypes', () => this.applyFilter());
+          this.loadSavedFilters();
+          this.$watch('selectedTypes', () => {
+            this.applyFilter();
+            this.persistFilters();
+          });
+          this.$watch('selectedReleaseTypes', () => {
+            this.applyFilter();
+            this.persistFilters();
+          });
+          this.$watch('selectedStatusesByType', () => {
+            this.applyFilter();
+            this.persistFilters();
+          }, { deep: true });
           this.applyFilter();
         },
-        dropdownLabel() {
-          if (this.allTypesSelected()) {
-            return 'All Types';
+        loadSavedFilters() {
+          try {
+            const raw = window.localStorage.getItem(this.storageKey);
+            if (!raw) {
+              return;
+            }
+
+            const saved = JSON.parse(raw);
+            const validTypes = new Set(this.availableMediaTypes.map(type => type.value));
+
+            // Saved under the name the old calendar dropdown used.
+            const savedTypes = saved.selectedTypes || saved.selectedMediaTypes;
+            if (Array.isArray(savedTypes)) {
+              this.selectedTypes = savedTypes.filter(
+                mediaType => validTypes.has(mediaType),
+              );
+            }
+
+            // Saved before release dates existed: leave them all shown.
+            if (Array.isArray(saved.selectedReleaseTypes)) {
+              const validReleaseTypes = new Set(
+                this.releaseTypeOptions.map(type => type.value),
+              );
+              this.selectedReleaseTypes = saved.selectedReleaseTypes.filter(
+                value => validReleaseTypes.has(value),
+              );
+            }
+
+            if (
+              saved.selectedStatusesByType
+              && typeof saved.selectedStatusesByType === 'object'
+            ) {
+              const mergedStatusesByType = {};
+
+              this.availableMediaTypes.forEach((type) => {
+                const availableStatuses = (
+                  this.availableStatusesByType[type.value] || []
+                ).map(status => status.value);
+                const savedStatuses = saved.selectedStatusesByType[type.value];
+
+                if (Array.isArray(savedStatuses)) {
+                  mergedStatusesByType[type.value] = savedStatuses.filter(
+                    status => availableStatuses.includes(status),
+                  );
+                } else {
+                  mergedStatusesByType[type.value] = availableStatuses;
+                }
+              });
+
+              this.selectedStatusesByType = mergedStatusesByType;
+            }
+          } catch (error) {
+            // Ignore storage failures (private mode or disabled storage).
           }
-          if (this.selectedMediaTypes.length === 0) {
-            return 'No Types';
-          }
-          if (this.selectedMediaTypes.length === 1) {
-            const selectedType = this.availableMediaTypes.find(
-              type => type.value === this.selectedMediaTypes[0],
-            );
-            return selectedType ? selectedType.label : '1 Type';
-          }
-          return `${this.selectedMediaTypes.length} Types`;
         },
-        allTypesSelected() {
+        persistFilters() {
+          try {
+            window.localStorage.setItem(this.storageKey, JSON.stringify({
+              selectedTypes: this.selectedTypes,
+              selectedReleaseTypes: this.selectedReleaseTypes,
+              selectedStatusesByType: this.selectedStatusesByType,
+            }));
+          } catch (error) {
+            // Ignore storage failures (private mode or disabled storage).
+          }
+        },
+        // Show everything again: every type, status and release date.
+        clearFilters() {
+          this.selectedTypes = this.availableMediaTypes.map(type => type.value);
+          this.selectedReleaseTypes = this.releaseTypeOptions.map(type => type.value);
+          const allStatuses = {};
+          this.availableMediaTypes.forEach((type) => {
+            allStatuses[type.value] = (
+              this.availableStatusesByType[type.value] || []
+            ).map(status => status.value);
+          });
+          this.selectedStatusesByType = allStatuses;
+        },
+        // The button label also flags filters the Media Types pane hides.
+        extraFilterLabels() {
+          const labels = [];
+          if (this.selectedTypes.some(type => this.hasPartialStatusFilter(type))) {
+            labels.push(gettext('Status'));
+          }
+          if (this.selectedReleaseTypes.length < this.releaseTypeOptions.length) {
+            labels.push(this.releaseTypesLabel());
+          }
+          return labels;
+        },
+        hasPartialStatusFilter(mediaType) {
           return (
-            this.availableMediaTypes.length > 0
-            && this.selectedMediaTypes.length === this.availableMediaTypes.length
+            this.hasStatusOptions(mediaType)
+            && !this.allStatusesSelectedForType(mediaType)
           );
         },
-        isTypeSelected(mediaType) {
-          return this.selectedMediaTypes.includes(mediaType);
+        typeLabel(type) {
+          const statusMarker = this.hasPartialStatusFilter(type.value) ? ' ·' : '';
+          return `${type.label}${statusMarker}`;
         },
-        toggleMediaType(mediaType) {
-          if (this.isTypeSelected(mediaType)) {
-            this.selectedMediaTypes = this.selectedMediaTypes.filter(
-              selectedType => selectedType !== mediaType,
+        releaseTypesLabel() {
+          const total = this.releaseTypeOptions.length;
+          const selected = this.selectedReleaseTypes.length;
+          if (!total || selected === total) {
+            return gettext('All');
+          }
+          if (selected === 0) {
+            return gettext('None');
+          }
+          const match = this.releaseTypeOptions.find(
+            type => type.value === this.selectedReleaseTypes[0],
+          );
+          return selected === 1 && match ? match.label : `${selected}/${total}`;
+        },
+        isReleaseTypeSelected(value) {
+          return this.selectedReleaseTypes.includes(value);
+        },
+        toggleReleaseType(value) {
+          if (this.isReleaseTypeSelected(value)) {
+            this.selectedReleaseTypes = this.selectedReleaseTypes.filter(
+              selected => selected !== value,
             );
           } else {
-            this.selectedMediaTypes = [...this.selectedMediaTypes, mediaType];
+            this.selectedReleaseTypes = [...this.selectedReleaseTypes, value];
           }
-          this.applyFilter();
         },
-        toggleAllTypes() {
-          if (this.allTypesSelected()) {
-            this.clearAll();
-            return;
+        hasStatusOptions(mediaType) {
+          return (
+            Array.isArray(this.availableStatusesByType[mediaType])
+            && this.availableStatusesByType[mediaType].length > 0
+          );
+        },
+        statusTypeLabel() {
+          const selectedType = this.availableMediaTypes.find(
+            type => type.value === this.statusType,
+          );
+          return selectedType ? selectedType.label : '';
+        },
+        isTypeStatusSelected(mediaType, status) {
+          return (this.selectedStatusesByType[mediaType] || []).includes(status);
+        },
+        toggleTypeStatus(mediaType, status) {
+          const selectedStatuses = this.selectedStatusesByType[mediaType] || [];
+          if (this.isTypeStatusSelected(mediaType, status)) {
+            this.selectedStatusesByType[mediaType] = selectedStatuses.filter(
+              selectedStatus => selectedStatus !== status,
+            );
+          } else {
+            this.selectedStatusesByType[mediaType] = [...selectedStatuses, status];
           }
-          this.selectAll();
         },
-        selectAll() {
-          this.selectedMediaTypes = this.availableMediaTypes.map(type => type.value);
-          this.applyFilter();
+        allStatusesSelectedForType(mediaType) {
+          const availableStatuses = this.availableStatusesByType[mediaType] || [];
+          const selectedStatuses = this.selectedStatusesByType[mediaType] || [];
+          return (
+            availableStatuses.length > 0
+            && selectedStatuses.length === availableStatuses.length
+          );
         },
-        clearAll() {
-          this.selectedMediaTypes = [];
-          this.applyFilter();
+        toggleAllStatusesForType(mediaType) {
+          if (this.allStatusesSelectedForType(mediaType)) {
+            this.selectedStatusesByType[mediaType] = [];
+          } else {
+            this.selectedStatusesByType[mediaType] = (
+              this.availableStatusesByType[mediaType] || []
+            ).map(status => status.value);
+          }
         },
         applyFilter() {
           if (this.$refs.gridTemplate) {
@@ -310,13 +596,20 @@
           this.$nextTick(() => this.bindMobileCalendar());
         },
         filterReleaseMarkup(html) {
-          const selected = new Set(this.selectedMediaTypes);
+          const selectedTypes = new Set(this.selectedTypes);
+          const selectedReleaseTypes = new Set(this.selectedReleaseTypes);
           const container = document.createElement('div');
           container.innerHTML = html;
 
           container.querySelectorAll('[data-release-media-type]').forEach(el => {
             const type = el.dataset.releaseMediaType;
-            if (!selected.has(type)) {
+            const status = el.dataset.releaseStatus;
+            const selectedForType = this.selectedStatusesByType[type] || [];
+            const releaseType = el.dataset.releaseType;
+            const typeHidden = !selectedTypes.has(type)
+              || (releaseType && !selectedReleaseTypes.has(releaseType));
+            const statusHidden = status && !selectedForType.includes(status);
+            if (typeHidden || statusHidden) {
               el.remove();
             }
           });
@@ -395,10 +688,10 @@
 
             const eventCount = releaseCountByDay.get(day) || 0;
             if (agendaTitle) {
-              agendaTitle.textContent = monthName ? `${monthName} ${day}` : `Day ${day}`;
+              agendaTitle.textContent = monthName ? `${monthName} ${day}` : `${gettext('Day')} ${day}`;
             }
             if (agendaCount) {
-              agendaCount.textContent = eventCount === 1 ? '1 release' : `${eventCount} releases`;
+              agendaCount.textContent = `${eventCount} ${gettext(eventCount === 1 ? 'release' : 'releases')}`;
             }
           };
 

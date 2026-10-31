@@ -1,14 +1,21 @@
 import logging
 
 from celery import shared_task
+from django.conf import settings
 from django.contrib.auth import get_user_model
 
 from app.models import Item
 from app.services import auto_pause
 from events import notifications
 from events.calendar.main import fetch_releases
+from events.calendar.selectors import get_items_to_process
 
 logger = logging.getLogger(__name__)
+
+# A Pocket Casts episode UUID is a standard 36-character UUID string
+# containing 4 hyphens; RSS GUIDs that already look like one are left alone.
+POCKETCASTS_UUID_LENGTH = 36
+POCKETCASTS_UUID_HYPHEN_COUNT = 4
 
 
 def _normalize_user_id(user_or_id):
@@ -50,11 +57,13 @@ def reload_calendar(user_id=None, item_ids=None, user=None, items_to_process=Non
 
     resolved_user = None
     if normalized_user_id is not None:
-        User = get_user_model()
-        resolved_user = User.objects.filter(id=normalized_user_id).first()
+        user_model = get_user_model()
+        resolved_user = user_model.objects.filter(id=normalized_user_id).first()
         if resolved_user is None:
-            logger.warning("Skipping calendar reload for missing user_id=%s", normalized_user_id)
-            return "User not found"
+            logger.warning(
+                "Skipping calendar reload for missing user_id=%s", normalized_user_id
+            )
+            return "user_model not found"
         logger.info("Reloading calendar for user: %s", resolved_user.username)
     else:
         logger.info("Reloading calendar for all users")
@@ -76,63 +85,87 @@ def reload_calendar(user_id=None, item_ids=None, user=None, items_to_process=Non
                 len(missing_item_ids),
             )
 
+    is_global_refresh = resolved_user is None and normalized_item_ids is None
+    if normalized_item_ids is None:
+        # Resolve the work list here rather than inside fetch_releases so the
+        # selection -- which queries TMDB's change feed -- runs once per reload
+        # instead of once per chunk.
+        resolved_items = list(get_items_to_process(resolved_user))
+
+    # Process a bounded slice now and re-queue the rest as its own task, so the
+    # worker is released between chunks instead of being held for the length of
+    # the whole walk.
+    chunk_size = getattr(settings, "CALENDAR_RELOAD_CHUNK_SIZE", 200)
+    deferred_item_ids = []
+    if (
+        chunk_size > 0
+        and resolved_items is not None
+        and len(resolved_items) > chunk_size
+    ):
+        deferred_item_ids = [item.id for item in resolved_items[chunk_size:]]
+        resolved_items = resolved_items[:chunk_size]
+
     result = fetch_releases(
         user=resolved_user,
         items_to_process=resolved_items,
     )
 
-    if resolved_user is None and normalized_item_ids is None:
+    if deferred_item_ids:
+        if resolved_user is None:
+            reload_calendar.delay(item_ids=deferred_item_ids)
+        else:
+            reload_calendar.delay(
+                user_id=resolved_user.pk,
+                item_ids=deferred_item_ids,
+            )
+        logger.info(
+            "calendar_reload_chunked processed=%s deferred=%s",
+            len(resolved_items),
+            len(deferred_item_ids),
+        )
+
+    if is_global_refresh:
         auto_pause.auto_pause_stale_items()
 
-        # Backfill metadata for items that have never been fetched
-        # Use aggressive batch size to complete initial backfill quickly
+        # Queue a metadata backfill for items that have never been fetched.
+        #
+        # This used to run inline at a batch size of up to 5000, so one calendar
+        # reload became a single task holding a worker while it fetched thousands
+        # of items' metadata - and each fetch caches a full provider payload, so
+        # it was also the fastest way to fill Redis (issue #521). Queued at the
+        # tier's normal batch size instead: convergence takes more passes, but no
+        # single task can monopolise a worker or the cache.
         try:
             from app.tasks import (
                 backfill_item_metadata_task,
                 count_release_backfill_items,
             )
 
-            remaining_metadata_count = Item.objects.filter(metadata_fetched_at__isnull=True).count()
+            remaining_metadata_count = Item.objects.filter(
+                metadata_fetched_at__isnull=True
+            ).count()
             remaining_release_count = count_release_backfill_items()
 
-            # Use larger batch for initial metadata imports, then keep release backfill
-            # running nightly so stale cached metadata can be corrected over time.
-            if remaining_metadata_count > 1000:
-                batch_size = 5000  # Aggressive initial backfill
-                logger.info(
-                    "Initial metadata backfill: processing %s items (batch of 5000)",
-                    remaining_metadata_count,
-                )
-            elif remaining_metadata_count > 0:
-                batch_size = 1000  # Cleanup mode
-                logger.info(
-                    "Metadata backfill cleanup: processing remaining %s items",
-                    remaining_metadata_count,
-                )
-            elif remaining_release_count > 0:
-                batch_size = 1000  # Release-date maintenance mode
-                logger.info(
-                    "Release-date backfill maintenance: processing remaining %s items",
-                    remaining_release_count,
-                )
-            else:
-                batch_size = 0  # Skip if nothing to do
-
-            if batch_size > 0:
-                backfill_result = backfill_item_metadata_task(batch_size=batch_size)
+            batch_size = 0
+            if remaining_metadata_count > 0 or remaining_release_count > 0:
+                batch_size = settings.CALENDAR_RELOAD_BACKFILL_BATCH_SIZE
                 logger.info(
                     (
-                        "Metadata backfill completed: %s successful, %s release dates updated, "
-                        "%s errors, %s metadata remaining, %s release remaining"
+                        "Queueing metadata backfill: %s metadata and %s release "
+                        "items remaining, batch of %s"
                     ),
-                    backfill_result.get("success_count", 0),
-                    backfill_result.get("release_updated_count", 0),
-                    backfill_result.get("error_count", 0),
-                    backfill_result.get("remaining_metadata", 0),
-                    backfill_result.get("remaining_release", 0),
+                    remaining_metadata_count,
+                    remaining_release_count,
+                    batch_size,
                 )
-        except Exception as e:
-            logger.error("Failed to backfill metadata during calendar reload: %s", e)
+
+            if batch_size > 0:
+                backfill_item_metadata_task.apply_async(
+                    kwargs={"batch_size": batch_size},
+                    priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
+                )
+        except Exception:
+            logger.exception("Failed to queue metadata backfill during calendar reload")
 
     return result
 
@@ -153,6 +186,13 @@ def send_daily_digest_notifications():
     return notifications.send_daily_digest()
 
 
+@shared_task(name="Send premiere digest")
+def send_premiere_digest_notifications():
+    """Send weekly digest of upcoming show and season premieres."""
+    logger.info("Starting premiere digest task")
+
+    return notifications.send_premiere_digest()
+
 
 @shared_task(name="Refresh podcast episodes")
 def refresh_podcast_episodes():
@@ -168,7 +208,9 @@ def refresh_podcast_episodes():
     logger.info("Starting podcast episode refresh task")
 
     # Get all shows with RSS feed URLs
-    shows = PodcastShow.objects.filter(rss_feed_url__isnull=False).exclude(rss_feed_url="")
+    shows = PodcastShow.objects.filter(rss_feed_url__isnull=False).exclude(
+        rss_feed_url=""
+    )
 
     if not shows.exists():
         logger.info("No podcast shows with RSS feed URLs found")
@@ -191,6 +233,7 @@ def refresh_podcast_episodes():
 
             # Get existing episodes
             from app.models import PodcastEpisode
+
             existing_episodes = {
                 episode.episode_uuid: episode
                 for episode in PodcastEpisode.objects.filter(show=show)
@@ -214,8 +257,15 @@ def refresh_podcast_episodes():
                     matched_episode = existing_episodes.get(rss_ep["guid"])
 
                 # Try by title + date
-                if not matched_episode and rss_ep.get("title") and rss_ep.get("published"):
-                    title_key = (rss_ep["title"].lower().strip(), rss_ep["published"].date())
+                if (
+                    not matched_episode
+                    and rss_ep.get("title")
+                    and rss_ep.get("published")
+                ):
+                    title_key = (
+                        rss_ep["title"].lower().strip(),
+                        rss_ep["published"].date(),
+                    )
                     matched_episode = existing_by_title_date.get(title_key)
 
                 if matched_episode:
@@ -226,10 +276,17 @@ def refresh_podcast_episodes():
                     # If UUID differs and we have RSS GUID, update to RSS GUID
                     # This ensures consistency when Pocket Casts UUID and RSS GUID differ
                     # But prefer keeping Pocket Casts UUID format if it looks like one
-                    if rss_ep.get("guid") and matched_episode.episode_uuid != rss_ep["guid"]:
+                    if (
+                        rss_ep.get("guid")
+                        and matched_episode.episode_uuid != rss_ep["guid"]
+                    ):
                         # Only update if the matched episode doesn't look like a Pocket Casts UUID
                         # Pocket Casts UUIDs typically have hyphens in specific positions
-                        is_pocketcasts_uuid = len(matched_episode.episode_uuid) == 36 and matched_episode.episode_uuid.count("-") == 4
+                        is_pocketcasts_uuid = (
+                            len(matched_episode.episode_uuid) == POCKETCASTS_UUID_LENGTH
+                            and matched_episode.episode_uuid.count("-")
+                            == POCKETCASTS_UUID_HYPHEN_COUNT
+                        )
                         if not is_pocketcasts_uuid:
                             logger.info(
                                 "Updating episode UUID from %s to %s for episode %s (RSS GUID)",
@@ -245,23 +302,38 @@ def refresh_podcast_episodes():
                         matched_episode.title = rss_ep["title"]
                         updated = True
                         update_fields.append("title")
-                    if rss_ep.get("published") and matched_episode.published != rss_ep["published"]:
+                    if (
+                        rss_ep.get("published")
+                        and matched_episode.published != rss_ep["published"]
+                    ):
                         matched_episode.published = rss_ep["published"]
                         updated = True
                         update_fields.append("published")
-                    if rss_ep.get("duration") and matched_episode.duration != rss_ep["duration"]:
+                    if (
+                        rss_ep.get("duration")
+                        and matched_episode.duration != rss_ep["duration"]
+                    ):
                         matched_episode.duration = rss_ep["duration"]
                         updated = True
                         update_fields.append("duration")
-                    if rss_ep.get("audio_url") and matched_episode.audio_url != rss_ep["audio_url"]:
+                    if (
+                        rss_ep.get("audio_url")
+                        and matched_episode.audio_url != rss_ep["audio_url"]
+                    ):
                         matched_episode.audio_url = rss_ep["audio_url"]
                         updated = True
                         update_fields.append("audio_url")
-                    if rss_ep.get("episode_number") is not None and matched_episode.episode_number != rss_ep["episode_number"]:
+                    if (
+                        rss_ep.get("episode_number") is not None
+                        and matched_episode.episode_number != rss_ep["episode_number"]
+                    ):
                         matched_episode.episode_number = rss_ep["episode_number"]
                         updated = True
                         update_fields.append("episode_number")
-                    if rss_ep.get("season_number") is not None and matched_episode.season_number != rss_ep["season_number"]:
+                    if (
+                        rss_ep.get("season_number") is not None
+                        and matched_episode.season_number != rss_ep["season_number"]
+                    ):
                         matched_episode.season_number = rss_ep["season_number"]
                         updated = True
                         update_fields.append("season_number")
@@ -272,10 +344,15 @@ def refresh_podcast_episodes():
                 else:
                     # Create new episode
                     import hashlib
+
                     episode_uuid = rss_ep.get("guid")
                     if not episode_uuid:
-                        uuid_str = f"{rss_ep.get('title', '')}{rss_ep.get('published', '')}"
-                        episode_uuid = hashlib.md5(uuid_str.encode()).hexdigest()[:36]
+                        uuid_str = (
+                            f"{rss_ep.get('title', '')}{rss_ep.get('published', '')}"
+                        )
+                        episode_uuid = hashlib.md5(
+                            uuid_str.encode(), usedforsecurity=False
+                        ).hexdigest()[:36]
 
                     if episode_uuid in existing_episodes:
                         continue
@@ -293,7 +370,11 @@ def refresh_podcast_episodes():
                         )
                         created_count += 1
                     except Exception:
-                        logger.debug("Skipping duplicate episode UUID %s for show %s", episode_uuid, show.title)
+                        logger.debug(
+                            "Skipping duplicate episode UUID %s for show %s",
+                            episode_uuid,
+                            show.title,
+                        )
 
             if created_count > 0 or updated_count_show > 0:
                 logger.info(
@@ -304,8 +385,8 @@ def refresh_podcast_episodes():
                 )
                 updated_count += 1
 
-        except Exception as e:
-            logger.error("Failed to refresh episodes for show %s: %s", show.title, e, exc_info=True)
+        except Exception:
+            logger.exception("Failed to refresh episodes for show %s", show.title)
             error_count += 1
 
     # Clean up duplicate episodes after refreshing
@@ -319,8 +400,8 @@ def refresh_podcast_episodes():
                 "Cleaned up %d duplicate podcast episodes after RSS refresh",
                 cleanup_stats["duplicates_removed"],
             )
-    except Exception as e:
-        logger.error("Failed to cleanup duplicate episodes: %s", e, exc_info=True)
+    except Exception:
+        logger.exception("Failed to cleanup duplicate episodes")
         # Don't fail the whole task if cleanup fails
 
     result = f"Refreshed {updated_count} shows, {error_count} errors"

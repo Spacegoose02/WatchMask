@@ -7,7 +7,7 @@ from typing import Any
 from django.conf import settings
 
 from app.models import MediaTypes
-from app.providers import services
+from app.providers import credentials, services
 
 TRAKT_BASE_URL = "https://api.trakt.tv"
 TRAKT_API_PROVIDER = "TRAKT"
@@ -23,15 +23,16 @@ TRAKT_SEARCH_TYPES = {
 
 def is_configured() -> bool:
     """Return whether Trakt API access is configured."""
-    return bool(getattr(settings, "TRAKT_API", ""))
+    return bool(credentials.get("trakt", "client_id"))
 
 
 def _headers() -> dict[str, str]:
     """Return Trakt request headers."""
     return {
         "Content-Type": "application/json",
+        "User-Agent": f"Watchmask/{settings.VERSION}",
         "trakt-api-version": TRAKT_API_VERSION,
-        "trakt-api-key": settings.TRAKT_API,
+        "trakt-api-key": credentials.get("trakt", "client_id"),
     }
 
 
@@ -163,7 +164,7 @@ def fetch_episode_ratings_for_season(
     if not show_id:
         return {}
 
-    import time  # noqa: PLC0415
+    import time
 
     results: dict[int, dict] = {}
     for episode_number in episode_numbers:

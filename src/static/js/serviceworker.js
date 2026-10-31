@@ -1,4 +1,4 @@
-const CACHE_NAME = "watchmask-v1";
+const CACHE_NAME = "floppy-v3";
 const urlsToCache = [
   "/static/css/main.css",
   "/static/favicon/android-chrome-192x192.png",
@@ -26,8 +26,13 @@ self.addEventListener("fetch", (event) => {
   const isSameOrigin = url.origin === self.location.origin;
   const isHtmxRequest = request.headers.get("HX-Request") === "true";
 
-  // Leave app routes and HTMX requests to the browser so they skip the worker
-  // entirely and never return stale dynamic HTML.
+  // Keep app routes and HTMX requests on network to avoid stale dynamic HTML.
+  //
+  // Return before respondWith. The browser then makes the request on its own
+  // network path. Calling respondWith(fetch(request)) here made the worker
+  // repeat a request that the browser can do without help. It also replaced
+  // the browser offline page with a failed promise, and it stopped navigation
+  // preload.
   if (
     request.method !== "GET" ||
     !isSameOrigin ||
@@ -44,13 +49,28 @@ self.addEventListener("fetch", (event) => {
         return response;
       }
 
-      return fetch(request).then((networkResponse) => {
-        if (networkResponse.ok) {
-          const responseClone = networkResponse.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(request, responseClone));
-        }
-        return networkResponse;
-      });
+      return fetch(request)
+        .then((networkResponse) => {
+          if (networkResponse.ok) {
+            const responseClone = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(request, responseClone));
+          }
+          return networkResponse;
+        })
+        .catch(async (error) => {
+          // The network is not available. Static URLs contain a file
+          // modification time (main.css?1786502224). An exact match fails
+          // after each rebuild, because the time changes. Give the previous
+          // version instead. A previous version is better than a page that
+          // cannot load.
+          const previousVersion = await caches.match(request, {
+            ignoreSearch: true,
+          });
+          if (previousVersion) {
+            return previousVersion;
+          }
+          throw error;
+        });
     }),
   );
 });

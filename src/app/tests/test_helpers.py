@@ -8,10 +8,13 @@ from django.utils import timezone
 
 from app.helpers import (
     enrich_items_with_user_data,
+    extract_release_datetime,
     form_error_messages,
     minutes_to_hhmm,
     normalize_navigation_url,
+    progress_activity,
     redirect_back,
+    supports_oauth_redirect,
 )
 from app.models import Game, Item, MediaTypes, Movie, Sources, Status
 
@@ -75,7 +78,9 @@ class HelpersTest(TestCase):
 
         request = MagicMock()
         request.GET = {}
-        request.POST = {"next": "/details/tmdb/movie/118340/guardians-of-the-galaxy?page=2"}
+        request.POST = {
+            "next": "/details/tmdb/movie/118340/guardians-of-the-galaxy?page=2"
+        }
 
         result = redirect_back(request)
 
@@ -83,6 +88,24 @@ class HelpersTest(TestCase):
             "/details/tmdb/movie/118340/guardians-of-the-galaxy",
         )
         self.assertEqual(result, "redirected")
+
+    def test_extract_release_datetime_valid_date_string(self):
+        """A normal release_date string is parsed into a UTC datetime."""
+        result = extract_release_datetime({"release_date": "2020-05-15"})
+        self.assertEqual((result.year, result.month, result.day), (2020, 5, 15))
+
+    def test_extract_release_datetime_valid_year_only(self):
+        """A plausible year-only value produces January 1st of that year."""
+        result = extract_release_datetime({"year": 1999})
+        self.assertEqual((result.year, result.month, result.day), (1999, 1, 1))
+
+    def test_extract_release_datetime_rejects_sentinel_year_one_string(self):
+        """A year-0001 date string must not produce the OverflowError sentinel."""
+        self.assertIsNone(extract_release_datetime({"release_date": "0001-01-01"}))
+
+    def test_extract_release_datetime_rejects_implausible_year(self):
+        """An implausible bare year (e.g. 1) must not produce a datetime."""
+        self.assertIsNone(extract_release_datetime({"year": 1}))
 
     def test_normalize_navigation_url_decodes_encoded_query_separators(self):
         """Navigation URLs from modal forms should restore their query separators."""
@@ -332,3 +355,73 @@ class EnrichItemsWithUserDataTest(TestCase):
             "recommendations",
         )
         self.assertEqual(len(enriched_items), 2)
+
+
+class SupportsOAuthRedirect(TestCase):
+    """Trakt rejects non-HTTPS redirect URIs unless the host is loopback (#681)."""
+
+    def test_https_is_accepted(self):
+        self.assertTrue(supports_oauth_redirect("https://floppy.example.com/import"))
+
+    def test_http_loopback_hosts_are_accepted(self):
+        for url in (
+            "http://localhost:8000/import",
+            "http://127.0.0.1:8000/import",
+            "http://127.5.5.5:8000/import",
+            "http://[::1]:8000/import",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(supports_oauth_redirect(url))
+
+    def test_http_lan_address_is_rejected(self):
+        self.assertFalse(supports_oauth_redirect("http://192.168.1.50:8000/import"))
+
+    def test_http_hostname_is_rejected(self):
+        self.assertFalse(supports_oauth_redirect("http://floppy.local:8000/import"))
+
+    def test_missing_url_is_rejected(self):
+        self.assertFalse(supports_oauth_redirect(None))
+        self.assertFalse(supports_oauth_redirect(""))
+
+    def test_non_http_scheme_is_rejected(self):
+        self.assertFalse(supports_oauth_redirect("ftp://floppy.example.com/import"))
+
+
+class ProgressActivityTest(TestCase):
+    """The progress-time fallback behind every Last Watched ordering."""
+
+    def test_completed_entry_without_watch_date_has_no_activity(self):
+        """A completed entry's progress time only records when it was logged."""
+        entry = MagicMock(status=Status.COMPLETED.value, progressed_at=timezone.now())
+        self.assertIsNone(progress_activity(entry))
+
+    def test_unfinished_entry_uses_its_progress_time(self):
+        """An in-progress entry still counts as recently watched."""
+        now = timezone.now()
+        entry = MagicMock(status=Status.IN_PROGRESS.value, progressed_at=now)
+        self.assertEqual(progress_activity(entry), now)
+
+    def test_media_list_sort_value_ignores_undated_completion(self):
+        """The media list ranks an undated completion below dated and playing ones."""
+        from app.media_list_filters import _sort_value
+
+        now = timezone.now()
+
+        def value(**fields):
+            media = MagicMock(spec=["status", "end_date", "progressed_at"])
+            for name, field in fields.items():
+                setattr(media, name, field)
+            entry = MagicMock(media=media)
+            return _sort_value(entry, "last_watched", None)
+
+        self.assertIsNone(
+            value(status=Status.COMPLETED.value, end_date=None, progressed_at=now),
+        )
+        self.assertEqual(
+            value(status=Status.IN_PROGRESS.value, end_date=None, progressed_at=now),
+            now,
+        )
+        self.assertEqual(
+            value(status=Status.COMPLETED.value, end_date=now, progressed_at=now),
+            now,
+        )

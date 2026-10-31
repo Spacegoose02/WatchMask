@@ -1,18 +1,20 @@
 {% extends "base.html" %}
+{% load i18n %}
+
 {% load app_tags %}
 
 {% block title %}
-  Create - Watchmask
+  {% translate "Create - Watchmask" %}
 {% endblock title %}
 
 {% block content %}
   <div class="mx-auto max-w-4xl">
     <div class="mb-8">
-      <h1 class="text-3xl font-bold mb-2">Create Custom Entry</h1>
-      <p class="text-gray-400">Add a custom media entry to your collection if it's not available in the database.</p>
+      <h1 class="text-3xl font-bold mb-2">{% translate "Create Custom Entry" %}</h1>
+      <p class="text-[var(--color-text-muted)]">{% translate "Add a custom media entry to your collection if it's not available in the database." %}</p>
     </div>
     {# djlint:off #}
-    <form method="post" class="space-y-6" x-data="{
+    {% translate "Progress (Episodes)" as media_i18n_40 %}{% translate "Progress (Chapters)" as media_i18n_41 %}{% translate "Progress (Play Time)" as media_i18n_42 %}{% translate "Progress (Pages)" as media_i18n_43 %}{% translate "Progress" as media_i18n_44 %}{% translate "Please select a parent TV show from the dropdown" as media_i18n_45 %}{% translate "Please select a parent Season from the dropdown" as media_i18n_46 %}<form method="post" class="space-y-6" x-data="{
       mediaType: 'tv',
       placeholderHtml: null,
 
@@ -31,7 +33,7 @@
 
           // Create the image element
           const img = document.createElement('img');
-          img.alt = 'Preview';
+          img.alt = '{% translate "Preview" %}';
           img.className = 'w-full h-full object-cover';
           img.src = imageUrl;
 
@@ -51,31 +53,36 @@
       showField(field) {
         // TV Show fields
         if (this.mediaType === 'tv') {
-          return ['title', 'image', 'score', 'status', 'notes'].includes(field);
+          return ['title', 'image', 'score', 'status', 'notes', 'synopsis'].includes(field);
         }
-    
+
         // Season fields
         else if (this.mediaType === 'season') {
-          return ['parentShow', 'image', 'seasonNumber', 'score', 'status', 'notes'].includes(field);
+          return ['parentShow', 'image', 'seasonNumber', 'score', 'status', 'notes', 'synopsis'].includes(field);
         }
-    
+
         // Episode fields
         else if (this.mediaType === 'episode') {
           return ['parentSeason', 'image', 'episodeNumber', 'endDate'].includes(field);
         }
-    
+
+        // Podcasts are tracked at the show level, which has no progress field
+        else if (this.mediaType === 'podcast') {
+          return ['title', 'image', 'score', 'status', 'startDate', 'endDate', 'notes', 'synopsis'].includes(field);
+        }
+
         // Movie, Anime, Manga, Game, Book fields
         else {
-          return ['title', 'image', 'score', 'progress', 'status', 'startDate', 'endDate', 'notes'].includes(field);
+          return ['title', 'image', 'score', 'progress', 'status', 'startDate', 'endDate', 'notes', 'synopsis'].includes(field);
         }
       },
     
       getProgressLabel() {
-        if (this.mediaType === 'anime') return 'Progress (Episodes)';
-        if (this.mediaType === 'manga') return 'Progress (Chapters)';
-        if (this.mediaType === 'game') return 'Progress (Play Time)';
-        if (this.mediaType === 'book') return 'Progress (Pages)';
-        return 'Progress';
+        if (this.mediaType === 'anime') return '{{ media_i18n_40|escapejs }}';
+        if (this.mediaType === 'manga') return '{{ media_i18n_41|escapejs }}';
+        if (this.mediaType === 'game') return '{{ media_i18n_42|escapejs }}';
+        if (this.mediaType === 'book') return '{{ media_i18n_43|escapejs }}';
+        return '{{ media_i18n_44|escapejs }}';
       },
     
       validateForm() {
@@ -83,7 +90,7 @@
         if (this.mediaType === 'season') {
           const parentTvId = document.getElementById('parent-tv-id').value;
           if (!parentTvId) {
-            alert('Please select a parent TV show from the dropdown');
+            alert('{{ media_i18n_45|escapejs }}');
             return false;
           }
         }
@@ -92,7 +99,7 @@
         if (this.mediaType === 'episode') {
           const parentSeasonId = document.getElementById('parent-season-id').value;
           if (!parentSeasonId) {
-            alert('Please select a parent Season from the dropdown');
+            alert('{{ media_i18n_46|escapejs }}');
             return false;
           }
         }
@@ -104,15 +111,15 @@
     {% csrf_token %}
     <input type="hidden" name="media_type" :value="mediaType">
 
-    <div class="bg-[#2a2f35] rounded-lg p-6">
+    <div class="bg-[var(--color-surface)] rounded-lg p-6">
       <div class="grid gap-6">
         <div x-cloak>
-          <label class="block text-sm font-medium mb-2 text-gray-300">Media Type</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Media Type" %}</label>
           <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
             {% for media_type in media_types %}
               <button type="button"
                       @click="mediaType = '{{ media_type }}'"
-                      :class="mediaType === '{{ media_type }}' ? 'bg-indigo-600 border-indigo-500 text-white' : 'border-gray-600 text-gray-300 hover:bg-[#39404b]'"
+                      :class="mediaType === '{{ media_type }}' ? 'bg-indigo-600 border-indigo-500 text-white' : 'border-[var(--color-surface-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]'"
                       class="flex items-center gap-2 p-3 rounded-md border transition-colors cursor-pointer">
                 {% icon media_type is_active=False %}
                 <span class="text-sm font-medium">{{ media_type|media_type_readable }}</span>
@@ -123,9 +130,9 @@
 
         <!-- Title field (TV, Movie, Anime, Manga, Game, Book) -->
         <div x-show="showField('title')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Title</label>
-          <input class="w-full p-2 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
-                 placeholder="Enter title"
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Title" %}</label>
+          <input class="w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
+                 placeholder="{% translate "Enter title" %}"
                  name="title"
                  type="text"
                  value="">
@@ -133,12 +140,12 @@
 
         <!-- Parent TV Show field (Season) -->
         <div x-show="showField('parentShow')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Parent TV Show</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Parent TV Show" %}</label>
           <div class="relative">
             <div class="relative">
               <input id="parent-tv-input"
-                     class="w-full p-2 pl-9 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
-                     placeholder="Search for a TV show..."
+                     class="w-full p-2 pl-9 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
+                     placeholder="{% translate "Search for a TV show..." %}"
                      name="q"
                      type="text"
                      autocomplete="off"
@@ -147,7 +154,7 @@
                      hx-target="#parent-tv-results">
               <!-- Hidden input to store the selected TV ID -->
               <input id="parent-tv-id" name="parent_tv" type="hidden">
-              {% include "app/icons/magnifying-glass.svg" with classes="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" %}
+              {% include "app/icons/magnifying-glass.svg" with classes="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--color-text-muted)]" %}
             </div>
             <div id="parent-tv-results"></div>
           </div>
@@ -155,11 +162,11 @@
 
         <!-- Season Number field (Season) -->
         <div x-show="showField('seasonNumber')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Season Number</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Season Number" %}</label>
           <div class="relative">
             <input min="1"
                    max="999"
-                   class="w-full p-2 pr-12 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] [appearance:textfield] [&amp;::-webkit-outer-spin-button]:appearance-none [&amp;::-webkit-inner-spin-button]:appearance-none"
+                   class="w-full p-2 pr-12 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] [appearance:textfield] [&amp;::-webkit-outer-spin-button]:appearance-none [&amp;::-webkit-inner-spin-button]:appearance-none"
                    name="season_number"
                    type="number"
                    value="1">
@@ -180,12 +187,12 @@
 
         <!-- Parent Season field (Episode) -->
         <div x-show="showField('parentSeason')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Parent Season</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Parent Season" %}</label>
           <div class="relative">
             <div class="relative">
               <input id="parent-season-input"
-                     class="w-full p-2 pl-9 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
-                     placeholder="Search for a season..."
+                     class="w-full p-2 pl-9 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
+                     placeholder="{% translate "Search for a season..." %}"
                      name="q"
                      type="text"
                      autocomplete="off"
@@ -194,7 +201,7 @@
                      hx-target="#parent-season-results">
               <!-- Hidden input to store the selected Season ID -->
               <input id="parent-season-id" name="parent_season" type="hidden">
-              {% include "app/icons/magnifying-glass.svg" with classes="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" %}
+              {% include "app/icons/magnifying-glass.svg" with classes="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--color-text-muted)]" %}
             </div>
             <div id="parent-season-results"></div>
           </div>
@@ -202,11 +209,11 @@
 
         <!-- Episode Number field (Episode) -->
         <div x-show="showField('episodeNumber')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Episode Number</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Episode Number" %}</label>
           <div class="relative">
             <input min="1"
                    max="999"
-                   class="w-full p-2 pr-12 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] [appearance:textfield] [&amp;::-webkit-outer-spin-button]:appearance-none [&amp;::-webkit-inner-spin-button]:appearance-none"
+                   class="w-full p-2 pr-12 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] [appearance:textfield] [&amp;::-webkit-outer-spin-button]:appearance-none [&amp;::-webkit-inner-spin-button]:appearance-none"
                    name="episode_number"
                    type="number"
                    value="1">
@@ -227,32 +234,33 @@
 
         <!-- Image URL field (All types) -->
         <div x-show="showField('image')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Image URL</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Image URL" %}</label>
           <div class="flex gap-4">
             <div class="flex-1">
-              <input class="w-full p-2 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
+              <input class="w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
                      name="image"
-                     placeholder="Enter image URL"
+                     placeholder="{% translate "Enter image URL" %}"
                      type="url"
                      value=""
                      x-on:input="updateImagePreview($event.target)">
             </div>
             <div id="image-preview"
-                 class="w-20 h-20 rounded-md overflow-hidden bg-[#39404b] border border-gray-600 flex items-center justify-center">
-              {% include "app/icons/image.svg" with classes="w-8 h-8 text-gray-500" %}
+                 class="w-20 h-20 rounded-md overflow-hidden bg-[var(--color-surface-strong)] border border-gray-600 flex items-center justify-center">
+              {% include "app/icons/image.svg" with classes="w-8 h-8 text-[var(--color-text-muted)]" %}
             </div>
             <!-- Hidden error icon template -->
             <div id="error-icon" class="hidden">{% include "app/icons/circle-x.svg" with classes="w-8 h-8 text-red-500" %}</div>
           </div>
         </div>
 
+        {% if user.ratings_enabled %}
         <!-- Score field (TV, Movie, Anime, Manga, Game, Book, Season) -->
         <div x-show="showField('score')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Score</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Score" %}</label>
           <div class="relative">
             <input min="0"
                    max="{{ user|rating_scale_max }}"
-                   class="w-full p-2 pr-12 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] [appearance:textfield] [&amp;::-webkit-outer-spin-button]:appearance-none [&amp;::-webkit-inner-spin-button]:appearance-none"
+                   class="w-full p-2 pr-12 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] [appearance:textfield] [&amp;::-webkit-outer-spin-button]:appearance-none [&amp;::-webkit-inner-spin-button]:appearance-none"
                    name="score"
                    type="number"
                    placeholder="0-{{ user|rating_scale_max }}">
@@ -270,17 +278,18 @@
             </div>
           </div>
         </div>
+        {% endif %}
 
         <!-- Progress field (Movie, Anime, Manga, Game, Book) -->
         <div x-show="showField('progress')">
-          <label class="block text-sm font-medium mb-2 text-gray-300"
-                 x-text="getProgressLabel()">Progress</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]"
+                 x-text="getProgressLabel()">{% translate "Progress" %}</label>
 
           <div class="relative">
-            <input class="w-full p-2 pr-12 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
+            {% translate "hh:mm or 111 minutes" as media_i18n_47 %}<input class="w-full p-2 pr-12 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
                    name="progress"
                    x-bind:type="mediaType === 'game' ? 'text' : 'number'"
-                   x-bind:placeholder="mediaType === 'game' ? 'hh:mm or 111 minutes' : ''"
+                   x-bind:placeholder="mediaType === 'game' ? '{{ media_i18n_47|escapejs }}' : ''"
                    x-bind:min="mediaType !== 'game' ? 0 : null"
                    x-bind:max="mediaType !== 'game' ? 99999 : null"
                    x-bind:class="{'[appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none': mediaType !== 'game'}"
@@ -304,11 +313,11 @@
 
         <!-- Status field (TV, Movie, Anime, Manga, Game, Book, Season) -->
         <div x-show="showField('status')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Status</label>
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Status" %}</label>
           <div class="relative">
-            <select class="w-full p-2 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
+            <select class="w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
                     name="status">
-              {% for status in Status.values %}<option value="{{ status }}">{{ status }}</option>{% endfor %}
+              {% for status in Status.values %}<option value="{{ status }}"{% if status == default_status %} selected{% endif %}>{% translate status %}</option>{% endfor %}
             </select>
             <div class="absolute inset-y-0 right-2 flex items-center pointer-events-none">
               {% include "app/icons/chevron-down.svg" with classes="w-4 h-4" %}
@@ -318,8 +327,8 @@
 
         <!-- Start Date field (Movie, Anime, Manga, Game, Book) -->
         <div x-show="showField('startDate')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Start Date</label>
-          <input class="w-full p-2 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Start Date" %}</label>
+          <input class="w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
                  name="start_date"
                  type="date"
                  value="">
@@ -327,8 +336,8 @@
 
         <!-- End Date field (Episode, Movie, Anime, Manga, Game, Book) -->
         <div x-show="showField('endDate')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">End Date</label>
-          <input class="w-full p-2 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "End Date" %}</label>
+          <input class="w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
                  name="end_date"
                  type="date"
                  value="">
@@ -336,18 +345,27 @@
 
         <!-- Notes field (TV, Movie, Anime, Manga, Game, Book, Season) -->
         <div x-show="showField('notes')">
-          <label class="block text-sm font-medium mb-2 text-gray-300">Notes</label>
-          <textarea class="w-full p-2 bg-[#39404b] rounded-md text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[#4a9eff] appearance-none"
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Notes" %}</label>
+          <textarea class="w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
                     rows="4"
                     name="notes"
-                    placeholder="Add any notes or comments..."></textarea>
+                    placeholder="{% translate "Add any notes or comments..." %}"></textarea>
+        </div>
+
+        <!-- Description field (TV, Movie, Anime, Manga, Game, Book, Season) -->
+        <div x-show="showField('synopsis')">
+          <label class="block text-sm font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Description" %}</label>
+          <textarea class="w-full p-2 bg-[var(--color-surface-strong)] rounded-md text-[var(--color-text)] border border-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] appearance-none"
+                    rows="4"
+                    name="synopsis"
+                    placeholder="{% translate "Add a description..." %}"></textarea>
         </div>
       </div>
 
       <button type="submit"
               class="flex items-center mt-5 px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
         {% include "app/icons/save.svg" with classes="w-4 h-4 mr-2" %}
-        Create Entry
+        {% translate "Create Entry" %}
       </button>
     </div>
   </form>

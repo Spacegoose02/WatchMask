@@ -7,10 +7,26 @@ from django.apps import AppConfig
 from django.conf import settings
 from django.core.cache import cache
 
+from app.log_safety import exception_summary
+
 logger = logging.getLogger(__name__)
 
-# Give the web UI time to settle after a restart before heavy IMDB work starts.
-IMDB_PROFILE_BACKFILL_STARTUP_DELAY_SECONDS = 600
+# Five whole-library sweeps used to be enqueued at startup within 30 seconds of
+# each other, so a restart put the container's heaviest work on the queue exactly
+# when it was still warming up. Spacing them lets the web tier become responsive
+# first, and beat picks up anything skipped soon enough now that the reconcilers
+# gate on durable state (issue #521).
+STARTUP_SWEEP_COUNTDOWNS = {
+    "imdb_person": 60,
+    "genre": 180,
+    "trakt_popularity": 300,
+    "igdb_ratings": 420,
+    "provider": 540,
+    "podcast_website": 660,
+    "external_ids": 780,
+    "game_groups": 900,
+    "watch_state": 1020,
+}
 
 
 def _is_celery_worker_process() -> bool:
@@ -32,6 +48,20 @@ def _is_runserver_parent_process() -> bool:
     return "runserver" in sys.argv and os.environ.get("RUN_MAIN") != "true"
 
 
+def _is_management_command_process() -> bool:
+    """Return whether this is a manage.py command other than runserver.
+
+    One-off commands (migrate, check, shell, ...) must not enqueue startup
+    tasks: publishing writes a TaskResult row mid-initialization and opens a
+    Postgres connection pool inside a short-lived process (issue #341).
+    Production gunicorn is launched without a manage.py token, so this never
+    suppresses the preloaded master's scheduling.
+    """
+    if not sys.argv or not sys.argv[0].endswith("manage.py"):
+        return False
+    return "runserver" not in sys.argv
+
+
 class AppConfig(AppConfig):
     """Default app config."""
 
@@ -41,8 +71,31 @@ class AppConfig(AppConfig):
     def ready(self):
         """Import signals when the app is ready."""
         import_module("app.signals")
+        import_module("app.signals_watch_state")
+        from app.signals_music import load_music_listen_hooks
+
+        load_music_listen_hooks()
+        # Task-boundary memory sampling. Connected from ready() rather than
+        # at module import so the handlers exist exactly once per process,
+        # before any task can run, and are skipped entirely when the
+        # instrumentation is switched off.
+        from app.memory_envelope import connect_celery_signals
+
+        connect_celery_signals()
+        # Task identity is cheap to keep and is what turns a lock error into a
+        # correlatable record (#1609). Transaction timing itself stays inside
+        # the performance instrumentation.
+        from app.db_diagnostics import connect_celery_signals as connect_db_signals
+
+        connect_db_signals()
+        if _is_management_command_process():
+            # One-off manage.py commands (migrate, shell, check, ...) must
+            # not enqueue startup tasks or consume the once-per-day startup
+            # cache keys the serving process needs (issue #341).
+            return
         if not settings.TESTING:
             self._repair_celery_redis_bindings()
+            self._tune_redis()
         is_celery_worker = _is_celery_worker_process()
         is_runserver_parent = _is_runserver_parent_process()
 
@@ -84,29 +137,38 @@ class AppConfig(AppConfig):
             self._schedule_history_day_coverage_warmup()
 
         if not settings.TESTING and not is_celery_worker and not is_runserver_parent:
-            # The IMDB refresh streams several large dataset dumps, so run it at
-            # most once a day rather than on every container restart.
-            if self._add_startup_cache_key("imdb_profile_backfill_startup_scheduled"):
-                self._schedule_imdb_game_person_profile_backfill()
+            self._schedule_imdb_game_person_profile_backfill()
             self._schedule_genre_backfill_reconcile()
             self._schedule_trakt_popularity_reconcile()
             self._schedule_igdb_rating_backfill_reconcile()
+            self._schedule_provider_backfill_reconcile()
+            self._schedule_podcast_website_backfill_reconcile()
+            self._schedule_external_ids_backfill_reconcile()
+            self._schedule_game_groups_backfill_reconcile()
+            self._schedule_watch_state_repair()
 
-    def _add_startup_cache_key(self, cache_key: str) -> bool:
-        """Return whether a once-per-day startup task can be scheduled."""
+    def _add_startup_cache_key(
+        self,
+        cache_key: str,
+        timeout: int = 86400,
+        *,
+        fail_open: bool = False,
+    ) -> bool:
+        """Return whether a once-per-period startup task can be scheduled."""
         try:
-            return bool(cache.add(cache_key, 1, timeout=86400))
-        except Exception:  # noqa: BLE001
+            return bool(cache.add(cache_key, 1, timeout=timeout))
+        except Exception as error:
             logger.debug(
-                "Cache not available, skipping startup scheduling for %s",
+                "Startup cache key write failed for %s (%s). Check REDIS_CACHE_URL.",
                 cache_key,
+                exception_summary(error),
             )
-            return False
+            return fail_open
 
     def _repair_celery_redis_bindings(self):
         """Normalize persisted Kombu Redis bindings after separator changes."""
         try:
-            from app.celery_broker import repair_celery_redis_bindings  # noqa: PLC0415
+            from app.celery_broker import repair_celery_redis_bindings
 
             repair_summary = repair_celery_redis_bindings()
             if repair_summary["repaired"] or repair_summary["removed"]:
@@ -120,8 +182,37 @@ class AppConfig(AppConfig):
                     repair_summary["repaired"],
                     repair_summary["removed"],
                 )
-        except Exception as error:  # noqa: BLE001
-            logger.warning("Failed to normalize Kombu Redis bindings: %s", error)
+        except Exception as error:
+            logger.warning(
+                "Failed to normalize Kombu Redis bindings: %s",
+                exception_summary(error),
+            )
+
+    def _tune_redis(self):
+        """Give Redis a memory ceiling if the operator hasn't set one.
+
+        Guarded by the same atomic startup key the scheduling helpers use, so
+        only one of the container's processes issues the CONFIG SET even though
+        every one of them runs ready(). Redis restarting resets its config, so
+        the key's TTL is short enough that the next process start re-applies it.
+        If the cache guard raises, tuning continues because CONFIG operations
+        are idempotent and the administration Redis can still be available.
+        """
+        if not self._add_startup_cache_key(
+            "redis_tuning_applied",
+            timeout=300,
+            fail_open=True,
+        ):
+            return
+        try:
+            from app.redis_tuning import tune_redis
+
+            tune_redis()
+        except Exception as error:
+            logger.warning(
+                "Redis memory tuning failed (%s). Run manage.py tune_redis --dry-run.",
+                exception_summary(error),
+            )
 
     def _schedule_runtime_population(self):
         """Schedule runtime population task to run once on startup."""
@@ -131,10 +222,10 @@ class AppConfig(AppConfig):
             # Delay startup work until Django is fully initialized.
             tasks.populate_runtime_data_continuous.apply_async(
                 countdown=60,
-                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
             )
             logger.info("Scheduled runtime population task to run on startup")
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("Failed to schedule runtime population task: %s", error)
 
     def _schedule_discover_startup_warmup(self):
@@ -143,10 +234,10 @@ class AppConfig(AppConfig):
             tasks = import_module("app.tasks")
             tasks.warm_discover_startup_tabs.apply_async(
                 countdown=90,
-                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
             )
             logger.info("Scheduled Discover startup warmup")
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("Failed to schedule Discover startup warmup: %s", error)
 
     def _schedule_history_day_coverage_warmup(self):
@@ -155,63 +246,56 @@ class AppConfig(AppConfig):
             tasks = import_module("app.tasks")
             tasks.warm_history_day_cache_coverage.apply_async(
                 countdown=300,
-                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
             )
             logger.info("Scheduled history day coverage warmup")
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("Failed to schedule history day coverage warmup: %s", error)
 
     def _schedule_imdb_game_person_profile_backfill(self):
-        """Schedule IMDB person profile repair when gender/image data is missing."""
+        """Schedule IMDB person profile repair when gender/image data is missing.
+
+        The missing-profile count check itself runs inside the Celery task
+        (not here) so no DB query happens during ``ready()``, which executes
+        pre-fork in the Gunicorn master under ``preload_app``.
+        """
         try:
-            from app.services import imdb_game_credits  # noqa: PLC0415
-
-            missing_count = imdb_game_credits.count_people_missing_profiles()
-            if missing_count <= 0:
-                return
-
             tasks_imdb = import_module("app.tasks_imdb")
-            # Use the long-lived refresh task name here instead of the newer
-            # dedicated profile-backfill task so older shared workers on the
-            # same broker can still execute the repair path.
-            tasks_imdb.refresh_imdb_game_credits_from_datasets.apply_async(
-                countdown=IMDB_PROFILE_BACKFILL_STARTUP_DELAY_SECONDS,
-                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
+            tasks_imdb.schedule_imdb_game_person_profile_backfill_if_needed.apply_async(
+                countdown=STARTUP_SWEEP_COUNTDOWNS["imdb_person"],
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
             )
-            logger.info(
-                "Scheduled IMDB person profile repair via refresh task for %s people on startup",
-                missing_count,
-            )
-        except Exception as error:  # noqa: BLE001
+            logger.info("Scheduled IMDB person profile backfill check on startup")
+        except Exception as error:
             logger.warning("Failed to schedule IMDB person profile backfill: %s", error)
 
     def _schedule_genre_backfill_reconcile(self):
-        """Schedule a one-time genre backfill reconcile."""
+        """Queue the genre reconcile gate for a worker to evaluate."""
         try:
             tasks = import_module("app.tasks")
-            version_key = f"genre_backfill_reconciled_v{tasks.GENRE_BACKFILL_VERSION}"
-            status = cache.get(version_key)
-
-            if status in {"done", "pending"}:
+            version = tasks.GENRE_BACKFILL_VERSION
+            # Atomic, so two gunicorn workers starting together can't both
+            # enqueue - the get-then-set this replaces had exactly that race.
+            if not self._add_startup_cache_key(
+                f"genre_reconcile_startup_v{version}",
+                timeout=3600,
+            ):
                 return
 
-            cache.set(version_key, "pending", timeout=300)
-
-            try:
-                tasks.reconcile_genre_backfill.apply_async(
-                    kwargs={"strategy_version": tasks.GENRE_BACKFILL_VERSION},
-                    countdown=0,
-                    priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
-                )
-            except Exception:
-                cache.delete(version_key)
-                raise
+            # The worker-side ensure task owns the durable state gate. Keeping
+            # that DB query out of ready() avoids checking out a pool
+            # connection during process startup.
+            tasks.ensure_genre_backfill_reconcile.apply_async(
+                kwargs={"strategy_version": version},
+                countdown=STARTUP_SWEEP_COUNTDOWNS["genre"],
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
+            )
 
             logger.info(
                 "Scheduled genre backfill reconcile (version=%s)",
-                tasks.GENRE_BACKFILL_VERSION,
+                version,
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("Failed to schedule genre backfill reconcile: %s", error)
 
     def _schedule_igdb_rating_backfill_reconcile(self):
@@ -222,7 +306,7 @@ class AppConfig(AppConfig):
         detail page happens to be visited. Runs once per strategy version.
         """
         try:
-            from app.tasks_igdb_ratings import (  # noqa: PLC0415
+            from app.tasks_igdb_ratings import (
                 IGDB_RATINGS_BACKFILL_VERSION,
                 reconcile_igdb_rating_backfill,
             )
@@ -233,13 +317,18 @@ class AppConfig(AppConfig):
             if status in {"done", "pending"}:
                 return
 
-            cache.set(version_key, "pending", timeout=300)
+            if not cache.add(
+                version_key,
+                "pending",
+                timeout=STARTUP_SWEEP_COUNTDOWNS["igdb_ratings"] + 300,
+            ):
+                return
 
             try:
                 reconcile_igdb_rating_backfill.apply_async(
                     kwargs={"strategy_version": IGDB_RATINGS_BACKFILL_VERSION},
-                    countdown=30,
-                    priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
+                    countdown=STARTUP_SWEEP_COUNTDOWNS["igdb_ratings"],
+                    priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
                 )
             except Exception:
                 cache.delete(version_key)
@@ -249,8 +338,195 @@ class AppConfig(AppConfig):
                 "Scheduled IGDB ratings backfill reconcile (version=%s)",
                 IGDB_RATINGS_BACKFILL_VERSION,
             )
-        except Exception as error:  # noqa: BLE001
-            logger.warning("Failed to schedule IGDB ratings backfill reconcile: %s", error)
+        except Exception as error:
+            logger.warning(
+                "Failed to schedule IGDB ratings backfill reconcile: %s", error
+            )
+
+    def _schedule_watch_state_repair(self):
+        """Queue the one-time watch state repair gate for a worker to evaluate.
+
+        The worker-side task owns the durable gate, so ready() runs no query.
+        """
+        try:
+            from app.tasks_watch_state import REPAIR_VERSION, ensure_watch_state_repair
+
+            if not self._add_startup_cache_key(
+                f"watch_state_repair_startup_v{REPAIR_VERSION}",
+                timeout=3600,
+            ):
+                return
+
+            ensure_watch_state_repair.apply_async(
+                countdown=STARTUP_SWEEP_COUNTDOWNS["watch_state"],
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
+            )
+            logger.info("Scheduled watch state repair (version=%s)", REPAIR_VERSION)
+        except Exception as error:
+            logger.warning("Failed to schedule watch state repair: %s", error)
+
+    def _schedule_podcast_website_backfill_reconcile(self):
+        """Queue the podcast website backfill gate for a worker to evaluate.
+
+        Shows and episodes tracked before podcast website links existed have a
+        blank website_url that would otherwise only fill in when someone opens
+        the show or re-runs a provider import (issue #1014). The worker-side
+        ensure task owns the durable state gate, so no DB query happens here in
+        ready(), which runs pre-fork in the Gunicorn master under preload_app.
+        """
+        try:
+            from app.tasks_podcast import (
+                PODCAST_WEBSITE_BACKFILL_VERSION,
+                ensure_podcast_website_backfill_reconcile,
+            )
+
+            if not self._add_startup_cache_key(
+                f"podcast_website_reconcile_startup_v{PODCAST_WEBSITE_BACKFILL_VERSION}",
+                timeout=3600,
+            ):
+                return
+
+            ensure_podcast_website_backfill_reconcile.apply_async(
+                kwargs={"strategy_version": PODCAST_WEBSITE_BACKFILL_VERSION},
+                countdown=STARTUP_SWEEP_COUNTDOWNS["podcast_website"],
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
+            )
+            logger.info(
+                "Scheduled podcast website backfill reconcile (version=%s)",
+                PODCAST_WEBSITE_BACKFILL_VERSION,
+            )
+        except Exception as error:
+            logger.warning(
+                "Failed to schedule podcast website backfill reconcile: %s", error
+            )
+
+    def _schedule_provider_backfill_reconcile(self):
+        """Queue the watch-provider reconcile gate for a worker to evaluate.
+
+        Items tracked before watch-provider data was persisted have no
+        streaming-service info until their detail page happens to be visited
+        or the periodic beat sweep reaches them; this kicks a reconcile pass
+        off immediately so the new filter isn't empty until then.
+        """
+        try:
+            from app.tasks_providers import (
+                WATCH_PROVIDERS_BACKFILL_VERSION,
+                ensure_provider_backfill_reconcile,
+            )
+
+            version = WATCH_PROVIDERS_BACKFILL_VERSION
+            if not self._add_startup_cache_key(
+                f"provider_reconcile_startup_v{version}",
+                timeout=3600,
+            ):
+                return
+
+            # The worker-side ensure task owns the durable state gate. Keeping
+            # that DB query out of ready() avoids checking out a pool
+            # connection during process startup.
+            ensure_provider_backfill_reconcile.apply_async(
+                kwargs={"strategy_version": version},
+                countdown=STARTUP_SWEEP_COUNTDOWNS["provider"],
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
+            )
+
+            logger.info(
+                "Scheduled watch provider backfill reconcile (version=%s)",
+                version,
+            )
+        except Exception as error:
+            logger.warning(
+                "Failed to schedule watch provider backfill reconcile: %s", error
+            )
+
+    def _schedule_external_ids_backfill_reconcile(self):
+        """Queue the external-ID reconcile gate for a worker to evaluate.
+
+        Movies tracked while tmdb.movie() discarded the IMDb ID TMDB returned
+        have no imdb_id in provider_external_ids, so they are invisible to the
+        Stremio catalog and IMDb rating sync until something refetches them.
+        Nothing refetches them on its own, so this kicks the catch-up sweep off
+        rather than leaving every existing library to a terminal command
+        (issue #1066).
+        """
+        try:
+            from app.tasks_external_ids import (
+                EXTERNAL_IDS_BACKFILL_VERSION,
+                ensure_external_ids_backfill_reconcile,
+            )
+
+            version = EXTERNAL_IDS_BACKFILL_VERSION
+            if not self._add_startup_cache_key(
+                f"external_ids_reconcile_startup_v{version}",
+                timeout=3600,
+            ):
+                return
+
+            # The worker-side ensure task owns the durable state gate. Keeping
+            # that DB query out of ready() avoids checking out a pool
+            # connection during process startup.
+            ensure_external_ids_backfill_reconcile.apply_async(
+                kwargs={"strategy_version": version},
+                countdown=STARTUP_SWEEP_COUNTDOWNS["external_ids"],
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
+            )
+
+            logger.info(
+                "Scheduled external ID backfill reconcile (version=%s)",
+                version,
+            )
+        except Exception as error:
+            logger.warning(
+                "Failed to schedule external ID backfill reconcile: %s", error
+            )
+
+    def _schedule_game_groups_backfill_reconcile(self):
+        """Schedule a one-time IGDB franchise/collection backfill for games.
+
+        Games tracked before catalog grouping was stored have blank franchise
+        and collection fields, so the new Games Group By view would show them
+        all as Ungrouped until each detail page happened to be visited. Runs
+        once per strategy version.
+        """
+        try:
+            from app.tasks_game_groups import (
+                GAME_GROUPS_BACKFILL_VERSION,
+                reconcile_game_groups_backfill,
+                reopen_unconfigured_game_groups,
+            )
+
+            reopen_unconfigured_game_groups()
+            version_key = f"game_groups_backfilled_v{GAME_GROUPS_BACKFILL_VERSION}"
+            status = cache.get(version_key)
+
+            if status in {"done", "pending"}:
+                return
+
+            if not cache.add(
+                version_key,
+                "pending",
+                timeout=STARTUP_SWEEP_COUNTDOWNS["game_groups"] + 300,
+            ):
+                return
+
+            try:
+                reconcile_game_groups_backfill.apply_async(
+                    kwargs={"strategy_version": GAME_GROUPS_BACKFILL_VERSION},
+                    countdown=STARTUP_SWEEP_COUNTDOWNS["game_groups"],
+                    priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
+                )
+            except Exception:
+                cache.delete(version_key)
+                raise
+
+            logger.info(
+                "Scheduled game groups backfill reconcile (version=%s)",
+                GAME_GROUPS_BACKFILL_VERSION,
+            )
+        except Exception as error:
+            logger.warning(
+                "Failed to schedule game groups backfill reconcile: %s", error
+            )
 
     def _schedule_trakt_popularity_reconcile(self):
         """Schedule Trakt popularity reconciliation on startup.
@@ -260,18 +536,17 @@ class AppConfig(AppConfig):
         queued so a broker hiccup at startup never silently blocks future restarts.
         """
         try:
-            from app.services.trakt_popularity import (  # noqa: PLC0415
+            from app.services.trakt_popularity import (
                 TRAKT_POPULARITY_SCORE_VERSION,
             )
 
             version_key = (
-                "trakt_popularity_reconciled_"
-                f"v{TRAKT_POPULARITY_SCORE_VERSION}"
+                f"trakt_popularity_reconciled_v{TRAKT_POPULARITY_SCORE_VERSION}"
             )
             daily_key = "trakt_popularity_reconcile_daily"
 
-            version_status = cache.get(version_key)   # None | "pending" | "done"
-            daily_status = cache.get(daily_key)        # None | 1
+            version_status = cache.get(version_key)  # None | "pending" | "done"
+            daily_status = cache.get(daily_key)  # None | 1
 
             version_done = version_status == "done"
             version_pending = version_status == "pending"
@@ -287,8 +562,8 @@ class AppConfig(AppConfig):
             tasks = import_module("app.tasks")
             tasks.reconcile_trakt_popularity.apply_async(
                 kwargs={"score_version": TRAKT_POPULARITY_SCORE_VERSION},
-                countdown=0 if is_version_recompute else 30,
-                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 1),
+                countdown=STARTUP_SWEEP_COUNTDOWNS["trakt_popularity"],
+                priority=getattr(settings, "CELERY_TASK_PRIORITY_BACKGROUND", 9),
             )
 
             # Set keys only after successful queue so a failed apply_async
@@ -301,5 +576,5 @@ class AppConfig(AppConfig):
                 "Scheduled Trakt popularity reconcile (version_trigger=%s)",
                 is_version_recompute,
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("Failed to schedule Trakt popularity reconcile: %s", error)

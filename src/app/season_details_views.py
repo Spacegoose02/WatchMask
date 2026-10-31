@@ -1,18 +1,23 @@
 import json
 import logging
 import time
+from datetime import datetime
 
 from django.conf import settings
 from django.contrib.auth.decorators import login_not_required
-from django.db import IntegrityError, transaction
+from django.db.models import Case, DateTimeField, Value, When
+from django.http import HttpResponse
 from django.shortcuts import render
+from django.template.loader import render_to_string
 from django.utils import timezone
 from django.views.decorators.http import require_GET
 
+from app import carousel as carousel_media
 from app import config, helpers
 from app.activity_builders import (
     _normalize_detail_episode_actions,
     _paginate_detail_episodes,
+    attach_unwatched_ratings,
 )
 from app.detail_builders import (
     _build_detail_link_sections,
@@ -21,6 +26,7 @@ from app.detail_builders import (
     _build_series_graph_from_raw,
     _build_trakt_popularity_context,
 )
+from app.detail_related import drop_recommendations_if_hidden
 from app.log_safety import exception_summary
 from app.metadata_sync_views import (
     _build_local_tv_with_seasons_metadata,
@@ -47,40 +53,91 @@ from app.tag_views import (
     _resolve_detail_tag_genres,
 )
 from app.view_constants import (
+    DETAIL_CAROUSEL_FRAGMENT,
     DETAIL_SECONDARY_FRAGMENT,
     LOCAL_ONLY_MISSING_SEASON_BANNER,
 )
-from lists.models import CustomList
+from lists.views_helpers import get_public_list_for_item
 
 logger = logging.getLogger(__name__)
+
+MIN_PLAUSIBLE_YEAR = 1900
+UNKNOWN_RELEASE_YEAR = 9999
 
 
 @login_not_required
 @require_GET
 def season_details(
-    request, source, media_id, title, season_number, parent_media_type=None,
+    request,
+    source,
+    media_id,
+    title,
+    season_number,
+    parent_media_type=None,
 ):
     """Return the details page for a season."""
+    if request.GET.get("fragment") == DETAIL_CAROUSEL_FRAGMENT:
+        # .strip() matters: an empty carousel must render as a truly empty
+        # string, not whitespace, so input.css's #detail-carousel-wrap:not(:empty)
+        # rule (a whitespace-only text node still counts as a child for :empty)
+        # correctly falls back to the non-carousel layout.
+        html = render_to_string(
+            "app/components/detail_carousel_fragment.html",
+            {
+                "carousel": carousel_media.resolve_carousel_media(
+                    MediaTypes.SEASON.value,
+                    source,
+                    media_id,
+                    season_number=season_number,
+                ),
+            },
+            request=request,
+        ).strip()
+        return HttpResponse(html)
+
     detail_view_started_at = time.perf_counter()
+    carousel_supported = carousel_media.carousel_supported(
+        MediaTypes.SEASON.value, source
+    ) and not carousel_media.confirmed_empty(
+        MediaTypes.SEASON.value,
+        source,
+        media_id,
+        season_number=season_number,
+    )
     render_secondary_only = request.GET.get("fragment") == DETAIL_SECONDARY_FRAGMENT
+    initial_carousel = (
+        carousel_media.resolve_carousel_media(
+            MediaTypes.SEASON.value,
+            source,
+            media_id,
+            season_number=season_number,
+            cached_only=True,
+        )
+        if carousel_supported and not render_secondary_only
+        else None
+    )
     defer_detail_secondary = not render_secondary_only
     detail_return_url = _detail_request_url(request)
+    detail_carousel_fragment_url = (
+        _detail_request_url(request, fragment=DETAIL_CAROUSEL_FRAGMENT)
+        if carousel_supported
+        else None
+    )
     detail_secondary_fragment_url = _detail_request_url(
         request,
         fragment=DETAIL_SECONDARY_FRAGMENT,
     )
 
-    # Treat all anonymous views as public (no user-specific data/actions)
+    # Anonymous views and explicit public-list links are public (no user-specific
+    # data/actions), while only a validated list reference can expose owner notes.
     is_anonymous = not request.user.is_authenticated
-    public_view = is_anonymous
-    public_list_view = request.GET.get("public_view") == "1" and is_anonymous
+    public_list_view = request.GET.get("public_view") == "1"
+    public_view = is_anonymous or public_list_view
 
     # Scope all Season Item / tracking lookups to the correct library type so that
     # anime seasons and TV seasons are fully independent.
     season_library_media_type = (
-        MediaTypes.ANIME.value
-        if parent_media_type == MediaTypes.ANIME.value
-        else None
+        MediaTypes.ANIME.value if parent_media_type == MediaTypes.ANIME.value else None
     )
 
     def _scoped_season_item_qs():
@@ -99,17 +156,19 @@ def season_details(
 
     # For public views, find a public list containing this item to get the owner
     list_owner = None
+    public_notes_view = False
     if public_list_view:
         try:
             item = _scoped_season_item_qs().first()
             if item:
-                public_list = CustomList.objects.filter(
-                    visibility="public",
-                    items=item,
-                ).select_related("owner").first()
+                public_list = get_public_list_for_item(
+                    request.GET.get("public_list"),
+                    item,
+                )
                 if public_list:
                     list_owner = public_list.owner
-        except Exception:
+                    public_notes_view = public_list.include_notes
+        except Exception:  # noqa: S110  # deliberate best-effort; failure is non-fatal here
             # If we can't find a list owner, list_owner stays None
             pass
 
@@ -127,44 +186,71 @@ def season_details(
         user_medias = []
         current_instance = None
     else:
-        if season_item_is_local_only:
-            season_qs = Season.objects.filter(
-                item__media_id=media_id,
-                item__media_type=MediaTypes.SEASON.value,
-                item__source=source,
-                item__season_number=season_number,
-                user=request.user,
-            )
-            if season_library_media_type:
-                season_qs = season_qs.filter(
-                    item__library_media_type=season_library_media_type,
-                )
-            else:
-                season_qs = season_qs.exclude(
-                    item__library_media_type=MediaTypes.ANIME.value,
-                )
+        # Resolve the tracked season across identity buckets (see #623): a
+        # season tracked via the show's TV identity must still be found from
+        # the anime-identity route, and vice versa, so read and write agree.
+        preferred_library_media_type = (
+            season_library_media_type or MediaTypes.SEASON.value
+        )
+        tracked_season = metadata_resolution.find_tracked_season(
+            request.user,
+            media_id,
+            source,
+            season_number,
+            library_media_type=preferred_library_media_type,
+        )
+        if tracked_season is None:
+            user_medias = []
+        elif season_item_is_local_only:
             user_medias = list(
-                season_qs.select_related("item", "related_tv", "related_tv__item")
+                Season.objects.filter(pk=tracked_season.pk)
+                .select_related("item", "related_tv", "related_tv__item")
                 .prefetch_related("episodes", "episodes__item")
             )
         else:
-            user_medias = BasicMedia.objects.filter_media_prefetch(
-                request.user,
+            user_medias = list(
+                BasicMedia.objects.filter_media_prefetch(
+                    request.user,
+                    media_id,
+                    MediaTypes.SEASON.value,
+                    source,
+                    season_number=season_number,
+                    library_media_type=tracked_season.item.library_media_type,
+                )
+            )
+        current_instance = user_medias[0] if user_medias else None
+
+    notes_entry = None
+    if render_secondary_only and not public_view and user_medias:
+        notes_entry = next(
+            (
+                entry
+                for entry in user_medias
+                if entry.notes and entry.notes.strip()
+            ),
+            None,
+        )
+    elif render_secondary_only and public_notes_view and list_owner:
+        public_user_medias = list(
+            BasicMedia.objects.filter_media_prefetch(
+                list_owner,
                 media_id,
                 MediaTypes.SEASON.value,
                 source,
                 season_number=season_number,
-            )
-            if season_library_media_type:
-                user_medias = user_medias.filter(
-                    item__library_media_type=season_library_media_type,
-                )
-            else:
-                user_medias = user_medias.exclude(
-                    item__library_media_type=MediaTypes.ANIME.value,
-                )
-            user_medias = list(user_medias)
-        current_instance = user_medias[0] if user_medias else None
+                library_media_type=(
+                    season_item.library_media_type if season_item else None
+                ),
+            ),
+        )
+        notes_entry = next(
+            (
+                entry
+                for entry in public_user_medias
+                if entry.notes and entry.notes.strip()
+            ),
+            None,
+        )
 
     episodes_in_db = current_instance.episodes.all() if current_instance else []
     if season_item_is_local_only:
@@ -185,12 +271,16 @@ def season_details(
         )
         season_metadata_missing = True
     else:
-        tv_with_seasons_metadata = services.get_media_metadata(
-            "tv_with_seasons",
-            media_id,
-            source,
-            [season_number],
-        )
+        with services.interactive_request_scope():
+            tv_with_seasons_metadata = services.get_media_metadata(
+                "tv_with_seasons",
+                media_id,
+                source,
+                [season_number],
+                language=metadata_resolution.metadata_language_default(
+                    request.user, show_item
+                ),
+            )
         season_metadata = tv_with_seasons_metadata.get(season_key)
         season_metadata_missing = season_metadata is None
         if season_metadata_missing:
@@ -217,7 +307,7 @@ def season_details(
                 current_instance.item,
                 season_metadata.get("image"),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "Skipping season image refresh for %s due to error",
                 request.path,
@@ -313,7 +403,8 @@ def season_details(
     # season_metadata["episodes"] with processed data that drops vote_average/score.
     _raw_graph_episodes = (
         list(season_metadata.get("episodes") or [])
-        if not season_metadata_missing and source in {Sources.TMDB.value, Sources.TVDB.value}
+        if not season_metadata_missing
+        and source in {Sources.TMDB.value, Sources.TVDB.value}
         else []
     )
 
@@ -325,67 +416,135 @@ def season_details(
         and source != Sources.MANUAL.value
         and season_metadata.get("episodes")
     ):
-        from datetime import datetime
-
         raw_episodes = season_metadata["episodes"]
         current_datetime = timezone.now()
         episodes_to_update = []
+        release_datetime_updates = []
+        episode_library_media_type = (
+            parent_media_type
+            if parent_media_type == MediaTypes.ANIME.value
+            else MediaTypes.EPISODE.value
+        )
 
+        # Parse every episode's air date up front and resolve/create the
+        # backing Item rows in bulk (one SELECT + at most one bulk_create),
+        # instead of one get_or_create() per episode. A per-episode
+        # get_or_create() fires an independent Item post_save signal
+        # (schedule_runtime_backfill_on_item_save) on every INSERT, and that
+        # signal re-runs several season-scoped DB queries (backfill-state
+        # cleanup, episode-runtime-backfill eligibility, cache-invalidation
+        # tracking-user lookup) that are identical for every episode in the
+        # same season — an N+1 that only shows up on a season's first view,
+        # when every episode is being created for the first time.
+        from events.calendar.helpers import date_parser
+        from events.models import is_released_datetime
+
+        parsed_episodes = []
+        episode_numbers = []
         for episode in raw_episodes:
             episode_number = episode.get("episode_number")
             if episode_number is None:
                 continue
 
-            # Get or create episode item — retry on race condition
-            lookup = dict(
-                media_id=media_id,
-                source=source,
-                media_type=MediaTypes.EPISODE.value,
-                library_media_type=parent_media_type if parent_media_type == MediaTypes.ANIME.value else MediaTypes.EPISODE.value,
-                season_number=season_number,
-                episode_number=episode_number,
+            # Parse the episode's air date once — reused below both for the
+            # "aired but runtime unknown" heuristic and to persist
+            # release_datetime. Without this, release_datetime is never set
+            # for any episode the user hasn't individually tracked/watched
+            # (that's the only other code path that extracts it), so an
+            # episode created here from a page view stays permanently NULL
+            # even once the provider does have its air date.
+            raw_air_date = episode.get("air_date")
+            # Episode provider dates are calendar dates, even when a provider
+            # has already wrapped one in a datetime. Persist the unknown-time
+            # sentinel so a shared Item does not depend on the timezone of the
+            # first viewer, and release state treats it as an all-day date.
+            normalized_air_date = (
+                raw_air_date.date()
+                if isinstance(raw_air_date, datetime)
+                else raw_air_date
             )
             try:
-                with transaction.atomic():
-                    episode_item, _ = Item.objects.get_or_create(
-                        **lookup,
-                        defaults={
-                            "title": season_metadata.get("title", ""),
-                            "image": settings.IMG_NONE,
-                        },
+                air_date_dt = (
+                    date_parser(normalized_air_date) if normalized_air_date else None
+                )
+            except (ValueError, TypeError):
+                air_date_dt = None
+            if air_date_dt and (
+                air_date_dt.year <= MIN_PLAUSIBLE_YEAR
+                or air_date_dt.year == UNKNOWN_RELEASE_YEAR
+            ):
+                air_date_dt = None
+
+            parsed_episodes.append((episode, episode_number, air_date_dt))
+            episode_numbers.append(episode_number)
+
+        def _fetch_episode_items(numbers):
+            return {
+                item.episode_number: item
+                for item in Item.objects.filter(
+                    media_id=media_id,
+                    source=source,
+                    media_type=MediaTypes.EPISODE.value,
+                    library_media_type=episode_library_media_type,
+                    season_number=season_number,
+                    episode_number__in=numbers,
+                )
+            }
+
+        episode_items_by_number = (
+            _fetch_episode_items(episode_numbers) if episode_numbers else {}
+        )
+
+        missing_numbers = [
+            number
+            for number in episode_numbers
+            if number not in episode_items_by_number
+        ]
+        created_any_episode = False
+        if missing_numbers:
+            air_date_by_number = {
+                number: air_date_dt
+                for _episode, number, air_date_dt in parsed_episodes
+            }
+            Item.objects.bulk_create(
+                [
+                    Item(
+                        media_id=media_id,
+                        source=source,
+                        media_type=MediaTypes.EPISODE.value,
+                        library_media_type=episode_library_media_type,
+                        season_number=season_number,
+                        episode_number=number,
+                        title=season_metadata.get("title", ""),
+                        image=settings.IMG_NONE,
+                        release_datetime=air_date_by_number.get(number),
                     )
-            except IntegrityError:
-                episode_item = Item.objects.get(**lookup)
+                    for number in missing_numbers
+                ],
+                ignore_conflicts=True,
+            )
+            # Re-fetch rather than trust the objects we just built: this picks
+            # up both our own new rows and any row a concurrent request won
+            # the race to create (ignore_conflicts silently drops ours then).
+            episode_items_by_number.update(_fetch_episode_items(missing_numbers))
+            created_any_episode = True
+
+        for episode, episode_number, air_date_dt in parsed_episodes:
+            episode_item = episode_items_by_number.get(episode_number)
+            if episode_item is None:
+                # Defensive: should always be populated by the bulk fetch/create
+                # above, but don't let a race or provider oddity crash the page.
+                continue
 
             # Extract runtime from raw episode data (TMDB returns integer minutes)
             runtime_minutes = None
             if episode.get("runtime") is not None:
                 runtime_minutes = (
-                    int(episode["runtime"])
-                    if episode["runtime"] > 0
-                    else None
+                    int(episode["runtime"]) if episode["runtime"] > 0 else None
                 )
-            elif episode.get("air_date"):
-                # Check if episode has aired
-                try:
-                    if isinstance(episode["air_date"], str):
-                        date_obj = datetime.strptime(episode["air_date"], "%Y-%m-%d")
-                        air_date_dt = timezone.make_aware(
-                            date_obj,
-                            timezone.get_current_timezone(),
-                        )
-                    else:
-                        air_date_dt = episode["air_date"]
-
-                    if (
-                        air_date_dt
-                        and air_date_dt.year > 1900
-                        and air_date_dt <= current_datetime
-                    ):
-                        # Episode has aired but no runtime - mark as unknown (use 999998)
-                        runtime_minutes = 999998
-                except (ValueError, TypeError):
-                    pass
+            elif air_date_dt and is_released_datetime(air_date_dt, current_datetime):
+                # Episode has aired but no runtime - mark as unknown (use 999998)
+                runtime_minutes = 999998
 
             # Extract provider rating from raw episode data (already in memory, no extra API call)
             score = None
@@ -406,12 +565,21 @@ def season_details(
                 episode_item.provider_rating != score
                 or episode_item.provider_rating_count != score_count
             )
+            # Only fill in a missing date, never overwrite one that's already
+            # set — this lets an episode created before its air date was
+            # known self-heal the next time anyone views the season page,
+            # without a dedicated backfill task.
+            release_datetime_changed = (
+                air_date_dt is not None and episode_item.release_datetime is None
+            )
 
             if runtime_changed:
                 episode_item.runtime_minutes = runtime_minutes
             if rating_changed:
                 episode_item.provider_rating = score
                 episode_item.provider_rating_count = score_count
+            if release_datetime_changed:
+                release_datetime_updates.append((episode_item.pk, air_date_dt))
 
             if runtime_changed or rating_changed:
                 episodes_to_update.append(episode_item)
@@ -419,28 +587,68 @@ def season_details(
         if episodes_to_update:
             Item.objects.bulk_update(
                 episodes_to_update,
-                ["runtime_minutes", "provider_rating", "provider_rating_count"],
+                [
+                    "runtime_minutes",
+                    "provider_rating",
+                    "provider_rating_count",
+                ],
                 batch_size=100,
             )
+
+        for batch_start in range(0, len(release_datetime_updates), 100):
+            release_datetime_batch = release_datetime_updates[
+                batch_start : batch_start + 100
+            ]
+            Item.objects.filter(
+                pk__in=[item_id for item_id, _ in release_datetime_batch],
+                release_datetime__isnull=True,
+            ).update(
+                release_datetime=Case(
+                    *(
+                        When(pk=item_id, then=Value(release_datetime))
+                        for item_id, release_datetime in release_datetime_batch
+                    ),
+                    output_field=DateTimeField(),
+                ),
+            )
+
+        if episodes_to_update or release_datetime_updates:
             # Invalidate time_left + media_list cache for all users
             from app.cache_utils import (
                 clear_media_list_cache_for_user,
                 clear_time_left_cache_for_user,
             )
+
             # Get all users who track this show
-            tracking_users = BasicMedia.objects.filter(
-                item__media_id=media_id,
-                item__source=source,
-                item__media_type__in=[MediaTypes.TV.value, MediaTypes.SEASON.value],
-            ).values_list("user_id", flat=True).distinct()
+            tracking_users = (
+                BasicMedia.objects.filter(
+                    item__media_id=media_id,
+                    item__source=source,
+                    item__media_type__in=[MediaTypes.TV.value, MediaTypes.SEASON.value],
+                )
+                .values_list("user_id", flat=True)
+                .distinct()
+            )
             for user_id in tracking_users:
                 clear_time_left_cache_for_user(user_id)
                 clear_media_list_cache_for_user(user_id)
 
+        # bulk_create() above doesn't fire Item's post_save signal, so
+        # explicitly (and only once for the whole season, not once per
+        # episode) request the same episode-runtime-backfill eligibility
+        # check that schedule_runtime_backfill_on_item_save would otherwise
+        # have queued redundantly for every newly created episode.
+        if created_any_episode and not settings.TESTING:
+            from app.tasks_runtime import enqueue_episode_runtime_backfill
+
+            enqueue_episode_runtime_backfill([(media_id, source, season_number)])
+
         # Trigger background Trakt episode ratings fetch if not yet populated
-        from app.providers import trakt as _trakt_provider  # noqa: PLC0415
+        from app.providers import trakt as _trakt_provider
+
         if (
-            source in {Sources.TMDB.value, Sources.TVDB.value}
+            not public_view
+            and source in {Sources.TMDB.value, Sources.TVDB.value}
             and _trakt_provider.is_configured()
             and Item.objects.filter(
                 media_id=media_id,
@@ -451,8 +659,9 @@ def season_details(
             ).exists()
         ):
             from app.tasks_trakt import (
-                populate_trakt_episode_ratings_for_season,  # noqa: PLC0415
+                populate_trakt_episode_ratings_for_season,
             )
+
             populate_trakt_episode_ratings_for_season.delay(
                 str(media_id), source, season_number
             )
@@ -462,11 +671,13 @@ def season_details(
             season_metadata["episodes"] = manual.process_episodes(
                 season_metadata,
                 episodes_in_db,
+                season=current_instance,
             )
         else:
             season_metadata["episodes"] = tmdb.process_episodes(
                 season_metadata,
                 episodes_in_db,
+                season=current_instance,
             )
 
     if (
@@ -495,8 +706,7 @@ def season_details(
 
         # Get all episode items for this season
         episode_numbers = [
-            ep.get("episode_number")
-            for ep in season_metadata["episodes"]
+            ep.get("episode_number") for ep in season_metadata["episodes"]
         ]
         episode_items = ItemModel.objects.filter(
             media_id=media_id,
@@ -513,8 +723,7 @@ def season_details(
             if item.episode_number is not None
         }
         episode_item_ids = [
-            item_by_episode_number[ep_num].id
-            for ep_num in item_by_episode_number
+            item_by_episode_number[ep_num].id for ep_num in item_by_episode_number
         ]
         collection_entries = {}
         if episode_item_ids:
@@ -541,6 +750,8 @@ def season_details(
             if db_item is not None and db_item.release_datetime is not None:
                 episode["air_date"] = db_item.release_datetime
 
+    drop_recommendations_if_hidden(request, season_metadata)
+
     # Enrich related items with user tracking data
     # For public views, use list owner's data if available
     if render_secondary_only and season_metadata.get("related"):
@@ -555,7 +766,9 @@ def season_details(
                     )
                 )
 
-    if current_instance and hasattr(current_instance, "derived_status_from_episode_progress"):
+    if current_instance and hasattr(
+        current_instance, "derived_status_from_episode_progress"
+    ):
         season_max_progress = (
             season_metadata.get("max_progress")
             if isinstance(season_metadata, dict)
@@ -567,13 +780,10 @@ def season_details(
         # Only auto-promote to Completed if the user hasn't manually overridden
         # to In Progress (rewatch scenario). PAUSED/DROPPED are already guarded
         # inside derived_status_from_episode_progress.
-        if (
-            derived == Status.COMPLETED.value
-            and current_instance.status not in {
-                Status.COMPLETED.value,
-                Status.IN_PROGRESS.value,
-            }
-        ):
+        if derived == Status.COMPLETED.value and current_instance.status not in {
+            Status.COMPLETED.value,
+            Status.IN_PROGRESS.value,
+        }:
             current_instance.promote_to_completed_if_fully_watched(
                 max_progress=season_max_progress,
             )
@@ -616,91 +826,147 @@ def season_details(
         # season_item is already scoped by library_media_type at the top of this view
         try:
             if season_item is None:
-                raise ItemModel.DoesNotExist
+                raise ItemModel.DoesNotExist  # noqa: TRY301  # raised for the surrounding handler by design
 
             # Check if the show has collection data, and trigger background fetch if not
             # We check the show item (not season) because episode collection data is tied to the show
             try:
-                # Use parent_media_type to pick the correct show Item (anime vs TV)
-                # so we don't hit MultipleObjectsReturned when both exist.
-                show_media_type = (
-                    MediaTypes.ANIME.value
-                    if parent_media_type == MediaTypes.ANIME.value
-                    else MediaTypes.TV.value
-                )
-                show_item = ItemModel.objects.get(
-                    media_id=media_id,
-                    source=source,
-                    media_type=show_media_type,
-                )
-                show_collection_entry = get_item_collection_entries(request.user, show_item).first()
+                if current_instance is not None:
+                    # A tracked season owns its parent identity, even when the
+                    # route resolves it from a different library bucket.
+                    show_item = current_instance.related_tv.item
+                else:
+                    show_library_media_type = (
+                        MediaTypes.ANIME.value
+                        if parent_media_type == MediaTypes.ANIME.value
+                        else MediaTypes.TV.value
+                    )
+                    show_items = ItemModel.objects.filter(
+                        media_id=media_id,
+                        source=source,
+                        library_media_type=show_library_media_type,
+                        season_number__isnull=True,
+                        episode_number__isnull=True,
+                    )
+                    # Grouped anime uses TV identities; older anime identities
+                    # can still supply collection data when no TV item exists.
+                    show_item = show_items.filter(
+                        media_type=MediaTypes.TV.value
+                    ).first()
+                    if (
+                        show_item is None
+                        and show_library_media_type == MediaTypes.ANIME.value
+                    ):
+                        show_item = show_items.filter(
+                            media_type=MediaTypes.ANIME.value
+                        ).first()
+                    if show_item is None:
+                        raise ItemModel.DoesNotExist  # noqa: TRY301 - skip auto-fetch when no scoped show exists
+                show_collection_entry = get_item_collection_entries(
+                    request.user, show_item
+                ).first()
 
-                logger.info("Season page: Checking show %s (item_id=%s) - collection entry exists: %s",
-                           show_item.title, show_item.id, show_collection_entry is not None)
+                logger.info(
+                    "Season page: Checking show %s (item_id=%s) - collection entry exists: %s",
+                    show_item.title,
+                    show_item.id,
+                    show_collection_entry is not None,
+                )
 
                 # If no collection entry exists for the show and auto-fetch is supported, trigger background fetch
-                if not show_collection_entry and config.supports_collection_auto_fetch(show_item.media_type):
+                if not show_collection_entry and config.supports_collection_auto_fetch(
+                    show_item.media_type
+                ):
                     plex_account = getattr(request.user, "plex_account", None)
                     if plex_account and plex_account.plex_token:
                         try:
                             from integrations.tasks import (
                                 fetch_collection_metadata_for_item,
                             )
+
                             # Trigger background task to fetch collection data for the show
                             result = fetch_collection_metadata_for_item.delay(
                                 user_id=request.user.id,
                                 item_id=show_item.id,
                                 lookup_policy="cached_only",
                             )
-                            logger.info("Triggered background collection fetch for show %s - %s (item_id=%s) from season page (task_id=%s)",
-                                       request.user.username, show_item.title, show_item.id, result.id if result else "None")
+                            logger.info(
+                                "Triggered background collection fetch for show %s - %s (item_id=%s) from season page (task_id=%s)",
+                                request.user.username,
+                                show_item.title,
+                                show_item.id,
+                                result.id if result else "None",
+                            )
                             # TODO(issue-166): Re-enable a user-facing collection-fetching banner only
                             # after the background task reliably self-resolves for empty collections;
                             # remove this reminder once that task/UX overhaul is complete.
                             fetching_collection_data = True
                             item_id_for_polling = show_item.id
-                        except Exception as task_exc:
-                            logger.error("Failed to trigger background collection fetch for show %s - %s: %s",
-                                        request.user.username, show_item.title, task_exc, exc_info=True)
+                        except Exception:
+                            logger.exception(
+                                "Failed to trigger background collection fetch for show %s - %s",
+                                request.user.username,
+                                show_item.title,
+                            )
                     else:
-                        logger.info("Season page: User %s does not have Plex connected, skipping background fetch", request.user.username)
+                        logger.info(
+                            "Season page: User %s does not have Plex connected, skipping background fetch",
+                            request.user.username,
+                        )
             except ItemModel.DoesNotExist:
                 # Show item doesn't exist yet, skip background fetch
-                logger.debug("Season page: Show item not found for media_id=%s, source=%s", media_id, source)
+                logger.debug(
+                    "Season page: Show item not found for media_id=%s, source=%s",
+                    media_id,
+                    source,
+                )
             except Exception as exc:
-                logger.error("Error checking show collection entry in season_details: %s", exception_summary(exc), exc_info=True)
+                logger.exception(
+                    "Error checking show collection entry in season_details: %s",
+                    exception_summary(exc),  # noqa: TRY401  # exception_summary() is the project's sanitised rendering
+                )
 
             # Get collection entry for the season item itself (if it exists)
-            collection_entries = list(get_item_collection_entries(request.user, season_item))
-            season_collection_entry = collection_entries[0] if collection_entries else None
+            collection_entries = list(
+                get_item_collection_entries(request.user, season_item)
+            )
+            season_collection_entry = (
+                collection_entries[0] if collection_entries else None
+            )
 
             # Get aggregated collection metadata from episodes (or season/show-level entry)
-            season_collection_metadata = get_season_collection_metadata(request.user, season_item)
+            season_collection_metadata = get_season_collection_metadata(
+                request.user, season_item
+            )
 
             # Use season-level entry if it exists, otherwise use aggregated metadata
             if season_collection_entry:
                 collection_entry = season_collection_entry
             elif season_collection_metadata:
                 # Check if aggregated metadata has any actual values
-                has_metadata = any([
-                    season_collection_metadata.get("resolution"),
-                    season_collection_metadata.get("hdr"),
-                    season_collection_metadata.get("audio_codec"),
-                    season_collection_metadata.get("audio_channels"),
-                    season_collection_metadata.get("bitrate"),
-                    season_collection_metadata.get("media_type"),
-                    season_collection_metadata.get("is_3d"),
-                ])
+                has_metadata = any(
+                    [
+                        season_collection_metadata.get("resolution"),
+                        season_collection_metadata.get("hdr"),
+                        season_collection_metadata.get("audio_codec"),
+                        season_collection_metadata.get("audio_channels"),
+                        season_collection_metadata.get("bitrate"),
+                        season_collection_metadata.get("media_type"),
+                        season_collection_metadata.get("is_3d"),
+                    ]
+                )
 
                 if has_metadata:
                     # Create a mock collection entry object from aggregated metadata
                     # This allows the template to access fields like collection_entry.resolution
                     from types import SimpleNamespace
+
                     collection_entry = SimpleNamespace(
                         resolution=season_collection_metadata.get("resolution") or "",
                         hdr=season_collection_metadata.get("hdr") or "",
                         audio_codec=season_collection_metadata.get("audio_codec") or "",
-                        audio_channels=season_collection_metadata.get("audio_channels") or "",
+                        audio_channels=season_collection_metadata.get("audio_channels")
+                        or "",
                         bitrate=season_collection_metadata.get("bitrate"),
                         media_type=season_collection_metadata.get("media_type") or "",
                         is_3d=season_collection_metadata.get("is_3d", False),
@@ -708,7 +974,9 @@ def season_details(
                     )
 
             # Get collection stats for this season (episodes)
-            season_collection_stats = get_season_collection_stats(request.user, season_item)
+            season_collection_stats = get_season_collection_stats(
+                request.user, season_item
+            )
         except ItemModel.DoesNotExist:
             pass
 
@@ -748,13 +1016,22 @@ def season_details(
         season_metadata["episodes"] = _normalize_detail_episode_actions(
             season_metadata["episodes"],
         )
+        attach_unwatched_ratings(
+            season_metadata["episodes"],
+            request.user,
+            season_metadata,
+        )
         season_metadata["episodes"], episode_load_more = _paginate_detail_episodes(
             request,
             season_metadata["episodes"],
         )
 
     # Resolve parent media type: anime URL kwarg takes priority, else detect via DB
-    if parent_media_type is None and anime_show_item and getattr(request.user, "anime_enabled", False):
+    if (
+        parent_media_type is None
+        and anime_show_item
+        and getattr(request.user, "anime_enabled", False)
+    ):
         parent_media_type = MediaTypes.ANIME.value
     if parent_media_type is None:
         parent_media_type = MediaTypes.TV.value
@@ -764,10 +1041,14 @@ def season_details(
         "media": season_metadata,
         "tv": tv_with_seasons_metadata,
         "media_type": MediaTypes.SEASON.value,
+        "season_number": season_number,
         "parent_media_type": parent_media_type,
         "user_medias": user_medias,
         "current_instance": current_instance,
         "public_view": public_view,
+        "public_notes_view": public_notes_view,
+        "show_notes": not public_view or public_notes_view,
+        "notes_entry": notes_entry,
         "collection_entry": collection_entry,
         "collection_entries": collection_entries,
         "collection_stats": season_collection_stats,
@@ -778,9 +1059,16 @@ def season_details(
         "item_id_for_polling": item_id_for_polling if not public_view else None,
         "trakt_score": trakt_score,
         "watch_providers": tmdb.filter_providers(
-            season_metadata.get("providers"), request.user.watch_provider_region
+            season_metadata.get("providers"),
+            request.user.watch_provider_region
+            if request.user.is_authenticated
+            else None,
         ),
-        "watch_provider_region": request.user.watch_provider_region,
+        "watch_provider_region": (
+            request.user.watch_provider_region
+            if request.user.is_authenticated
+            else None
+        ),
         "detail_link_sections": _build_detail_link_sections(
             season_metadata,
             MediaTypes.SEASON.value,
@@ -791,6 +1079,7 @@ def season_details(
             season_metadata,
             season_item,
             request.user,
+            genre_list_media_type=parent_media_type,
         ),
         "detail_tag_preview_genres_json": json.dumps(
             _resolve_detail_tag_genres(season_metadata, season_item)
@@ -814,6 +1103,9 @@ def season_details(
         "detail_secondary_fragment_url": detail_secondary_fragment_url,
         "defer_detail_secondary": defer_detail_secondary,
         "render_secondary_only": render_secondary_only,
+        "carousel_supported": carousel_supported,
+        "initial_carousel": initial_carousel,
+        "detail_carousel_fragment_url": detail_carousel_fragment_url,
         **_build_detail_person_rows(season_metadata),
     }
     logger.info(

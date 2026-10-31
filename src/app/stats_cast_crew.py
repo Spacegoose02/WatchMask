@@ -18,7 +18,6 @@ from app.models import (
     CreditRoleType,
     Item,
     ItemPersonCredit,
-    MediaTypes,
     Person,
     PersonGender,
 )
@@ -26,22 +25,45 @@ from app.statistics_talent import _aggregate_top_talent
 
 logger = logging.getLogger(__name__)
 
+MINUTES_PER_HOUR = 60
+
 # Mirrors GENRE_PALETTE in statistics-charts.js for consistent genre coloring.
 GENRE_PALETTE = [
-    "#6366f1", "#ec4899", "#10b981", "#f59e0b", "#3b82f6",
-    "#8b5cf6", "#ef4444", "#14b8a6", "#f97316", "#a855f7",
-    "#06b6d4", "#84cc16",
+    "#6366f1",
+    "#ec4899",
+    "#10b981",
+    "#f59e0b",
+    "#3b82f6",
+    "#8b5cf6",
+    "#ef4444",
+    "#14b8a6",
+    "#f97316",
+    "#a855f7",
+    "#06b6d4",
+    "#84cc16",
 ]
 
 # One color per "Known for" pill role — kept in sync with the role
 # classification already used across top talent (actor/actress/director/
 # writer) plus a voice-actor variant derived from ItemPersonCredit.role text.
 KNOWN_FOR_PILL_STYLES = {
-    "actor": {"label": "Actor", "classes": "bg-indigo-500/20 text-indigo-300"},
-    "actress": {"label": "Actress", "classes": "bg-pink-500/20 text-pink-300"},
-    "director": {"label": "Director", "classes": "bg-amber-500/20 text-amber-300"},
-    "writer": {"label": "Writer", "classes": "bg-emerald-500/20 text-emerald-300"},
-    "voice_actor": {"label": "Voice Actor", "classes": "bg-cyan-500/20 text-cyan-300"},
+    "actor": {"label": "Actor", "classes": "bg-indigo-500/20 text-[var(--color-text)]"},
+    "actress": {
+        "label": "Actress",
+        "classes": "bg-pink-500/20 text-[var(--color-text)]",
+    },
+    "director": {
+        "label": "Director",
+        "classes": "bg-amber-500/20 text-[var(--color-text)]",
+    },
+    "writer": {
+        "label": "Writer",
+        "classes": "bg-emerald-500/20 text-[var(--color-text)]",
+    },
+    "voice_actor": {
+        "label": "Voice Actor",
+        "classes": "bg-cyan-500/20 text-[var(--color-text)]",
+    },
 }
 
 ROLE_LEADER_COLUMNS = (
@@ -55,8 +77,8 @@ ROLE_LEADER_COLUMNS = (
 def _compact_role_leader_time_label(total_minutes):
     """Return a single-unit watched-time label for narrow leaderboard cells."""
     total_minutes = int(total_minutes or 0)
-    if total_minutes >= 60:
-        return f"{math.floor(total_minutes / 60)}h"
+    if total_minutes >= MINUTES_PER_HOUR:
+        return f"{math.floor(total_minutes / MINUTES_PER_HOUR)}h"
     return f"{total_minutes}m"
 
 
@@ -227,7 +249,12 @@ def _media_strip_from_totals(totals, limit=25, sort_by="plays"):
         )
 
     if sort_by == "titles":
-        strip.sort(key=lambda entry: ((entry.get("title") or "").lower(), entry.get("year") or 0))
+        strip.sort(
+            key=lambda entry: (
+                (entry.get("title") or "").lower(),
+                entry.get("year") or 0,
+            )
+        )
 
     return strip
 
@@ -354,7 +381,9 @@ def build_media_strip_row(
         "time": "time watched",
         "titles": "title",
     }.get(sort_by, "plays")
-    summary = f"{title_count} title{'s' if title_count != 1 else ''} · sorted by {sort_label}"
+    summary = (
+        f"{title_count} title{'s' if title_count != 1 else ''} · sorted by {sort_label}"
+    )
     return {
         "row_id": row_id,
         "title": title,
@@ -384,7 +413,7 @@ def _run_comparison_studio_delta(
             schedule_missing_backfill=False,
             media_type=media_type,
         )
-    except Exception as exc:  # noqa: BLE001 - best effort comparison
+    except Exception as exc:
         logger.debug(
             "studio_footprint_comparison_failed user_id=%s error=%s",
             user.id,
@@ -393,9 +422,9 @@ def _run_comparison_studio_delta(
         return None
 
     comparison_by_sort = comparison_talent.get("by_sort") or {}
-    comparison_studios = (
-        (comparison_by_sort.get("plays") or {}).get("top_studios") or []
-    )
+    comparison_studios = (comparison_by_sort.get("plays") or {}).get(
+        "top_studios"
+    ) or []
     comparison_appearances = sum(
         studio.get("plays", 0) for studio in comparison_studios
     )
@@ -559,5 +588,3 @@ def get_era_spotlight(
         row["formatted_duration"] = helpers.minutes_to_hhmm(row["minutes"])
 
     return ranked
-
-

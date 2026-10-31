@@ -2,16 +2,13 @@
 
 import logging
 from collections import Counter, defaultdict
+from heapq import nsmallest
 from types import SimpleNamespace
 
 from django.conf import settings
-from django.contrib.auth import get_user_model
-from django.core.cache import cache
 from django.db.models import Q
-from django.utils import timezone
 
 from app import credits as credit_helpers
-from app import statistics as stats
 from app.models import (
     CreditRoleType,
     Episode,
@@ -23,8 +20,9 @@ from app.models import (
     Movie,
     Person,
     PersonGender,
-    Sources,
+    Studio,
 )
+from app.stats_utils import _format_hours_minutes
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +31,8 @@ logger = logging.getLogger(__name__)
 STATISTICS_TOP_N = 50
 # Cross-type global top-rated heap — intentionally same value but a distinct card.
 STATISTICS_TOP_RATED_OVERALL = 50
+
+RUNTIME_UNKNOWN_AIRED = 999998  # aired but runtime unknown
 
 
 def _safe_runtime_minutes(value):
@@ -43,26 +43,50 @@ def _safe_runtime_minutes(value):
     except (TypeError, ValueError):
         return 0
     # Exclude fallback values: 999998 (aired but runtime unknown) and 999999 (unknown runtime)
-    if minutes >= 999998:
+    if minutes >= RUNTIME_UNKNOWN_AIRED:
         return 0
     return minutes
 
 
-def _tv_episode_play_rows(user, start_date, end_date):
+def _require_movie_or_game_date(qs, start_date, end_date, *, is_all_time=None):
+    """Restrict a movie/game queryset to dated entries, unless this is an all-time query.
+
+    "All Time" has no period an entry could fail to belong to, so entries
+    with no recorded date are kept. Any concrete range still needs a date to
+    place the entry within it. `is_all_time` defaults to inferring from
+    `start_date`/`end_date` both being None, but callers that must pass
+    concrete (e.g. day-list-derived) bounds for other reasons while still
+    meaning "all time" for filtering purposes can pass it explicitly.
+    """
+    if is_all_time is None:
+        is_all_time = start_date is None and end_date is None
+    if is_all_time:
+        return qs
+    return qs.filter(Q(end_date__isnull=False) | Q(start_date__isnull=False))
+
+
+def _tv_episode_play_rows(user, start_date, end_date, *, is_all_time=None):
     """Return watched TV episode rows and the season/show items they touch."""
-    episodes_qs = Episode.objects.filter(
-        related_season__user=user,
-        end_date__isnull=False,
-    )
-    if start_date:
-        episodes_qs = episodes_qs.filter(end_date__gte=start_date)
-    if end_date:
-        episodes_qs = episodes_qs.filter(end_date__lte=end_date)
+    if is_all_time is None:
+        is_all_time = start_date is None and end_date is None
+    episodes_qs = Episode.objects.filter(related_season__user=user)
+    if not is_all_time:
+        if start_date or end_date:
+            episodes_qs = episodes_qs.filter(end_date__isnull=False)
+        if start_date:
+            episodes_qs = episodes_qs.filter(end_date__gte=start_date)
+        if end_date:
+            episodes_qs = episodes_qs.filter(end_date__lte=end_date)
 
     episode_play_rows = []
     season_item_ids = set()
     tv_item_ids = set()
-    for episode_item_id, season_item_id, tv_item_id, runtime_minutes in episodes_qs.values_list(
+    for (
+        episode_item_id,
+        season_item_id,
+        tv_item_id,
+        runtime_minutes,
+    ) in episodes_qs.values_list(
         "item_id",
         "related_season__item_id",
         "related_season__related_tv__item_id",
@@ -90,7 +114,11 @@ def _tv_episode_play_rows(user, start_date, end_date):
         season_item_ids,
     )
     if season_item_ids:
-        for credit in ItemPersonCredit.objects.filter(item_id__in=season_item_ids).iterator():
+        for credit in (
+            ItemPersonCredit.objects.filter(item_id__in=season_item_ids)
+            .values_list("item_id", "role_type", "department", "role", named=True)
+            .iterator(chunk_size=500)
+        ):
             if credit.role_type == CreditRoleType.CAST.value:
                 season_items_with_cast_credits.add(credit.item_id)
                 continue
@@ -129,7 +157,10 @@ def _is_writer_credit(credit) -> bool:
     role = (credit.role or "").strip().lower()
     if department == "writing":
         return True
-    return any(keyword in role for keyword in ("writer", "screenplay", "story", "teleplay", "script"))
+    return any(
+        keyword in role
+        for keyword in ("writer", "screenplay", "story", "teleplay", "script")
+    )
 
 
 def _cast_bucket_for_person(person) -> str:
@@ -139,10 +170,19 @@ def _cast_bucket_for_person(person) -> str:
     return "actress"
 
 
-def _build_person_talent_context(user, start_date=None, end_date=None, schedule_missing_backfill=True):
+def _build_person_talent_context(
+    user,
+    start_date=None,
+    end_date=None,
+    schedule_missing_backfill=True,
+    *,
+    is_all_time=None,
+):
     """Build shared watched-item context for per-person talent computations."""
     if not user:
         return None
+    if is_all_time is None:
+        is_all_time = start_date is None and end_date is None
 
     movie_play_counts = Counter()
     movie_watch_minutes = Counter()
@@ -152,48 +192,49 @@ def _build_person_talent_context(user, start_date=None, end_date=None, schedule_
         user,
         start_date,
         end_date,
+        is_all_time=is_all_time,
     )
     episode_play_rows = tv_episode_rows.episode_play_rows
     season_item_ids = tv_episode_rows.season_item_ids
     tv_item_ids = tv_episode_rows.tv_item_ids
     season_items_with_cast_credits = tv_episode_rows.season_items_with_cast_credits
-    season_items_with_director_credits = tv_episode_rows.season_items_with_director_credits
+    season_items_with_director_credits = (
+        tv_episode_rows.season_items_with_director_credits
+    )
     season_items_with_writer_credits = tv_episode_rows.season_items_with_writer_credits
     season_items_with_usable_credits = tv_episode_rows.season_items_with_usable_credits
 
-    movies_qs = Movie.objects.filter(
-        user=user,
-    ).filter(
-        Q(end_date__isnull=False) | Q(start_date__isnull=False),
+    movies_qs = _require_movie_or_game_date(
+        Movie.objects.filter(user=user), start_date, end_date, is_all_time=is_all_time
     )
-    if start_date:
+    if not is_all_time and start_date:
         movies_qs = movies_qs.filter(
             Q(end_date__gte=start_date)
             | (Q(end_date__isnull=True) & Q(start_date__gte=start_date)),
         )
-    if end_date:
+    if not is_all_time and end_date:
         movies_qs = movies_qs.filter(
             Q(end_date__lte=end_date)
             | (Q(end_date__isnull=True) & Q(start_date__lte=end_date)),
         )
-    for item_id, runtime_minutes in movies_qs.values_list("item_id", "item__runtime_minutes").iterator():
+    for item_id, runtime_minutes in movies_qs.values_list(
+        "item_id", "item__runtime_minutes"
+    ).iterator():
         if item_id:
             movie_play_counts[item_id] += 1
             movie_watch_minutes[item_id] += _safe_runtime_minutes(runtime_minutes)
 
-    from app.stats_time import _calculate_game_time_in_range  # noqa: PLC0415
+    from app.stats_time import _calculate_game_time_in_range
 
-    games_qs = Game.objects.filter(
-        user=user,
-    ).filter(
-        Q(end_date__isnull=False) | Q(start_date__isnull=False),
+    games_qs = _require_movie_or_game_date(
+        Game.objects.filter(user=user), start_date, end_date, is_all_time=is_all_time
     )
-    if start_date:
+    if not is_all_time and start_date:
         games_qs = games_qs.filter(
             Q(end_date__gte=start_date)
             | (Q(end_date__isnull=True) & Q(start_date__gte=start_date)),
         )
-    if end_date:
+    if not is_all_time and end_date:
         games_qs = games_qs.filter(
             Q(end_date__lte=end_date)
             | (Q(end_date__isnull=True) & Q(start_date__lte=end_date)),
@@ -202,7 +243,9 @@ def _build_person_talent_context(user, start_date=None, end_date=None, schedule_
         if not game.item_id:
             continue
         game_play_counts[game.item_id] += 1
-        game_watch_minutes[game.item_id] += int(_calculate_game_time_in_range(game, start_date, end_date) or 0)
+        game_watch_minutes[game.item_id] += int(
+            _calculate_game_time_in_range(game, start_date, end_date) or 0
+        )
 
     if not movie_play_counts and not game_play_counts and not episode_play_rows:
         return None
@@ -210,8 +253,18 @@ def _build_person_talent_context(user, start_date=None, end_date=None, schedule_
     movie_item_ids = set(movie_play_counts.keys())
     game_item_ids = set(game_play_counts.keys())
     show_item_ids = set(tv_item_ids)
-    episode_item_ids = {episode_item_id for episode_item_id, _, _, _ in episode_play_rows if episode_item_id}
-    played_item_ids = movie_item_ids | game_item_ids | show_item_ids | season_item_ids | episode_item_ids
+    episode_item_ids = {
+        episode_item_id
+        for episode_item_id, _, _, _ in episode_play_rows
+        if episode_item_id
+    }
+    played_item_ids = (
+        movie_item_ids
+        | game_item_ids
+        | show_item_ids
+        | season_item_ids
+        | episode_item_ids
+    )
     if not played_item_ids:
         return None
     item_rows = list(
@@ -220,21 +273,23 @@ def _build_person_talent_context(user, start_date=None, end_date=None, schedule_
         ).values_list("id", "media_type", "media_id", "source"),
     )
     item_media_type_by_id = {
-        item_id: media_type
-        for item_id, media_type, _media_id, _source in item_rows
+        item_id: media_type for item_id, media_type, _media_id, _source in item_rows
     }
     item_media_key_by_id = {
         item_id: (media_type, str(media_id))
         for item_id, media_type, media_id, _source in item_rows
     }
     item_source_by_id = {
-        item_id: source
-        for item_id, _media_type, _media_id, source in item_rows
+        item_id: source for item_id, _media_type, _media_id, source in item_rows
     }
 
-    tv_items_with_usable_credits = credit_helpers.usable_credits_backfill_item_ids(tv_item_ids)
+    tv_items_with_usable_credits = credit_helpers.usable_credits_backfill_item_ids(
+        tv_item_ids
+    )
 
-    missing_credit_item_ids = credit_helpers.missing_credits_backfill_item_ids(played_item_ids)
+    missing_credit_item_ids = credit_helpers.missing_credits_backfill_item_ids(
+        played_item_ids
+    )
     if missing_credit_item_ids and schedule_missing_backfill:
         try:
             from app.tasks import enqueue_credits_backfill_items
@@ -294,16 +349,26 @@ def _get_person_talent_totals_from_context(user, person, context):
     person_credits = ItemPersonCredit.objects.filter(
         item_id__in=played_item_ids,
         person_id=person.id,
+    ).values_list(
+        "item_id",
+        "role_type",
+        "department",
+        "role",
+        "sort_order",
+        named=True,
     )
-    for credit in person_credits:
+    for credit in person_credits.iterator(chunk_size=500):
         item_media_type = item_media_type_by_id.get(credit.item_id)
         if not item_media_type:
             continue
         if credit.role_type == CreditRoleType.CAST.value:
-            if item_media_type == MediaTypes.TV.value and not credit_helpers.is_usable_tv_show_credit(
-                item_source_by_id.get(credit.item_id),
-                credit.role_type,
-                credit.sort_order,
+            if (
+                item_media_type == MediaTypes.TV.value
+                and not credit_helpers.is_usable_tv_show_credit(
+                    item_source_by_id.get(credit.item_id),
+                    credit.role_type,
+                    credit.sort_order,
+                )
             ):
                 continue
             cast_bucket = _cast_bucket_for_person(person)
@@ -328,10 +393,30 @@ def _get_person_talent_totals_from_context(user, person, context):
     bucket_plays_by_media_key = defaultdict(lambda: defaultdict(int))
 
     role_sources = (
-        ("actor", actor_credit_item_ids, season_items_with_cast_credits, CreditRoleType.CAST.value),
-        ("actress", actress_credit_item_ids, season_items_with_cast_credits, CreditRoleType.CAST.value),
-        ("director", director_credit_item_ids, season_items_with_director_credits, CreditRoleType.CREW.value),
-        ("writer", writer_credit_item_ids, season_items_with_writer_credits, CreditRoleType.CREW.value),
+        (
+            "actor",
+            actor_credit_item_ids,
+            season_items_with_cast_credits,
+            CreditRoleType.CAST.value,
+        ),
+        (
+            "actress",
+            actress_credit_item_ids,
+            season_items_with_cast_credits,
+            CreditRoleType.CAST.value,
+        ),
+        (
+            "director",
+            director_credit_item_ids,
+            season_items_with_director_credits,
+            CreditRoleType.CREW.value,
+        ),
+        (
+            "writer",
+            writer_credit_item_ids,
+            season_items_with_writer_credits,
+            CreditRoleType.CREW.value,
+        ),
     )
 
     for item_id, plays in movie_play_counts.items():
@@ -364,7 +449,12 @@ def _get_person_talent_totals_from_context(user, person, context):
                 bucket_minutes_by_media_key[bucket][media_key] += watched_minutes
                 bucket_plays_by_media_key[bucket][media_key] += plays
 
-    for episode_item_id, season_item_id, tv_item_id, watched_minutes in episode_play_rows:
+    for (
+        episode_item_id,
+        season_item_id,
+        tv_item_id,
+        watched_minutes,
+    ) in episode_play_rows:
         if not tv_item_id:
             continue
         media_key = item_media_key_by_id.get(tv_item_id)
@@ -407,7 +497,9 @@ def _get_person_talent_totals_from_context(user, person, context):
             "bucket": bucket,
             "plays": int(bucket_plays.get(bucket, 0)),
             "watched_minutes": watched_minutes,
-            "watched_time": stats._format_hours_minutes(watched_minutes, user.duration_format),
+            "watched_time": _format_hours_minutes(
+                watched_minutes, user.duration_format
+            ),
             "unique_movies": unique_movies,
             "unique_games": unique_games,
             "unique_shows": unique_shows,
@@ -482,6 +574,31 @@ def get_person_talent_totals(
     return _get_person_talent_totals_from_context(user, person, context)
 
 
+TALENT_MEDIA_TYPES = frozenset(
+    {
+        MediaTypes.MOVIE.value,
+        MediaTypes.TV.value,
+        MediaTypes.ANIME.value,
+        MediaTypes.GAME.value,
+    }
+)
+
+
+def _normalize_talent_media_types(media_type, allowed=TALENT_MEDIA_TYPES):
+    """Turn "tv", "tv,movie" or a collection into a set of `allowed` types.
+
+    Returns None (no filtering) for None/"all"/empty input. Types without
+    cast/crew data (books, music, ...) are dropped, so a selection made only of
+    them yields an empty set and therefore no talent.
+    """
+    if media_type in (None, "", "all"):
+        return None
+    if isinstance(media_type, str):
+        media_type = media_type.split(",")
+    selected = {str(value).strip() for value in media_type} & allowed
+    return frozenset(selected)
+
+
 def _aggregate_top_talent(
     user,
     start_date,
@@ -489,12 +606,21 @@ def _aggregate_top_talent(
     limit=STATISTICS_TOP_N,
     schedule_missing_backfill=True,
     media_type=None,
+    *,
+    is_all_time=None,
 ):
     """Aggregate top cast/crew/studio rollups from watched movie and TV plays.
 
-    media_type restricts the aggregation to one of "movie", "tv", "anime", or
-    "game" — None/"all" (the default) keeps the unfiltered cross-type rollup.
+    media_type restricts the aggregation to "movie", "tv", "anime", and/or
+    "game": one value, or several as a comma-separated string or a collection.
+    None/"all" (the default) keeps the unfiltered cross-type rollup.
+    `is_all_time` defaults to inferring "all time" from start_date/end_date
+    both being None; callers that must pass concrete bounds for other
+    reasons (e.g. day-list-derived aware datetimes) while still meaning "all
+    time" for date filtering can pass it explicitly.
     """
+    if is_all_time is None:
+        is_all_time = start_date is None and end_date is None
     movie_play_counts = Counter()
     movie_watch_minutes = Counter()
     game_play_counts = Counter()
@@ -517,32 +643,36 @@ def _aggregate_top_talent(
         user,
         start_date,
         end_date,
+        is_all_time=is_all_time,
     )
     episode_play_rows = tv_episode_rows.episode_play_rows
     season_item_ids = tv_episode_rows.season_item_ids
     tv_item_ids = tv_episode_rows.tv_item_ids
     season_items_with_cast_credits = tv_episode_rows.season_items_with_cast_credits
-    season_items_with_director_credits = tv_episode_rows.season_items_with_director_credits
+    season_items_with_director_credits = (
+        tv_episode_rows.season_items_with_director_credits
+    )
     season_items_with_writer_credits = tv_episode_rows.season_items_with_writer_credits
     season_items_with_usable_credits = tv_episode_rows.season_items_with_usable_credits
 
-    # Movie plays: count completed/dated movie entries.
-    movies_qs = Movie.objects.filter(
-        user=user,
-    ).filter(
-        Q(end_date__isnull=False) | Q(start_date__isnull=False),
+    # Movie plays: count completed/dated movie entries (all-time includes
+    # entries with no recorded date; a concrete range still requires one).
+    movies_qs = _require_movie_or_game_date(
+        Movie.objects.filter(user=user), start_date, end_date, is_all_time=is_all_time
     )
-    if start_date:
+    if not is_all_time and start_date:
         movies_qs = movies_qs.filter(
             Q(end_date__gte=start_date)
             | (Q(end_date__isnull=True) & Q(start_date__gte=start_date)),
         )
-    if end_date:
+    if not is_all_time and end_date:
         movies_qs = movies_qs.filter(
             Q(end_date__lte=end_date)
             | (Q(end_date__isnull=True) & Q(start_date__lte=end_date)),
         )
-    for item_id, runtime_minutes in movies_qs.values_list("item_id", "item__runtime_minutes").iterator():
+    for item_id, runtime_minutes in movies_qs.values_list(
+        "item_id", "item__runtime_minutes"
+    ).iterator():
         if item_id:
             movie_play_counts[item_id] += 1
             movie_watch_minutes[item_id] += _safe_runtime_minutes(runtime_minutes)
@@ -550,47 +680,46 @@ def _aggregate_top_talent(
     # Game plays: same completed/dated filter as movies. Games only have
     # best-effort IMDB-sourced cast (see app.services.imdb_game_credits), so
     # this just needs their item ids folded into played_item_ids below.
-    games_qs = Game.objects.filter(
-        user=user,
-    ).filter(
-        Q(end_date__isnull=False) | Q(start_date__isnull=False),
+    games_qs = _require_movie_or_game_date(
+        Game.objects.filter(user=user), start_date, end_date, is_all_time=is_all_time
     )
-    if start_date:
+    if not is_all_time and start_date:
         games_qs = games_qs.filter(
             Q(end_date__gte=start_date)
             | (Q(end_date__isnull=True) & Q(start_date__gte=start_date)),
         )
-    if end_date:
+    if not is_all_time and end_date:
         games_qs = games_qs.filter(
             Q(end_date__lte=end_date)
             | (Q(end_date__isnull=True) & Q(start_date__lte=end_date)),
         )
-    from app.stats_time import _calculate_game_time_in_range  # noqa: PLC0415
+    from app.stats_time import _calculate_game_time_in_range
 
     for game in games_qs.select_related("item").iterator():
         if not game.item_id:
             continue
         game_play_counts[game.item_id] += 1
-        game_watch_minutes[game.item_id] += int(_calculate_game_time_in_range(game, start_date, end_date) or 0)
+        game_watch_minutes[game.item_id] += int(
+            _calculate_game_time_in_range(game, start_date, end_date) or 0
+        )
 
-    if media_type not in (None, "all"):
-        if media_type == MediaTypes.MOVIE.value:
+    selected_types = _normalize_talent_media_types(media_type)
+    if selected_types is not None:
+        if MediaTypes.MOVIE.value not in selected_types:
+            movie_play_counts = Counter()
+            movie_watch_minutes = Counter()
+        if MediaTypes.GAME.value not in selected_types:
+            game_play_counts = Counter()
+            game_watch_minutes = Counter()
+        selected_show_types = selected_types & {
+            MediaTypes.TV.value,
+            MediaTypes.ANIME.value,
+        }
+        if not selected_show_types:
             episode_play_rows = []
             season_item_ids = set()
             tv_item_ids = set()
-            game_play_counts = Counter()
-            game_watch_minutes = Counter()
-        elif media_type == MediaTypes.GAME.value:
-            movie_play_counts = Counter()
-            movie_watch_minutes = Counter()
-            episode_play_rows = []
-            season_item_ids = set()
-            tv_item_ids = set()
-        elif media_type in (MediaTypes.TV.value, MediaTypes.ANIME.value):
-            movie_play_counts = Counter()
-            movie_watch_minutes = Counter()
-            game_play_counts = Counter()
-            game_watch_minutes = Counter()
+        elif len(selected_show_types) == 1:
             # TV and Anime share the same related_tv FK chain in
             # _tv_episode_play_rows, so the split can only happen here once
             # each show's own Item.media_type is known.
@@ -600,19 +729,12 @@ def _aggregate_top_talent(
             tv_item_ids = {
                 item_id
                 for item_id in tv_item_ids
-                if show_media_type_by_id.get(item_id) == media_type
+                if show_media_type_by_id.get(item_id) in selected_show_types
             }
-            episode_play_rows = [row for row in episode_play_rows if row[2] in tv_item_ids]
+            episode_play_rows = [
+                row for row in episode_play_rows if row[2] in tv_item_ids
+            ]
             season_item_ids = {row[1] for row in episode_play_rows if row[1]}
-        else:
-            # No cast/crew data exists for other media types (books, music, etc).
-            movie_play_counts = Counter()
-            movie_watch_minutes = Counter()
-            episode_play_rows = []
-            season_item_ids = set()
-            tv_item_ids = set()
-            game_play_counts = Counter()
-            game_watch_minutes = Counter()
 
     if not movie_play_counts and not episode_play_rows and not game_play_counts:
         by_sort = {mode: _empty_talent_bucket() for mode in valid_sort_modes}
@@ -626,69 +748,93 @@ def _aggregate_top_talent(
     movie_item_ids = set(movie_play_counts.keys())
     game_item_ids = set(game_play_counts.keys())
     show_item_ids = set(tv_item_ids)
-    episode_item_ids = {episode_item_id for episode_item_id, _, _, _ in episode_play_rows if episode_item_id}
-    played_item_ids = movie_item_ids | show_item_ids | season_item_ids | episode_item_ids | game_item_ids
-    item_rows = list(
+    episode_item_ids = {
+        episode_item_id
+        for episode_item_id, _, _, _ in episode_play_rows
+        if episode_item_id
+    }
+    played_item_ids = (
+        movie_item_ids
+        | show_item_ids
+        | season_item_ids
+        | episode_item_ids
+        | game_item_ids
+    )
+    item_media_type_by_id = {}
+    item_source_by_id = {}
+    for item_id, media_type_value, source in (
         Item.objects.filter(
             id__in=played_item_ids,
-        ).values_list("id", "media_type", "media_id", "source"),
-    )
-    item_media_type_by_id = {
-        item_id: media_type
-        for item_id, media_type, _media_id, _source in item_rows
-    }
-    item_source_by_id = {
-        item_id: source
-        for item_id, _media_type, _media_id, source in item_rows
-    }
+        )
+        .values_list("id", "media_type", "source")
+        .iterator(chunk_size=500)
+    ):
+        item_media_type_by_id[item_id] = media_type_value
+        item_source_by_id[item_id] = source
 
     cast_actor_ids_by_item = defaultdict(set)
     cast_actress_ids_by_item = defaultdict(set)
     director_ids_by_item = defaultdict(set)
     writer_ids_by_item = defaultdict(set)
     studio_ids_by_item = defaultdict(set)
+    person_names = {}
+    studio_names = {}
     people_by_id = {}
     studios_by_id = {}
 
-    person_credits = ItemPersonCredit.objects.filter(item_id__in=played_item_ids).select_related("person")
-    for credit in person_credits:
-        person = credit.person
-        if not person:
-            continue
-        people_by_id[person.id] = person
-
+    # Project only aggregation fields. A cached select_related queryset keeps a
+    # separate Person instance (including biography) alive for every credit.
+    person_credits = ItemPersonCredit.objects.filter(
+        item_id__in=played_item_ids
+    ).values_list(
+        "item_id",
+        "person_id",
+        "role_type",
+        "role",
+        "department",
+        "sort_order",
+        "person__gender",
+        "person__name",
+        named=True,
+    )
+    for credit in person_credits.iterator(chunk_size=500):
+        person_names[credit.person_id] = credit.person__name.lower()
         if credit.role_type == CreditRoleType.CAST.value:
             item_media_type = item_media_type_by_id.get(credit.item_id)
-            if item_media_type == MediaTypes.TV.value and not credit_helpers.is_usable_tv_show_credit(
-                item_source_by_id.get(credit.item_id),
-                credit.role_type,
-                credit.sort_order,
+            if (
+                item_media_type == MediaTypes.TV.value
+                and not credit_helpers.is_usable_tv_show_credit(
+                    item_source_by_id.get(credit.item_id),
+                    credit.role_type,
+                    credit.sort_order,
+                )
             ):
                 continue
-            cast_bucket = _cast_bucket_for_person(person)
-            if cast_bucket == "actor":
-                cast_actor_ids_by_item[credit.item_id].add(person.id)
+            if credit.person__gender == PersonGender.FEMALE.value:
+                cast_actress_ids_by_item[credit.item_id].add(credit.person_id)
             else:
-                cast_actress_ids_by_item[credit.item_id].add(person.id)
+                cast_actor_ids_by_item[credit.item_id].add(credit.person_id)
             continue
-
         if credit.role_type == CreditRoleType.CREW.value:
             if _is_director_credit(credit):
-                director_ids_by_item[credit.item_id].add(person.id)
+                director_ids_by_item[credit.item_id].add(credit.person_id)
             if _is_writer_credit(credit):
-                writer_ids_by_item[credit.item_id].add(person.id)
+                writer_ids_by_item[credit.item_id].add(credit.person_id)
 
     studio_item_ids = movie_item_ids | show_item_ids | game_item_ids
-    studio_credits = ItemStudioCredit.objects.filter(item_id__in=studio_item_ids).select_related("studio")
-    for credit in studio_credits:
-        studio = credit.studio
-        if not studio:
-            continue
-        studios_by_id[studio.id] = studio
-        studio_ids_by_item[credit.item_id].add(studio.id)
+    studio_credits = ItemStudioCredit.objects.filter(
+        item_id__in=studio_item_ids
+    ).values_list("item_id", "studio_id", "studio__name")
+    for item_id, studio_id, name in studio_credits.iterator(chunk_size=500):
+        studio_names[studio_id] = name.lower()
+        studio_ids_by_item[item_id].add(studio_id)
 
-    tv_items_with_usable_credits = credit_helpers.usable_credits_backfill_item_ids(tv_item_ids)
-    missing_credit_item_ids = credit_helpers.missing_credits_backfill_item_ids(played_item_ids)
+    tv_items_with_usable_credits = credit_helpers.usable_credits_backfill_item_ids(
+        tv_item_ids
+    )
+    missing_credit_item_ids = credit_helpers.missing_credits_backfill_item_ids(
+        played_item_ids
+    )
 
     if missing_credit_item_ids and schedule_missing_backfill:
         try:
@@ -781,7 +927,12 @@ def _aggregate_top_talent(
             studio_minutes[studio_id] += watched_minutes
             studio_game_items[studio_id].add(item_id)
 
-    for episode_item_id, season_item_id, tv_item_id, watched_minutes in episode_play_rows:
+    for (
+        episode_item_id,
+        season_item_id,
+        tv_item_id,
+        watched_minutes,
+    ) in episode_play_rows:
         if not tv_item_id:
             continue
 
@@ -798,7 +949,9 @@ def _aggregate_top_talent(
             and season_item_id in season_items_with_usable_credits
         )
         show_has_usable_credits = tv_item_id in tv_items_with_usable_credits
-        actor_ids = cast_actor_ids_by_item.get(episode_item_id, set()) | cast_actor_ids_by_item.get(
+        actor_ids = cast_actor_ids_by_item.get(
+            episode_item_id, set()
+        ) | cast_actor_ids_by_item.get(
             season_item_id,
             set(),
         )
@@ -815,7 +968,9 @@ def _aggregate_top_talent(
             actor_minutes[person_id] += watched_minutes
             actor_show_items[person_id].add(tv_item_id)
 
-        actress_ids = cast_actress_ids_by_item.get(episode_item_id, set()) | cast_actress_ids_by_item.get(
+        actress_ids = cast_actress_ids_by_item.get(
+            episode_item_id, set()
+        ) | cast_actress_ids_by_item.get(
             season_item_id,
             set(),
         )
@@ -832,7 +987,9 @@ def _aggregate_top_talent(
             actress_minutes[person_id] += watched_minutes
             actress_show_items[person_id].add(tv_item_id)
 
-        director_ids = director_ids_by_item.get(episode_item_id, set()) | director_ids_by_item.get(
+        director_ids = director_ids_by_item.get(
+            episode_item_id, set()
+        ) | director_ids_by_item.get(
             season_item_id,
             set(),
         )
@@ -849,7 +1006,9 @@ def _aggregate_top_talent(
             director_minutes[person_id] += watched_minutes
             director_show_items[person_id].add(tv_item_id)
 
-        writer_ids = writer_ids_by_item.get(episode_item_id, set()) | writer_ids_by_item.get(
+        writer_ids = writer_ids_by_item.get(
+            episode_item_id, set()
+        ) | writer_ids_by_item.get(
             season_item_id,
             set(),
         )
@@ -871,34 +1030,56 @@ def _aggregate_top_talent(
             studio_minutes[studio_id] += watched_minutes
             studio_show_items[studio_id].add(tv_item_id)
 
-    def _person_sort_key(person_id, plays, minutes, movie_items_by_person, game_items_by_person, show_items_by_person, mode):
+    def _person_sort_key(
+        person_id,
+        plays,
+        minutes,
+        movie_items_by_person,
+        game_items_by_person,
+        show_items_by_person,
+        mode,
+    ):
         unique_movies = len(movie_items_by_person.get(person_id, set()))
         unique_games = len(game_items_by_person.get(person_id, set()))
         unique_shows = len(show_items_by_person.get(person_id, set()))
         unique_titles = unique_movies + unique_games + unique_shows
-        person = people_by_id.get(person_id)
-        name_key = person.name.lower() if person else ""
+        name_key = person_names.get(person_id, "")
         if mode == "time":
             return (-minutes, -plays, -unique_titles, name_key)
         if mode == "titles":
             return (-unique_titles, -plays, -minutes, name_key)
         return (-plays, -minutes, -unique_titles, name_key)
 
-    def _studio_sort_key(studio_id, plays, minutes, movie_items_by_studio, game_items_by_studio, show_items_by_studio, mode):
+    def _studio_sort_key(
+        studio_id,
+        plays,
+        minutes,
+        movie_items_by_studio,
+        game_items_by_studio,
+        show_items_by_studio,
+        mode,
+    ):
         unique_movies = len(movie_items_by_studio.get(studio_id, set()))
         unique_games = len(game_items_by_studio.get(studio_id, set()))
         unique_shows = len(show_items_by_studio.get(studio_id, set()))
         unique_titles = unique_movies + unique_games + unique_shows
-        studio = studios_by_id.get(studio_id)
-        name_key = studio.name.lower() if studio else ""
+        name_key = studio_names.get(studio_id, "")
         if mode == "time":
             return (-minutes, -plays, -unique_titles, name_key)
         if mode == "titles":
             return (-unique_titles, -plays, -minutes, name_key)
         return (-plays, -minutes, -unique_titles, name_key)
 
-    def _sorted_people(counter_obj, minute_counter, movie_items_by_person, game_items_by_person, show_items_by_person, mode):
-        ranked = sorted(
+    def _sorted_people(
+        counter_obj,
+        minute_counter,
+        movie_items_by_person,
+        game_items_by_person,
+        show_items_by_person,
+        mode,
+    ):
+        ranked = nsmallest(
+            limit,
             counter_obj.items(),
             key=lambda row: _person_sort_key(
                 row[0],
@@ -909,8 +1090,14 @@ def _aggregate_top_talent(
                 show_items_by_person,
                 mode,
             ),
-        )[:limit]
+        )
         payload = []
+        missing_ids = {person_id for person_id, _ in ranked} - people_by_id.keys()
+        people_by_id.update(
+            Person.objects.filter(pk__in=missing_ids)
+            .only("name", "image", "source", "source_person_id")
+            .in_bulk()
+        )
         for person_id, plays in ranked:
             person = people_by_id.get(person_id)
             if not person:
@@ -927,7 +1114,9 @@ def _aggregate_top_talent(
                     "person_id": person.source_person_id,
                     "plays": int(plays),
                     "watched_minutes": watched_minutes,
-                    "watched_time": stats._format_hours_minutes(watched_minutes, user.duration_format),
+                    "watched_time": _format_hours_minutes(
+                        watched_minutes, user.duration_format
+                    ),
                     "unique_movies": unique_movies,
                     "unique_games": unique_games,
                     "unique_shows": unique_shows,
@@ -936,8 +1125,16 @@ def _aggregate_top_talent(
             )
         return payload
 
-    def _sorted_studios(counter_obj, minute_counter, movie_items_by_studio, game_items_by_studio, show_items_by_studio, mode):
-        ranked = sorted(
+    def _sorted_studios(
+        counter_obj,
+        minute_counter,
+        movie_items_by_studio,
+        game_items_by_studio,
+        show_items_by_studio,
+        mode,
+    ):
+        ranked = nsmallest(
+            limit,
             counter_obj.items(),
             key=lambda row: _studio_sort_key(
                 row[0],
@@ -948,8 +1145,14 @@ def _aggregate_top_talent(
                 show_items_by_studio,
                 mode,
             ),
-        )[:limit]
+        )
         payload = []
+        missing_ids = {studio_id for studio_id, _ in ranked} - studios_by_id.keys()
+        studios_by_id.update(
+            Studio.objects.filter(pk__in=missing_ids)
+            .only("name", "logo", "source", "source_studio_id")
+            .in_bulk()
+        )
         for studio_id, plays in ranked:
             studio = studios_by_id.get(studio_id)
             if not studio:
@@ -966,7 +1169,9 @@ def _aggregate_top_talent(
                     "studio_id": studio.source_studio_id,
                     "plays": int(plays),
                     "watched_minutes": watched_minutes,
-                    "watched_time": stats._format_hours_minutes(watched_minutes, user.duration_format),
+                    "watched_time": _format_hours_minutes(
+                        watched_minutes, user.duration_format
+                    ),
                     "unique_movies": unique_movies,
                     "unique_games": unique_games,
                     "unique_shows": unique_shows,

@@ -2,12 +2,15 @@ import datetime
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import UUID, uuid4
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase, override_settings
+from django.core.cache import cache
+from django.test import TestCase, override_settings, tag
 from django.urls import reverse
 from django.utils import timezone
 
+from app import history_cache
 from app.models import (
     TV,
     Album,
@@ -16,6 +19,7 @@ from app.models import (
     Book,
     Comic,
     ComicIssue,
+    DeletedMedia,
     Episode,
     Game,
     Item,
@@ -28,6 +32,93 @@ from app.models import (
     Status,
     Track,
 )
+from app.providers import services
+
+
+class MediaSaveProviderFailure(TestCase):
+    """A provider that cannot supply a title is a failed save, not a 500."""
+
+    def setUp(self):
+        """Create a user and log in."""
+        self.credentials = {"username": "test", "password": "12345"}
+        self.user = get_user_model().objects.create_user(**self.credentials)
+        self.client.login(**self.credentials)
+
+    def _save_with_provider_status(self, status_code):
+        error = Exception("provider said no")
+        error.response = SimpleNamespace(status_code=status_code, headers={})
+        with patch(
+            "app.save_views.ensure_item_metadata",
+            side_effect=services.ProviderAPIError(Sources.POCKETCASTS.value, error),
+        ):
+            return self.client.post(
+                reverse("media_save"),
+                {
+                    "media_id": "gone-show-uuid",
+                    "source": Sources.POCKETCASTS.value,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "status": Status.PLANNING.value,
+                },
+                follow=True,
+            )
+
+    def test_provider_404_shows_a_message_and_saves_nothing(self):
+        response = self._save_with_provider_status(404)
+
+        self.assertEqual(response.status_code, 200)
+        page_messages = [str(m) for m in response.context["messages"]]
+        self.assertTrue(any("no longer has this title" in m for m in page_messages))
+        self.assertFalse(Item.objects.filter(media_id="gone-show-uuid").exists())
+
+    def test_htmx_first_save_gets_a_toast_not_a_redirect(self):
+        error = Exception("provider said no")
+        error.response = SimpleNamespace(status_code=404, headers={})
+        with patch(
+            "app.save_views.ensure_item_metadata",
+            side_effect=services.ProviderAPIError(Sources.POCKETCASTS.value, error),
+        ):
+            response = self.client.post(
+                reverse("media_save"),
+                {
+                    "media_id": "gone-show-uuid",
+                    "source": Sources.POCKETCASTS.value,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "status": Status.PLANNING.value,
+                },
+                HTTP_HX_REQUEST="true",
+            )
+
+        self.assertEqual(response.status_code, 502)
+        toast = json.loads(response["HX-Trigger"])["showToast"]
+        self.assertEqual(toast["type"], "error")
+        self.assertIn("no longer has this title", toast["message"])
+
+    def test_unconfigured_provider_keeps_setup_guidance(self):
+        with patch(
+            "app.save_views.ensure_item_metadata",
+            side_effect=services.ProviderNotConfiguredError(
+                Sources.IGDB.value,
+                "IGDB credentials are not set.",
+            ),
+        ):
+            response = self.client.post(
+                reverse("media_save"),
+                {
+                    "media_id": "1",
+                    "source": Sources.IGDB.value,
+                    "media_type": MediaTypes.GAME.value,
+                    "status": Status.PLANNING.value,
+                },
+            )
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_provider_outage_asks_the_user_to_retry(self):
+        response = self._save_with_provider_status(503)
+
+        self.assertEqual(response.status_code, 200)
+        page_messages = [str(m) for m in response.context["messages"]]
+        self.assertTrue(any("did not respond" in m for m in page_messages))
 
 
 class CreateMedia(TestCase):
@@ -39,6 +130,7 @@ class CreateMedia(TestCase):
         self.user = get_user_model().objects.create_user(**self.credentials)
         self.client.login(**self.credentials)
 
+    @tag("network")
     @override_settings(MEDIA_ROOT=("create_media"))
     def test_create_anime(self):
         """Test the creation of a TV object."""
@@ -65,6 +157,7 @@ class CreateMedia(TestCase):
             True,
         )
 
+    @tag("network")
     @override_settings(MEDIA_ROOT=("create_media"))
     def test_create_tv(self):
         """Test the creation of a TV object through views."""
@@ -127,7 +220,9 @@ class CreateMedia(TestCase):
 
     @patch("app.models.providers.services.get_media_metadata")
     @patch("app.views.services.get_media_metadata")
-    def test_create_reading_media_with_null_format_metadata(self, view_metadata_mock, model_metadata_mock):
+    def test_create_reading_media_with_null_format_metadata(
+        self, view_metadata_mock, model_metadata_mock
+    ):
         """Creating reading media should coerce None format metadata to an empty string."""
         cases = [
             (
@@ -162,7 +257,9 @@ class CreateMedia(TestCase):
                 "max_progress": max_progress,
                 "details": {
                     "format": None,
-                    "number_of_pages": max_progress if media_type == MediaTypes.BOOK.value else None,
+                    "number_of_pages": max_progress
+                    if media_type == MediaTypes.BOOK.value
+                    else None,
                 },
             }
             view_metadata_mock.return_value = metadata
@@ -186,11 +283,15 @@ class CreateMedia(TestCase):
                 media_type=media_type,
             )
             self.assertEqual(item.format, "")
-            self.assertTrue(model_class.objects.filter(item=item, user=self.user).exists())
+            self.assertTrue(
+                model_class.objects.filter(item=item, user=self.user).exists()
+            )
 
     @patch("app.models.providers.services.get_media_metadata")
     @patch("app.views.services.get_media_metadata")
-    def test_create_comic_persists_authors_from_people_metadata(self, view_metadata_mock, model_metadata_mock):
+    def test_create_comic_persists_authors_from_people_metadata(
+        self, view_metadata_mock, model_metadata_mock
+    ):
         """Comic saves should persist provider people names into Item.authors."""
         metadata = {
             "title": "People Writer Comic",
@@ -285,11 +386,15 @@ class CreateMedia(TestCase):
             media_type=MediaTypes.MOVIE.value,
         )
         self.assertIsNotNone(item.release_datetime)
-        self.assertEqual(item.release_datetime.date(), timezone.datetime(1999, 3, 31).date())
+        self.assertEqual(
+            item.release_datetime.date(), timezone.datetime(1999, 3, 31).date()
+        )
 
     @patch("app.models.providers.services.get_media_metadata")
     @patch("app.views.services.get_media_metadata")
-    def test_create_reading_media_persists_metadata_genres(self, view_metadata_mock, model_metadata_mock):
+    def test_create_reading_media_persists_metadata_genres(
+        self, view_metadata_mock, model_metadata_mock
+    ):
         metadata_by_media = {
             (MediaTypes.BOOK.value, "book-genre", Sources.OPENLIBRARY.value): {
                 "title": "Book Genre",
@@ -370,6 +475,7 @@ class CreateMedia(TestCase):
             self.assertEqual(item.genres, expected_genres)
             self.assertTrue(model.objects.filter(item=item, user=self.user).exists())
 
+    @tag("network")
     def test_create_season(self):
         """Test the creation of a Season through views."""
         Item.objects.create(
@@ -394,6 +500,48 @@ class CreateMedia(TestCase):
             Season.objects.filter(item__media_id="1668", user=self.user).exists(),
             True,
         )
+
+    @patch("app.providers.services.get_media_metadata")
+    def test_complete_season_with_blank_end_date_creates_dateless_episodes(
+        self,
+        metadata_mock,
+    ):
+        """Marking a season Completed with end_date left blank sets no watch date.
+
+        Regression test for GitHub issue #452: bulk-completing a season used
+        to always stamp remaining episodes with today's date.
+        """
+        metadata_mock.return_value = {
+            "episodes": [
+                {"episode_number": 1, "image": "img1.jpg", "air_date": None},
+                {"episode_number": 2, "image": "img2.jpg", "air_date": None},
+            ],
+            "image": "season_img.jpg",
+        }
+        Item.objects.create(
+            media_id="1668",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Friends",
+            image="http://example.com/image.jpg",
+            season_number=1,
+        )
+        self.client.post(
+            reverse("media_save"),
+            {
+                "media_id": "1668",
+                "source": Sources.TMDB.value,
+                "media_type": MediaTypes.SEASON.value,
+                "season_number": 1,
+                "status": Status.COMPLETED.value,
+                "end_date": "",
+            },
+        )
+        season = Season.objects.get(item__media_id="1668", user=self.user)
+        episodes = Episode.objects.filter(related_season=season)
+        self.assertEqual(episodes.count(), 2)
+        for episode in episodes:
+            self.assertIsNone(episode.end_date)
 
     @patch("app.providers.services.get_media_metadata")
     def test_create_tvdb_season_with_tv_identity_media_type(self, metadata_mock):
@@ -459,6 +607,79 @@ class CreateMedia(TestCase):
             1,
         )
 
+    def test_media_save_updates_existing_tv_identity_linked_season(self):
+        """Saving from the anime-bucket season page must update, not duplicate.
+
+        Regression test for GitHub issue #623: when a season is already
+        tracked via `related_tv` pointing at the show's TV-identity `TV` row,
+        clicking "Add to tracker" on the anime-identity season page (which has
+        no `instance_id`, because the page failed to find the existing row)
+        used to try to INSERT a second `Season` row and 500 with
+        `IntegrityError: ... app_season_unique_tv_item`.
+        """
+        tv_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Naruto Shippuden",
+            image="http://example.com/image.jpg",
+            library_media_type=MediaTypes.TV.value,
+        )
+        tv_identity = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        season_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=0,
+            title="Naruto Shippuden",
+            image="http://example.com/season.jpg",
+            library_media_type=MediaTypes.TV.value,
+        )
+        existing_season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv_identity,
+            status=Status.IN_PROGRESS.value,
+            notes="pre-existing notes",
+            score=8.5,
+        )
+
+        response = self.client.post(
+            reverse("media_save"),
+            {
+                "media_id": "79824",
+                "source": Sources.TVDB.value,
+                "media_type": MediaTypes.SEASON.value,
+                "identity_media_type": MediaTypes.ANIME.value,
+                "library_media_type": MediaTypes.ANIME.value,
+                "season_number": 0,
+                "status": Status.COMPLETED.value,
+                # A real submission resubmits the modal's pre-filled fields
+                # unchanged alongside the one the user actually edited.
+                "notes": "pre-existing notes",
+                "score": 8.5,
+            },
+        )
+
+        self.assertNotEqual(response.status_code, 500)
+        self.assertEqual(
+            Season.objects.filter(
+                item__media_id="79824",
+                item__season_number=0,
+                user=self.user,
+            ).count(),
+            1,
+        )
+        existing_season.refresh_from_db()
+        self.assertEqual(existing_season.status, Status.COMPLETED.value)
+        self.assertEqual(existing_season.notes, "pre-existing notes")
+        self.assertEqual(existing_season.score, 8.5)
+
+    @tag("network")
     def test_create_episodes(self):
         """Test the creation of Episode through views."""
         self.client.post(
@@ -478,6 +699,39 @@ class CreateMedia(TestCase):
                 item__episode_number=1,
             ).exists(),
             True,
+        )
+
+    @patch(
+        "app.providers.services.get_media_metadata",
+        return_value={"episodes": [{"episode_number": 1}]},
+    )
+    def test_create_episode_rejects_absent_provider_coordinate(self, _metadata_mock):
+        """Episode saves must fail before creating a season or history row."""
+        response = self.client.post(
+            reverse("episode_save"),
+            {
+                "media_id": "1668",
+                "season_number": 1,
+                "episode_number": 99,
+                "source": Sources.TMDB.value,
+                "date": "2023-06-01T00:00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(
+            Season.objects.filter(
+                user=self.user,
+                item__media_id="1668",
+                item__season_number=1,
+            ).exists(),
+        )
+        self.assertFalse(
+            Episode.objects.filter(
+                related_season__user=self.user,
+                item__media_id="1668",
+                item__episode_number=99,
+            ).exists(),
         )
 
     @patch("app.models.providers.services.get_media_metadata")
@@ -522,7 +776,14 @@ class CreateMedia(TestCase):
             ],
         }
 
-        def metadata_side_effect(media_type, media_id, source, season_numbers=None, **_kwargs):
+        def metadata_side_effect(
+            media_type,
+            media_id,
+            source,
+            season_numbers=None,
+            _episode_number=None,
+            **_kwargs,
+        ):
             self.assertEqual(media_id, "1668")
             self.assertEqual(source, Sources.TMDB.value)
             if media_type == "tv_with_seasons":
@@ -554,6 +815,7 @@ class CreateMedia(TestCase):
         )
         self.assertEqual(create_response.status_code, 302)
 
+        watch_operation_id = uuid4()
         response = self.client.post(
             f"{reverse('episode_save')}?next=/details/tmdb/tv/1668/friends/season/1",
             {
@@ -562,19 +824,43 @@ class CreateMedia(TestCase):
                 "episode_number": 1,
                 "source": Sources.TMDB.value,
                 "end_date": "2023-06-02",
+                "watch_operation_id": watch_operation_id,
             },
             HTTP_HX_REQUEST="true",
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, 'id="episode-track-button-', html=False)
+        self.assertContains(
+            response,
+            'id="episode-track-button-',
+            count=2,
+            html=False,
+        )
+        # An additional data attribute now separates the id and OOB marker.
+        self.assertRegex(
+            response.content.decode(),
+            r'id="episode-track-button-\d+-list"[^>]*\bhx-swap-oob="true"',
+        )
+        latest_episode = Episode.objects.filter(
+            item__media_id="1668",
+            related_season__user=self.user,
+            item__episode_number=1,
+        ).latest("id")
+        self.assertContains(
+            response,
+            f'"instance_id": "{latest_episode.id}"',
+            count=2,
+            html=False,
+        )
         self.assertContains(response, 'id="episode-history-', html=False)
         self.assertContains(response, 'hx-swap-oob="true"', html=False)
-        self.assertContains(response, "Watched 2 times")
+        self.assertContains(response, "2\u00d7 watched")
         self.assertContains(response, "season-progress-mobile-", html=False)
         self.assertContains(response, "season-progress-desktop-", html=False)
         trigger = json.loads(response["HX-Trigger"])
-        self.assertEqual(trigger["closeModal"], {})
+        returned_token = trigger["closeModal"]["watchOperationId"]
+        self.assertEqual(str(UUID(returned_token)), returned_token)
+        self.assertNotEqual(returned_token, str(watch_operation_id))
         self.assertEqual(trigger["showToast"]["type"], "success")
         self.assertIn("Added watch", trigger["showToast"]["message"])
         self.assertEqual(
@@ -649,10 +935,12 @@ class CreateMedia(TestCase):
         )
 
     @patch("app.save_views.ensure_item_metadata")
-    def test_create_game_htmx_returns_activity_subtitle_update(self, ensure_item_metadata_mock):
+    def test_create_game_htmx_returns_activity_subtitle_update(
+        self, ensure_item_metadata_mock
+    ):
         """HTMX game saves should refresh the shared activity subtitle in place."""
         item = Item.objects.create(
-            media_id="game-123",
+            media_id="123",
             source=Sources.IGDB.value,
             media_type=MediaTypes.GAME.value,
             title="Tracked Game",
@@ -666,7 +954,7 @@ class CreateMedia(TestCase):
             f"{reverse('media_save')}?next=/details/igdb/game/123/tracked-game",
             {
                 "track_form_id": "track-form-test",
-                "media_id": "game-123",
+                "media_id": "123",
                 "source": Sources.IGDB.value,
                 "media_type": MediaTypes.GAME.value,
                 "status": Status.PLANNING.value,
@@ -678,7 +966,9 @@ class CreateMedia(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, 'id="detail-activity-subtitle-slot-game-game-123-igdb"', html=False)
+        self.assertContains(
+            response, 'id="detail-activity-subtitle-slot-game-123-igdb"', html=False
+        )
         self.assertContains(response, "Progress: 3h 25min")
         self.assertContains(response, "April 13, 2026 - May 12, 2026")
         self.assertContains(response, "data-track-action-root", html=False)
@@ -688,11 +978,93 @@ class CreateMedia(TestCase):
         self.assertIn("Added", trigger["showToast"]["message"])
         self.assertTrue(
             Game.objects.filter(
-                item__media_id="game-123",
+                item__media_id="123",
                 user=self.user,
                 progress=205,
                 status=Status.PLANNING.value,
             ).exists(),
+        )
+
+    @patch("app.save_views.ensure_item_metadata")
+    @patch("app.save_views._build_detail_activity_state")
+    def test_create_game_htmx_recovers_from_post_save_enrichment_failure(
+        self,
+        activity_state_mock,
+        ensure_item_metadata_mock,
+    ):
+        """A post-save rendering failure must not blank a first-save response.
+
+        Regression test for #601: the record is already committed by this point,
+        so a downstream enrichment error (e.g. building the activity subtitle)
+        must still return a valid confirmation, not a 500 swapped into a fragment.
+        """
+        item = Item.objects.create(
+            media_id="456",
+            source=Sources.IGDB.value,
+            media_type=MediaTypes.GAME.value,
+            title="Tracked Game",
+            image="http://example.com/game.jpg",
+        )
+        ensure_item_metadata_mock.return_value = SimpleNamespace(item=item)
+        activity_state_mock.side_effect = RuntimeError("boom")
+
+        response = self.client.post(
+            f"{reverse('media_save')}?next=/details/igdb/game/456/tracked-game",
+            {
+                "track_form_id": "track-form-test",
+                "media_id": "456",
+                "source": Sources.IGDB.value,
+                "media_type": MediaTypes.GAME.value,
+                "status": Status.PLANNING.value,
+                "progress": "0h",
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "data-track-action-root", html=False)
+        trigger = json.loads(response["HX-Trigger"])
+        self.assertEqual(trigger["closeModal"]["formId"], "track-form-test")
+        self.assertEqual(trigger["showToast"]["type"], "success")
+        self.assertEqual(
+            Game.objects.filter(item__media_id="456", user=self.user).count(),
+            1,
+        )
+
+    @patch("app.providers.services.get_media_metadata")
+    def test_create_movie_htmx_hydrates_real_first_save_metadata(
+        self,
+        metadata_mock,
+    ):
+        """The genuine first-save hydration path (uncached Item) must not blank.
+
+        Unlike other HTMX create tests, this does not mock ``ensure_item_metadata``
+        itself, so the real get-or-create + provider-metadata code path runs.
+        """
+        metadata_mock.return_value = {
+            "title": "Brand New Movie",
+            "image": "http://example.com/movie.jpg",
+        }
+
+        response = self.client.post(
+            f"{reverse('media_save')}?next=/details/tmdb/movie/999/brand-new-movie",
+            {
+                "track_form_id": "track-form-test",
+                "media_id": "999",
+                "source": Sources.TMDB.value,
+                "media_type": MediaTypes.MOVIE.value,
+                "status": Status.PLANNING.value,
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "data-track-action-root", html=False)
+        trigger = json.loads(response["HX-Trigger"])
+        self.assertEqual(trigger["showToast"]["type"], "success")
+        self.assertEqual(
+            Movie.objects.filter(item__media_id="999", user=self.user).count(),
+            1,
         )
 
     @patch("app.save_views.ensure_item_metadata")
@@ -928,10 +1300,11 @@ class CreateMedia(TestCase):
             if media_type == "tv_with_seasons":
                 self.assertEqual(season_numbers, [1])
                 return tv_with_seasons_metadata
+            if media_type == MediaTypes.SEASON.value:
+                self.assertEqual(season_numbers, [1])
+                return tv_with_seasons_metadata["season/1"]
             if media_type == MediaTypes.TV.value:
                 return tv_metadata
-            if media_type == MediaTypes.SEASON.value:
-                return tv_with_seasons_metadata["season/1"]
             error_message = f"Unexpected metadata request: {media_type}"
             raise AssertionError(error_message)
 
@@ -1005,6 +1378,103 @@ class EditMedia(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(Movie.objects.get(item__media_id="10494").score, 10)
 
+    @patch("app.models.providers.services.get_media_metadata")
+    def test_edit_episode_tracking_details(self, metadata_mock):
+        """Episode edits and save-as-new submissions persist the right row."""
+        metadata_mock.return_value = {"season/1": {"episodes": []}}
+        season_item = Item.objects.create(
+            media_id="episode-edit-1",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Episode Edit",
+            image="http://example.com/season.jpg",
+            season_number=1,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        episode_item = Item.objects.create(
+            media_id="episode-edit-1",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Episode One",
+            image="http://example.com/episode.jpg",
+            season_number=1,
+            episode_number=1,
+        )
+        episode = Episode.objects.create(
+            item=episode_item,
+            related_season=season,
+            end_date=datetime.datetime(2025, 1, 2, tzinfo=datetime.UTC),
+        )
+
+        response = self.client.post(
+            reverse("episode_save"),
+            {
+                "instance_id": episode.id,
+                "media_id": episode_item.media_id,
+                "source": episode_item.source,
+                "media_type": MediaTypes.EPISODE.value,
+                "season_number": 1,
+                "episode_number": 1,
+                "score": 8.5,
+                "status": Status.PAUSED.value,
+                "start_date": "2025-01-01",
+                "notes": "Paused midway",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        episode.refresh_from_db()
+        self.assertEqual(episode.score, 8.5)
+        self.assertEqual(episode.status, Status.PAUSED.value)
+        self.assertEqual(episode.start_date.date().isoformat(), "2025-01-01")
+        self.assertIsNone(episode.end_date)
+        self.assertEqual(episode.notes, "Paused midway")
+        self.assertFalse(episode.dropped)
+        metadata_mock.return_value = {
+            "max_progress": 1,
+            "season/1": {
+                "details": {"episodes": 1},
+                "episodes": [{"episode_number": 1}],
+            },
+        }
+        operation_id = uuid4()
+        with (
+            patch("app.save_views.resolve_episode_coordinate"),
+            patch(
+                "app.save_views.fork_services_episode.resolve_or_create_season",
+                return_value=season,
+            ),
+        ):
+            response = self.client.post(
+                reverse("episode_save"),
+                {
+                    "instance_id": episode.id,
+                    "save_as_new_entry": "1",
+                    "media_id": episode_item.media_id,
+                    "source": episode_item.source,
+                    "media_type": MediaTypes.EPISODE.value,
+                    "season_number": 1,
+                    "episode_number": 1,
+                    "end_date": "2025-01-03",
+                    "notes": "Second watch",
+                    "watch_operation_id": operation_id,
+                },
+            )
+
+        self.assertEqual(response.status_code, 302)
+        history = Episode.objects.filter(item=episode_item).order_by("id")
+        self.assertEqual(history.count(), 2)
+        episode.refresh_from_db()
+        self.assertEqual(episode.notes, "Paused midway")
+        new_entry = history.exclude(pk=episode.pk).get()
+        self.assertEqual(new_entry.notes, "Second watch")
+        self.assertEqual(new_entry.end_date.date().isoformat(), "2025-01-03")
+        self.assertEqual(new_entry.watch_operation_id, operation_id)
+
     def test_edit_movie_htmx_returns_inline_detail_update(self):
         """HTMX saves should update the detail tracker in place."""
         item = Item.objects.create(
@@ -1024,7 +1494,7 @@ class EditMedia(TestCase):
             start_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
             end_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
         )
-        Movie.objects.get(item__media_id="10494")
+        initial_status = Movie.objects.get(item__media_id="10494").status
 
         response = self.client.post(
             f"{reverse('media_save')}?next=/details/tmdb/movie/10494/perfect-blue",
@@ -1045,9 +1515,13 @@ class EditMedia(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "data-track-action-root", html=False)
         self.assertContains(response, 'id="track-action-movie-10494"', html=False)
+        # The modal is teleported to <body>, so the pill must replace itself by id.
+        self.assertContains(response, 'hx-swap-oob="outerHTML"', html=False)
         self.assertContains(response, f'id="detail-score-chip-{movie.id}"', html=False)
         self.assertContains(response, "Edit rating")
-        self.assertContains(response, "Completed")
+        # A completed movie offers another entry beside Check-in.
+        self.assertContains(response, "Check-in</span>", html=False)
+        self.assertContains(response, "Add new entry")
         trigger = json.loads(response["HX-Trigger"])
         self.assertEqual(trigger["closeModal"]["formId"], "track-form-test")
         self.assertEqual(trigger["showToast"]["type"], "success")
@@ -1178,7 +1652,8 @@ class EditMedia(TestCase):
         game.refresh_from_db()
         self.assertIsNone(game.start_date)
 
-    @patch("app.save_views.ensure_item_metadata")
+    @tag("network")
+    @patch("app.views.ensure_item_metadata")
     def test_create_movie_htmx_inserts_score_chip_slot(self, ensure_item_metadata_mock):
         """HTMX tracker creation should insert the score chip into the page."""
         item = Item.objects.create(
@@ -1211,7 +1686,11 @@ class EditMedia(TestCase):
             'id="detail-score-chip-slot-movie-10494-tmdb"',
             html=False,
         )
-        self.assertContains(response, f'id="detail-score-chip-{Movie.objects.get(item__media_id="10494").id}"', html=False)
+        self.assertContains(
+            response,
+            f'id="detail-score-chip-{Movie.objects.get(item__media_id="10494").id}"',
+            html=False,
+        )
         self.assertContains(response, "Edit rating")
         self.assertContains(response, "Completed")
         trigger = json.loads(response["HX-Trigger"])
@@ -1265,19 +1744,62 @@ class EditMedia(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "data-track-action-root", html=False)
-        self.assertContains(response, "trackOpen: true", html=False)
+        self.assertContains(response, "editTrackOpen: true", html=False)
         self.assertContains(response, "track-form-test")
         self.assertContains(response, "data-track-modal-root", html=False)
         self.assertContains(
             response,
-            'hx-target="closest [data-track-action-root]"',
+            'hx-target="this"',
             html=False,
         )
-        self.assertContains(response, 'hx-swap="outerHTML"', html=False)
+        self.assertContains(response, 'hx-swap="none"', html=False)
+        self.assertContains(response, 'hx-swap-oob="outerHTML"', html=False)
         self.assertEqual(
             Movie.objects.get(item__media_id="10494").status,
             initial_status,
         )
+
+    @patch("app.save_views.ensure_item_metadata")
+    def test_add_movie_entry_htmx_validation_error_reopens_create_modal(
+        self, ensure_item_metadata_mock,
+    ):
+        """A failed Add new entry reopens its own modal on the split button."""
+        item = Item.objects.create(
+            media_id="10494",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Perfect Blue",
+            image="http://example.com/image.jpg",
+        )
+        Movie.objects.create(
+            item=item,
+            user=self.user,
+            progress=1,
+            status=Status.COMPLETED.value,
+        )
+        ensure_item_metadata_mock.return_value = SimpleNamespace(item=item)
+
+        response = self.client.post(
+            f"{reverse('media_save')}?next=/details/tmdb/movie/10494/perfect-blue",
+            {
+                "track_form_id": "track-form-test",
+                "media_id": "10494",
+                "source": Sources.TMDB.value,
+                "media_type": MediaTypes.MOVIE.value,
+                "progress": 1,
+                "status": "bogus",
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Check-in</span>", html=False)
+        self.assertContains(response, "createTrackOpen: true", html=False)
+        self.assertContains(response, "editTrackOpen: false", html=False)
+        self.assertContains(response, "track-form-test")
+        self.assertContains(response, "data-track-modal-root", html=False)
+        self.assertContains(response, 'hx-swap-oob="outerHTML"', html=False)
+        self.assertEqual(Movie.objects.filter(item=item).count(), 1)
 
     def test_edit_movie_image_url(self):
         """Test overriding a movie image URL from the edit form."""
@@ -1342,11 +1864,13 @@ class DeleteMedia(TestCase):
             season_number=1,
             episode_number=99,
         )
-        self.episode = Episode.objects.create(
-            item=self.item_ep,
-            related_season=self.season,
-            end_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self.episode = Episode.objects.create(
+                item=self.item_ep,
+                related_season=self.season,
+                end_date=datetime.datetime(2023, 6, 1, 0, 0, tzinfo=datetime.UTC),
+            )
+        cache.clear()
 
     def test_delete_tv(self):
         """Test the deletion of a tv through views."""
@@ -1378,6 +1902,37 @@ class DeleteMedia(TestCase):
             0,
         )
 
+    def test_delete_custom_tv(self):
+        """Deleting a manual/custom item tombstones a UUID media_id (#877)."""
+        manual_id = Item.generate_manual_id()
+        item = Item.objects.create(
+            media_id=manual_id,
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.TV.value,
+            title="Custom Show",
+            image="http://example.com/image.jpg",
+        )
+        tv_obj = TV.objects.create(item=item, user=self.user, status=Status.IN_PROGRESS.value)
+
+        response = self.client.post(
+            reverse("media_delete"),
+            data={
+                "instance_id": tv_obj.id,
+                "media_type": MediaTypes.TV.value,
+            },
+        )
+
+        self.assertNotEqual(response.status_code, 405)
+        self.assertFalse(TV.objects.filter(id=tv_obj.id).exists())
+        self.assertTrue(
+            DeletedMedia.objects.filter(
+                user=self.user,
+                media_type=MediaTypes.TV.value,
+                source=Sources.MANUAL.value,
+                media_id=manual_id,
+            ).exists(),
+        )
+
     def test_unwatch_episode(self):
         """Test unwatching of an episode through views."""
         self.client.post(
@@ -1391,4 +1946,67 @@ class DeleteMedia(TestCase):
         self.assertEqual(
             Episode.objects.filter(related_season__user=self.user).count(),
             0,
+        )
+
+    def test_unwatch_episode_htmx_updates_episode_controls(self):
+        """HTMX episode deletes update the list without redirecting the page."""
+        response = self.client.post(
+            reverse("media_delete") + "?next=/details/tmdb/tv/1668/friends/season/1",
+            data={
+                "instance_id": self.episode.id,
+                "media_type": MediaTypes.EPISODE.value,
+            },
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("HX-Redirect", response)
+        self.assertContains(response, 'id="episode-track-button-', html=False)
+        self.assertContains(response, 'id="episode-history-', html=False)
+        self.assertContains(response, "season-progress-mobile-", html=False)
+        self.assertContains(response, "season-progress-desktop-", html=False)
+        trigger = json.loads(response["HX-Trigger"])
+        self.assertEqual(trigger["closeModal"], {})
+        self.assertEqual(trigger["showToast"]["type"], "success")
+        self.assertFalse(Episode.objects.filter(pk=self.episode.id).exists())
+
+    @patch("app.signals._handle_media_cache_change")
+    def test_unwatch_episode_removes_warm_history_cache_entry(
+        self,
+        _handle_media_cache_change,
+    ):
+        """Deleting a play must remove its cached history card before redirect."""
+        logging_style = "repeats"
+        history_cache.refresh_history_cache(
+            self.user.id,
+            logging_style=logging_style,
+        )
+        history_day_key = history_cache.history_day_key(self.episode.end_date)
+        cached_day = cache.get(
+            history_cache._day_cache_key(
+                self.user.id,
+                logging_style,
+                history_day_key,
+            ),
+        )
+        self.assertTrue(cached_day["entries"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                reverse("media_delete"),
+                data={
+                    "instance_id": self.episode.id,
+                    "media_type": MediaTypes.EPISODE.value,
+                },
+            )
+
+        self.assertEqual(response.status_code, 302)
+        history_days, _ = history_cache.get_month_history(
+            self.user,
+            self.episode.end_date.year,
+            self.episode.end_date.month,
+            logging_style_override=logging_style,
+        )
+        self.assertFalse(
+            any(day["entries"] for day in history_days),
         )

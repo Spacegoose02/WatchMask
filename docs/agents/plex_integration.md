@@ -11,8 +11,9 @@ The system prioritizes **TMDB IDs** as the canonical source of truth. All Plex e
 1.  **Explicit TMDB ID**: Extracted directly from Plex GUIDs (e.g., `tmdb://123`).
 2.  **IMDB/TVDB Lookup**: If only IMDB (`tt123`) or TVDB (`789`) IDs are present, the system queries the TMDB `find` API to resolve the corresponding `tmdb_id`.
 3.  **Title Search Fallback**:
-    -   If no external IDs are found (or they return 404s), the system performs a search against TMDB using the media title.
-    -   **TV Shows**: Uses `grandparentTitle` (series title) or `title`. Match attempts to filter by year if available.
+    -   For TV history entries, Plex item metadata and then show metadata from `grandparentRatingKey`/`grandparentKey` are checked before title search.
+    -   If no deterministic IDs are found (or they return 404s), the system performs a search against TMDB using the media title.
+    -   **TV Shows**: Uses `grandparentTitle` (series title) or `title` only after the Plex show-level lookup. Match attempts to filter by year if available.
     -   **Movies**: Uses `title` and `year`.
 
 **GUID extraction & conflicts:**
@@ -21,6 +22,7 @@ The system prioritizes **TMDB IDs** as the canonical source of truth. All Plex e
 **TV `tmdb_id` semantics:**
 -   For TV history rows, `tmdb_id` represents the **show** TMDB ID, with season/episode numbers stored separately.
 -   If Plex provides episode-level TMDB IDs or non-standard numbering (anime, specials, absolute order), resolution can fall back to title search during metadata lookup; unresolved episodes are skipped.
+-   **Episode-number remap order:** when the record's season/episode numbers do not exist on the resolved TMDB show, `_validate_or_remap_episode` tries, in order: (1) the AniBridge v3 episode graph for anime split-numbering (TVDB S4E19 → TMDB S1E85), keyed by the show's TVDB id and accepted only for the already-resolved TMDB show and a target season that actually contains the episode; (2) `tmdb.find` on the episode-level TVDB/IMDB Guid; (3) cumulative spilling from a TVDB-numbered season into TMDB's later split seasons. If none matches, the entry is skipped and counted as `skipped_numbering_mismatch`.
 
 **Title search policy:**
 -   Searches use `TMDB_LANG` (default `en`) with no region override and no original-title fallback.
@@ -42,7 +44,7 @@ Plex history import uses Plex's history endpoint as the canonical event stream. 
 -   Sorted newest-first (`sort=viewedAt:desc`) and paged with `X-Plex-Container-Start`/`X-Plex-Container-Size`. `PLEX_HISTORY_PAGE_SIZE` controls page size; `PLEX_HISTORY_MAX_ITEMS` (0 = no cap) limits how far back we fetch. There is no time windowing, so re-importing overlapping ranges is expected.
 
 **Fields we rely on:**
--   IDs: `Guid`/`guid` entries with TMDB/IMDB/TVDB identifiers are required for deterministic resolution. Order is: resolve IDs from the history row (including title search when allowed); if missing, fetch `GET {server_uri}/library/metadata/{ratingKey}` to pull GUIDs (no title search in this step); if still missing, the movie/TV recorders may still fall back to title search when a title is available, otherwise the entry is skipped.
+-   IDs: `Guid`/`guid` entries with TMDB/IMDB/TVDB identifiers are required for deterministic resolution. For TV history, resolve IDs from the history row, fetch `GET {server_uri}/library/metadata/{ratingKey}` when needed, then inspect the Plex show at `grandparentRatingKey`/`grandparentKey` before allowing title search. Movies retain their existing title fallback when a title is available; otherwise the entry is skipped.
 -   Titles: `title` or `grandparentTitle` is required for title-search fallback; Plex-only GUIDs without a title are skipped.
 -   Timing: `viewedAt` or `lastViewedAt` (epoch seconds) is the authoritative `watched_at`. If missing, we fall back to import time; `viewCount`/`viewOffset` are ignored. Rows missing `viewedAt`/`lastViewedAt` are nondeterministic and can dedupe poorly across runs.
 -   TV structure: `parentIndex` (season) and `index` (episode) must be numeric. Missing numbers can cause the entry to be skipped or treated as a movie in show libraries.
@@ -91,6 +93,13 @@ Real-time webhooks (`src/integrations/webhooks/plex.py`) share the same ID resol
 -   **Dedupe Intent**: Webhook dedupe is tuned for bursty duplicate deliveries; import dedupe is tuned for replaying long history pages, so the rules intentionally differ.
 -   **Reliability**: Webhooks are best-effort with no ordering guarantees. If a scrobble is missed, rerun the Plex history import (manual or scheduled) to reconcile gaps.
 -   **Metadata**: Webhooks fetch TMDB metadata inline (cached); there is no separate refresh queue.
+-   **Ratings (`media.rate`)**: Movie ratings update the movie instance; episode and show ratings update the show-level TV rating; season ratings update the matching Season rating. A `-1.0` rating clears the stored score. Show and season payloads are mapped only on the rating path — other events keep ignoring them.
+
+### Shared webhook routing
+
+A Plex webhook owner can share the existing tokenized webhook endpoint with other Floppy users from **Settings → Integrations**. Each share stores one or more comma-separated Plex usernames for the recipient and an owner-selected library allow-list. Shares are disabled until the recipient explicitly enables them.
+
+The webhook URL and Plex token remain owned by the sharing user. Incoming events are matched to enabled shares when the Plex username matches any configured username, then processed into the recipient's history and playback state. Plex API lookups and collection metadata use the owner's Plex account, so recipients do not need to connect Plex separately. Share IDs, rather than Plex tokens, are passed to Celery; the worker reloads the share and rechecks that it is still enabled before processing.
 
 ## Troubleshooting & logging
 

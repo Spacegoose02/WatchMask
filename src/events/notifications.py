@@ -1,11 +1,11 @@
 import logging
+from dataclasses import dataclass
 from datetime import UTC
 from html import escape
 
-import apprise
 from django.apps import apps
 from django.contrib.auth import get_user_model
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.utils import timezone
 
 from app.models import TV, MediaTypes, Season
@@ -13,6 +13,24 @@ from app.templatetags import app_tags
 from events.models import INACTIVE_TRACKING_STATUSES, Event
 
 logger = logging.getLogger(__name__)
+
+BATCH_COLLAPSE_THRESHOLD = 3
+
+
+@dataclass
+class BatchEvent:
+    """A run of >= BATCH_COLLAPSE_THRESHOLD episode events for one item."""
+
+    first_event: Event
+    min_ep: int
+    max_ep: int
+    is_finale: bool
+
+    @property
+    def range_label(self):
+        """Return the human-readable episode range for this batch."""
+        prefix = "All Episodes" if self.min_ep == 1 else "Episodes"
+        return f"{prefix} {self.min_ep}-{self.max_ep}"
 
 
 def send_releases():
@@ -58,7 +76,12 @@ def send_releases():
         )
         logger.info("Marked %s events as notified", len(result["event_ids"]))
 
-    return f"{result['event_count']} recent releases processed"
+    failed_deliveries = result.get("failed_deliveries", {})
+    record_failed_alerts(failed_deliveries)
+
+    return f"{result['event_count']} recent releases processed" + describe_failures(
+        failed_deliveries,
+    )
 
 
 def send_daily_digest():
@@ -109,21 +132,105 @@ def send_daily_digest():
         events=events,
         users=users,
         title=title,
+        skip_alerted_for_instant_users=True,
     )
 
-    return f"Daily digest sent for {result['event_count']} releases"
+    return f"Daily digest sent for {result['event_count']} releases" + (
+        describe_failures(result.get("failed_deliveries", {}))
+    )
 
 
-def send_notifications(events, users, title):
+def describe_failures(failed_deliveries):
+    """Return a task-result suffix naming how many users could not be reached."""
+    if not failed_deliveries:
+        return ""
+    return f" (delivery failed for {len(failed_deliveries)} user(s))"
+
+
+def record_failed_alerts(failed_deliveries):
+    """Remember which users a real-time alert did not reach, per event."""
+    through = Event.alert_failed_users.through
+    through.objects.bulk_create(
+        [
+            through(event_id=event_id, user_id=user_id)
+            for user_id, event_ids in failed_deliveries.items()
+            for event_id in event_ids
+        ],
+        ignore_conflicts=True,
+    )
+
+
+def send_premiere_digest():
+    """Send weekly digest of new show and season premieres."""
+    # Rolling 7-day window starting at local midnight today
+    now_in_current_tz = timezone.localtime()
+    today_start = now_in_current_tz.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    week_end = today_start + timezone.timedelta(days=7)
+
+    today_start_utc = today_start.astimezone(UTC)
+    week_end_utc = week_end.astimezone(UTC)
+
+    users = (
+        get_user_model()
+        .objects.filter(
+            ~Q(notification_urls=""),
+            premiere_notifications_enabled=True,
+        )
+        .prefetch_related("notification_excluded_items")
+    )
+
+    if not users.exists():
+        return "No users with premiere notifications enabled"
+
+    # A season's first episode (content_number=1) marks its premiere
+    base_queryset = Event.objects.filter(
+        item__media_type=MediaTypes.SEASON.value,
+        content_number=1,
+        datetime__gte=today_start_utc,
+        datetime__lt=week_end_utc,
+    ).select_related("item")
+
+    events = Event.objects.sort_with_sentinel_last(base_queryset)
+
+    if not events.exists():
+        return "No premieres scheduled this week"
+
+    result = send_notifications(
+        events=events,
+        users=users,
+        title="🎬 Watchmask: Premieres This Week 🎬",
+        formatter=format_premiere_notification_html,
+    )
+
+    return f"Premiere digest sent for {result['event_count']} premieres"
+
+
+def send_notifications(
+    events,
+    users,
+    title,
+    formatter=None,
+    skip_alerted_for_instant_users=False,
+):
     """Process events and send notifications to appropriate users.
 
     Args:
         events: QuerySet of Event objects
         users: QuerySet of User objects
         title: Notification title
+        formatter: Callable(releases) -> HTML body. Defaults to
+            format_notification_html.
+        skip_alerted_for_instant_users: Leave out events already announced by
+            send_releases() for users who have release notifications on.
 
     Returns:
-        Dictionary with results information
+        Dictionary with results information. failed_deliveries maps each user
+        id whose notification could not be sent to that user's event ids.
     """
     event_count = events.count()
     logger.info(
@@ -131,6 +238,8 @@ def send_notifications(events, users, title):
         users.count(),
     )
     logger.info("Found %s events for notification", event_count)
+
+    events = annotate_finale_events(events)
 
     # Create event lookup for quick access
     events_by_item_and_content = {}
@@ -144,18 +253,41 @@ def send_notifications(events, users, title):
     user_releases = get_user_releases(
         users=users,
         target_events=events_by_item_and_content,
+        skip_alerted_for_instant_users=skip_alerted_for_instant_users,
     )
 
-    deliver_notifications(user_releases, users, title)
+    failed_user_ids = deliver_notifications(
+        user_releases,
+        users,
+        title,
+        formatter=formatter,
+    )
 
     return {
         "event_count": event_count,
         "event_ids": event_ids,
+        "failed_deliveries": {
+            user_id: [event.id for event in user_releases[user_id]]
+            for user_id in failed_user_ids
+        },
     }
 
 
-def get_user_releases(users, target_events):
-    """Get user releases with optimized queries that avoid N+1 problems."""
+def get_user_releases(users, target_events, skip_alerted_for_instant_users=False):
+    """Get user releases with optimized queries that avoid N+1 problems.
+
+    notification_sent is global, so it only counts as "already alerted" for
+    users who receive release notifications, and only when their alert did not
+    fail; everyone else still sees the event.
+    """
+    failed_alerts = set()
+    if skip_alerted_for_instant_users:
+        failed_alerts = set(
+            Event.alert_failed_users.through.objects.filter(
+                event_id__in=[event.id for event in target_events.values()],
+            ).values_list("user_id", "event_id"),
+        )
+
     user_exclusions = {}
     for user in users:
         user_exclusions[user.id] = set(
@@ -164,7 +296,15 @@ def get_user_releases(users, target_events):
 
     user_enabled_types = {}
     for user in users:
-        user_enabled_types[user.id] = user.get_active_media_types()
+        enabled_types = user.get_active_media_types()
+        # Episode events use the season media type, but TV Seasons is only a
+        # display setting: enabling TV Series is enough (same rule as the calendar).
+        if (
+            MediaTypes.TV.value in enabled_types
+            and MediaTypes.SEASON.value not in enabled_types
+        ):
+            enabled_types = [*enabled_types, MediaTypes.SEASON.value]
+        user_enabled_types[user.id] = enabled_types
 
     user_tracking_data = get_all_user_tracking_data(
         users,
@@ -176,8 +316,31 @@ def get_user_releases(users, target_events):
         user_events = []
         enabled_types = user_enabled_types[user.id]
         excluded_items = user_exclusions.get(user.id, set())
+        hidden_item_ids = Event.objects.hidden_duplicate_item_ids(
+            user,
+            enabled_types,
+        )
+
+        skip_alerted = (
+            skip_alerted_for_instant_users and user.release_notifications_enabled
+        )
 
         for event in target_events.values():
+            if (
+                skip_alerted
+                and event.notification_sent
+                and (user.id, event.id) not in failed_alerts
+            ):
+                continue
+
+            # Digital and physical dates only apply to the user's own region
+            if event.release_type and event.region != user.watch_provider_region:
+                continue
+
+            # Check if a preferred cross-provider/cross-bucket duplicate exists
+            if event.item.id in hidden_item_ids:
+                continue
+
             # Check if user has excluded this item
             if event.item.media_type != Season and event.item.id in excluded_items:
                 continue
@@ -198,6 +361,42 @@ def get_user_releases(users, target_events):
             user_releases[user.id] = user_events
 
     return user_releases
+
+
+def annotate_finale_events(events):
+    """Annotate regular season events whose episode is the highest known one."""
+    events = list(events)
+    unannotated_events = [
+        event for event in events if not hasattr(event, "_is_season_finale")
+    ]
+    if not unannotated_events:
+        return events
+
+    season_item_ids = {
+        event.item_id
+        for event in unannotated_events
+        if event.item.media_type == MediaTypes.SEASON.value
+        and event.item.season_number
+        and event.item.season_number > 0
+        and event.content_number is not None
+    }
+    final_episode_by_item = dict(
+        Event.objects.filter(
+            item_id__in=season_item_ids,
+            content_number__isnull=False,
+        )
+        .values("item_id")
+        .annotate(final_episode=Max("content_number"))
+        .values_list("item_id", "final_episode"),
+    )
+
+    for event in unannotated_events:
+        event._is_season_finale = (
+            event.item_id in final_episode_by_item
+            and event.content_number == final_episode_by_item[event.item_id]
+        )
+
+    return events
 
 
 def get_all_user_tracking_data(users, target_events, user_exclusions):
@@ -370,14 +569,29 @@ def is_user_tracking_item(user, item, user_tracking_data):
     return media_obj.status not in INACTIVE_TRACKING_STATUSES
 
 
-def deliver_notifications(user_releases, users, title):
+def deliver_notifications(user_releases, users, title, formatter=None):
     """Deliver notifications to users using calendar logic.
 
     Args:
         user_releases: Dictionary mapping user IDs to lists of events
         users: QuerySet of User objects
         title: Notification title
+        formatter: Callable(releases) -> HTML body. Defaults to
+            format_notification_html.
+
+    Returns:
+        List of user ids whose notification could not be sent.
     """
+    # Imported here, not at module scope: apprise loads its whole notification
+    # plugin registry on import, and that cost lands in every long-lived
+    # process that merely imports this module.
+    import apprise
+
+    if formatter is None:
+        formatter = format_notification_html
+
+    failed_user_ids = []
+
     # Create user lookup
     users_by_id = {user.id: user for user in users}
 
@@ -398,16 +612,20 @@ def deliver_notifications(user_releases, users, title):
             continue
 
         # Format notification as HTML for richer email output
-        notification_body = format_notification_html(releases=releases)
+        notification_body = formatter(releases=releases)
 
         # Send notification
-        send_user_notification(
+        sent = send_user_notification(
             user,
             urls,
             title,
             notification_body,
             body_format=apprise.NotifyFormat.HTML,
         )
+        if not sent:
+            failed_user_ids.append(user_id)
+
+    return failed_user_ids
 
 
 def group_releases_by_type(releases):
@@ -421,6 +639,39 @@ def group_releases_by_type(releases):
     return releases_by_type
 
 
+def collapse_batch_events(media_events):
+    """Group events by item, collapsing runs of >= BATCH_COLLAPSE_THRESHOLD.
+
+    Args:
+        media_events: List of Event objects for a single media type
+
+    Returns:
+        List of Event and BatchEvent objects, in first-seen order
+    """
+    by_item = {}
+    for event in media_events:
+        by_item.setdefault(event.item_id, []).append(event)
+
+    units = []
+    for group in by_item.values():
+        if len(group) < BATCH_COLLAPSE_THRESHOLD:
+            units.extend(group)
+            continue
+
+        group.sort(key=lambda e: e.content_number or 0)
+        episode_numbers = [e.content_number for e in group if e.content_number is not None]
+        units.append(
+            BatchEvent(
+                first_event=group[0],
+                min_ep=min(episode_numbers),
+                max_ep=max(episode_numbers),
+                is_finale=any(getattr(e, "_is_season_finale", False) for e in group),
+            ),
+        )
+
+    return units
+
+
 def format_notification(releases):
     """Format notification text for releases.
 
@@ -430,6 +681,8 @@ def format_notification(releases):
     Returns:
         Formatted notification text as a string
     """
+    releases = annotate_finale_events(releases)
+
     # Group releases by media type
     releases_by_type = group_releases_by_type(releases)
 
@@ -448,15 +701,25 @@ def format_notification(releases):
         else:
             notification_body.append(f"{icon}  {media_type.upper()}")
 
-        for event in media_events:
-            if event.is_sentinel_time:
-                # Don't show time for sentinel times
-                notification_body.append(f"  • {event}")
+        for unit in collapse_batch_events(media_events):
+            if isinstance(unit, BatchEvent):
+                first_event = unit.first_event
+                line = f"  • {first_event.item} ({unit.range_label})"
+                is_finale = unit.is_finale
             else:
+                line = f"  • {unit}"
+                first_event = unit
+                is_finale = unit._is_season_finale
+
+            if not first_event.is_sentinel_time:
                 # Convert to local timezone and format
-                local_dt = timezone.localtime(event.datetime)
+                local_dt = timezone.localtime(first_event.datetime)
                 time_str = local_dt.strftime("%H:%M")
-                notification_body.append(f"  • {event} ({time_str})")
+                line += f" ({time_str})"
+
+            if is_finale:
+                line += " * Season Finale"
+            notification_body.append(line)
 
         # Add a blank line between media types
         notification_body.append("")
@@ -468,6 +731,7 @@ def format_notification(releases):
 
 def format_notification_html(releases):
     """Format notification HTML for releases."""
+    releases = annotate_finale_events(releases)
     releases_by_type = group_releases_by_type(releases)
     notification_html = ["<div>"]
 
@@ -483,15 +747,55 @@ def format_notification_html(releases):
             f"<p><strong>{escape(icon)} {escape(heading)}</strong></p><ul>",
         )
 
-        for event in media_events:
-            if event.is_sentinel_time:
-                line = escape(str(event))
+        for unit in collapse_batch_events(media_events):
+            if isinstance(unit, BatchEvent):
+                first_event = unit.first_event
+                label = f"{first_event.item} ({unit.range_label})"
+                is_finale = unit.is_finale
             else:
-                local_dt = timezone.localtime(event.datetime)
+                label = str(unit)
+                first_event = unit
+                is_finale = unit._is_season_finale
+
+            if first_event.is_sentinel_time:
+                line = escape(label)
+            else:
+                local_dt = timezone.localtime(first_event.datetime)
                 time_str = local_dt.strftime("%H:%M")
-                line = f"{escape(str(event))} ({time_str})"
+                line = f"{escape(label)} ({time_str})"
+            if is_finale:
+                line += ' <span style="color: #dc2626;">* Season Finale</span>'
             notification_html.append(f"<li>{line}</li>")
 
+        notification_html.append("</ul>")
+
+    notification_html.append("<p>Enjoy your media!</p></div>")
+    return "".join(notification_html)
+
+
+def format_premiere_notification_html(releases):
+    """Format premiere digest HTML, grouping new shows vs new seasons."""
+    new_shows = [event for event in releases if event.item.season_number == 1]
+    new_seasons = [event for event in releases if event.item.season_number != 1]
+
+    notification_html = ["<div>"]
+
+    for heading, events in (
+        ("🎬 New Shows", new_shows),
+        ("🆕 New Seasons", new_seasons),
+    ):
+        if not events:
+            continue
+
+        notification_html.append(f"<p><strong>{escape(heading)}</strong></p><ul>")
+        for event in events:
+            if event.is_sentinel_time:
+                line = escape(str(event.item))
+            else:
+                local_dt = timezone.localtime(event.datetime)
+                date_str = local_dt.strftime("%a, %b %d")
+                line = f"{escape(str(event.item))} ({date_str})"
+            notification_html.append(f"<li>{line}</li>")
         notification_html.append("</ul>")
 
     notification_html.append("<p>Enjoy your media!</p></div>")
@@ -503,7 +807,7 @@ def send_user_notification(
     urls,
     title,
     body,
-    body_format=apprise.NotifyFormat.TEXT,
+    body_format=None,
 ):
     """Send a notification to a specific user.
 
@@ -512,8 +816,19 @@ def send_user_notification(
         urls: List of notification URLs
         title: Notification title
         body: Notification body
-        body_format: Apprise body format
+        body_format: Apprise body format. Defaults to plain text.
+
+    Returns:
+        True if Apprise reported the notification as sent, False otherwise.
     """
+    # Imported here, not at module scope: apprise loads its whole notification
+    # plugin registry on import, and that cost lands in every long-lived
+    # process that merely imports this module.
+    import apprise
+
+    if body_format is None:
+        body_format = apprise.NotifyFormat.TEXT
+
     apobj = apprise.Apprise()
     for url in urls:
         apobj.add(url)
@@ -530,10 +845,12 @@ def send_user_notification(
                 "Notification sent to %s",
                 user.username,
             )
-        else:
-            logger.error(
-                "Failed to send notification to %s",
-                user.username,
-            )
+            return True
+        logger.error(
+            "Failed to send notification to %s",
+            user.username,
+        )
     except Exception:
         logger.exception("Error sending notification to %s", user.username)
+
+    return False

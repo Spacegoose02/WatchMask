@@ -15,17 +15,59 @@ from app.models.music import ArtistMember
 
 logger = logging.getLogger(__name__)
 
+# Lengths of the partial-date strings MusicBrainz can return for a release
+# date: "YYYY", "YYYY-MM", or a full "YYYY-MM-DD" (10+ chars).
+DATE_STR_LEN_YEAR_ONLY = 4
+DATE_STR_LEN_YEAR_MONTH = 7
+DATE_STR_LEN_FULL_DATE = 10
+
+# Fuzzy string-similarity ratio above which two candidate names/titles are
+# considered the same for artist/album MBID resolution.
+FUZZY_MATCH_SIMILARITY_THRESHOLD = 0.8
+
+# When resolving ambiguous MusicBrainz search results, trust the first
+# candidate outright if the result set is this small or smaller.
+FEW_CANDIDATES_AUTO_TRUST_MAX = 3
+
+
+def album_for_media_id(media_id, user=None):
+    """Return the Album behind an album page's media id, or None.
+
+    The album page identifies its Item with the release id, else the release
+    group id, else ``album-<pk>`` for an album with no MusicBrainz id. Duplicate
+    rows for one MusicBrainz identity resolve to the canonical one for ``user``.
+    """
+    media_id = str(media_id or "")
+    albums = Album.objects.select_related("artist")
+    if media_id.startswith("album-"):
+        album_pk = media_id.removeprefix("album-")
+        matches = list(albums.filter(pk=album_pk)) if album_pk.isdigit() else []
+    elif media_id:
+        matches = list(
+            albums.filter(
+                models.Q(musicbrainz_release_id=media_id)
+                | models.Q(musicbrainz_release_group_id=media_id),
+            ),
+        )
+    else:
+        matches = []
+    if not matches:
+        return None
+    # Rank every exact match first: the seed row's own group id would otherwise
+    # hide a duplicate that has the same release id but no group id.
+    return find_canonical_album(_preferred_album(matches, user), user=user)
+
 
 def _parse_partial_date(date_str):
     """Parse a MusicBrainz partial date string (YYYY, YYYY-MM, or YYYY-MM-DD)."""
     if not date_str:
         return None
     try:
-        if len(date_str) >= 10:
+        if len(date_str) >= DATE_STR_LEN_FULL_DATE:
             return parse_date(date_str[:10])
-        if len(date_str) == 7:
+        if len(date_str) == DATE_STR_LEN_YEAR_MONTH:
             return parse_date(date_str + "-01")
-        if len(date_str) == 4:
+        if len(date_str) == DATE_STR_LEN_YEAR_ONLY:
             return parse_date(date_str + "-01-01")
     except (ValueError, TypeError):
         return None
@@ -79,20 +121,44 @@ def _album_implied_genres(direct_genres: list[str]) -> list[str]:
     ]
 
 
+def _music_item_direct_genres(album: Album) -> list[str]:
+    """Return album genres, or the album artist's genres when the album has none."""
+    from app.providers import musicbrainz
+
+    if album.genres:
+        return list(album.genres)
+    artist_genres = (
+        Artist.objects.filter(id=album.artist_id)
+        .values_list("genres", flat=True)
+        .first()
+    )
+    return musicbrainz._normalize_musicbrainz_genre_names(artist_genres)
+
+
 def _sync_album_music_item_genres(album: Album) -> int:
-    """Propagate album direct/implied genres to linked music Items."""
+    """Propagate album direct/implied genres to linked music Items.
+
+    Direct genres fall back to the album artist's genres when the album has none.
+    An empty list does not clear genres already stored on the item. A match on any
+    of the item, track, album, or artist is copied onto the rows that have none.
+    """
     update_count = 0
     if not album.id:
         return update_count
 
-    for music in Music.objects.filter(album=album).select_related("item"):
+    direct_genres = _music_item_direct_genres(album)
+    for music in Music.objects.filter(album=album).select_related(
+        "item",
+        "track",
+        "artist",
+    ):
         item = getattr(music, "item", None)
         if not item:
             continue
 
         update_fields = []
-        if item.genres != list(album.genres or []):
-            item.genres = list(album.genres or [])
+        if direct_genres and item.genres != direct_genres:
+            item.genres = list(direct_genres)
             update_fields.append("genres")
         if item.implied_genres != list(album.implied_genres or []):
             item.implied_genres = list(album.implied_genres or [])
@@ -101,20 +167,72 @@ def _sync_album_music_item_genres(album: Album) -> int:
         if update_fields:
             item.save(update_fields=update_fields)
             update_count += 1
+        store_matched_genres(
+            artist=album.artist,
+            album=album,
+            track=music.track,
+            item=item,
+        )
 
     return update_count
 
 
+def _normalized_genre_names(genres) -> list[str]:
+    """Return display genre names, dropping blanks."""
+    from app.providers import musicbrainz
+
+    return musicbrainz._normalize_musicbrainz_genre_names(genres)
+
+
+def store_matched_genres(
+    *,
+    artist: Artist | None = None,
+    album: Album | None = None,
+    track: Track | None = None,
+    item: Item | None = None,
+) -> list[str]:
+    """Copy the first non-empty genre list onto related rows that have none.
+
+    Album, catalog item, track, then artist. A row that already has genres is left
+    as it is.
+    """
+    rows = [album, item, track, artist]
+    chosen = []
+    for row in rows:
+        if row is None:
+            continue
+        names = _normalized_genre_names(getattr(row, "genres", None))
+        if names:
+            chosen = names
+            break
+    if not chosen:
+        return []
+
+    for row in rows:
+        if row is None or not row.pk:
+            continue
+        if _normalized_genre_names(row.genres):
+            continue
+        row.genres = list(chosen)
+        row.save(update_fields=["genres"])
+    return chosen
+
+
 def sync_music_item_genres_from_album(item: Item, album: Album | None) -> list[str]:
-    """Copy album direct/implied genres onto a music Item and save if changed."""
+    """Copy album direct/implied genres onto a music Item and save if changed.
+
+    Direct genres fall back to the album artist's genres when the album has none.
+    An empty album does not clear genres already stored on the item. Whatever list
+    is present is then copied onto the album, track, and artist when those are empty.
+    """
     if not item or not album:
         return []
 
     update_fields = []
-    direct_genres = list(album.genres or [])
+    direct_genres = _music_item_direct_genres(album)
     implied_genres = list(album.implied_genres or [])
 
-    if item.genres != direct_genres:
+    if direct_genres and item.genres != direct_genres:
         item.genres = direct_genres
         update_fields.append("genres")
     if item.implied_genres != implied_genres:
@@ -123,6 +241,17 @@ def sync_music_item_genres_from_album(item: Item, album: Album | None) -> list[s
 
     if update_fields:
         item.save(update_fields=update_fields)
+
+    music = (
+        Music.objects.filter(item=item, album=album).select_related("track").first()
+    )
+    track = music.track if music is not None and music.track_id else None
+    store_matched_genres(
+        artist=album.artist,
+        album=album,
+        track=track,
+        item=item,
+    )
     return update_fields
 
 
@@ -143,13 +272,18 @@ def get_artist_hero_image(artist: Artist) -> str:
         URL to the hero image, or settings.IMG_NONE
     """
     # Get all albums for this artist that have images
-    albums_with_images = Album.objects.filter(
-        artist=artist,
-    ).exclude(
-        image="",
-    ).exclude(
-        image=settings.IMG_NONE,
-    ).order_by("release_date")
+    albums_with_images = (
+        Album.objects.filter(
+            artist=artist,
+        )
+        .exclude(
+            image="",
+        )
+        .exclude(
+            image=settings.IMG_NONE,
+        )
+        .order_by("release_date")
+    )
 
     if albums_with_images.exists():
         # Return the earliest album's image (often the most iconic)
@@ -192,7 +326,7 @@ def resolve_artist_mbid(name: str, sort_name: str | None = None):
     variants_tried = []
     total_candidates_seen = 0
     for variant in variants:
-        variant = variant.strip()
+        variant = variant.strip()  # noqa: PLW2901  # deliberate in-loop normalisation
         if not variant or variant in seen:
             continue
         seen.add(variant)
@@ -236,38 +370,9 @@ def resolve_artist_mbid(name: str, sort_name: str | None = None):
             target_norm,
         )
 
-        # PRIORITY 1: For exact unquoted name searches, trust MusicBrainz search ranking immediately
-        # Manual searches work because users pick the first result - we should do the same
-        if is_exact_search and candidates:
-            first_cand = candidates[0]
-            first_cand_id = first_cand.get("id")
-            first_cand_name = first_cand.get("name", "Unknown")
-            if first_cand_id:
-                chosen = first_cand_id
-                logger.info(
-                    "resolve_artist_mbid: DECISION - using first candidate for exact search '%s' -> '%s' (MBID=%s, %d candidates, trusting MB search ranking)",
-                    variant,
-                    first_cand_name,
-                    first_cand_id,
-                    len(candidates),
-                )
-            else:
-                logger.info(
-                    "resolve_artist_mbid: exact search '%s' returned candidates but first has no ID, falling back to strict matching",
-                    variant,
-                )
-        elif not is_exact_search:
-            logger.info(
-                "resolve_artist_mbid: variant '%s' is not exact search (quoted/normalized), using strict matching",
-                variant,
-            )
-        elif not candidates:
-            logger.info(
-                "resolve_artist_mbid: exact search '%s' has no candidates, skipping",
-                variant,
-            )
-
-        # PRIORITY 2: For quoted/normalized variants, use stricter matching
+        # A search hit only counts when its name matches. MusicBrainz ranks
+        # "Ray Treblo" next to Ray Charles, and taking that first row attaches
+        # the wrong person.
         if not chosen:
             logger.info(
                 "resolve_artist_mbid: attempting strict matching for variant '%s'",
@@ -283,9 +388,11 @@ def resolve_artist_mbid(name: str, sort_name: str | None = None):
             for cand in candidates:
                 cid = cand.get("id")
                 cname = cand.get("name") or ""
-                cand_norm = _norm_name(cname)
+                sort_name = cand.get("sort_name") or cand.get("sort-name") or ""
+                cand_names = [_norm_name(cname), _norm_name(sort_name)]
+                cand_norm = cand_names[0]
                 exact_match_attempted = True
-                if cid and cand_norm == target_norm:
+                if cid and target_norm in cand_names:
                     chosen = cid
                     logger.info(
                         "resolve_artist_mbid: DECISION - exact normalized match '%s' -> '%s' (MBID=%s, norm='%s'=='%s')",
@@ -322,11 +429,13 @@ def resolve_artist_mbid(name: str, sort_name: str | None = None):
                         # Simple similarity: check if one contains the other or vice versa
                         shorter = min(len(cand_norm), len(target_norm))
                         longer = max(len(cand_norm), len(target_norm))
-                        contains_match = cand_norm in target_norm or target_norm in cand_norm
+                        contains_match = (
+                            cand_norm in target_norm or target_norm in cand_norm
+                        )
                         similarity_ratio = shorter / longer if longer > 0 else 0
                         if shorter > 0 and contains_match:
                             # Check length similarity
-                            if similarity_ratio >= 0.8:
+                            if similarity_ratio >= FUZZY_MATCH_SIMILARITY_THRESHOLD:
                                 chosen = cid
                                 logger.info(
                                     "resolve_artist_mbid: DECISION - fuzzy match '%s' -> '%s' (MBID=%s, norm: '%s'->'%s', similarity=%.2f)",
@@ -372,39 +481,7 @@ def resolve_artist_mbid(name: str, sort_name: str | None = None):
                         break
                 if not chosen and case_match_attempted:
                     logger.info(
-                        "resolve_artist_mbid: case-insensitive match failed for '%s', trying first candidate fallback",
-                        variant,
-                    )
-
-            # Final fallback: use first candidate for non-exact searches
-            if not chosen and candidates:
-                first_cand = candidates[0]
-                first_cand_id = first_cand.get("id")
-                first_cand_name = first_cand.get("name", "Unknown")
-                if first_cand_id:
-                    # Trust first result if very few candidates (1-3) regardless of search type
-                    if len(candidates) <= 3:
-                        chosen = first_cand_id
-                        logger.info(
-                            "resolve_artist_mbid: DECISION - using first candidate for '%s' -> '%s' (MBID=%s, only %d candidates, trusting MB search ranking)",
-                            variant,
-                            first_cand_name,
-                            first_cand_id,
-                            len(candidates),
-                        )
-                    # Fallback: use first candidate but log as lower confidence
-                    else:
-                        chosen = first_cand_id
-                        logger.info(
-                            "resolve_artist_mbid: DECISION - using first candidate for '%s' -> '%s' (MBID=%s, no exact/fuzzy match, %d total candidates)",
-                            variant,
-                            first_cand_name,
-                            first_cand_id,
-                            len(candidates),
-                        )
-                else:
-                    logger.info(
-                        "resolve_artist_mbid: first candidate for '%s' has no ID, cannot use",
+                        "resolve_artist_mbid: case-insensitive match failed for '%s'",
                         variant,
                     )
 
@@ -465,7 +542,7 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
     variants_tried = []
     total_candidates_seen = 0
     for variant in variants:
-        variant = variant.strip()
+        variant = variant.strip()  # noqa: PLW2901  # deliberate in-loop normalisation
         if not variant or variant in seen:
             continue
         seen.add(variant)
@@ -518,7 +595,9 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
             first_cand_release_id = first_cand.get("release_id")
             first_cand_title = first_cand.get("title", "Unknown")
             first_cand_artist = first_cand.get("artist_name", "")
-            first_cand_artist_norm = _norm_name(first_cand_artist) if first_cand_artist else None
+            first_cand_artist_norm = (
+                _norm_name(first_cand_artist) if first_cand_artist else None
+            )
 
             # If artist name was provided, verify artist matches
             if target_artist_norm and first_cand_artist_norm:
@@ -639,7 +718,10 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
                     if cand_title_norm and target_norm:
                         shorter = min(len(cand_title_norm), len(target_norm))
                         longer = max(len(cand_title_norm), len(target_norm))
-                        contains_match = cand_title_norm in target_norm or target_norm in cand_title_norm
+                        contains_match = (
+                            cand_title_norm in target_norm
+                            or target_norm in cand_title_norm
+                        )
                         similarity_ratio = shorter / longer if longer > 0 else 0
 
                         # Check artist match if artist name was provided
@@ -650,7 +732,12 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
                             else:
                                 artist_matches = cand_artist_norm == target_artist_norm
 
-                        if shorter > 0 and contains_match and similarity_ratio >= 0.8 and artist_matches:
+                        if (
+                            shorter > 0
+                            and contains_match
+                            and similarity_ratio >= FUZZY_MATCH_SIMILARITY_THRESHOLD
+                            and artist_matches
+                        ):
                             chosen_release_id = cand_release_id
                             logger.info(
                                 "resolve_album_mbid: DECISION - fuzzy match '%s' -> '%s' by '%s' (release_id=%s, norm: '%s'->'%s', similarity=%.2f, artist_match=%s)",
@@ -664,7 +751,11 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
                                 artist_matches,
                             )
                             break
-                        if shorter > 0 and contains_match and similarity_ratio >= 0.8:
+                        if (
+                            shorter > 0
+                            and contains_match
+                            and similarity_ratio >= FUZZY_MATCH_SIMILARITY_THRESHOLD
+                        ):
                             logger.info(
                                 "resolve_album_mbid: fuzzy match rejected for '%s' vs '%s' (similarity=%.2f >= 0.8 but artist mismatch: '%s' vs '%s')",
                                 variant,
@@ -692,7 +783,11 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
                     cand_artist = cand.get("artist_name") or ""
                     case_match_attempted = True
 
-                    title_matches = cand_release_id and cand_title and cand_title.lower() == album_title.lower()
+                    title_matches = (
+                        cand_release_id
+                        and cand_title
+                        and cand_title.lower() == album_title.lower()
+                    )
                     artist_matches = True
                     if artist_name and cand_artist:
                         artist_matches = cand_artist.lower() == artist_name.lower()
@@ -720,7 +815,7 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
                 first_cand_title = first_cand.get("title", "Unknown")
                 if first_cand_release_id:
                     # Trust first result if very few candidates (1-3) regardless of search type
-                    if len(candidates) <= 3:
+                    if len(candidates) <= FEW_CANDIDATES_AUTO_TRUST_MAX:
                         chosen_release_id = first_cand_release_id
                         logger.info(
                             "resolve_album_mbid: DECISION - using first candidate for '%s' -> '%s' (release_id=%s, only %d candidates, trusting MB search ranking)",
@@ -752,12 +847,19 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
                 # We need to make a direct API call since get_release doesn't return release_group_id in the result dict
                 # Import the private function for this specific use case
                 from app.providers.musicbrainz import _mb_request
+
                 try:
-                    release_response = _mb_request(f"release/{chosen_release_id}", {"inc": "release-groups"})
+                    release_response = _mb_request(
+                        f"release/{chosen_release_id}", {"inc": "release-groups"}
+                    )
                     release_group = release_response.get("release-group", {})
                     chosen_release_group_id = release_group.get("id")
                 except Exception as e:
-                    logger.debug("Failed to get release_group_id for release %s: %s", chosen_release_id, e)
+                    logger.debug(
+                        "Failed to get release_group_id for release %s: %s",
+                        chosen_release_id,
+                        e,
+                    )
                     chosen_release_group_id = None
 
                 logger.info(
@@ -767,7 +869,12 @@ def resolve_album_mbid(album_title: str, artist_name: str | None = None):
                     chosen_release_id,
                     chosen_release_group_id or "None",
                 )
-                return chosen_release_group_id, chosen_release_id, len(candidates), variant
+                return (
+                    chosen_release_group_id,
+                    chosen_release_id,
+                    len(candidates),
+                    variant,
+                )
             except Exception as e:
                 logger.warning(
                     "resolve_album_mbid: Failed to fetch release data for release_id %s: %s",
@@ -825,21 +932,27 @@ def refresh_album_cover_art(album: Album) -> bool:
         logger.debug("Failed to fetch cover art for album %s: %s", album.title, e)
 
     # Try iTunes as fallback if MusicBrainz didn't find artwork
-    if album.image == settings.IMG_NONE or not album.image:
-        if album.artist and album.title:
-            try:
-                from integrations import itunes_music_artwork
-                itunes_image = itunes_music_artwork.fetch_album_artwork(
-                    album_title=album.title,
-                    artist_name=album.artist.name,
-                )
-                if itunes_image:
-                    album.image = itunes_image
-                    album.save(update_fields=["image"])
-                    logger.info("Updated cover art for album %s from iTunes", album.title)
-                    return True
-            except Exception as e:
-                logger.debug("Failed to fetch cover art from iTunes for album %s: %s", album.title, e)
+    if (album.image == settings.IMG_NONE or not album.image) and (
+        album.artist and album.title
+    ):
+        try:
+            from integrations import itunes_music_artwork
+
+            itunes_image = itunes_music_artwork.fetch_album_artwork(
+                album_title=album.title,
+                artist_name=album.artist.name,
+            )
+            if itunes_image:
+                album.image = itunes_image
+                album.save(update_fields=["image"])
+                logger.info("Updated cover art for album %s from iTunes", album.title)
+                return True
+        except Exception as e:
+            logger.debug(
+                "Failed to fetch cover art from iTunes for album %s: %s",
+                album.title,
+                e,
+            )
 
     return False
 
@@ -889,7 +1002,9 @@ def sync_artist_discography(artist: Artist, force: bool = False) -> int:
 
     # Skip if no MusicBrainz ID
     if not artist.musicbrainz_id:
-        logger.debug("Artist %s has no MusicBrainz ID, skipping discography sync", artist.name)
+        logger.debug(
+            "Artist %s has no MusicBrainz ID, skipping discography sync", artist.name
+        )
         return 0
 
     # Skip if already synced recently unless forced
@@ -911,7 +1026,9 @@ def sync_artist_discography(artist: Artist, force: bool = False) -> int:
 
     try:
         # Skip cover art fetching during sync - covers are loaded async via HTMX
-        discography = musicbrainz.get_artist_discography(artist.musicbrainz_id, skip_cover_art=True)
+        discography = musicbrainz.get_artist_discography(
+            artist.musicbrainz_id, skip_cover_art=True
+        )
 
         synced_count = 0
         for album_data in discography:
@@ -961,11 +1078,12 @@ def sync_artist_discography(artist: Artist, force: bool = False) -> int:
             synced_count,
             artist.name,
         )
-        return synced_count
 
-    except Exception as e:
-        logger.exception("Failed to sync discography for artist %s: %s", artist.name, e)
+    except Exception:
+        logger.exception("Failed to sync discography for artist %s", artist.name)
         return 0
+    else:
+        return synced_count
 
 
 def _sync_single_artist_member(band: Artist, member_data: dict) -> bool:
@@ -1014,7 +1132,9 @@ def sync_artist_members(artist: Artist, force: bool = False) -> int:
         artist.save()
 
     if not artist.musicbrainz_id:
-        logger.debug("Artist %s has no MusicBrainz ID, skipping member sync", artist.name)
+        logger.debug(
+            "Artist %s has no MusicBrainz ID, skipping member sync", artist.name
+        )
         return 0
 
     if not force and artist.members_synced_at:
@@ -1049,11 +1169,12 @@ def sync_artist_members(artist: Artist, force: bool = False) -> int:
             synced_count,
             artist.name,
         )
-        return synced_count
 
-    except Exception as e:
-        logger.exception("Failed to sync members for artist %s: %s", artist.name, e)
+    except Exception:
+        logger.exception("Failed to sync members for artist %s", artist.name)
         return 0
+    else:
+        return synced_count
 
 
 def sync_album_artist_credits(album: Album, release_data: dict) -> None:
@@ -1115,16 +1236,16 @@ def sync_album_artist_credits(album: Album, release_data: dict) -> None:
 
 def album_artist_credits_need_sync(album: Album) -> bool:
     """Return True when album credits are missing or look like fallback data."""
-    credits = list(album.artist_credits.all()[:2])
-    if not credits:
+    credit_entries = list(album.artist_credits.all()[:2])
+    if not credit_entries:
         return True
 
     return (
-        len(credits) == 1
+        len(credit_entries) == 1
         and album.artist_id is not None
-        and credits[0].artist_id == album.artist_id
-        and credits[0].position == 0
-        and credits[0].join_phrase == ""
+        and credit_entries[0].artist_id == album.artist_id
+        and credit_entries[0].position == 0
+        and credit_entries[0].join_phrase == ""
     )
 
 
@@ -1144,11 +1265,16 @@ def find_canonical_album(album: Album, user=None) -> Album:
     if identity_filter is None:
         return album
 
-    from app.models import AlbumTracker, Music
-
     candidates = list(Album.objects.filter(identity_filter).select_related("artist"))
     if len(candidates) <= 1:
         return album
+
+    return _preferred_album(candidates, user)
+
+
+def _preferred_album(candidates: list[Album], user=None) -> Album:
+    """Return the candidate a user is most likely to mean."""
+    from app.models import AlbumTracker, Music
 
     def score(candidate: Album) -> tuple:
         user_tracker = 0
@@ -1192,7 +1318,9 @@ def merge_album_records(source_album: Album, target_album: Album) -> Album:
         not target_album.musicbrainz_release_group_id
         and source_album.musicbrainz_release_group_id
     ):
-        target_album.musicbrainz_release_group_id = source_album.musicbrainz_release_group_id
+        target_album.musicbrainz_release_group_id = (
+            source_album.musicbrainz_release_group_id
+        )
         updates.add("musicbrainz_release_group_id")
     if not target_album.release_date and source_album.release_date:
         target_album.release_date = source_album.release_date
@@ -1288,6 +1416,45 @@ def canonicalize_album(album: Album, user=None) -> Album:
     return merge_album_records(album, canonical)
 
 
+def canonicalize_albums(albums: list[Album], user=None) -> list[Album]:
+    """Canonicalize many albums, checking for duplicate rows in one query.
+
+    Only albums whose MusicBrainz identity is shared with another row go
+    through canonicalize_album; every other album is returned as it is.
+    """
+    group_ids = {
+        a.musicbrainz_release_group_id for a in albums if a.musicbrainz_release_group_id
+    }
+    release_ids = {
+        a.musicbrainz_release_id
+        for a in albums
+        if a.musicbrainz_release_id and not a.musicbrainz_release_group_id
+    }
+    group_counts = {}
+    release_counts = {}
+    if group_ids or release_ids:
+        rows = Album.objects.filter(
+            models.Q(musicbrainz_release_group_id__in=group_ids)
+            | models.Q(musicbrainz_release_id__in=release_ids),
+        ).values_list("musicbrainz_release_group_id", "musicbrainz_release_id")
+        for group_id, release_id in rows:
+            if group_id in group_ids:
+                group_counts[group_id] = group_counts.get(group_id, 0) + 1
+            if release_id in release_ids:
+                release_counts[release_id] = release_counts.get(release_id, 0) + 1
+
+    canonical = []
+    for album in albums:
+        if album.musicbrainz_release_group_id:
+            shared = group_counts.get(album.musicbrainz_release_group_id, 0) > 1
+        elif album.musicbrainz_release_id:
+            shared = release_counts.get(album.musicbrainz_release_id, 0) > 1
+        else:
+            shared = False
+        canonical.append(canonicalize_album(album, user=user) if shared else album)
+    return canonical
+
+
 def needs_discography_sync(artist: Artist, max_age_days: int = 7) -> bool:
     """Check if an artist needs discography sync.
 
@@ -1347,7 +1514,10 @@ def _split_release_type(release_type: str | None) -> tuple[str, list[str], str]:
 
 
 def build_discography_groups(albums: list[Album]) -> list[dict]:
-    groups: dict[str, dict] = defaultdict(lambda: {"albums": [], "primary": "Unknown", "secondary": []})
+    """Return the build discography groups."""
+    groups: dict[str, dict] = defaultdict(
+        lambda: {"albums": [], "primary": "Unknown", "secondary": []}
+    )
     for album in albums:
         primary, secondary, label = _split_release_type(album.release_type)
         entry = groups[label]
@@ -1359,17 +1529,28 @@ def build_discography_groups(albums: list[Album]) -> list[dict]:
         label, data = item
         primary = data["primary"]
         secondary = data["secondary"]
-        primary_order = _DISCOGRAPHY_PRIMARY_ORDER.get(primary, len(_DISCOGRAPHY_PRIMARY_ORDER))
-        secondary_order = tuple(_DISCOGRAPHY_SECONDARY_ORDER.get(sec, 100) for sec in secondary)
-        return (primary_order, 0 if not secondary else 1, secondary_order, label.lower())
+        primary_order = _DISCOGRAPHY_PRIMARY_ORDER.get(
+            primary, len(_DISCOGRAPHY_PRIMARY_ORDER)
+        )
+        secondary_order = tuple(
+            _DISCOGRAPHY_SECONDARY_ORDER.get(sec, 100) for sec in secondary
+        )
+        return (
+            primary_order,
+            0 if not secondary else 1,
+            secondary_order,
+            label.lower(),
+        )
 
     grouped = []
     for label, data in sorted(groups.items(), key=sort_key):
-        grouped.append({
-            "label": label,
-            "albums": data["albums"],
-            "count": len(data["albums"]),
-        })
+        grouped.append(
+            {
+                "label": label,
+                "albums": data["albums"],
+                "count": len(data["albums"]),
+            }
+        )
 
     return grouped
 
@@ -1398,7 +1579,9 @@ def ensure_album_has_release_id(album: Album) -> bool:
 
     # Try to get a release from the release group
     try:
-        release_id = musicbrainz.get_release_for_group(album.musicbrainz_release_group_id)
+        release_id = musicbrainz.get_release_for_group(
+            album.musicbrainz_release_group_id
+        )
         if release_id:
             album.musicbrainz_release_id = release_id
             album.save(update_fields=["musicbrainz_release_id"])
@@ -1482,7 +1665,9 @@ def populate_album_tracks(album: Album) -> int:
                 created_or_updated += 1
 
         # Also update album image if missing
-        if (not album.image or album.image == settings.IMG_NONE) and release_data.get("image"):
+        if (not album.image or album.image == settings.IMG_NONE) and release_data.get(
+            "image"
+        ):
             album.image = release_data["image"]
 
         album.tracks_populated = True
@@ -1498,8 +1683,76 @@ def populate_album_tracks(album: Album) -> int:
         logger.info("Populated %d tracks for album %s", len(tracks_data), album.title)
         return len(tracks_data)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Failed to populate tracks for album %s: %s", album.title, exception_summary(exc))
+        logger.warning(
+            "Failed to populate tracks for album %s: %s",
+            album.title,
+            exception_summary(exc),
+        )
         return 0
+
+
+def sync_album_release_tracks(album: Album, release_id: str) -> int:
+    """Replace an album's tracklist with a specific MusicBrainz release's tracks.
+
+    Unlike populate_album_tracks(), this always re-fetches and rebuilds the
+    tracklist for the given release_id, regardless of tracks_populated - it's
+    the path for a user explicitly picking a pressing, not the lazy first-sync
+    path. Sets album.musicbrainz_release_id to release_id so the choice sticks.
+
+    Returns the number of tracks synced.
+    """
+    from django.core.cache import cache as django_cache
+
+    from app.providers import musicbrainz
+
+    django_cache.delete(f"musicbrainz_release_{release_id}")
+    release_data = musicbrainz.get_release(release_id)
+    sync_album_artist_credits(album, release_data)
+
+    new_image = release_data.get("image", "")
+    if new_image and new_image != settings.IMG_NONE:
+        album.image = new_image
+
+    direct_genres = _album_direct_genres(album, release_data)
+    album.genres = direct_genres
+    album.implied_genres = _album_implied_genres(direct_genres)
+
+    tracks_data = release_data.get("tracks", [])
+    Track.objects.filter(album=album).delete()
+    for track_data in tracks_data:
+        Track.objects.update_or_create(
+            album=album,
+            disc_number=track_data.get("disc_number", 1),
+            track_number=track_data.get("track_number"),
+            defaults={
+                "title": track_data.get("title", "Unknown Track"),
+                "musicbrainz_recording_id": track_data.get("recording_id"),
+                "duration_ms": track_data.get("duration_ms"),
+                "genres": _dedupe_display_values(
+                    track_data.get("genres", []) or direct_genres,
+                ),
+            },
+        )
+
+    album.musicbrainz_release_id = release_id
+    album.tracks_populated = True
+    album.save(
+        update_fields=[
+            "musicbrainz_release_id",
+            "tracks_populated",
+            "image",
+            "genres",
+            "implied_genres",
+        ],
+    )
+    _sync_album_music_item_genres(album)
+    logger.info(
+        "Synced %d tracks for album %s from release %s",
+        len(tracks_data),
+        album.title,
+        release_id,
+    )
+    return len(tracks_data)
 
 
 def prefetch_album_covers(artist: Artist, limit: int | None = 20) -> int:
@@ -1544,22 +1797,28 @@ def prefetch_album_covers(artist: Artist, limit: int | None = 20) -> int:
             logger.debug("Failed to prefetch cover for %s: %s", album.title, e)
 
         # Try iTunes as fallback if MusicBrainz didn't find artwork
-        if album.image == settings.IMG_NONE or not album.image:
-            if album.title:
-                try:
-                    from integrations import itunes_music_artwork
-                    artist_name = album.artist.name if album.artist else artist.name
-                    itunes_image = itunes_music_artwork.fetch_album_artwork(
-                        album_title=album.title,
-                        artist_name=artist_name,
+        if (album.image == settings.IMG_NONE or not album.image) and album.title:
+            try:
+                from integrations import itunes_music_artwork
+
+                artist_name = album.artist.name if album.artist else artist.name
+                itunes_image = itunes_music_artwork.fetch_album_artwork(
+                    album_title=album.title,
+                    artist_name=artist_name,
+                )
+                if itunes_image:
+                    album.image = itunes_image
+                    album.save(update_fields=["image"])
+                    updated += 1
+                    logger.debug(
+                        "Prefetched cover for album %s from iTunes", album.title
                     )
-                    if itunes_image:
-                        album.image = itunes_image
-                        album.save(update_fields=["image"])
-                        updated += 1
-                        logger.debug("Prefetched cover for album %s from iTunes", album.title)
-                except Exception as e:
-                    logger.debug("Failed to prefetch cover from iTunes for %s: %s", album.title, e)
+            except Exception as e:
+                logger.debug(
+                    "Failed to prefetch cover from iTunes for %s: %s",
+                    album.title,
+                    e,
+                )
 
         # Both sources failed — mark as confirmed-missing so polling stops
         if not album.image:
@@ -1659,17 +1918,29 @@ def merge_artist_records(source_artist: Artist, target_artist: Artist) -> Artist
         ):
             target_album.image = source_album.image
             updates.add("image")
-        if not target_album.musicbrainz_release_id and source_album.musicbrainz_release_id:
+        if (
+            not target_album.musicbrainz_release_id
+            and source_album.musicbrainz_release_id
+        ):
             target_album.musicbrainz_release_id = source_album.musicbrainz_release_id
             updates.add("musicbrainz_release_id")
-        if not target_album.musicbrainz_release_group_id and source_album.musicbrainz_release_group_id:
+        if (
+            not target_album.musicbrainz_release_group_id
+            and source_album.musicbrainz_release_group_id
+        ):
             # Check for conflicts before setting - another album on this artist might already have this release_group_id
-            conflict = Album.objects.filter(
-                artist=target_album.artist,
-                musicbrainz_release_group_id=source_album.musicbrainz_release_group_id,
-            ).exclude(id=target_album.id).first()
+            conflict = (
+                Album.objects.filter(
+                    artist=target_album.artist,
+                    musicbrainz_release_group_id=source_album.musicbrainz_release_group_id,
+                )
+                .exclude(id=target_album.id)
+                .first()
+            )
             if not conflict:
-                target_album.musicbrainz_release_group_id = source_album.musicbrainz_release_group_id
+                target_album.musicbrainz_release_group_id = (
+                    source_album.musicbrainz_release_group_id
+                )
                 updates.add("musicbrainz_release_group_id")
             else:
                 logger.debug(
@@ -1948,7 +2219,9 @@ def fix_music_album_links(user, limit: int | None = None):
             music.album = music.track.album
             if not music.artist_id and music.track.album.artist_id:
                 music.artist = music.track.album.artist
-            music.save(update_fields=["album", "artist"] if not music.artist_id else ["album"])
+            music.save(
+                update_fields=["album", "artist"] if not music.artist_id else ["album"]
+            )
             fixed_count += 1
             continue
 

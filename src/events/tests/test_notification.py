@@ -12,12 +12,14 @@ from events.models import Event
 from events.notifications import (
     format_notification,
     format_notification_html,
+    format_premiere_notification_html,
     get_all_user_tracking_data,
     get_tv_tracking_data,
     get_user_releases,
     is_user_tracking_item,
     send_daily_digest,
     send_notifications,
+    send_premiere_digest,
     send_releases,
 )
 
@@ -622,6 +624,105 @@ class NotificationTests(TestCase):
         self.assertTrue(season1_event_found)
         self.assertFalse(season2_event_found)
 
+    def _digest_recipients(self, event):
+        """Return which of user1/user2 get `event` in a digest, by user id."""
+        users = get_user_model().objects.filter(id__in=[self.user1.id, self.user2.id])
+        target_events = {(event.item.id, event.content_number): event}
+        return set(
+            get_user_releases(
+                users,
+                target_events,
+                skip_alerted_for_instant_users=True,
+            ),
+        )
+
+    def test_digest_skips_alerted_event_for_instant_users_only(self):
+        """An already-alerted event is dropped only for users with instant alerts."""
+        self.user1.release_notifications_enabled = True
+        self.user1.save()
+        self.user2.release_notifications_enabled = False
+        self.user2.save()
+
+        self.anime_event.notification_sent = True
+        self.anime_event.save()
+
+        # user1 was already alerted in real time; user2 never was
+        self.assertEqual(self._digest_recipients(self.anime_event), {self.user2.id})
+
+    def test_digest_keeps_never_alerted_event_for_instant_users(self):
+        """An event no alert covered (e.g. missed window) still reaches the digest."""
+        self.user1.release_notifications_enabled = True
+        self.user1.save()
+
+        self.anime_event.notification_sent = False
+        self.anime_event.save()
+
+        self.assertIn(self.user1.id, self._digest_recipients(self.anime_event))
+
+    def test_digest_keeps_event_when_users_alert_failed(self):
+        """A user whose real-time alert failed still gets the event in the digest."""
+        self.user1.release_notifications_enabled = True
+        self.user1.save()
+        self.user2.release_notifications_enabled = True
+        self.user2.save()
+
+        self.anime_event.notification_sent = True
+        self.anime_event.save()
+        self.anime_event.alert_failed_users.add(self.user1)
+
+        # user2 was alerted, user1 was not
+        self.assertEqual(self._digest_recipients(self.anime_event), {self.user1.id})
+
+    @patch("apprise.Apprise")
+    def test_failed_alert_is_reported_and_recovered_by_the_digest(self, mock_apprise):
+        """A failed send is recorded, reported in the task result, and re-listed."""
+        mock_apprise.return_value.notify.return_value = False
+        for user in (self.user1, self.user2):
+            user.release_notifications_enabled = True
+            user.save()
+
+        result = send_releases()
+
+        self.assertIn("delivery failed for 2 user(s)", result)
+        self.anime_event.refresh_from_db()
+        self.assertTrue(self.anime_event.notification_sent)
+        self.assertEqual(
+            set(self.anime_event.alert_failed_users.values_list("id", flat=True)),
+            {self.user1.id, self.user2.id},
+        )
+        self.assertEqual(
+            self._digest_recipients(self.anime_event),
+            {self.user1.id, self.user2.id},
+        )
+
+    @patch("apprise.Apprise")
+    def test_successful_alert_records_no_failure(self, mock_apprise):
+        """A successful send leaves no failure record and no failure in the result."""
+        mock_apprise.return_value.notify.return_value = True
+        for user in (self.user1, self.user2):
+            user.release_notifications_enabled = True
+            user.save()
+
+        result = send_releases()
+
+        self.assertNotIn("failed", result)
+        self.anime_event.refresh_from_db()
+        self.assertFalse(self.anime_event.alert_failed_users.exists())
+        self.assertEqual(self._digest_recipients(self.anime_event), set())
+
+    def test_get_user_releases_default_ignores_notification_sent(self):
+        """Other callers (real-time, premiere digest) are unaffected by the flag."""
+        self.anime_event.notification_sent = True
+        self.anime_event.save()
+        users = get_user_model().objects.filter(id=self.user1.id)
+        target_events = {
+            (self.anime_event.item.id, self.anime_event.content_number): (
+                self.anime_event
+            ),
+        }
+
+        self.assertIn(self.user1.id, get_user_releases(users, target_events))
+
     def test_is_user_tracking_item(self):
         """Test the is_user_tracking_item function."""
         # Create tracking data
@@ -715,6 +816,7 @@ class NotificationTests(TestCase):
             )
             self.assertIn("<ul>", call.kwargs["body"])
             self.assertIn("Enjoy your media!", call.kwargs["body"])
+            self.assertIn("* Season Finale", call.kwargs["body"])
 
     def test_format_notification(self):
         """Test the format_notification function."""
@@ -743,6 +845,66 @@ class NotificationTests(TestCase):
         self.assertNotIn("MANGA", notification_text)
         self.assertNotIn("Test Manga", notification_text)
 
+    def test_finale_marker_excludes_non_final_and_special_events(self):
+        """Mark only the highest known regular-season episode as a finale."""
+        earlier_event = Event.objects.create(
+            item=self.season1_item,
+            content_number=4,
+            datetime=timezone.now(),
+        )
+        specials_item = Item.objects.create(
+            media_id="1668",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Test TV Show - Specials",
+            season_number=0,
+            image="http://example.com/tv.jpg",
+        )
+        special_event = Event.objects.create(
+            item=specials_item,
+            content_number=1,
+            datetime=timezone.now(),
+        )
+        missing_number_event = Event.objects.create(
+            item=self.season2_item,
+            content_number=None,
+            datetime=timezone.now(),
+        )
+
+        releases = [
+            earlier_event,
+            self.season1_event,
+            special_event,
+            missing_number_event,
+            self.anime_event,
+        ]
+        notification_text = format_notification(releases)
+        notification_html = format_notification_html(releases)
+
+        self.assertEqual(notification_text.count("* Season Finale"), 1)
+        self.assertEqual(notification_html.count("* Season Finale"), 1)
+        self.assertIn("Test TV Show - Season 1 S1 E5", notification_text)
+        self.assertIn("Test TV Show - Season 1 S1 E4", notification_text)
+        self.assertIn(
+            '<span style="color: #dc2626;">* Season Finale</span>',
+            notification_html,
+        )
+
+    def test_finale_marker_preserves_sentinel_time_format(self):
+        """A finale with an unknown time keeps the no-time display."""
+        self.season1_event.datetime = timezone.now().replace(
+            hour=11,
+            minute=59,
+            second=59,
+            microsecond=999999,
+        )
+        self.season1_event.save()
+
+        notification_text = format_notification([self.season1_event])
+
+        self.assertIn("Test TV Show - Season 1 S1 E5 * Season Finale", notification_text)
+        self.assertNotIn("(11:59)", notification_text)
+
     def test_format_notification_html(self):
         """Test the format_notification_html function."""
         releases = [self.anime_event, self.manga_event, self.season1_event]
@@ -759,6 +921,105 @@ class NotificationTests(TestCase):
         self.assertIn("E5", notification_html)
         self.assertIn("#10", notification_html)
         self.assertIn("Enjoy your media!", notification_html)
+
+    def test_format_notification_collapses_full_season_batch(self):
+        """A run of >= 3 episodes for one item collapses into one summary line."""
+        events = [self.season1_event]
+        for content_number in (1, 2, 3, 4):
+            events.append(
+                Event.objects.create(
+                    item=self.season1_item,
+                    content_number=content_number,
+                    datetime=timezone.now(),
+                ),
+            )
+
+        notification_text = format_notification(events)
+
+        self.assertEqual(
+            notification_text.count("Test TV Show - Season 1 S1"),
+            1,
+        )
+        self.assertIn("All Episodes 1-5", notification_text)
+        self.assertIn("* Season Finale", notification_text)
+        self.assertNotIn("E5", notification_text)
+
+    def test_format_notification_batch_mid_season_range(self):
+        """A batch that doesn't start at episode 1 shows a plain range, no finale."""
+        # A later, not-yet-notified episode establishes the real season finale,
+        # so the mid-season batch below must not be flagged as one.
+        Event.objects.create(
+            item=self.season2_item,
+            content_number=10,
+            datetime=timezone.now(),
+        )
+        events = [
+            Event.objects.create(
+                item=self.season2_item,
+                content_number=content_number,
+                datetime=timezone.now(),
+            )
+            for content_number in (4, 5, 6)
+        ]
+
+        notification_text = format_notification(events)
+
+        self.assertIn("Episodes 4-6", notification_text)
+        self.assertNotIn("All Episodes", notification_text)
+        self.assertNotIn("* Season Finale", notification_text)
+
+    def test_format_notification_keeps_one_and_two_episodes_uncollapsed(self):
+        """Fewer than 3 episodes for an item still render as individual bullets."""
+        second_episode = Event.objects.create(
+            item=self.season1_item,
+            content_number=4,
+            datetime=timezone.now(),
+        )
+
+        notification_text = format_notification([self.season1_event, second_episode])
+
+        self.assertIn("Test TV Show - Season 1 S1 E5", notification_text)
+        self.assertIn("Test TV Show - Season 1 S1 E4", notification_text)
+        self.assertNotIn("Episodes", notification_text)
+
+    def test_format_notification_only_collapses_the_batch_item(self):
+        """A batch for one item doesn't affect an unrelated single-episode item."""
+        events = [self.season3_event]
+        for content_number in (1, 2, 3, 4):
+            events.append(
+                Event.objects.create(
+                    item=self.season1_item,
+                    content_number=content_number,
+                    datetime=timezone.now(),
+                ),
+            )
+        events.append(self.season1_event)
+
+        notification_text = format_notification(events)
+
+        self.assertIn("Episodes 1-5", notification_text)
+        self.assertIn("Test TV Show - Season 3 S3 E1", notification_text)
+
+    def test_format_notification_html_collapses_full_season_batch(self):
+        """HTML notifications collapse batches the same way as plain text."""
+        events = [self.season1_event]
+        for content_number in (1, 2, 3, 4):
+            events.append(
+                Event.objects.create(
+                    item=self.season1_item,
+                    content_number=content_number,
+                    datetime=timezone.now(),
+                ),
+            )
+
+        notification_html = format_notification_html(events)
+
+        self.assertEqual(notification_html.count("<li>"), 1)
+        self.assertIn("All Episodes 1-5", notification_html)
+        self.assertIn(
+            '<span style="color: #dc2626;">* Season Finale</span>',
+            notification_html,
+        )
 
     @patch("events.notifications.send_notifications")
     def test_no_recent_events(self, mock_send_notifications):
@@ -1122,6 +1383,88 @@ class NotificationTests(TestCase):
         self.assertEqual(result, "Daily digest sent for 5 releases")
 
     @patch("events.notifications.send_notifications")
+    def test_send_premiere_digest(self, mock_send_notifications):
+        """Test the send_premiere_digest task picks up show and season premieres."""
+        mock_send_notifications.return_value = {
+            "event_count": 2,
+            "event_ids": [],
+        }
+
+        now = timezone.localtime()
+        today = now.replace(hour=12, minute=0, second=0, microsecond=0)
+
+        # New show premiere: season1_item is season_number=1
+        new_show_event = Event.objects.create(
+            item=self.season1_item,
+            content_number=1,
+            datetime=today,
+            notification_sent=False,
+        )
+
+        # New season premiere: season3_event already has content_number=1
+        self.season3_event.datetime = today
+        self.season3_event.save()
+
+        get_user_model().objects.all().update(premiere_notifications_enabled=True)
+
+        result = send_premiere_digest()
+
+        mock_send_notifications.assert_called_once()
+        call_kwargs = mock_send_notifications.call_args[1]
+        self.assertEqual(call_kwargs["formatter"], format_premiere_notification_html)
+
+        event_ids = {event.id for event in call_kwargs["events"]}
+        self.assertIn(new_show_event.id, event_ids)
+        self.assertIn(self.season3_event.id, event_ids)
+        # Non-premiere events (content_number != 1) must not be included
+        self.assertNotIn(self.season1_event.id, event_ids)
+
+        self.assertEqual(result, "Premiere digest sent for 2 premieres")
+
+    @patch("events.notifications.send_notifications")
+    def test_premiere_digest_no_premieres(self, mock_send_notifications):
+        """Test premiere digest when no premieres are scheduled this week."""
+        # season3_event has content_number=1 by default (setUp); push it
+        # outside the digest window so this test reflects an empty week.
+        self.season3_event.datetime = timezone.now() - timedelta(days=30)
+        self.season3_event.save()
+
+        get_user_model().objects.all().update(premiere_notifications_enabled=True)
+
+        result = send_premiere_digest()
+
+        mock_send_notifications.assert_not_called()
+        self.assertEqual(result, "No premieres scheduled this week")
+
+    @patch("events.notifications.send_notifications")
+    def test_premiere_digest_no_users(self, mock_send_notifications):
+        """Test premiere digest when no users have it enabled."""
+        get_user_model().objects.all().update(premiere_notifications_enabled=False)
+
+        result = send_premiere_digest()
+
+        mock_send_notifications.assert_not_called()
+        self.assertEqual(result, "No users with premiere notifications enabled")
+
+    def test_format_premiere_notification_html(self):
+        """Test format_premiere_notification_html groups shows vs seasons."""
+        new_show_event = Event.objects.create(
+            item=self.season1_item,
+            content_number=1,
+            datetime=timezone.now(),
+            notification_sent=False,
+        )
+
+        releases = [new_show_event, self.season3_event]
+        notification_html = format_premiere_notification_html(releases)
+
+        self.assertIn("New Shows", notification_html)
+        self.assertIn("New Seasons", notification_html)
+        self.assertIn("Test TV Show - Season 1", notification_html)
+        self.assertIn("Test TV Show - Season 3", notification_html)
+        self.assertIn("Enjoy your media!", notification_html)
+
+    @patch("events.notifications.send_notifications")
     def test_daily_digest_with_notification_urls(self, mock_send_notifications):
         """Test daily digest only sends to users with notification URLs."""
         # Setup mock
@@ -1176,3 +1519,155 @@ class NotificationTests(TestCase):
 
         # Verify the result message
         self.assertEqual(result, "Daily digest sent for 5 releases")
+
+
+class CrossBucketAnimeNotificationTests(TestCase):
+    """Release notifications must not duplicate a show across Anime and TV (#968)."""
+
+    def setUp(self):
+        self.credentials = {
+            "username": "notify-dedup-user",
+            "password": "12345",
+            "notification_urls": "https://example.com/notify",
+        }
+        self.user = get_user_model().objects.create_user(**self.credentials)
+
+        self.anime_item = Item.objects.create(
+            media_id="52991",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Test Anime",
+            image="http://example.com/anime.jpg",
+        )
+        self.tv_show_item = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Test TV Show",
+            image="http://example.com/tv.jpg",
+        )
+        self.season1_item = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Test TV Show - Season 1",
+            season_number=1,
+            image="http://example.com/tv.jpg",
+        )
+
+        Anime.objects.create(
+            item=self.anime_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        TV.objects.create(
+            item=self.tv_show_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+
+        now = timezone.now()
+        ten_mins_ago = now - timedelta(minutes=10)
+        self.anime_event = Event.objects.create(
+            item=self.anime_item,
+            content_number=1,
+            datetime=ten_mins_ago,
+            notification_sent=False,
+        )
+        self.season1_event = Event.objects.create(
+            item=self.season1_item,
+            content_number=1,
+            datetime=ten_mins_ago,
+            notification_sent=False,
+        )
+
+    def test_get_user_releases_hides_anime_duplicate_of_tracked_tv_show(self):
+        users_with_notifications = (
+            get_user_model()
+            .objects.filter(~models.Q(notification_urls=""))
+            .prefetch_related("notification_excluded_items")
+        )
+        target_events = {
+            (
+                self.anime_event.item.id,
+                self.anime_event.content_number,
+            ): self.anime_event,
+            (
+                self.season1_event.item.id,
+                self.season1_event.content_number,
+            ): self.season1_event,
+        }
+
+        with patch(
+            "events.models.resolve_provider_series_id",
+            side_effect=lambda mal_id, provider: (
+                "1396" if provider == "tmdb" else None
+            ),
+        ):
+            user_releases = get_user_releases(users_with_notifications, target_events)
+
+        user_events = user_releases[self.user.id]
+        self.assertTrue(
+            any(event.id == self.season1_event.id for event in user_events),
+        )
+        self.assertFalse(
+            any(event.id == self.anime_event.id for event in user_events),
+        )
+
+
+class SeasonsDisabledNotificationTests(TestCase):
+    """Episode release notifications must not depend on the TV Seasons setting (#1438)."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="seasons-off-user",
+            password="12345",
+            notification_urls="https://example.com/notify",
+            tv_enabled=True,
+            season_enabled=False,
+        )
+        tv_item = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Test TV Show",
+            image="http://example.com/tv.jpg",
+        )
+        season_item = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Test TV Show - Season 1",
+            season_number=1,
+            image="http://example.com/tv.jpg",
+        )
+        TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        self.event = Event.objects.create(
+            item=season_item,
+            content_number=1,
+            datetime=timezone.now() - timedelta(minutes=10),
+            notification_sent=False,
+        )
+
+    def test_episode_event_included_when_seasons_disabled(self):
+        target_events = {(self.event.item.id, 1): self.event}
+
+        user_releases = get_user_releases([self.user], target_events)
+
+        self.assertEqual(
+            [event.id for event in user_releases.get(self.user.id, [])],
+            [self.event.id],
+        )
+
+    def test_episode_event_skipped_when_tv_disabled(self):
+        self.user.tv_enabled = False
+        self.user.save(update_fields=["tv_enabled"])
+        target_events = {(self.event.item.id, 1): self.event}
+
+        user_releases = get_user_releases([self.user], target_events)
+
+        self.assertNotIn(self.user.id, user_releases)

@@ -1,5 +1,3 @@
-# ruff: noqa: D102, S106
-
 from datetime import timedelta
 from unittest.mock import call, patch
 
@@ -447,7 +445,9 @@ class DiscoverTabCacheTests(TestCase):
         )
 
     @patch("app.discover.service.get_discover_rows", return_value=[])
-    def test_refresh_tab_cache_force_preserves_taste_profile(self, mock_get_discover_rows):
+    def test_refresh_tab_cache_force_preserves_taste_profile(
+        self, mock_get_discover_rows
+    ):
         expires_at = timezone.now() + timedelta(hours=1)
         DiscoverRowCache.objects.create(
             user=self.user,
@@ -509,10 +509,14 @@ class DiscoverTabCacheTests(TestCase):
             return [self._row(title="Superseded Movie")]
 
         mock_get_discover_rows.side_effect = build_rows
+        # The viewer is on the tab, so the superseded build is redone at once.
+        tab_cache.mark_active(self.user.id, "movie", show_more=False)
 
         rows = tab_cache.refresh_tab_cache(self.user, "movie")
 
-        payload, is_stale = tab_cache.get_tab_cache(self.user.id, "movie", show_more=False)
+        payload, is_stale = tab_cache.get_tab_cache(
+            self.user.id, "movie", show_more=False
+        )
         self.assertEqual(rows[0].items[0].title, "Superseded Movie")
         self.assertEqual(payload["rows"][0]["items"][0]["title"], "Optimistic Movie")
         self.assertTrue(is_stale)
@@ -526,6 +530,39 @@ class DiscoverTabCacheTests(TestCase):
             clear_provider_cache=False,
             priority=tab_cache.DISCOVER_TASK_PRIORITY_INTERACTIVE,
         )
+
+    @patch("app.discover.tab_cache.schedule_tab_refresh", return_value=True)
+    @patch("app.discover.service.get_discover_rows")
+    def test_superseded_build_waits_for_a_viewer(
+        self, mock_get_discover_rows, mock_schedule_tab_refresh
+    ):
+        def build_rows(*args, **kwargs):
+            tab_cache.bump_activity_version(self.user.id, "movie")
+            return [self._row(title="Superseded Movie")]
+
+        mock_get_discover_rows.side_effect = build_rows
+
+        tab_cache.refresh_tab_cache(self.user, "movie")
+
+        mock_schedule_tab_refresh.assert_not_called()
+
+    @patch("app.discover.tab_cache.schedule_tab_refresh", return_value=True)
+    def test_background_invalidation_skips_rebuild_right_after_one(
+        self, mock_schedule
+    ):
+        with patch("app.discover.service.get_discover_rows", return_value=[]):
+            tab_cache.refresh_tab_cache(self.user, "movie")
+        mock_schedule.reset_mock()
+        version = tab_cache.get_activity_version(self.user.id, "movie")
+
+        tab_cache.invalidate_for_media_change(self.user.id, "movie")
+
+        # Still marked stale for the next view, but no background rebuild.
+        self.assertNotEqual(
+            tab_cache.get_activity_version(self.user.id, "movie"), version
+        )
+        scheduled = [call.args[1] for call in mock_schedule.call_args_list]
+        self.assertNotIn("movie", scheduled)
 
     @patch("app.discover.tab_cache.schedule_tab_refresh", return_value=True)
     def test_invalidate_for_media_change_bumps_versions_and_clears_lower_caches(

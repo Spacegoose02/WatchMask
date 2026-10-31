@@ -1,0 +1,496 @@
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.utils import timezone
+
+from app.models import (
+    TV,
+    Episode,
+    Item,
+    MediaTypes,
+    Season,
+    Sources,
+    Status,
+)
+from events.models import Event
+
+METADATA_PATH = "app.providers.services.get_media_metadata"
+
+
+class TVCompletionIdentityTests(TestCase):
+    """Whole-show completion must preserve compatible imported identities."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="completion-user",
+            password="x",
+        )
+
+    def _tv(self, library_media_type):
+        item = Item.objects.create(
+            media_id="show-812",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=library_media_type,
+            title="Show",
+        )
+        return TV.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+
+    def _complete_tv(self, tv):
+        tv_metadata = {
+            "max_progress": 1,
+            "related": {"seasons": [{"season_number": 1}]},
+        }
+        season_metadata = {
+            "season/1": {
+                "image": "season.jpg",
+                "episodes": [{"episode_number": 1}],
+            },
+        }
+        with (
+            patch(METADATA_PATH, side_effect=[tv_metadata, season_metadata]),
+            patch.object(Item, "fetch_releases"),
+        ):
+            tv.status = Status.COMPLETED.value
+            tv.save()
+
+    def _season_item(self, library_media_type):
+        return Item.objects.create(
+            media_id="show-812",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            library_media_type=library_media_type,
+            season_number=1,
+            title="Show Season 1",
+        )
+
+    def test_reuses_imported_tv_bucket_season_and_history(self):
+        tv = self._tv(MediaTypes.TV.value)
+        season_item = self._season_item(MediaTypes.TV.value)
+        start_date = datetime(2025, 4, 1, tzinfo=UTC)
+        end_date = datetime(2025, 4, 2, tzinfo=UTC)
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv,
+            status=Status.IN_PROGRESS.value,
+            score=8.5,
+            notes="Imported note",
+        )
+        episode_item = Item.objects.create(
+            media_id="show-812",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            library_media_type=MediaTypes.TV.value,
+            season_number=1,
+            episode_number=1,
+            title="Episode 1",
+        )
+        Episode.objects.bulk_create(
+            [
+                Episode(
+                    item=episode_item,
+                    related_season=season,
+                    end_date=end_date,
+                ),
+            ],
+        )
+        episode = Episode.objects.get(related_season=season, item=episode_item)
+        season_start_date = season.start_date
+        season_end_date = season.end_date
+        item_count = Item.objects.count()
+        season_history_count = season.history.count()
+
+        self._complete_tv(tv)
+
+        season.refresh_from_db()
+        episode.refresh_from_db()
+        self.assertEqual(season.item_id, season_item.id)
+        self.assertEqual(season.status, Status.COMPLETED.value)
+        self.assertEqual(season.score, 8.5)
+        self.assertEqual(season.notes, "Imported note")
+        self.assertEqual(season.start_date, season_start_date)
+        self.assertEqual(season.end_date, season_end_date)
+        self.assertEqual(episode.end_date, end_date)
+        self.assertGreaterEqual(season.history.count(), season_history_count)
+        self.assertEqual(Item.objects.count(), item_count)
+        self.assertEqual(Season.objects.filter(related_tv=tv).count(), 1)
+        self.assertEqual(Episode.objects.filter(related_season=season).count(), 1)
+
+    def test_normal_tv_does_not_reuse_anime_season(self):
+        tv = self._tv(MediaTypes.TV.value)
+        anime_tv = self._tv(MediaTypes.ANIME.value)
+        anime_season = Season.objects.create(
+            item=self._season_item(MediaTypes.ANIME.value),
+            user=self.user,
+            related_tv=anime_tv,
+            status=Status.PLANNING.value,
+        )
+
+        self._complete_tv(tv)
+
+        normal_season = Season.objects.get(related_tv=tv)
+        self.assertEqual(normal_season.item.library_media_type, MediaTypes.SEASON.value)
+        self.assertEqual(anime_season.item.library_media_type, MediaTypes.ANIME.value)
+        self.assertEqual(Season.objects.filter(related_tv=anime_tv).count(), 1)
+
+    def test_anime_does_not_reuse_normal_tv_season(self):
+        tv = self._tv(MediaTypes.ANIME.value)
+        normal_tv = self._tv(MediaTypes.TV.value)
+        normal_season = Season.objects.create(
+            item=self._season_item(MediaTypes.TV.value),
+            user=self.user,
+            related_tv=normal_tv,
+            status=Status.PLANNING.value,
+        )
+
+        self._complete_tv(tv)
+
+        anime_season = Season.objects.get(related_tv=tv)
+        self.assertEqual(anime_season.item.library_media_type, MediaTypes.ANIME.value)
+        self.assertEqual(normal_season.item.library_media_type, MediaTypes.TV.value)
+        self.assertEqual(Season.objects.filter(related_tv=normal_tv).count(), 1)
+
+    def test_missing_target_item_converges_when_creation_is_interleaved(self):
+        tv = self._tv(MediaTypes.TV.value)
+        original_title_fields = Item.title_fields_from_metadata
+        inserted = False
+
+        def insert_conflicting_item(metadata, fallback_title=""):
+            nonlocal inserted
+            if not inserted:
+                inserted = True
+                Item.objects.create(
+                    media_id="show-812",
+                    source=Sources.TVDB.value,
+                    media_type=MediaTypes.SEASON.value,
+                    library_media_type=MediaTypes.SEASON.value,
+                    season_number=1,
+                    title="Raced season",
+                )
+            return original_title_fields(metadata, fallback_title=fallback_title)
+
+        with (
+            patch(
+                METADATA_PATH,
+                side_effect=[
+                    {
+                        "max_progress": 1,
+                        "related": {"seasons": [{"season_number": 1}]},
+                    },
+                    {
+                        "season/1": {
+                            "episodes": [{"episode_number": 1}],
+                        },
+                    },
+                ],
+            ),
+            patch.object(Item, "fetch_releases"),
+            patch.object(
+                Item,
+                "title_fields_from_metadata",
+                side_effect=insert_conflicting_item,
+            ),
+        ):
+            tv.status = Status.COMPLETED.value
+            tv.save()
+
+        self.assertEqual(
+            Item.objects.filter(
+                media_id="show-812",
+                media_type=MediaTypes.SEASON.value,
+                season_number=1,
+            ).count(),
+            1,
+        )
+        self.assertEqual(Season.objects.filter(related_tv=tv).count(), 1)
+
+
+class SeasonCompletionEvidenceTests(TestCase):
+    """Season completion must use distinct episode evidence."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="evidence-user",
+            password="x",
+        )
+        tv_item = Item.objects.create(
+            media_id="evidence-show",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Evidence Show",
+        )
+        self.tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+        season_item = Item.objects.create(
+            media_id="evidence-show",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=1,
+            title="Evidence Show Season 1",
+            local_season_episode_count=10,
+        )
+        self.season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=self.tv,
+            status=Status.PLANNING.value,
+        )
+
+    def _record_episodes(self, episode_numbers, status=Status.COMPLETED.value):
+        items = {
+            number: Item.objects.create(
+                media_id="evidence-show",
+                source=Sources.TVDB.value,
+                media_type=MediaTypes.EPISODE.value,
+                season_number=1,
+                episode_number=number,
+                title=f"Episode {number}",
+            )
+            for number in set(episode_numbers)
+        }
+        Episode.objects.bulk_create(
+            [
+                Episode(
+                    item=items[number],
+                    related_season=self.season,
+                    status=status,
+                    dropped=status == Status.DROPPED.value,
+                    end_date=timezone.now(),
+                )
+                for number in episode_numbers
+            ],
+        )
+
+    def _add_release_events(self):
+        now = timezone.now()
+        Event.objects.bulk_create(
+            [
+                Event(
+                    item=self.season.item,
+                    content_number=number,
+                    datetime=now - timedelta(days=number),
+                )
+                for number in range(1, 11)
+            ],
+        )
+
+    def _sync_status(self):
+        self.season.refresh_from_db()
+        self.season._sync_status_after_episode_change()
+        self.season.refresh_from_db()
+        return self.season.status
+
+    def test_late_episode_with_release_events_stays_in_progress(self):
+        self._add_release_events()
+        self._record_episodes([10])
+        Season.objects.filter(pk=self.season.pk).update(status=Status.COMPLETED.value)
+
+        self.assertEqual(self._sync_status(), Status.IN_PROGRESS.value)
+
+    def test_late_episode_with_local_count_stays_in_progress(self):
+        self._record_episodes([10])
+        Season.objects.filter(pk=self.season.pk).update(status=Status.COMPLETED.value)
+
+        self.assertEqual(self._sync_status(), Status.IN_PROGRESS.value)
+
+    def test_all_distinct_local_episodes_complete_the_season(self):
+        self._record_episodes(range(1, 11))
+
+        self.assertEqual(self._sync_status(), Status.COMPLETED.value)
+
+    def test_repeated_plays_do_not_inflate_completion_count(self):
+        self._record_episodes([1, 2, 3, 4, 5, 6, 7, 8, 10, 10])
+
+        self.assertEqual(self.season.completed_episode_count, 9)
+        self.assertEqual(self._sync_status(), Status.IN_PROGRESS.value)
+
+    def test_dropped_episode_does_not_count_as_completed(self):
+        self._record_episodes(range(1, 10))
+        self._record_episodes([10], status=Status.DROPPED.value)
+
+        self.assertEqual(self.season.completed_episode_count, 9)
+        self.assertEqual(self._sync_status(), Status.IN_PROGRESS.value)
+
+    def test_manual_in_progress_rewatch_stays_in_progress(self):
+        self._record_episodes(range(1, 11))
+        Season.objects.filter(pk=self.season.pk).update(status=Status.IN_PROGRESS.value)
+
+        self.assertEqual(self._sync_status(), Status.IN_PROGRESS.value)
+
+    def test_resync_of_completed_season_leaves_a_returning_show_in_progress(self):
+        """Editing a play of a finished season does not finish an airing show (#1265).
+
+        The re-sync used to mark the show Completed as soon as every season
+        was, without asking the provider whether the show has ended.
+        """
+        self._record_episodes(range(1, 11))
+        Season.objects.filter(pk=self.season.pk).update(status=Status.COMPLETED.value)
+        TV.objects.filter(pk=self.tv.pk).update(status=Status.IN_PROGRESS.value)
+        returning = {
+            "details": {"status": "Continuing"},
+            "related": {"seasons": [{"season_number": 1}]},
+        }
+
+        with patch(
+            "app.providers.services.get_media_metadata",
+            return_value=returning,
+        ):
+            self.assertEqual(self._sync_status(), Status.COMPLETED.value)
+
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.IN_PROGRESS.value)
+
+    def test_completed_season_finishes_an_ended_show(self):
+        self._record_episodes(range(1, 11))
+        ended = {
+            "details": {"status": "Ended"},
+            "related": {"seasons": [{"season_number": 1}]},
+        }
+
+        with patch(
+            "app.providers.services.get_media_metadata",
+            return_value=ended,
+        ):
+            self.assertEqual(self._sync_status(), Status.COMPLETED.value)
+
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.COMPLETED.value)
+
+    def test_added_plays_complete_an_in_progress_season(self):
+        """New plays covering every episode complete the season (#1265).
+
+        Unlike a bare re-sync, where In progress means a manual reopen.
+        """
+        self._record_episodes(range(1, 11))
+        Season.objects.filter(pk=self.season.pk).update(status=Status.IN_PROGRESS.value)
+        self.season.refresh_from_db()
+
+        with patch(
+            "app.providers.services.get_media_metadata",
+            return_value={"details": {"status": "Ended"}},
+        ):
+            self.season._sync_status_after_episode_change(plays_added=True)
+
+        self.season.refresh_from_db()
+        self.assertEqual(self.season.status, Status.COMPLETED.value)
+
+    def test_resync_of_completed_season_finishes_an_ended_show(self):
+        """A show left open by a provider outage is finished on a later re-sync."""
+        self._record_episodes(range(1, 11))
+        Season.objects.filter(pk=self.season.pk).update(status=Status.COMPLETED.value)
+        TV.objects.filter(pk=self.tv.pk).update(status=Status.IN_PROGRESS.value)
+        ended = {
+            "details": {"status": "Ended"},
+            "related": {"seasons": [{"season_number": 1}]},
+        }
+
+        with patch(
+            "app.providers.services.get_media_metadata",
+            return_value=ended,
+        ):
+            self.assertEqual(self._sync_status(), Status.COMPLETED.value)
+
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.COMPLETED.value)
+
+
+class AnnouncedSeasonCompletionTests(TestCase):
+    """An announced, unaired season never blocks or reopens earlier seasons (#1618)."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="announced-user",
+            password="x",
+        )
+        tv_item = Item.objects.create(
+            media_id="announced-show",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Announced Show",
+        )
+        self.tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        self.seasons = {}
+        for number, status in ((1, Status.COMPLETED.value), (2, Status.PLANNING.value)):
+            item = Item.objects.create(
+                media_id="announced-show",
+                source=Sources.TVDB.value,
+                media_type=MediaTypes.SEASON.value,
+                season_number=number,
+                title=f"Announced Show Season {number}",
+            )
+            self.seasons[number] = Season.objects.create(
+                item=item,
+                user=self.user,
+                related_tv=self.tv,
+                status=status,
+            )
+
+    def _metadata(self, production_status, season_two_air_date):
+        return {
+            "details": {"status": production_status},
+            "related": {
+                "seasons": [
+                    {"season_number": 1, "first_air_date": "2020-01-01"},
+                    {"season_number": 2, "first_air_date": season_two_air_date},
+                ],
+            },
+        }
+
+    def test_ended_show_ignores_a_season_dated_in_the_future(self):
+        with patch(METADATA_PATH, return_value=self._metadata("Ended", "2099-01-01")):
+            self.tv._handle_completed_season(1)
+
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.COMPLETED.value)
+
+    def test_ended_show_waits_for_an_undated_planning_season(self):
+        """Undated is not unaired: the season may be one the user skipped."""
+        with patch(METADATA_PATH, return_value=self._metadata("Ended", None)):
+            self.tv._handle_completed_season(1)
+
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.IN_PROGRESS.value)
+
+    def test_ended_show_waits_for_a_planning_season_that_already_aired(self):
+        with patch(METADATA_PATH, return_value=self._metadata("Ended", "2020-06-01")):
+            self.tv._handle_completed_season(1)
+
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.IN_PROGRESS.value)
+
+    def test_returning_show_stays_in_progress_with_a_future_season(self):
+        """The stored status stays In progress; the card says Caught Up (R5)."""
+        with patch(
+            METADATA_PATH,
+            return_value=self._metadata("Returning Series", "2099-01-01"),
+        ):
+            self.tv._handle_completed_season(1)
+
+        self.tv.refresh_from_db()
+        self.assertEqual(self.tv.status, Status.IN_PROGRESS.value)
+
+    def test_future_season_leaves_the_completed_season_alone(self):
+        with patch(
+            METADATA_PATH,
+            return_value=self._metadata("Returning Series", "2099-01-01"),
+        ):
+            self.tv._handle_completed_season(1)
+
+        self.seasons[1].refresh_from_db()
+        self.seasons[2].refresh_from_db()
+        self.assertEqual(self.seasons[1].status, Status.COMPLETED.value)
+        self.assertEqual(self.seasons[2].status, Status.PLANNING.value)

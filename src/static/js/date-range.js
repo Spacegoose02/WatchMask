@@ -74,23 +74,23 @@ function dateRangePicker(options = {}) {
   defaultStartDate.setFullYear(defaultStartDate.getFullYear() - 1);
 
   const predefinedRanges = [
-    { name: "Today", displayName: "Today" },
-    { name: "Yesterday", displayName: "Yesterday" },
-    { name: "This Week", displayName: "This week" },
-    { name: "Last 7 Days", displayName: "Last 7 days" },
-    { name: "This Month", displayName: "Month to date" },
-    { name: "Last 30 Days", displayName: "Last 30 days" },
-    { name: "Last 90 Days", displayName: "Last 90 days" },
-    { name: "This Year", displayName: "Year to date" },
-    { name: "Last 6 Months", displayName: "Last 6 months" },
-    { name: "Last 12 Months", displayName: "Last 12 months" },
-    { name: "All Time", displayName: "All time" },
+    { name: "Today", displayName: gettext("Today") },
+    { name: "Yesterday", displayName: gettext("Yesterday") },
+    { name: "This Week", displayName: gettext("This week") },
+    { name: "Last 7 Days", displayName: gettext("Last 7 days") },
+    { name: "This Month", displayName: gettext("Month to date") },
+    { name: "Last 30 Days", displayName: gettext("Last 30 days") },
+    { name: "Last 90 Days", displayName: gettext("Last 90 days") },
+    { name: "This Year", displayName: gettext("Year to date") },
+    { name: "Last 6 Months", displayName: gettext("Last 6 months") },
+    { name: "Last 12 Months", displayName: gettext("Last 12 months") },
+    { name: "All Time", displayName: gettext("All time") },
   ];
 
   const comparisonOptions = [
-    { value: "previous_period", label: "Previous period" },
-    { value: "last_year", label: "Last year" },
-    { value: "none", label: "No comparison" },
+    { value: "previous_period", label: gettext("Previous period") },
+    { value: "last_year", label: gettext("Last year") },
+    { value: "none", label: gettext("No comparison") },
   ];
 
   return {
@@ -103,8 +103,9 @@ function dateRangePicker(options = {}) {
     endDate: initialEndDate || formatDateForInput(today),
     customRangeLabel: "",
     compareMode: initialCompareMode,
-    selectedMediaType: "all",
-    mediaTypeOptions: initialMediaTypeOptions,
+    // Empty means "All media"; otherwise the ticked media type slugs.
+    selectedMediaTypes: [],
+    mediaTypeOptions: initialMediaTypeOptions.map((option) => ({ ...option, label: gettext(option.label) })),
     ratingScaleMax: ratingScaleMax,
     summaryStatsByType: {},
     consumptionStatsByType: {},
@@ -113,33 +114,33 @@ function dateRangePicker(options = {}) {
     comparisonOptions,
 
     get currentTypeSummary() {
-      const key = this.summaryStatsByType[this.selectedMediaType]
-        ? this.selectedMediaType
-        : "all";
-      const s = this.summaryStatsByType[key] || {};
+      const s = StatsMediaMerge.mergeSummary(this.summaryStatsByType, this.selectedMediaTypes);
       const start = s.longest_streak_start;
       const end = s.longest_streak_end;
       let dates = "";
       if (start) {
         const fmt = (iso) => {
           const [y, m, d] = iso.split("-").map(Number);
-          const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-          return `${months[m - 1]} ${d}, ${y}`;
+          return new Date(y, m - 1, d).toLocaleDateString(document.documentElement.lang || undefined, { month: "short", day: "numeric", year: "numeric" });
         };
         dates = start === end ? fmt(start) : `${fmt(start)} – ${fmt(end)}`;
       }
       const totalMinutes = s.total_minutes || 0;
       const totalHours = Math.round(totalMinutes / 60);
       const totalDays = Math.floor(totalMinutes / 60 / 24);
-      return { ...s, longest_streak_dates_display: dates, total_hours: totalHours, total_days: totalDays };
+      // Match the charts: format weekday names for the current UI locale,
+      // even when a warm statistics snapshot stores the English name.
+      const weekday = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].indexOf(s.most_active_day);
+      const weekdayLabel = weekday < 0 ? s.most_active_day : new Date(2024, 0, weekday + 1).toLocaleDateString(document.documentElement.lang || undefined, { weekday: "long" });
+      return { ...s, most_active_day_label: weekdayLabel, longest_streak_dates_display: dates, total_hours: totalHours, total_days: totalDays };
     },
 
     get currentConsumption() {
-      return this.consumptionStatsByType[this.selectedMediaType] || {};
+      return StatsMediaMerge.mergeConsumption(this.consumptionStatsByType, this.selectedMediaTypes);
     },
 
     fmt(value, decimals) {
-      return Number(value ?? 0).toFixed(decimals);
+      return Number(value ?? 0).toLocaleString(document.documentElement.lang || undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
     },
 
     consumptionIconPath(metric) {
@@ -147,7 +148,7 @@ function dateRangePicker(options = {}) {
     },
 
     consumptionUnitAbbr(unit) {
-      return unit === "Hours" ? "hrs" : unit;
+      return unit === "Hours" ? gettext("hrs") : gettext(unit);
     },
 
     consumptionTiles() {
@@ -156,18 +157,18 @@ function dateRangePicker(options = {}) {
       const primary = c.primary;
       const secondary = c.secondary;
       const buckets = [
-        { key: "year", label: "Per Year", field: "per_year" },
-        { key: "month", label: "Per Month", field: "per_month" },
-        { key: "day", label: "Per Day", field: "per_day" },
+        { key: "year", label: gettext("Per Year"), field: "per_year" },
+        { key: "month", label: gettext("Per Month"), field: "per_month" },
+        { key: "day", label: gettext("Per Day"), field: "per_day" },
       ];
       const tiles = buckets.map((b) => ({
         key: b.key,
         icon: primary.icon,
         bg: "bg-indigo-600/20",
-        color: "text-indigo-400",
+        color: "text-[var(--color-link)]",
         label: b.label,
         value: this.fmt(primary[b.field], 1) + " " + this.consumptionUnitAbbr(primary.unit),
-        caption: secondary ? this.fmt(secondary[b.field], 1) + " " + secondary.unit : "",
+        caption: secondary ? this.fmt(secondary[b.field], 1) + " " + gettext(secondary.unit) : "",
       }));
       (c.bonuses || []).forEach((bonus, i) => {
         tiles.push(this.consumptionBonusTile(bonus, i));
@@ -178,28 +179,30 @@ function dateRangePicker(options = {}) {
     consumptionBonusTile(bonus, i) {
       if (bonus.kind === "playtime") {
         const hrs = bonus.value;
-        const value = hrs < 1 ? Math.round(hrs * 60) + " min" : this.fmt(hrs, 1) + " hrs";
+        const value = hrs < 1 ? Math.round(hrs * 60) + " " + gettext("min") : this.fmt(hrs, 1) + " " + gettext("hrs");
         return {
           key: "bonus-" + i, icon: "gamepad", bg: "bg-emerald-600/20", color: "text-emerald-400",
-          label: "Average Playtime", value, caption: "Per Day",
+          label: gettext("Average Playtime"), value, caption: gettext("Per Day"),
         };
       }
       if (bonus.kind === "length") {
         return {
           key: "bonus-" + i, icon: "book-open", bg: "bg-emerald-600/20", color: "text-emerald-400",
-          label: "Average Length", value: this.fmt(bonus.value, 0), caption: "Pages",
+          label: gettext("Average Length"), value: this.fmt(bonus.value, 0), caption: gettext("Pages"),
         };
       }
       return {
         key: "bonus-" + i, icon: bonus.icon, bg: "bg-emerald-600/20", color: "text-emerald-400",
-        label: bonus.label, value: this.fmt(bonus.value, 2) + " " + bonus.unit, caption: "",
+        label: gettext(bonus.label), value: this.fmt(bonus.value, 2) + " " + gettext(bonus.unit), caption: "",
       };
     },
 
     averageRatingRows() {
-      const types = this.selectedMediaType === "all"
-        ? this.mediaTypeOptions.filter((opt) => opt.value !== "all")
-        : this.mediaTypeOptions.filter((opt) => opt.value === this.selectedMediaType);
+      const types = this.mediaTypeOptions.filter((opt) => (
+        this.selectedMediaTypes.length
+          ? this.selectedMediaTypes.includes(opt.value)
+          : opt.value !== "all"
+      ));
       const scaleMax = this.ratingScaleMax || 10;
       return types
         .map((opt) => {
@@ -226,27 +229,27 @@ function dateRangePicker(options = {}) {
 
     get currentTypeLabel() {
       const labels = {
-        all: "titles", movie: "films", tv: "shows", game: "games",
-        book: "books", anime: "titles", music: "albums", podcast: "podcasts",
-        comic: "comics", manga: "manga",
+        all: gettext("titles"), movie: gettext("films"), tv: gettext("shows"), game: gettext("games"),
+        book: gettext("books"), anime: gettext("titles"), music: gettext("albums"), podcast: gettext("podcasts"),
+        comic: gettext("comics"), manga: gettext("manga"),
       };
-      return labels[this.selectedMediaType] || "titles";
+      return labels[this.singleMediaType()] || gettext("titles");
     },
 
     get currentTypeFlavor() {
       const flavors = {
-        all: "stories, ideas, and worlds",
-        movie: "film and storytelling",
-        tv: "episodes and seasons",
-        game: "play and adventure",
-        book: "reading and discovery",
-        anime: "anime and storytelling",
-        music: "music and discovery",
-        podcast: "listening and learning",
-        comic: "comics and art",
-        manga: "manga and art",
+        all: gettext("stories, ideas, and worlds"),
+        movie: gettext("film and storytelling"),
+        tv: gettext("episodes and seasons"),
+        game: gettext("play and adventure"),
+        book: gettext("reading and discovery"),
+        anime: gettext("anime and storytelling"),
+        music: gettext("music and discovery"),
+        podcast: gettext("listening and learning"),
+        comic: gettext("comics and art"),
+        manga: gettext("manga and art"),
       };
-      return flavors[this.selectedMediaType] || "stories, ideas, and worlds";
+      return flavors[this.singleMediaType()] || gettext("stories, ideas, and worlds");
     },
 
     init() {
@@ -269,9 +272,9 @@ function dateRangePicker(options = {}) {
       this.detectRangeFromDates(initialRangeName);
       this.compareMode = this.normalizeCompareMode(compareParam || initialCompareMode);
 
-      if (mediaTypeParam && this.mediaTypeOptions.some((o) => o.value === mediaTypeParam)) {
-        this.selectedMediaType = mediaTypeParam;
-      }
+      this.selectedMediaTypes = this.normalizeMediaTypes(
+        StatsMediaMerge.parseMediaTypeParam(mediaTypeParam, this.mediaTypeValues()),
+      );
 
       const summaryEl = document.getElementById("summary_stats_by_type");
       if (summaryEl) {
@@ -284,10 +287,17 @@ function dateRangePicker(options = {}) {
       }
 
       window.addEventListener("stats-charts-initialized", () => {
-        if (this.selectedMediaType !== "all") {
+        if (this.selectedMediaTypes.length) {
           this.updateFilteredCharts();
         }
       });
+      const refitMenus = () => {
+        if (this.isRangeOpen || this.isMediaTypeOpen || this.isCompareOpen) {
+          this.fitOpenMenus();
+        }
+      };
+      window.addEventListener("resize", refitMenus);
+      window.addEventListener("scroll", refitMenus, { passive: true });
     },
 
     toggleRangeDropdown() {
@@ -295,7 +305,24 @@ function dateRangePicker(options = {}) {
       if (this.isRangeOpen) {
         this.isCompareOpen = false;
         this.isMediaTypeOpen = false;
+        this.fitOpenMenus();
       }
+    },
+
+    // The menus are positioned under their buttons, and where that is depends on
+    // how the toolbar wraps and how far the page is scrolled. Cap each open menu
+    // to the room left below it so it scrolls instead of leaving the window.
+    fitOpenMenus() {
+      this.$nextTick(() => {
+        this.$root.querySelectorAll(".stats-dropdown-panel").forEach((panel) => {
+          if (!panel.offsetParent) {
+            return;
+          }
+          // offsetTop ignores the open/close scale animation, unlike getBoundingClientRect.
+          const top = panel.offsetParent.getBoundingClientRect().top + panel.offsetTop;
+          panel.style.maxHeight = `${Math.max(160, window.innerHeight - top - 16)}px`;
+        });
+      });
     },
 
     toggleCompareDropdown() {
@@ -307,6 +334,7 @@ function dateRangePicker(options = {}) {
       if (this.isCompareOpen) {
         this.isRangeOpen = false;
         this.isMediaTypeOpen = false;
+        this.fitOpenMenus();
       }
     },
 
@@ -315,17 +343,53 @@ function dateRangePicker(options = {}) {
       if (this.isMediaTypeOpen) {
         this.isRangeOpen = false;
         this.isCompareOpen = false;
+        this.fitOpenMenus();
       }
     },
 
+    // Every selectable type, without the "All media" row.
+    mediaTypeValues() {
+      return this.mediaTypeOptions.filter((o) => o.value !== "all").map((o) => o.value);
+    },
+
+    // Ticking every type is the same as ticking none: back to "All media".
+    normalizeMediaTypes(types) {
+      return types.length === this.mediaTypeValues().length ? [] : types;
+    },
+
+    isMediaTypeSelected(value) {
+      return value === "all"
+        ? this.selectedMediaTypes.length === 0
+        : this.selectedMediaTypes.includes(value);
+    },
+
+    // The one selected type, or "all" when nothing or several are selected.
+    singleMediaType() {
+      return this.selectedMediaTypes.length === 1 ? this.selectedMediaTypes[0] : "all";
+    },
+
+    // Clicking "All media" clears the selection; clicking a type adds or
+    // removes it, so from "All media" the first click selects just that type.
     selectMediaType(value) {
-      this.selectedMediaType = value;
-      this.isMediaTypeOpen = false;
-      const url = new URL(window.location.href);
+      let types;
       if (value === "all") {
-        url.searchParams.delete("media-type");
+        types = [];
+      } else if (this.selectedMediaTypes.includes(value)) {
+        types = this.selectedMediaTypes.filter((type) => type !== value);
       } else {
-        url.searchParams.set("media-type", value);
+        types = [...this.selectedMediaTypes, value];
+      }
+      const order = this.mediaTypeValues();
+      types.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+      this.selectedMediaTypes = this.normalizeMediaTypes(types);
+      if (value === "all") {
+        this.isMediaTypeOpen = false;
+      }
+      const url = new URL(window.location.href);
+      if (this.selectedMediaTypes.length) {
+        url.searchParams.set("media-type", StatsMediaMerge.formatMediaTypeParam(this.selectedMediaTypes));
+      } else {
+        url.searchParams.delete("media-type");
       }
       window.history.replaceState({}, "", url.toString());
       this.$nextTick(() => {
@@ -335,7 +399,7 @@ function dateRangePicker(options = {}) {
     },
 
     updateFilteredCharts() {
-      const type = this.selectedMediaType;
+      const types = this.selectedMediaTypes;
       if (typeof Chart === "undefined") return;
       const chart = Chart.getChart("scoreStackedChartCopy");
       if (chart) {
@@ -352,21 +416,37 @@ function dateRangePicker(options = {}) {
           "Podcast": "podcast",
         };
         chart.data.datasets.forEach((ds) => {
-          const dsType = ds.media_type || labelToType[ds.label];
-          ds.hidden = type !== "all" && dsType !== type;
+          const dsType = ds.media_type || labelToType[ds.source_label || ds.label];
+          ds.hidden = types.length > 0 && !types.includes(dsType);
         });
         chart.update("none");
       }
     },
 
     isMediaTypeVisible(type) {
-      return this.selectedMediaType === "all" || this.selectedMediaType === type;
+      return this.selectedMediaTypes.length === 0 || this.selectedMediaTypes.includes(type);
+    },
+
+    // The cast/crew, studio and genre cards only have data for these types.
+    isTalentVisible() {
+      const talentTypes = ["tv", "movie", "anime", "game"];
+      return this.selectedMediaTypes.length === 0
+        || this.selectedMediaTypes.some((type) => talentTypes.includes(type));
+    },
+
+    // First play / last play / today-in-history cards exist only for All and
+    // for each single type; they cannot be merged for a partial selection.
+    isHighlightSetVisible(type) {
+      return type === "all"
+        ? this.selectedMediaTypes.length === 0
+        : this.selectedMediaTypes.length === 1 && this.selectedMediaTypes[0] === type;
     },
 
     mediaTypeTriggerLabel() {
-      if (this.selectedMediaType === "all") return "All media";
-      const opt = this.mediaTypeOptions.find((o) => o.value === this.selectedMediaType);
-      return opt ? opt.label : "All media";
+      const selected = this.mediaTypeOptions.filter((o) => this.selectedMediaTypes.includes(o.value));
+      if (!selected.length) return gettext("All media");
+      if (selected.length <= 2) return selected.map((o) => o.label).join(", ");
+      return selected.length + " " + gettext("Types");
     },
 
     hasFiniteRange() {
@@ -396,12 +476,12 @@ function dateRangePicker(options = {}) {
     rangeTriggerLabel() {
       return this.isKnownPredefinedRange(this.selectedRange)
         ? this.getRangeDisplayName(this.selectedRange)
-        : "Custom range";
+        : gettext("Custom range");
     },
 
     currentRangeSummaryLabel() {
       if (!this.hasFiniteRange()) {
-        return "All activity";
+        return gettext("All activity");
       }
       return this.formatDateRange(this.startDate, this.endDate);
     },
@@ -410,7 +490,7 @@ function dateRangePicker(options = {}) {
       const option = this.comparisonOptions.find(
         (entry) => entry.value === this.compareMode,
       );
-      return option ? option.label : "Previous period";
+      return option ? option.label : gettext("Previous period");
     },
 
     comparisonSummaryLabel(mode = this.compareMode) {
@@ -533,7 +613,7 @@ function dateRangePicker(options = {}) {
         return "";
       }
       if (range.start === "all" && range.end === "all") {
-        return "All activity";
+        return gettext("All activity");
       }
       return this.formatDateRange(range.start, range.end);
     },
@@ -559,8 +639,8 @@ function dateRangePicker(options = {}) {
       url.searchParams.set("start-date", this.startDate);
       url.searchParams.set("end-date", this.endDate);
       url.searchParams.set("compare", this.normalizeCompareMode(this.compareMode));
-      if (this.selectedMediaType && this.selectedMediaType !== "all") {
-        url.searchParams.set("media-type", this.selectedMediaType);
+      if (this.selectedMediaTypes.length) {
+        url.searchParams.set("media-type", StatsMediaMerge.formatMediaTypeParam(this.selectedMediaTypes));
       } else {
         url.searchParams.delete("media-type");
       }
@@ -587,20 +667,20 @@ function dateRangePicker(options = {}) {
 
       const data = await response.json();
       if (!response.ok || !data.success) {
-        throw new Error(data.error || "Failed to save compare mode");
+        throw new Error(data.error || gettext("Failed to save compare mode"));
       }
     },
 
     formatDisplayDate(dateString) {
       if (!dateString || dateString === "all") {
-        return "All time";
+        return gettext("All time");
       }
 
       const date = parseLocalDate(dateString);
       const format = this.getDateFormat();
 
       if (!format) {
-        return date.toLocaleDateString(undefined, {
+        return date.toLocaleDateString(document.documentElement.lang || undefined, {
           month: "short",
           day: "numeric",
           year: "numeric",
@@ -611,8 +691,8 @@ function dateRangePicker(options = {}) {
     },
 
     getDateFormat() {
-      const scriptTag = document.querySelector("script[data-date-format]");
-      const selectedFormat = scriptTag?.dataset.dateFormat;
+      const formatElement = document.querySelector("[data-date-format]");
+      const selectedFormat = formatElement?.dataset.dateFormat;
       const dateFormats = this.getDateFormatValues();
 
       if (
@@ -644,10 +724,10 @@ function dateRangePicker(options = {}) {
       const year = date.getFullYear();
       const month = String(date.getMonth() + 1).padStart(2, "0");
       const day = String(date.getDate()).padStart(2, "0");
-      const shortMonth = date.toLocaleString(undefined, { month: "short" });
-      const longMonth = date.toLocaleString(undefined, { month: "long" });
-      const shortWeekday = date.toLocaleString(undefined, { weekday: "short" });
-      const longWeekday = date.toLocaleString(undefined, { weekday: "long" });
+      const shortMonth = date.toLocaleString(document.documentElement.lang || undefined, { month: "short" });
+      const longMonth = date.toLocaleString(document.documentElement.lang || undefined, { month: "long" });
+      const shortWeekday = date.toLocaleString(document.documentElement.lang || undefined, { weekday: "short" });
+      const longWeekday = date.toLocaleString(document.documentElement.lang || undefined, { weekday: "long" });
       const ordinalSuffix = this.getOrdinalSuffix(date.getDate());
 
       const formatters = {
@@ -682,6 +762,7 @@ function dateRangePicker(options = {}) {
     },
 
     getOrdinalSuffix(day) {
+      if ((document.documentElement.lang || "en").startsWith("de")) return ".";
       if (day >= 11 && day <= 13) {
         return "th";
       }
@@ -703,7 +784,7 @@ function dateRangePicker(options = {}) {
       }
 
       if (start === "all" && end === "all") {
-        return "All activity";
+        return gettext("All activity");
       }
 
       const startLabel = this.formatDisplayDate(start);

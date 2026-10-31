@@ -23,7 +23,7 @@ class Artist(models.Model):
         blank=True,
         help_text="MusicBrainz Artist ID (UUID)",
     )
-    image = models.URLField(blank=True, default="")
+    image = models.TextField(blank=True, default="")
     country = models.CharField(
         max_length=5,
         blank=True,
@@ -99,7 +99,7 @@ class Album(models.Model):
         blank=True,
     )
     release_date = models.DateField(null=True, blank=True)
-    image = models.URLField(blank=True, default="")
+    image = models.TextField(blank=True, default="")
     release_type = models.CharField(
         max_length=50,
         blank=True,
@@ -140,7 +140,44 @@ class Album(models.Model):
         return self.title
 
 
+class MusicReleasePreference(models.Model):
+    """Per-user MusicBrainz release choice for an album."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="music_release_preferences",
+    )
+    album = models.ForeignKey(
+        Album,
+        on_delete=models.CASCADE,
+        related_name="music_release_preferences",
+    )
+    release_id = models.CharField(
+        max_length=36,
+        help_text="MusicBrainz Release ID (UUID) selected for display",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model and field configuration."""
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "album"],
+                name="unique_music_release_preference_per_user_album",
+            ),
+        ]
+
+    def __str__(self):
+        """Return the selected release label."""
+        return f"{self.user_id}:{self.album_id}->release/{self.release_id}"
+
+
 class AlbumArtist(models.Model):
+    """Album artist."""
+
     album = models.ForeignKey(
         Album,
         on_delete=models.CASCADE,
@@ -155,6 +192,8 @@ class AlbumArtist(models.Model):
     join_phrase = models.CharField(max_length=100, blank=True, default="")
 
     class Meta:
+        """Model and field configuration."""
+
         ordering = ["position"]
         constraints = [
             models.UniqueConstraint(
@@ -162,6 +201,10 @@ class AlbumArtist(models.Model):
                 name="unique_album_artist_credit",
             ),
         ]
+
+    def __str__(self):
+        """Return the album and artist this link joins."""
+        return f"{self.album} - {self.artist}"
 
 
 class ArtistMember(models.Model):
@@ -263,6 +306,11 @@ class Track(models.Model):
         seconds = total_seconds % 60
         return f"{minutes}:{seconds:02d}"
 
+    @property
+    def runtime_minutes(self):
+        """Return the track duration in whole minutes for date shortcuts."""
+        return self.duration_ms // 60000 if self.duration_ms else ""
+
 
 class Music(Media):
     """Model for music tracks.
@@ -297,12 +345,23 @@ class Music(Media):
         blank=True,
         help_text="Link to Track catalog entry from MusicBrainz",
     )
+    origin_url = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="Client origin URL for this play, when the scrobble sent one.",
+    )
 
     @property
     def formatted_progress(self):
         """Return progress as play count."""
         plays = self.progress or 0
         return f"{plays} play{'s' if plays != 1 else ''}"
+
+    @property
+    def progress_unit(self):
+        """Return the unit `progress` is measured in."""
+        return "plays"
 
     @property
     def formatted_aggregated_progress(self):

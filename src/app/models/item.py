@@ -5,18 +5,51 @@ import uuid
 from collections import defaultdict
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.db.models import CheckConstraint, Q, UniqueConstraint
 from django.utils import translation
 from unidecode import unidecode
 
 import app
-import events
 from app import providers
 from app.mixins import CalendarTriggerMixin
 from app.models.choices import MediaTypes, Sources
 
 logger = logging.getLogger(__name__)
+
+
+SYNC_IDENTITY_FIELDS = frozenset({
+    "source", "media_id", "media_type", "library_media_type", "season_number",
+    "episode_number", "episode_order", "episode_order_id", "provider_external_ids",
+})
+
+
+class ItemQuerySet(models.QuerySet):
+    """Invalidate strict snapshots when an item's actionable identity changes."""
+
+    def update(self, **kwargs):
+        """Cover identity rewrites that bypass model-save signals."""
+        if not SYNC_IDENTITY_FIELDS.intersection(kwargs):
+            return super().update(**kwargs)
+        from app.services.sync_lock import invalidate_item_contexts
+
+        with transaction.atomic():
+            ids = list(self.values_list("pk", flat=True))
+            invalidate_item_contexts(ids)
+            return super().update(**kwargs)
+
+    def delete(self):
+        """Acquire affected users' barriers in order before cascading deletes."""
+        from app.services.sync_lock import invalidate_item_contexts
+
+        with transaction.atomic():
+            item_ids = list(self.values_list("pk", flat=True))
+            invalidate_item_contexts(item_ids)
+            self._sync_deleting_item_ids = frozenset(item_ids)
+            try:
+                return super().delete()
+            finally:
+                del self._sync_deleting_item_ids
 
 
 class Item(CalendarTriggerMixin, models.Model):
@@ -42,28 +75,76 @@ class Item(CalendarTriggerMixin, models.Model):
     title = models.TextField()
     original_title = models.TextField(null=True, blank=True)
     localized_title = models.TextField(null=True, blank=True)
-    image = models.URLField()  # if add default, custom media entry will show the value
+    synopsis = models.TextField(
+        blank=True,
+        default="",
+        help_text="Cached provider synopsis, used as a fallback when live metadata is unavailable",
+    )
+    source_url = models.TextField(
+        blank=True,
+        default="",
+        help_text="Cached provider detail page URL, used as a fallback when live metadata is unavailable",
+    )
+    image = models.TextField(
+        blank=True, default=""
+    )  # if add default, custom media entry will show the value
     season_number = models.PositiveIntegerField(null=True, blank=True)
     episode_number = models.PositiveIntegerField(null=True, blank=True)
-    runtime_minutes = models.PositiveIntegerField(null=True, blank=True, help_text="Runtime in minutes")
-    number_of_pages = models.PositiveIntegerField(null=True, blank=True, help_text="Number of pages for books")
+    episode_order = models.ForeignKey(
+        "app.EpisodeOrder", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="items",
+    )
+    provider_episode_id = models.CharField(max_length=255, blank=True, default="")
+    runtime_minutes = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Runtime in minutes"
+    )
+    number_of_pages = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Number of pages for books"
+    )
     release_datetime = models.DateTimeField(null=True, blank=True)
     genres = models.JSONField(default=list, blank=True)
     implied_genres = models.JSONField(default=list, blank=True)
+    watch_providers = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="TMDB watch-provider data by region, e.g. {region: {flatrate: [...]}}",
+    )
     # Metadata fields for filtering, sorting, and statistics
-    country = models.CharField(max_length=255, blank=True, default="", help_text="Origin country")
-    languages = models.JSONField(default=list, blank=True, help_text="Array of languages")
-    platforms = models.JSONField(default=list, blank=True, help_text="Array of platforms (Games)")
-    format = models.CharField(max_length=100, blank=True, default="", help_text="Media format type")
-    status = models.CharField(max_length=100, blank=True, default="", help_text="Production status")
-    studios = models.JSONField(default=list, blank=True, help_text="Array of production studios")
-    themes = models.JSONField(default=list, blank=True, help_text="Array of themes (Games)")
+    country = models.CharField(
+        max_length=255, blank=True, default="", help_text="Origin country"
+    )
+    languages = models.JSONField(
+        default=list, blank=True, help_text="Array of languages"
+    )
+    platforms = models.JSONField(
+        default=list, blank=True, help_text="Array of platforms (Games)"
+    )
+    format = models.CharField(
+        max_length=100, blank=True, default="", help_text="Media format type"
+    )
+    status = models.CharField(
+        max_length=100, blank=True, default="", help_text="Production status"
+    )
+    studios = models.JSONField(
+        default=list, blank=True, help_text="Array of production studios"
+    )
+    themes = models.JSONField(
+        default=list, blank=True, help_text="Array of themes (Games)"
+    )
     authors = models.JSONField(default=list, blank=True, help_text="Array of authors")
-    publishers = models.CharField(max_length=255, blank=True, default="", help_text="Publisher name")
+    publishers = models.CharField(
+        max_length=255, blank=True, default="", help_text="Publisher name"
+    )
     isbn = models.JSONField(default=list, blank=True, help_text="Array of ISBN numbers")
-    source_material = models.CharField(max_length=100, blank=True, default="", help_text="Source material (Anime)")
-    creators = models.JSONField(default=list, blank=True, help_text="Array of creators (Comics)")
-    runtime = models.CharField(max_length=50, blank=True, default="", help_text="Formatted runtime string")
+    source_material = models.CharField(
+        max_length=100, blank=True, default="", help_text="Source material (Anime)"
+    )
+    creators = models.JSONField(
+        default=list, blank=True, help_text="Array of creators (Comics)"
+    )
+    runtime = models.CharField(
+        max_length=50, blank=True, default="", help_text="Formatted runtime string"
+    )
     provider_popularity = models.FloatField(
         null=True,
         blank=True,
@@ -89,6 +170,26 @@ class Item(CalendarTriggerMixin, models.Model):
         blank=True,
         help_text="Rating count from Trakt metadata",
     )
+    imdb_rating = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Average rating value from IMDB public datasets",
+    )
+    imdb_rating_count = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Rating count from IMDB public datasets",
+    )
+    mal_rating = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Average rating value from MyAnimeList",
+    )
+    mal_rating_count = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Rating count from MyAnimeList",
+    )
     igdb_user_rating = models.FloatField(
         null=True,
         blank=True,
@@ -98,6 +199,43 @@ class Item(CalendarTriggerMixin, models.Model):
         null=True,
         blank=True,
         help_text="User rating count from IGDB metadata",
+    )
+    opencritic_id = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Matched OpenCritic game ID",
+    )
+    opencritic_score = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="OpenCritic top critic average (0-100)",
+    )
+    opencritic_percent_recommended = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Share of OpenCritic critics who recommend the game",
+    )
+    opencritic_tier = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        help_text="OpenCritic tier: Mighty, Strong, Fair or Weak",
+    )
+    opencritic_review_count = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Number of top critic reviews on OpenCritic",
+    )
+    opencritic_url = models.URLField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="OpenCritic page for the matched game",
+    )
+    opencritic_checked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When OpenCritic was last asked about this game",
     )
     trakt_popularity_score = models.FloatField(
         null=True,
@@ -114,7 +252,9 @@ class Item(CalendarTriggerMixin, models.Model):
         blank=True,
         help_text="When Trakt popularity metadata was last fetched",
     )
-    provider_keywords = models.JSONField(default=list, blank=True, help_text="Provider keywords")
+    provider_keywords = models.JSONField(
+        default=list, blank=True, help_text="Provider keywords"
+    )
     provider_certification = models.CharField(
         max_length=20,
         blank=True,
@@ -133,7 +273,25 @@ class Item(CalendarTriggerMixin, models.Model):
         default="",
         help_text="Provider collection/franchise name",
     )
-    provider_external_ids = models.JSONField(default=dict, blank=True, help_text="Resolved external ids")
+    provider_franchise_id = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="Provider franchise id",
+    )
+    provider_franchise_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Provider franchise name",
+    )
+    # When provider metadata was last written to this row. Null means it has
+    # not been refreshed since this field existed, which is a different claim
+    # from "refreshed long ago" and is reported as such.
+    metadata_refreshed_at = models.DateTimeField(null=True, blank=True)
+    provider_external_ids = models.JSONField(
+        default=dict, blank=True, help_text="Resolved external ids"
+    )
     provider_game_lengths = models.JSONField(
         default=dict,
         blank=True,
@@ -169,7 +327,14 @@ class Item(CalendarTriggerMixin, models.Model):
         blank=True,
         help_text="When game length metadata was last fetched",
     )
-    metadata_fetched_at = models.DateTimeField(null=True, blank=True, help_text="When metadata was last fetched")
+    metadata_fetched_at = models.DateTimeField(
+        null=True, blank=True, help_text="When metadata was last fetched"
+    )
+    calendar_checked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When calendar releases were last fetched for this item",
+    )
     manual_metadata = models.JSONField(
         blank=True,
         default=dict,
@@ -182,8 +347,32 @@ class Item(CalendarTriggerMixin, models.Model):
         choices=[("local_only_missing_season", "Local only: missing season metadata")],
         help_text="Flags special provider metadata states for UI and recovery flows",
     )
+    local_season_episode_count = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Authoritative episode count for a season the provider is missing, "
+            "sourced from the media server so progress can still complete"
+        ),
+    )
+    provider_episode_count = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Total episode count reported by the metadata provider",
+    )
     series_name = models.TextField(null=True, blank=True)
     series_position = models.FloatField(null=True, blank=True)
+    metadata_migration_pinned_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When automatic metadata-provider migration (e.g. TMDB->TVDB) was "
+            "skipped for this item due to an incompatible season/episode "
+            "structure, so future runs don't keep retrying it"
+        ),
+    )
+
+    objects = models.Manager.from_queryset(ItemQuerySet)()
 
     class Meta:
         """Meta options for the model."""
@@ -197,7 +386,13 @@ class Item(CalendarTriggerMixin, models.Model):
             ),
             # Ensures seasons are unique within a show per library type
             UniqueConstraint(
-                fields=["media_id", "source", "media_type", "library_media_type", "season_number"],
+                fields=[
+                    "media_id",
+                    "source",
+                    "media_type",
+                    "library_media_type",
+                    "season_number",
+                ],
                 condition=Q(season_number__isnull=False, episode_number__isnull=True),
                 name="unique_item_with_season",
             ),
@@ -260,7 +455,8 @@ class Item(CalendarTriggerMixin, models.Model):
                 name="%(app_label)s_%(class)s_media_type_valid",
             ),
             CheckConstraint(
-                condition=Q(library_media_type="") | Q(library_media_type__in=MediaTypes.values),
+                condition=Q(library_media_type="")
+                | Q(library_media_type__in=MediaTypes.values),
                 name="%(app_label)s_%(class)s_library_media_type_valid",
             ),
         ]
@@ -277,6 +473,29 @@ class Item(CalendarTriggerMixin, models.Model):
                 fields=["trakt_popularity_rank"],
                 name="app_item_trakt_pop_rank_idx",
             ),
+            # Episode/season-scoped lookups (runtime index, MAX(episode),
+            # season ratings) filter by media_id+media_type; the unique
+            # constraints above are partial indexes SQLite can't use for
+            # them, so without this they full-scan the table.
+            models.Index(
+                fields=["media_id", "media_type", "source"],
+                name="app_item_media_lookup_idx",
+            ),
+            # Library, search and released-episode queries filter by
+            # media_type first. Without a media_type-leading index they scan
+            # the whole (~2 KB/row) table; the trailing columns also cover the
+            # per-show released-episode aggregate without reading item rows.
+            models.Index(
+                fields=[
+                    "media_type",
+                    "media_id",
+                    "source",
+                    "season_number",
+                    "episode_number",
+                    "release_datetime",
+                ],
+                name="app_item_type_lookup_idx",
+            ),
         ]
         ordering = ["media_id"]
 
@@ -288,6 +507,66 @@ class Item(CalendarTriggerMixin, models.Model):
             if self.episode_number is not None:
                 name += f"E{self.episode_number}"
         return name
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        """Save the item, ensuring JSONField arrays are never None."""
+        if not self.library_media_type:
+            self.library_media_type = self.media_type
+
+        update_fields = kwargs.get("update_fields")
+        if self.pk and (update_fields is None or SYNC_IDENTITY_FIELDS.intersection(update_fields)):
+            fields = sorted(SYNC_IDENTITY_FIELDS - {"episode_order"})
+            previous = Item.objects.filter(pk=self.pk).values(*fields).first()
+            if previous and any(previous[field] != getattr(self, field) for field in fields):
+                from app.services.sync_lock import invalidate_item_contexts
+
+                invalidate_item_contexts([self.pk])
+
+        # Ensure all JSONField arrays are lists, never None
+        json_array_fields = [
+            "genres",
+            "languages",
+            "platforms",
+            "studios",
+            "themes",
+            "authors",
+            "isbn",
+            "creators",
+        ]
+        for field_name in json_array_fields:
+            value = getattr(self, field_name, None)
+            if value is None:
+                setattr(self, field_name, [])
+
+        json_object_fields = [
+            "manual_metadata",
+            "provider_external_ids",
+            "provider_game_lengths",
+            "watch_providers",
+        ]
+        update_fields = kwargs.get("update_fields")
+        deferred_fields = self.get_deferred_fields()
+        for field_name in json_object_fields:
+            if (
+                update_fields is not None
+                and field_name not in update_fields
+                and field_name in deferred_fields
+            ):
+                continue
+            value = getattr(self, field_name, None)
+            if value is None:
+                setattr(self, field_name, {})
+
+        super().save(*args, **kwargs)
+
+    @transaction.atomic
+    def delete(self, *args, **kwargs):
+        """Serialize catalog deletion before its collector touches tracking rows."""
+        from app.services.sync_lock import invalidate_item_contexts
+
+        invalidate_item_contexts([self.pk])
+        return super().delete(*args, **kwargs)
 
     @classmethod
     def _normalize_title_value(cls, value):
@@ -360,7 +639,9 @@ class Item(CalendarTriggerMixin, models.Model):
         """Build item title fields for an episode payload."""
         metadata = metadata or {}
         episode_title = cls._normalize_title_value(
-            metadata.get("episode_title") or metadata.get("name") or metadata.get("title"),
+            metadata.get("episode_title")
+            or metadata.get("name")
+            or metadata.get("title"),
         )
         if episode_title:
             return cls.title_fields_from_metadata(
@@ -471,14 +752,11 @@ class Item(CalendarTriggerMixin, models.Model):
         display_script = cls._title_script_bucket(display_title)
         alternative_script = cls._title_script_bucket(alternative_title)
 
-        if (
+        return not (
             display_script in locale_scripts
             and alternative_script not in locale_scripts
             and alternative_script != "unknown"
-        ):
-            return False
-
-        return True
+        )
 
     @classmethod
     def resolve_title_variants(
@@ -493,15 +771,11 @@ class Item(CalendarTriggerMixin, models.Model):
         """Resolve display and alternate titles from raw title fields."""
         preference = (preference or "localized").lower()
         original_title = cls._normalize_title_value(original_title)
-        localized_title = (
-            cls._normalize_title_value(localized_title)
-            or cls._normalize_title_value(title)
-        )
+        localized_title = cls._normalize_title_value(
+            localized_title
+        ) or cls._normalize_title_value(title)
         fallback_title = (
-            cls._normalize_title_value(title)
-            or localized_title
-            or original_title
-            or ""
+            cls._normalize_title_value(title) or localized_title or original_title or ""
         )
 
         if preference == "original":
@@ -556,11 +830,11 @@ class Item(CalendarTriggerMixin, models.Model):
         """Return the persisted time-to-beat value in minutes for a source."""
         payload = self.provider_game_lengths or {}
         if source == "hltb":
-            summary = ((payload.get("hltb") or {}).get("summary") or {})
+            summary = (payload.get("hltb") or {}).get("summary") or {}
             return self._coerce_positive_int(summary.get("all_styles_minutes"))
 
         if source == "igdb":
-            summary = ((payload.get("igdb") or {}).get("summary") or {})
+            summary = (payload.get("igdb") or {}).get("summary") or {}
             seconds = self._coerce_positive_int(summary.get("normally_seconds"))
             return round(seconds / 60) if seconds else None
 
@@ -573,7 +847,9 @@ class Item(CalendarTriggerMixin, models.Model):
             return None
 
         payload = self.provider_game_lengths or {}
-        active_source = self.provider_game_lengths_source or payload.get("active_source") or ""
+        active_source = (
+            self.provider_game_lengths_source or payload.get("active_source") or ""
+        )
         sources = []
         if active_source in {"hltb", "igdb"}:
             sources.append(active_source)
@@ -593,6 +869,13 @@ class Item(CalendarTriggerMixin, models.Model):
         minutes = self.game_time_to_beat_minutes
         return app.helpers.minutes_to_hhmm(minutes) if minutes else "--"
 
+    @property
+    def book_max_progress(self):
+        """Return total progress units: runtime minutes for audiobooks, else pages."""
+        if self.format == "audiobook":
+            return self.runtime_minutes or None
+        return self.number_of_pages or None
+
     def get_alternative_title(self, user=None):
         """Return the opposite title variant for tooltip display."""
         _, alternative_title = self.get_display_and_alternative_title(user=user)
@@ -603,44 +886,19 @@ class Item(CalendarTriggerMixin, models.Model):
         """Generate a unique ID for manual items."""
         return str(uuid.uuid4())
 
-    def save(self, *args, **kwargs):
-        """Save the item, ensuring JSONField arrays are never None."""
-        if not self.library_media_type:
-            self.library_media_type = self.media_type
-
-        # Ensure all JSONField arrays are lists, never None
-        json_array_fields = [
-            "genres",
-            "languages",
-            "platforms",
-            "studios",
-            "themes",
-            "authors",
-            "isbn",
-            "creators",
-        ]
-        for field_name in json_array_fields:
-            value = getattr(self, field_name, None)
-            if value is None:
-                setattr(self, field_name, [])
-
-        json_object_fields = [
-            "manual_metadata",
-            "provider_external_ids",
-            "provider_game_lengths",
-        ]
-        for field_name in json_object_fields:
-            value = getattr(self, field_name, None)
-            if value is None:
-                setattr(self, field_name, {})
-
-        super().save(*args, **kwargs)
-
     def fetch_releases(self, delay):
         """Fetch releases for the item."""
         if self._disable_calendar_triggers:
             return
         if settings.TESTING:
+            return
+
+        from events import tasks as event_tasks  # avoid a module-load cycle
+
+        if self.episode_order_id:
+            from app.services.order_calendar import refresh_order_events
+
+            refresh_order_events(self.episode_order)
             return
 
         if self.media_type == MediaTypes.SEASON.value:
@@ -650,6 +908,17 @@ class Item(CalendarTriggerMixin, models.Model):
                     media_id=self.media_id,
                     source=self.source,
                     media_type=MediaTypes.TV.value,
+                )
+            except Item.MultipleObjectsReturned:
+                # The show also exists in another library bucket (e.g. "season").
+                tv_item = (
+                    Item.objects.filter(
+                        media_id=self.media_id,
+                        source=self.source,
+                        media_type=MediaTypes.TV.value,
+                    )
+                    .order_by("id")
+                    .first()
                 )
             except Item.DoesNotExist:
                 # Get metadata for the TV show
@@ -684,9 +953,9 @@ class Item(CalendarTriggerMixin, models.Model):
         item_ids_to_process = [item.id for item in items_to_process]
 
         if delay:
-            events.tasks.reload_calendar.apply_async(
+            event_tasks.reload_calendar.apply_async(
                 kwargs={"item_ids": item_ids_to_process},
                 countdown=3,
             )
         else:
-            events.tasks.reload_calendar(item_ids=item_ids_to_process)
+            event_tasks.reload_calendar(item_ids=item_ids_to_process)

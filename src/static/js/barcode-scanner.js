@@ -3,9 +3,45 @@
  * Uses ZXing library to decode barcodes from uploaded photos
  */
 
+// ZXing is a 336 KB library needed only after someone picks a photo to scan,
+// so it is not in every page's <head>: base.html names its URL on this
+// script's tag and the first scan loads it.
+const ZXING_SRC =
+  typeof document !== 'undefined' && document.currentScript
+    ? document.currentScript.dataset.zxingSrc
+    : null;
+let zxingLoading = null;
+
+function loadZXing() {
+  if (typeof window.ZXing !== 'undefined') {
+    return Promise.resolve();
+  }
+  if (!ZXING_SRC) {
+    return Promise.reject(new Error('ZXing library URL is not configured'));
+  }
+  if (!zxingLoading) {
+    zxingLoading = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = ZXING_SRC;
+      script.onload = () => resolve();
+      script.onerror = () => {
+        zxingLoading = null;
+        reject(new Error('ZXing library failed to load'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return zxingLoading;
+}
+
 // Barcode scanning functionality using ZXing
 async function initBarcodeScanner() {
-  // ZXing is loaded from CDN in base.html
+  try {
+    await loadZXing();
+  } catch (error) {
+    console.error('[BARCODE] Could not load ZXing:', error);
+    return null;
+  }
   console.log('[BARCODE] initBarcodeScanner called, window.ZXing:', typeof window.ZXing, window.ZXing ? 'exists' : 'undefined');
   if (typeof window.ZXing === 'undefined') {
     console.error('[BARCODE] ZXing library not loaded - make sure the script tag loaded correctly');
@@ -72,13 +108,40 @@ function computeIsbn13CheckDigit(isbn12) {
   return (10 - (sum % 10)) % 10;
 }
 
+/**
+ * Compute the ISBN-10 check digit (positions weighted 10..2, remainder mod 11).
+ * Returns 10 for a remainder of 10 ('X' in print, but this path only ever
+ * sees digit-only input - see normalizeIsbn).
+ */
+function computeIsbn10CheckDigit(isbn9) {
+  let sum = 0;
+  for (let i = 0; i < 9; i += 1) {
+    const digit = Number.parseInt(isbn9[i], 10);
+    if (Number.isNaN(digit)) {
+      return null;
+    }
+    sum += digit * (10 - i);
+  }
+  return (11 - (sum % 11)) % 11;
+}
+
 function normalizeIsbn(code) {
   if (!code) return null;
 
   const cleaned = code.replace(/\D/g, '');
 
   if (cleaned.length === 10) {
-    const isbn12 = `978${cleaned.slice(0, 9)}`;
+    const isbn9 = cleaned.slice(0, 9);
+    // cleaned is digits-only (\D was stripped above), so an ISBN-10 check
+    // digit of 'X' never reaches this branch - only a 0-9 check digit does.
+    // A misread digit from a blurry scan can still produce 10 digits, so the
+    // check digit is verified here instead of trusted, otherwise a misscan
+    // silently turns into a different, wrong-but-valid-looking ISBN-13.
+    const providedCheckDigit = Number.parseInt(cleaned[9], 10);
+    if (providedCheckDigit !== computeIsbn10CheckDigit(isbn9)) {
+      return null;
+    }
+    const isbn12 = `978${isbn9}`;
     const checkDigit = computeIsbn13CheckDigit(isbn12);
     return checkDigit === null ? null : `${isbn12}${checkDigit}`;
   }

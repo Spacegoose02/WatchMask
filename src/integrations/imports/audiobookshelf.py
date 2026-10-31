@@ -1,10 +1,12 @@
-"""Audiobookshelf importer for audiobook progress."""
+"""Audiobookshelf importer for audiobook and podcast progress."""
 
 import hashlib
 import logging
 import re
+import time
+import unicodedata
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -12,14 +14,26 @@ from urllib.parse import urljoin, urlparse
 import requests
 from django.conf import settings
 from django.utils import timezone
+from django.utils.text import slugify
 
 import app
 from app import helpers as app_helpers
 from app.log_safety import exception_summary
-from app.models import MediaTypes, Sources, Status
+from app.models import (
+    MediaTypes,
+    Podcast,
+    PodcastEpisode,
+    PodcastShow,
+    PodcastShowTracker,
+    Sources,
+    Status,
+)
 from app.providers import services
-from integrations.imports.helpers import MediaImportError, decrypt
+from app.services.synced_status import keep_held_status
+from integrations import audiobookshelf_cover, connection_health, import_progress
+from integrations.imports.helpers import MediaImportError, decrypt_or_raise
 from integrations.models import AudiobookshelfAccount
+from integrations.safe_fetch import send_to_self_hosted
 
 logger = logging.getLogger(__name__)
 HTTP_BAD_REQUEST = 400
@@ -28,6 +42,23 @@ BOOK_METADATA_PROVIDER_ORDER = (
     Sources.OPENLIBRARY.value,
 )
 TITLE_MATCH_THRESHOLD = 0.72
+# How long a book whose provider enrichment came back thin is left alone before
+# the providers are tried again. Without this, any book the providers can't
+# match - a common case for non-English audiobooks, which carry an ASIN and no
+# ISBN - is flagged unhealthy by _needs_book_repair on *every* sync and
+# re-queries Hardcover/OpenLibrary forever (see #861).
+BOOK_REPAIR_COOLDOWN = timedelta(days=30)
+# Blank posters are the visible symptom of #861, so they get a much shorter
+# cooldown: an install upgrading past the cover fix heals within a day instead
+# of waiting a month.
+BOOK_COVER_REPAIR_COOLDOWN = timedelta(days=1)
+# (strptime format, characters to feed it) pairs, most specific first.
+PUBLISHED_DATE_FORMATS = (
+    ("%Y-%m-%d", 10),
+    ("%d-%b-%Y", 11),
+    ("%Y-%m", 7),
+    ("%Y", 4),
+)
 
 
 class AudiobookshelfClientError(Exception):
@@ -46,21 +77,35 @@ class AudiobookshelfClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
 
-    def _request(self, path: str):
+    def _request(self, path: str, max_retries: int = 3, base_delay: float = 0.5):
+        """GET a path, retrying transient network failures.
+
+        A single dropped connection (TLS handshake timeout, reset, etc.) is
+        common on self-hosted setups and shouldn't be treated the same as a
+        real API error - retry it a few times before giving up (see #1047).
+        """
         url = f"{self.base_url}{path}"
-        response = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {self.token}"},
-            timeout=20,
-        )
+        attempt = 0
+        while True:
+            try:
+                response = send_to_self_hosted(
+                    requests.get,
+                    url,
+                    headers={"Authorization": f"Bearer {self.token}"},
+                    timeout=20,
+                )
+            except requests.exceptions.RequestException:
+                attempt += 1
+                if attempt >= max_retries:
+                    raise
+                time.sleep(base_delay * attempt)
+                continue
+            break
         if response.status_code in (401, 403):
             msg = "Audiobookshelf token is invalid or expired"
             raise AudiobookshelfAuthError(msg)
         if response.status_code >= HTTP_BAD_REQUEST:
-            msg = (
-                "Audiobookshelf request failed "
-                f"({response.status_code}) for {path}"
-            )
+            msg = f"Audiobookshelf request failed ({response.status_code}) for {path}"
             raise AudiobookshelfClientError(msg)
         return response.json()
 
@@ -68,12 +113,19 @@ class AudiobookshelfClient:
         """Return authenticated user payload."""
         return self._request("/api/me")
 
-    def get_library_item(self, library_item_id: str):
-        """Return metadata for an Audiobookshelf library item."""
-        return self._request(f"/api/items/{library_item_id}")
+    def get_library_item(self, library_item_id: str, *, expanded: bool = False):
+        """Return metadata for an Audiobookshelf library item.
+
+        Podcast library items only expose per-episode durations in the
+        expanded payload, so podcast lookups must pass expanded=True.
+        """
+        path = f"/api/items/{library_item_id}"
+        if expanded:
+            path = f"{path}?expanded=1"
+        return self._request(path)
 
 
-def importer(identifier, user, mode):  # noqa: ARG001
+def importer(identifier, user, mode):
     """Import Audiobookshelf progress for a user."""
     return AudiobookshelfImporter(user).import_data()
 
@@ -90,7 +142,12 @@ class AudiobookshelfImporter:
             msg = "Connect Audiobookshelf before importing"
             raise MediaImportError(msg) from error
 
-        token = decrypt(self.account.api_token)
+        try:
+            token = decrypt_or_raise(self.account.api_token)
+        except MediaImportError as error:
+            connection_health.record_failure(self.account, str(error), auth=True)
+            raise
+
         self.client = AudiobookshelfClient(self.account.base_url, token)
         self.warnings = []
         self.enable_provider_enrichment = not settings.TESTING
@@ -101,20 +158,23 @@ class AudiobookshelfImporter:
         try:
             me = self.client.get_me()
         except AudiobookshelfAuthError as error:
-            self.account.connection_broken = True
-            self.account.last_error_message = str(error)
-            self.account.save(
-                update_fields=[
-                    "connection_broken",
-                    "last_error_message",
-                    "updated_at",
-                ],
-            )
+            connection_health.record_failure(self.account, str(error), auth=True)
             raise MediaImportError(str(error)) from error
+        except requests.exceptions.RequestException as error:
+            # An unreachable or unresponsive server is not a rejected token, so
+            # the account is not marked broken (see connection-health.md).
+            msg = (
+                "Audiobookshelf server did not respond "
+                f"({exception_summary(error)})"
+            )
+            connection_health.record_failure(self.account, msg, auth=False)
+            raise MediaImportError(msg) from error
 
         progress_entries = me.get("mediaProgress") or []
         last_sync_ms = self.account.last_sync_ms or 0
-        book_progress_entries = self._book_progress_entries(progress_entries)
+        book_progress_entries, podcast_progress_entries = self._split_progress_entries(
+            progress_entries,
+        )
         existing_items = self._existing_book_items(book_progress_entries)
         changed_entries, unchanged_entries = self._partition_book_progress_entries(
             book_progress_entries,
@@ -158,6 +218,26 @@ class AudiobookshelfImporter:
                 repaired_count,
             )
 
+        changed_podcast_entries, _ = self._partition_book_progress_entries(
+            podcast_progress_entries,
+            last_sync_ms,
+        )
+        podcast_max_seen, podcast_processed = self._import_changed_podcast_episodes(
+            changed_podcast_entries,
+            imported_counts,
+            last_sync_ms,
+        )
+        # The cursor is shared with the book pass, so it has to cover podcast
+        # entries too or their progress is replayed on every run.
+        max_seen = max(max_seen, podcast_max_seen)
+
+        if changed_podcast_entries:
+            logger.info(
+                "Audiobookshelf changed podcast entries processed=%s imported=%s",
+                len(changed_podcast_entries),
+                podcast_processed,
+            )
+
         self.account.last_sync_ms = max_seen
         self.account.last_sync_at = timezone.now()
         self.account.connection_broken = False
@@ -184,9 +264,7 @@ class AudiobookshelfImporter:
 
         media_info = item_metadata.get("media") or {}
         metadata = (
-            media_info.get("metadata")
-            or item_metadata.get("mediaMetadata")
-            or {}
+            media_info.get("metadata") or item_metadata.get("mediaMetadata") or {}
         )
 
         fallback_title = f"Audiobookshelf {library_item_id}"
@@ -198,22 +276,16 @@ class AudiobookshelfImporter:
         genres = self._extract_genres(metadata)
         series_name, series_position = self._extract_series_info(metadata)
 
-        image = self._normalize_cover_url(item_metadata.get("coverPath"))
-        # ABS returns coverPath as a server filesystem path (e.g. /metadata/items/.../cover.jpg).
-        # Map any ABS-hosted non-API URL to the authenticated cover endpoint so that
-        # _should_prefer_provider_cover triggers provider enrichment with a valid fallback.
-        if image:
-            _parsed = urlparse(image)
-            _abs_host = urlparse(self.account.base_url).netloc.lower()
-            if (
-                _parsed.netloc.lower() == _abs_host
-                and not ("/api/items/" in _parsed.path and "/cover" in _parsed.path)
-            ):
-                image = f"{self.account.base_url.rstrip('/')}/api/items/{library_item_id}/cover"
+        image = self._resolve_cover_image(library_item_id, item_metadata)
 
+        # Enrichment is still worth running for thin metadata even when the
+        # cover is already settled - it fills in authors, publisher, genres and
+        # the release date.
         should_enrich = (
-            self._should_prefer_provider_cover(image)
+            self._needs_cover_from_provider(image)
             or not authors_list
+            or not publishers
+            or not genres
         )
         provider_metadata = (
             self._resolve_provider_metadata(
@@ -225,8 +297,17 @@ class AudiobookshelfImporter:
             else None
         )
 
-        if self._should_prefer_provider_cover(image):
-            image = provider_metadata.get("image") if isinstance(provider_metadata, dict) else image
+        if self._needs_cover_from_provider(image):
+            provider_image = (
+                provider_metadata.get("image")
+                if isinstance(provider_metadata, dict)
+                else None
+            )
+            # A provider match with no cover art of its own (Hardcover returns
+            # settings.IMG_NONE in that case) must not blank out a working
+            # fallback cover we already have (see #861).
+            if provider_image and provider_image != settings.IMG_NONE:
+                image = provider_image
         if not image:
             image = settings.IMG_NONE
 
@@ -247,12 +328,26 @@ class AudiobookshelfImporter:
             if isinstance(provider_metadata, dict)
             else None
         )
+        if release_datetime is None:
+            release_datetime = self._extract_published_datetime(metadata)
         if not series_name:
-            series_name = provider_metadata.get("series_name") if isinstance(provider_metadata, dict) else None
+            series_name = (
+                provider_metadata.get("series_name")
+                if isinstance(provider_metadata, dict)
+                else None
+            )
         if series_position is None:
-            series_position = provider_metadata.get("series_position") if isinstance(provider_metadata, dict) else None
+            series_position = (
+                provider_metadata.get("series_position")
+                if isinstance(provider_metadata, dict)
+                else None
+            )
 
-        provider_title = provider_metadata.get("title") if isinstance(provider_metadata, dict) else None
+        provider_title = (
+            provider_metadata.get("title")
+            if isinstance(provider_metadata, dict)
+            else None
+        )
         title_fields = app.models.Item.title_fields_from_metadata(
             {
                 "title": title,
@@ -271,9 +366,7 @@ class AudiobookshelfImporter:
         if not title_fields.get("localized_title"):
             title_fields["localized_title"] = title_fields.get("title") or title
         duration_seconds = (
-            media_info.get("duration")
-            or progress_entry.get("duration")
-            or 0
+            media_info.get("duration") or progress_entry.get("duration") or 0
         )
         runtime_minutes = int(duration_seconds // 60) if duration_seconds else None
         metadata_fetched_at = timezone.now()
@@ -318,16 +411,22 @@ class AudiobookshelfImporter:
         finished_at = self._parse_datetime(progress_entry.get("finishedAt"))
         started_at = self._parse_datetime(progress_entry.get("startedAt"))
 
-        media, _ = app.models.Book.objects.update_or_create(
-            user=self.user,
-            item=item,
-            defaults={
+        existing = app.models.Book.objects.filter(user=self.user, item=item).first()
+        defaults = keep_held_status(
+            existing,
+            {
                 "progress": progress_minutes,
                 "status": status,
                 "start_date": started_at,
                 "end_date": finished_at if is_finished else None,
                 "notes": "Format: Audiobook (Audiobookshelf)",
             },
+            self._parse_datetime(progress_entry.get("lastUpdate")),
+        )
+        media, _ = app.models.Book.objects.update_or_create(
+            user=self.user,
+            item=item,
+            defaults=defaults,
         )
         return media
 
@@ -363,19 +462,25 @@ class AudiobookshelfImporter:
         value = f"{base_url.strip().lower()}::{library_item_id}"
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
 
-    def _book_progress_entries(self, progress_entries):
+    def _split_progress_entries(self, progress_entries):
+        """Split ABS progress entries into book and podcast episode entries.
+
+        A podcast entry carries an episodeId (mediaItemType podcastEpisode);
+        its libraryItemId identifies the show, not the episode.
+        """
         book_progress_entries = []
+        podcast_progress_entries = []
         for entry in progress_entries:
             library_item_id = entry.get("libraryItemId")
             if not library_item_id:
                 continue
 
-            # Skip podcast episode progress in v1.
             if entry.get("episodeId"):
+                podcast_progress_entries.append((str(library_item_id), entry))
                 continue
 
             book_progress_entries.append((str(library_item_id), entry))
-        return book_progress_entries
+        return book_progress_entries, podcast_progress_entries
 
     def _partition_book_progress_entries(self, book_progress_entries, last_sync_ms):
         changed_entries = []
@@ -396,7 +501,9 @@ class AudiobookshelfImporter:
     ):
         max_seen = last_sync_ms
         changed_processed = 0
-        for library_item_id, entry in changed_entries:
+        total = len(changed_entries)
+        for i, (library_item_id, entry) in enumerate(changed_entries, start=1):
+            import_progress.report(i, total, "Audiobookshelf: books")
             max_seen = max(max_seen, int(entry.get("lastUpdate") or 0))
 
             item_metadata = self._fetch_library_item(library_item_id)
@@ -432,7 +539,9 @@ class AudiobookshelfImporter:
         imported_counts,
     ):
         repaired_count = 0
-        for library_item_id, entry in repair_candidates:
+        total = len(repair_candidates)
+        for i, (library_item_id, entry) in enumerate(repair_candidates, start=1):
+            import_progress.report(i, total, "Audiobookshelf: repairing books")
             item_metadata = self._fetch_library_item(library_item_id)
             if item_metadata is None:
                 continue
@@ -467,51 +576,461 @@ class AudiobookshelfImporter:
             if media_id in items_by_media_id
         }
 
-    def _fetch_library_item(self, library_item_id: str):
+    def _fetch_library_item(self, library_item_id: str, *, expanded: bool = False):
+        kwargs = {"expanded": True} if expanded else {}
         try:
-            return self.client.get_library_item(library_item_id)
-        except AudiobookshelfClientError:
+            return self.client.get_library_item(library_item_id, **kwargs)
+        except (AudiobookshelfClientError, requests.exceptions.RequestException):
             self.warnings.append(f"{library_item_id}: failed to fetch metadata")
             return None
+
+    def _import_changed_podcast_episodes(
+        self,
+        changed_entries,
+        imported_counts,
+        last_sync_ms,
+    ):
+        """Import podcast episode progress, one library fetch per show."""
+        max_seen = last_sync_ms
+        processed = 0
+        entries_by_show = defaultdict(list)
+        for library_item_id, entry in changed_entries:
+            max_seen = max(max_seen, int(entry.get("lastUpdate") or 0))
+            entries_by_show[library_item_id].append(entry)
+
+        total = len(changed_entries)
+        current = 0
+        for library_item_id, entries in entries_by_show.items():
+            item_metadata = self._fetch_library_item(library_item_id, expanded=True)
+            if item_metadata is None:
+                current += len(entries)
+                import_progress.report(current, total, "Audiobookshelf: podcasts")
+                continue
+
+            show = self._ensure_podcast_show(library_item_id, item_metadata)
+            episodes_by_id = self._index_podcast_episodes(item_metadata)
+
+            for entry in entries:
+                current += 1
+                import_progress.report(current, total, "Audiobookshelf: podcasts")
+                episode_id = str(entry.get("episodeId") or "")
+                episode_metadata = episodes_by_id.get(episode_id)
+                if episode_metadata is None:
+                    self.warnings.append(
+                        f"{library_item_id}: episode {episode_id} "
+                        "missing from library item",
+                    )
+                    continue
+
+                if self._record_podcast_progress(show, episode_metadata, entry):
+                    imported_counts[MediaTypes.PODCAST.value] += 1
+                    processed += 1
+        return max_seen, processed
+
+    def _index_podcast_episodes(self, item_metadata: dict[str, Any]):
+        media_info = item_metadata.get("media") or {}
+        episodes = media_info.get("episodes") or []
+        return {
+            str(episode.get("id")): episode
+            for episode in episodes
+            if isinstance(episode, dict) and episode.get("id")
+        }
+
+    def _podcast_show_uuid(self, library_item_id: str):
+        return f"abs_{self._stable_media_id(self.account.base_url, library_item_id)}"
+
+    def _ensure_podcast_show(self, library_item_id: str, item_metadata: dict[str, Any]):
+        """Create or update the podcast show for an ABS library item."""
+        media_info = item_metadata.get("media") or {}
+        metadata = media_info.get("metadata") or {}
+        feed_url = str(metadata.get("feedUrl") or "").strip()
+        podcast_uuid = self._podcast_show_uuid(library_item_id)
+
+        show = None
+        if feed_url:
+            show = PodcastShow.objects.filter(rss_feed_url=feed_url).first()
+        if show is None:
+            show = PodcastShow.objects.filter(podcast_uuid=podcast_uuid).first()
+
+        title = (
+            metadata.get("title")
+            or item_metadata.get("title")
+            or f"Audiobookshelf {library_item_id}"
+        )
+        defaults = {
+            "title": str(title)[:255],
+            "slug": slugify(title)[:255],
+            "author": str(metadata.get("author") or "")[:255],
+            "description": str(metadata.get("description") or ""),
+            "language": str(metadata.get("language") or "")[:10],
+            "genres": self._extract_genres(metadata),
+            "image": self._podcast_show_image(library_item_id, item_metadata, metadata),
+            "rss_feed_url": feed_url,
+        }
+
+        if show is None:
+            return PodcastShow.objects.create(
+                podcast_uuid=podcast_uuid,
+                source=Sources.AUDIOBOOKSHELF.value,
+                **defaults,
+            )
+
+        # An existing show may have been created by another integration
+        # (Pocket Casts, GPodder) for the same feed; keep its source.
+        update_fields = []
+        for field, value in defaults.items():
+            if value and getattr(show, field) != value:
+                setattr(show, field, value)
+                update_fields.append(field)
+        if update_fields:
+            show.save(update_fields=update_fields)
+        return show
+
+    def _podcast_show_image(
+        self,
+        library_item_id: str,
+        item_metadata: dict[str, Any],
+        metadata: dict[str, Any],
+    ):
+        """Prefer the public feed artwork over the authenticated ABS cover."""
+        image_url = self._normalize_cover_url(metadata.get("imageUrl"))
+        if (
+            image_url
+            and urlparse(image_url).netloc.lower()
+            != urlparse(
+                self.account.base_url,
+            ).netloc.lower()
+        ):
+            return image_url
+        if self._abs_cover_value(item_metadata) or image_url:
+            return audiobookshelf_cover.build_cover_proxy_url(
+                self.account.id,
+                library_item_id,
+            )
+        return ""
+
+    def _ensure_podcast_episode(self, show, episode_metadata: dict[str, Any]):
+        """Create or update the catalog episode for an ABS podcast episode."""
+        episode_id = str(episode_metadata.get("id") or "")
+        enclosure = episode_metadata.get("enclosure") or {}
+        audio_url = str(enclosure.get("url") or "")[:500]
+        guid = str(episode_metadata.get("guid") or "").strip()
+        episode_uuid = (guid or audio_url or f"abs_{episode_id}")[:500]
+
+        episode = PodcastEpisode.objects.filter(
+            show=show,
+            episode_uuid=episode_uuid,
+        ).first()
+        if episode is None and audio_url:
+            episode = PodcastEpisode.objects.filter(
+                show=show,
+                audio_url=audio_url,
+            ).first()
+
+        title = str(episode_metadata.get("title") or "Unknown Episode")
+        updates = {
+            "title": title[:500],
+            "slug": slugify(title)[:255],
+            "published": self._parse_datetime(episode_metadata.get("publishedAt")),
+            "duration": self._podcast_episode_duration(episode_metadata),
+            "audio_url": audio_url,
+            "episode_number": self._coerce_positive_int(
+                episode_metadata.get("episode"),
+            ),
+            "season_number": self._coerce_positive_int(
+                episode_metadata.get("season"),
+            ),
+            "file_type": str(enclosure.get("type") or "")[:50],
+            "episode_type": str(episode_metadata.get("episodeType") or "")[:50],
+        }
+
+        if episode is None:
+            episode, _ = PodcastEpisode.objects.get_or_create(
+                show=show,
+                episode_uuid=episode_uuid,
+                defaults=updates,
+            )
+            return episode
+
+        update_fields = []
+        for field, value in updates.items():
+            if value not in (None, "") and getattr(episode, field) != value:
+                setattr(episode, field, value)
+                update_fields.append(field)
+        if update_fields:
+            episode.save(update_fields=update_fields)
+        return episode
+
+    def _podcast_episode_duration(self, episode_metadata: dict[str, Any]):
+        duration = episode_metadata.get("duration")
+        if not duration:
+            audio_file = episode_metadata.get("audioFile") or {}
+            duration = audio_file.get("duration")
+        try:
+            seconds = int(float(duration))
+        except (TypeError, ValueError):
+            return None
+        return seconds if seconds > 0 else None
+
+    def _coerce_positive_int(self, value):
+        """Coerce ABS season/episode numbers, which arrive as strings."""
+        if value in (None, ""):
+            return None
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
+    def _ensure_podcast_item(self, show, episode, total_seconds):
+        """Return the trackable item for a podcast episode."""
+        runtime_minutes = None
+        if total_seconds:
+            runtime_minutes = max(1, total_seconds // 60)
+        elif episode.duration:
+            runtime_minutes = max(1, episode.duration // 60)
+
+        defaults = {
+            "title": episode.title,
+            "image": show.image or settings.IMG_NONE,
+        }
+        if runtime_minutes:
+            defaults["runtime_minutes"] = runtime_minutes
+        if episode.published:
+            defaults["release_datetime"] = episode.published
+
+        # Keyed on the show source so a feed already tracked through another
+        # integration keeps a single item per episode.
+        item, _ = app.models.Item.objects.get_or_create(
+            media_id=episode.episode_uuid,
+            source=show.source,
+            media_type=MediaTypes.PODCAST.value,
+            defaults=defaults,
+        )
+        update_fields = []
+        if item.title != episode.title:
+            item.title = episode.title
+            update_fields.append("title")
+        if runtime_minutes and item.runtime_minutes != runtime_minutes:
+            item.runtime_minutes = runtime_minutes
+            update_fields.append("runtime_minutes")
+        if episode.published and item.release_datetime != episode.published:
+            item.release_datetime = episode.published
+            update_fields.append("release_datetime")
+        if update_fields:
+            item.save(update_fields=update_fields)
+        return item
+
+    def _record_podcast_progress(
+        self,
+        show,
+        episode_metadata: dict[str, Any],
+        progress_entry: dict[str, Any],
+    ):
+        """Write a single ABS podcast episode progress entry."""
+        is_completed = self._is_finished_progress_entry(progress_entry)
+        position_seconds = int(float(progress_entry.get("currentTime") or 0))
+        if not is_completed and position_seconds <= 0:
+            # Touched but never started; ABS keeps such rows around.
+            return False
+
+        episode = self._ensure_podcast_episode(show, episode_metadata)
+        total_seconds = (
+            int(float(progress_entry.get("duration") or 0)) or episode.duration or None
+        )
+
+        # Completed rows get lifted to the full runtime by Media.process_status.
+        progress_minutes = max(1, position_seconds // 60) if position_seconds > 0 else 0
+
+        item = self._ensure_podcast_item(show, episode, total_seconds)
+        PodcastShowTracker.objects.get_or_create(
+            user=self.user,
+            show=show,
+            defaults={"status": Status.IN_PROGRESS.value},
+        )
+
+        end_date = None
+        if is_completed:
+            end_date = self._parse_datetime(
+                progress_entry.get("finishedAt"),
+            ) or self._parse_datetime(progress_entry.get("lastUpdate"))
+
+        status_value = (
+            Status.COMPLETED.value if is_completed else Status.IN_PROGRESS.value
+        )
+        provider_status = 3 if is_completed else 2
+
+        entries = list(
+            Podcast.objects.filter(user=self.user, item=item)
+            .select_related("episode", "show", "item")
+            .order_by("-created_at"),
+        )
+        latest_in_progress = next(
+            (entry for entry in entries if entry.end_date is None),
+            None,
+        )
+        latest_completed = next(
+            (entry for entry in entries if entry.end_date is not None),
+            None,
+        )
+
+        if latest_in_progress is not None:
+            if (
+                latest_in_progress.played_up_to_seconds == (position_seconds or None)
+                and latest_in_progress.end_date == end_date
+                and latest_in_progress.status == status_value
+            ):
+                return False
+            self._update_podcast_row(
+                latest_in_progress,
+                show=show,
+                episode=episode,
+                status=status_value,
+                progress_minutes=progress_minutes,
+                position_seconds=position_seconds,
+                provider_status=provider_status,
+                end_date=end_date,
+            )
+            return True
+
+        if (
+            latest_completed is not None
+            and is_completed
+            and latest_completed.played_up_to_seconds == (position_seconds or None)
+        ):
+            return False
+
+        Podcast.objects.create(
+            user=self.user,
+            item=item,
+            show=show,
+            episode=episode,
+            status=status_value,
+            progress=progress_minutes,
+            played_up_to_seconds=position_seconds or None,
+            last_seen_status=provider_status,
+            position_updated_at=timezone.now() if position_seconds else None,
+            start_date=self._parse_datetime(progress_entry.get("startedAt")),
+            end_date=end_date,
+        )
+        return True
+
+    def _update_podcast_row(
+        self,
+        podcast,
+        *,
+        show,
+        episode,
+        status,
+        progress_minutes,
+        position_seconds,
+        provider_status,
+        end_date,
+    ):
+        """Update an existing in-progress podcast row in place."""
+        updates = {
+            "show": show,
+            "episode": episode,
+            "status": status,
+            "progress": progress_minutes,
+            "played_up_to_seconds": position_seconds or None,
+            "last_seen_status": provider_status,
+        }
+        if end_date is not None:
+            updates["end_date"] = end_date
+
+        update_fields = []
+        for field, value in updates.items():
+            if getattr(podcast, field) != value:
+                setattr(podcast, field, value)
+                update_fields.append(field)
+
+        # Keeps ?updated_since= delta sync on the playback progress API honest;
+        # progressed_at only monitors 'progress', not the seconds position.
+        if "played_up_to_seconds" in update_fields:
+            podcast.position_updated_at = timezone.now()
+            update_fields.append("position_updated_at")
+
+        if update_fields:
+            podcast.save(update_fields=update_fields)
 
     def _needs_book_repair(self, item):
         if item is None:
             return True
 
         image = item.image or ""
+        # A raw ABS-hosted URL can never load in the browser, so it is always
+        # worth re-repairing. This terminates by itself: the repair rewrites it
+        # into a proxy URL, which _is_stale_abs_cover then ignores.
+        if self._is_stale_abs_cover(image):
+            return True
+
+        if item.metadata_fetched_at is None:
+            return True
+        age = timezone.now() - item.metadata_fetched_at
+
+        # A blank poster is the user-visible symptom of #861, so rows written
+        # before the cover fix should heal on the next day's sync rather than
+        # waiting out the full metadata cooldown. It still needs *a* cooldown:
+        # when ABS genuinely has no artwork and no provider matches, the image
+        # stays IMG_NONE and would otherwise be re-repaired on every sync.
+        if (
+            not image or image == settings.IMG_NONE
+        ) and age >= BOOK_COVER_REPAIR_COOLDOWN:
+            return True
+
+        # Books the providers simply cannot match - non-English audiobooks
+        # carrying an ASIN and no ISBN, say - would otherwise be flagged
+        # unhealthy on every single sync and re-query Hardcover/OpenLibrary
+        # forever (#861). The cooldown makes that retry periodic instead.
+        if age < BOOK_REPAIR_COOLDOWN:
+            return False
+
+        # A missing ISBN is not a defect for audiobooks: ABS carries an ASIN for
+        # most audio editions and no ISBN at all, so requiring one here marked
+        # those items unhealthy forever and re-repaired them on every sync.
         return any(
             (
-                self._is_stale_abs_cover(image),
                 not item.authors,
-                not item.isbn,
                 not item.publishers,
                 not item.genres,
                 item.release_datetime is None,
                 not item.original_title,
                 not item.localized_title,
-                item.metadata_fetched_at is None,
             ),
         )
 
     def _is_stale_abs_cover(self, image_url: str) -> bool:
-        """Return True for ABS-hosted URLs that are not the proper API cover endpoint.
+        """Return True for a stored cover URL that predates the ABS cover proxy.
 
-        These are filesystem paths that were mapped to HTTP URLs before the URL
-        normalisation fix and need to be re-normalised on the next repair pass.
-        Using this instead of _should_prefer_provider_cover in the repair check
-        avoids infinite re-repair for items whose provider enrichment failed and
-        are left with the /api/items/{id}/cover fallback URL.
+        Older rows (including ones written before the proxy fix, see #861) may
+        still hold a raw ABS-hosted URL - even the previously "normalised"
+        /api/items/.../cover form, which requires a bearer token a plain
+        <img src> can never attach. Any such URL needs to be re-repaired into
+        the proxy form so the poster actually loads. It deliberately says
+        nothing about blank or placeholder covers: _needs_book_repair handles
+        those under a cooldown, so an item ABS has no artwork for is not
+        re-repaired on every sync.
         """
         if not image_url or image_url == settings.IMG_NONE:
             return False
+        if audiobookshelf_cover.is_cover_proxy_url(image_url):
+            # A proxy URL only resolves while its signature verifies, and
+            # rotating SECRET_KEY invalidates every stored token at once.
+            # Nothing else would ever rewrite them, so an unverifiable token
+            # is stale rather than healthy. Re-signing it on repair makes this
+            # terminate on the next pass.
+            token = image_url.rsplit("/", 1)[-1]
+            return audiobookshelf_cover.resolve_cover_proxy_token(token) is None
+        return self._is_own_abs_host(image_url)
+
+    def _is_own_abs_host(self, image_url: str) -> bool:
+        """Return whether `image_url` points at this account's own ABS server."""
         parsed = urlparse(image_url)
         if parsed.scheme not in {"http", "https"}:
             return False
         abs_host = urlparse(self.account.base_url).netloc.lower()
-        return (
-            parsed.netloc.lower() == abs_host
-            and not ("/api/items/" in parsed.path and "/cover" in parsed.path)
-        )
+        return parsed.netloc.lower() == abs_host
 
     def _extract_author_names(self, metadata: dict[str, Any]):
         raw_authors = metadata.get("authors")
@@ -573,6 +1092,26 @@ class AudiobookshelfImporter:
             return candidate
         return ""
 
+    def _extract_published_datetime(self, metadata: dict[str, Any]):
+        """Build a release datetime from the ABS publication fields.
+
+        ABS exposes publishedDate ("2022-08-26") and publishedYear, which is
+        usually a bare year but sometimes carries a full date ("26-Aug-2022").
+        Used as a fallback when provider enrichment supplies no release date,
+        so books keep a release date even without a provider match.
+        """
+        for raw in (metadata.get("publishedDate"), metadata.get("publishedYear")):
+            if not raw:
+                continue
+            value = str(raw).strip()
+            for fmt, length in PUBLISHED_DATE_FORMATS:
+                try:
+                    parsed = datetime.strptime(value[:length], fmt)  # noqa: DTZ007
+                except ValueError:
+                    continue
+                return parsed.replace(tzinfo=UTC)
+        return None
+
     def _extract_publisher(self, metadata: dict[str, Any]):
         raw = metadata.get("publisher") or metadata.get("publishers")
         if isinstance(raw, list):
@@ -605,7 +1144,9 @@ class AudiobookshelfImporter:
                     series_name = first_series
         normalized_name = str(series_name).strip() if series_name else None
         try:
-            normalized_position = float(series_position) if series_position is not None else None
+            normalized_position = (
+                float(series_position) if series_position is not None else None
+            )
         except (TypeError, ValueError):
             normalized_position = None
         return normalized_name, normalized_position
@@ -626,29 +1167,78 @@ class AudiobookshelfImporter:
             return f"{self.account.base_url.rstrip('/')}{cover}"
         return urljoin(f"{self.account.base_url.rstrip('/')}/", cover)
 
-    def _should_prefer_provider_cover(self, image_url):
-        if not image_url or image_url == settings.IMG_NONE:
-            return True
-        parsed_image = urlparse(image_url)
-        if parsed_image.scheme not in {"http", "https"}:
-            return True
+    def _abs_cover_value(self, item_metadata: dict[str, Any]):
+        """Return the raw cover value Audiobookshelf reports for an item.
 
-        abs_host = urlparse(self.account.base_url).netloc.lower()
-        image_host = parsed_image.netloc.lower()
-        is_abs_api_cover = (
-            image_host == abs_host
-            and "/api/items/" in parsed_image.path
-            and "/cover" in parsed_image.path
-        )
-        return is_abs_api_cover
+        Depending on the ABS version the cover lives at the library item's top
+        level, under ``media``, or only as an image entry in ``libraryFiles``.
+        Reading just the top-level key made Floppy conclude the item had no
+        artwork at all and fall back to whatever a metadata provider happened
+        to return - or to the placeholder (see #861).
+        """
+        cover_value = item_metadata.get("coverPath")
+        if cover_value:
+            return cover_value
 
-    def _resolve_provider_metadata(self, title: str, authors: list[str], isbns: list[str]):
+        media_info = item_metadata.get("media")
+        if isinstance(media_info, dict) and media_info.get("coverPath"):
+            return media_info["coverPath"]
+
+        library_files = item_metadata.get("libraryFiles")
+        if isinstance(library_files, list):
+            for library_file in library_files:
+                if not isinstance(library_file, dict):
+                    continue
+                if library_file.get("fileType") != "image":
+                    continue
+                file_metadata = library_file.get("metadata")
+                path = (
+                    file_metadata.get("path")
+                    if isinstance(file_metadata, dict)
+                    else None
+                )
+                if path:
+                    return path
+        return ""
+
+    def _resolve_cover_image(self, library_item_id: str, item_metadata: dict[str, Any]):
+        """Return the cover URL for an ABS book, preferring the user's own art.
+
+        Audiobookshelf artwork is what the user curated, so it wins over
+        Hardcover/OpenLibrary art: a provider match carrying a dead or simply
+        wrong cover URL used to replace a perfectly good ABS cover (see #861).
+        The ABS ``/api/items/:id/cover`` endpoint requires a bearer token a
+        plain ``<img src>`` can never attach, so any ABS-hosted cover is served
+        through Floppy's own authenticated proxy rather than the raw ABS URL.
+        """
+        cover_value = self._abs_cover_value(item_metadata)
+        image = self._normalize_cover_url(cover_value)
+        # A coverPath on some other host is a remote cover the user configured
+        # in ABS; it is already directly loadable, so keep it as-is.
+        if image and not self._is_own_abs_host(image):
+            return image
+        if cover_value:
+            return audiobookshelf_cover.build_cover_proxy_url(
+                self.account.id,
+                library_item_id,
+            )
+        return ""
+
+    def _needs_cover_from_provider(self, image_url):
+        """Return whether provider art is needed because we have no cover.
+
+        Audiobookshelf art now wins outright (see #861), so provider artwork
+        is only used when ABS gave us nothing to show.
+        """
+        return not image_url or image_url == settings.IMG_NONE
+
+    def _resolve_provider_metadata(
+        self, title: str, authors: list[str], isbns: list[str]
+    ):
         if not title:
             return None
 
-        search_plan = []
-        for isbn in isbns:
-            search_plan.append((isbn, True))
+        search_plan = [(isbn, True) for isbn in isbns]
 
         author_hint = authors[0] if authors else ""
         if author_hint:
@@ -673,7 +1263,7 @@ class AudiobookshelfImporter:
                         1,
                         provider_source,
                     )
-                except Exception as error:  # noqa: BLE001
+                except Exception as error:
                     logger.debug(
                         "Audiobookshelf metadata search failed provider=%s isbn_query=%s error=%s",
                         provider_source,
@@ -682,7 +1272,9 @@ class AudiobookshelfImporter:
                     )
                     continue
 
-                results = response.get("results", []) if isinstance(response, dict) else []
+                results = (
+                    response.get("results", []) if isinstance(response, dict) else []
+                )
                 if not results:
                     continue
 
@@ -700,7 +1292,7 @@ class AudiobookshelfImporter:
                         str(candidate.get("media_id")),
                         provider_source,
                     )
-                except Exception as error:  # noqa: BLE001
+                except Exception as error:
                     logger.debug(
                         "Audiobookshelf metadata fetch failed provider=%s error=%s",
                         provider_source,
@@ -768,7 +1360,7 @@ class AudiobookshelfImporter:
         }
         if normalized_target_authors.intersection(normalized_provider_authors):
             return True
-        return title_score >= 0.88
+        return title_score >= TITLE_MATCH_THRESHOLD
 
     def _title_similarity(self, left: str, right: str):
         normalized_left = self._normalize_name(left)
@@ -778,7 +1370,40 @@ class AudiobookshelfImporter:
         return SequenceMatcher(None, normalized_left, normalized_right).ratio()
 
     def _normalize_name(self, value):
-        normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+        """Casefold and strip punctuation while keeping non-ASCII letters.
+
+        The old form was ``re.sub(r"[^a-z0-9]+", " ", value.lower())``, which
+        deleted every non-ASCII character: a Cyrillic or Japanese title
+        normalised to the empty string and so could never match a provider
+        result, and accented Latin titles were degraded below
+        TITLE_MATCH_THRESHOLD (see #861).
+
+        Accents are folded off Latin letters, so "Zeitbrüch" still matches
+        "Zeitbruch". They are *not* folded off other scripts, where a
+        combining mark changes the word rather than its spelling: stripping
+        them would collapse Japanese は/ば/ぱ and the Cyrillic ye/yo pair,
+        scoring different works as a perfect match and letting a provider
+        overwrite the item's metadata with another book's.
+        """
+        decomposed = unicodedata.normalize("NFKD", str(value or ""))
+        kept = []
+        base_is_ascii = False
+        for char in decomposed:
+            if unicodedata.combining(char):
+                # NFKD decomposes an accented Latin letter to an ASCII base
+                # plus its mark, so an ASCII base is exactly the case where
+                # dropping the mark is a spelling variant rather than a
+                # different character.
+                if not base_is_ascii:
+                    kept.append(char)
+                continue
+            base_is_ascii = char.isascii()
+            kept.append(char)
+        # Recompose so a mark kept above rejoins its base into a single
+        # alphanumeric character; left bare it would read as punctuation
+        # below and split the word in half.
+        recomposed = unicodedata.normalize("NFC", "".join(kept))
+        normalized = re.sub(r"[\W_]+", " ", recomposed.casefold())
         return re.sub(r"\s+", " ", normalized).strip()
 
     def _extract_provider_authors(self, provider_metadata: dict[str, Any] | None):
@@ -791,7 +1416,9 @@ class AudiobookshelfImporter:
 
         raw_authors = details.get("authors") or details.get("author") or []
         if isinstance(raw_authors, str):
-            raw_authors = [part.strip() for part in raw_authors.split(",") if part.strip()]
+            raw_authors = [
+                part.strip() for part in raw_authors.split(",") if part.strip()
+            ]
         elif not isinstance(raw_authors, list):
             raw_authors = [raw_authors] if raw_authors else []
 

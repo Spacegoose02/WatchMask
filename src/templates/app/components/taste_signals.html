@@ -1,3 +1,5 @@
+
+{% load i18n %}
 {% comment %}
   Taste Signals — two sortable sub-panels sharing one Time/Plays dropdown in
   the card header (mirrors Role Leaders' dropdown pattern): Top Genres and
@@ -6,21 +8,25 @@
   Required context: top_genres_combined, era_spotlight, genre_sort_by,
   selected_range_name, start_date_str, end_date_str.
 {% endcomment %}
-<div x-data="{
+{% translate "Plays" as media_i18n_62 %}{% translate "Time" as media_i18n_61 %}<div x-data="{
        open: false,
        selectedSort: '{{ genre_sort_by|default:"time"|escapejs }}',
        selectedLabel: '',
        loading: false,
+       refreshQueued: false,
+       mediaTypeTimer: null,
        currentRangeName: '{{ selected_range_name|default:""|escapejs }}',
        currentStartDate: '{{ start_date_str|default:""|escapejs }}',
        currentEndDate: '{{ end_date_str|default:""|escapejs }}',
        selectedMediaType: 'all',
        init() {
-         this.selectedLabel = this.selectedSort === 'plays' ? 'Plays' : 'Time';
+         this.selectedLabel = this.selectedSort === 'plays' ? '{{ media_i18n_62|escapejs }}' : '{{ media_i18n_61|escapejs }}';
          this.selectedMediaType = new URLSearchParams(window.location.search).get('media-type') || 'all';
          window.addEventListener('stats-media-type-changed', () => {
            this.selectedMediaType = new URLSearchParams(window.location.search).get('media-type') || 'all';
-           this.refresh();
+           // Several types can be ticked in quick succession: wait for the last tick.
+           clearTimeout(this.mediaTypeTimer);
+           this.mediaTypeTimer = setTimeout(() => this.refresh(), 300);
          });
          // The initial server render is always the unfiltered all-types aggregate —
          // if the page loaded with a media-type already in the URL (reload,
@@ -32,6 +38,8 @@
        },
        async refresh() {
          if (this.loading) {
+           // A request is running; run once more when it ends so the latest selection wins.
+           this.refreshQueued = true;
            return;
          }
          const previousSort = this.selectedSort;
@@ -78,6 +86,10 @@
            console.error('Failed to refresh taste signals:', error);
          } finally {
            this.loading = false;
+           if (this.refreshQueued) {
+             this.refreshQueued = false;
+             this.refresh();
+           }
          }
        },
        async setSort(sortBy, label) {
@@ -92,8 +104,8 @@
      }">
   <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
     <div class="flex flex-col space-y-1">
-      <h2 class="text-xl font-semibold text-white">Taste Signals</h2>
-      <p class="text-sm text-gray-400">What your library says about your taste.</p>
+      <h2 class="text-xl font-semibold text-[var(--color-text)]">{% translate "Taste Signals" %}</h2>
+      <p class="text-sm text-[var(--color-text-muted)]">{% translate "What your library says about your taste." %}</p>
     </div>
 
     <div class="w-full sm:w-auto sm:min-w-32 sm:ml-auto">
@@ -101,7 +113,7 @@
         <button type="button"
                 @click="open = !open"
                 @click.outside="open = false"
-                class="flex items-center justify-between w-full gap-2 px-3 py-2 bg-[#272c31] border border-gray-600 rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
+                class="flex items-center justify-between w-full gap-2 px-3 py-2 bg-[var(--color-panel)] border border-gray-600 rounded-md text-[var(--color-text-secondary)] text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent cursor-pointer">
           <span x-text="selectedLabel"></span>
           <svg xmlns="http://www.w3.org/2000/svg"
                width="24"
@@ -112,7 +124,7 @@
                stroke-width="2"
                stroke-linecap="round"
                stroke-linejoin="round"
-               class="w-4 h-4 ml-1 text-gray-400">
+               class="w-4 h-4 ml-1 text-[var(--color-text-muted)]">
             <path d="m6 9 6 6 6-6"></path>
           </svg>
         </button>
@@ -123,16 +135,16 @@
              x-transition:leave="transition ease-in duration-75"
              x-transition:leave-start="transform opacity-100 scale-100"
              x-transition:leave-end="transform opacity-0 scale-95"
-             class="absolute right-0 z-10 mt-2 min-w-full py-1 bg-[#272c31] rounded-md shadow-lg overflow-hidden border border-gray-600">
-          <button type="button"
-                  @click="setSort('time', 'Time')"
-                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-            Time
+             class="absolute right-0 z-10 mt-2 min-w-full py-1 bg-[var(--color-panel)] rounded-md shadow-lg overflow-hidden border border-gray-600">
+          {% translate "Time" as media_i18n_61 %}<button type="button"
+                  @click="setSort('time', '{{ media_i18n_61|escapejs }}')"
+                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+            {% translate "Time" %}
           </button>
-          <button type="button"
-                  @click="setSort('plays', 'Plays')"
-                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-gray-300 hover:bg-[#39404b] hover:text-white">
-            Plays
+          {% translate "Plays" as media_i18n_62 %}<button type="button"
+                  @click="setSort('plays', '{{ media_i18n_62|escapejs }}')"
+                  class="block w-full px-3 py-2 text-left text-sm transition-colors text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-strong)] hover:text-[var(--color-text)]">
+            {% translate "Plays" %}
           </button>
         </div>
       </div>
@@ -142,8 +154,8 @@
   <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
     <div>
       <div class="flex items-center gap-2 mb-3">
-        {% include "app/icons/tag.svg" with classes="w-4 h-4 text-indigo-400" %}
-        <span class="text-sm font-semibold text-white">Top Genres</span>
+        {% include "app/icons/tag.svg" with classes="w-4 h-4 text-[var(--color-link)]" %}
+        <span class="text-sm font-semibold text-[var(--color-text)]">{% translate "Top Genres" %}</span>
       </div>
       <div x-ref="tasteSignalsGenres">
         {% include "app/components/taste_signals_genres.html" %}
@@ -153,7 +165,7 @@
     <div>
       <div class="flex items-center gap-2 mb-3">
         {% include "app/icons/clock.svg" with classes="w-4 h-4 text-amber-400" %}
-        <span class="text-sm font-semibold text-white">Era Spotlight</span>
+        <span class="text-sm font-semibold text-[var(--color-text)]">{% translate "Era Spotlight" %}</span>
       </div>
       <div x-ref="tasteSignalsDecades">
         {% include "app/components/taste_signals_decades.html" %}

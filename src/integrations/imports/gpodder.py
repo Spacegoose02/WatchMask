@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections import defaultdict
+from datetime import UTC, timedelta
 
 from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.utils.text import slugify
 
-from app import history_cache
+import events
 from app.models import (
     Item,
     MediaTypes,
@@ -22,11 +23,20 @@ from app.models import (
     Sources,
     Status,
 )
-from integrations import gpodder_api, podcast_rss
+from integrations import connection_health, gpodder_api, import_progress, podcast_rss
 from integrations import models as integration_models
-from integrations.imports.helpers import MediaImportError, decrypt
+from integrations.imports.helpers import MediaImportError, decrypt_or_raise
 
 logger = logging.getLogger(__name__)
+
+MIN_SIGNIFICANT_PROGRESS_SECONDS = 60
+DUPLICATE_COMPLETION_WINDOW_SECONDS = 300
+FULL_RESYNC_INTERVAL = timedelta(hours=24)
+
+
+def show_key_for_feed(normalized_feed):
+    """Return the stable podcast_uuid Floppy uses for a GPodder feed URL."""
+    return f"gp_{hashlib.md5(normalized_feed.encode(), usedforsecurity=False).hexdigest()}"
 
 
 def importer(identifier, user, mode):
@@ -39,19 +49,26 @@ class GPodderImporter:
     """Importer for GPodder-compatible podcast history."""
 
     def __init__(self, user, mode):
+        """Store the extra keyword arguments this form needs."""
         self.user = user
         self.mode = mode
         self.warnings = []
+        self.created_item_ids = []
         try:
             self.account = user.gpodder_account
         except integration_models.GPodderAccount.DoesNotExist as exc:
-            raise MediaImportError("GPodder account not connected.") from exc
+            msg = "GPodder account not connected."
+            raise MediaImportError(msg) from exc
 
-        self.credentials = gpodder_api.GPodderCredentials(
-            server_url=decrypt(self.account.server_url),
-            username=decrypt(self.account.username),
-            password=decrypt(self.account.password),
-        )
+        try:
+            self.credentials = gpodder_api.GPodderCredentials(
+                server_url=decrypt_or_raise(self.account.server_url),
+                username=decrypt_or_raise(self.account.username),
+                password=decrypt_or_raise(self.account.password),
+            )
+        except MediaImportError as error:
+            connection_health.record_failure(self.account, str(error), auth=True)
+            raise
         self._seen_fingerprints = set()
         self._episode_cache = {}
         self._show_cache = {}
@@ -62,11 +79,11 @@ class GPodderImporter:
             gpodder_api.verify_login(self.credentials)
             self.account.connection_broken = False
             self.account.last_error_message = ""
-            self.account.save(update_fields=["connection_broken", "last_error_message", "updated_at"])
+            self.account.save(
+                update_fields=["connection_broken", "last_error_message", "updated_at"]
+            )
         except gpodder_api.GPodderAuthError as exc:
-            self.account.connection_broken = True
-            self.account.last_error_message = str(exc)[:500]
-            self.account.save(update_fields=["connection_broken", "last_error_message", "updated_at"])
+            connection_health.record_failure(self.account, str(exc), auth=True)
             raise MediaImportError(str(exc)) from exc
         except gpodder_api.GPodderClientError as exc:
             self.account.last_error_message = str(exc)[:500]
@@ -76,18 +93,41 @@ class GPodderImporter:
         try:
             gpodder_api.register_device(self.credentials, self.account.device_id)
         except gpodder_api.GPodderError as exc:
-            logger.info("Skipping GPodder device registration for user %s: %s", self.user.username, exc)
+            logger.info(
+                "Skipping GPodder device registration for user %s: %s",
+                self.user.username,
+                exc,
+            )
 
-        subscriptions = self._load_subscriptions()
+        is_full_resync = (
+            self.account.last_full_resync_at is None
+            or timezone.now() - self.account.last_full_resync_at
+            >= FULL_RESYNC_INTERVAL
+        )
         actions, next_cursor = gpodder_api.fetch_episode_actions(
             self.credentials,
-            since=self.account.episode_actions_since,
+            since=None if is_full_resync else self.account.episode_actions_since,
             device=self.account.device_filter,
         )
+        # Subscriptions mean one RSS download per feed. An incremental poll with
+        # no listening activity has nothing to match against them, so skip it;
+        # the daily full resync still refreshes the catalog.
+        if is_full_resync or any(
+            action.get("action") == "play" and self._has_listening_activity(action)
+            for action in actions
+        ):
+            subscriptions = self._load_subscriptions()
+        else:
+            subscriptions = {}
 
         imported_counts = defaultdict(int)
-        sorted_actions = sorted(actions, key=lambda action: self._parse_action_timestamp(action) or timezone.now())
-        for action in sorted_actions:
+        sorted_actions = sorted(
+            actions,
+            key=lambda action: self._parse_action_timestamp(action) or timezone.now(),
+        )
+        total = len(sorted_actions)
+        for i, action in enumerate(sorted_actions, start=1):
+            import_progress.report(i, total, "GPodder")
             if action.get("action") != "play":
                 continue
             if not self._has_listening_activity(action):
@@ -102,26 +142,36 @@ class GPodderImporter:
         self.account.last_sync_at = timezone.now()
         self.account.connection_broken = False
         self.account.last_error_message = ""
+        if is_full_resync:
+            self.account.last_full_resync_at = self.account.last_sync_at
         self.account.save(
             update_fields=[
                 "episode_actions_since",
                 "last_sync_at",
+                "last_full_resync_at",
                 "connection_broken",
                 "last_error_message",
                 "updated_at",
             ],
         )
 
-        history_cache.invalidate_history_cache(self.user.id, force=True)
-        from app import statistics_cache
-
-        statistics_cache.schedule_all_ranges_refresh(self.user.id)
+        # Each play is saved through the ORM, so its post_save signal marks the
+        # touched history and statistics days, and import_media skips its
+        # library-wide catch-up for this importer (#1158). New episode items
+        # still need calendar events; imports suppress the per-item trigger.
+        if self.created_item_ids:
+            events.tasks.reload_calendar.apply_async(
+                kwargs={"item_ids": self.created_item_ids},
+                countdown=3,
+            )
         return dict(imported_counts), self.warnings
 
     def _load_subscriptions(self):
         """Return subscription metadata keyed by normalized feed URL."""
         subscriptions = {}
-        feed_urls = gpodder_api.fetch_subscriptions(self.credentials)
+        feed_urls = gpodder_api.fetch_subscriptions(
+            self.credentials, self.account.device_id
+        )
         for raw_feed_url in feed_urls:
             normalized_feed = gpodder_api.normalize_external_url(raw_feed_url)
             if not normalized_feed:
@@ -134,12 +184,17 @@ class GPodderImporter:
             rss_metadata = {}
             rss_episodes = []
             try:
-                rss_metadata = podcast_rss.fetch_show_metadata_from_rss(raw_feed_url)
-                rss_episodes = podcast_rss.fetch_episodes_from_rss(raw_feed_url)
-            except Exception as exc:  # noqa: BLE001
-                self.warnings.append(f"Failed to refresh RSS feed {raw_feed_url}: {exc}")
+                rss_metadata, rss_episodes = podcast_rss.fetch_feed_from_rss(
+                    raw_feed_url
+                )
+            except Exception as exc:
+                self.warnings.append(
+                    f"Failed to refresh RSS feed {raw_feed_url}: {exc}"
+                )
 
-            show = self._ensure_show(raw_feed_url, normalized_feed, rss_metadata, show=show)
+            show = self._ensure_show(
+                raw_feed_url, normalized_feed, rss_metadata, show=show
+            )
             episode_map = {}
             for rss_episode in rss_episodes:
                 episode = self._ensure_episode(show, rss_episode)
@@ -159,16 +214,22 @@ class GPodderImporter:
         if show is None:
             show = PodcastShow.objects.filter(rss_feed_url=normalized_feed).first()
         if show is None:
-            show = PodcastShow.objects.filter(podcast_uuid=self._show_key(normalized_feed)).first()
+            show = PodcastShow.objects.filter(
+                podcast_uuid=self._show_key(normalized_feed)
+            ).first()
 
         defaults = {
             "source": Sources.GPODDER.value,
-            "title": rss_metadata.get("title") or slugify(normalized_feed).replace("-", " ")[:255] or "Podcast",
+            "title": rss_metadata.get("title")
+            or slugify(normalized_feed).replace("-", " ")[:255]
+            or "Podcast",
             "slug": slugify(rss_metadata.get("title") or normalized_feed)[:255],
             "author": rss_metadata.get("author", "")[:255],
             "description": rss_metadata.get("description", ""),
             "language": rss_metadata.get("language", "")[:10],
             "rss_feed_url": raw_feed_url,
+            "image": rss_metadata.get("image", ""),
+            "website_url": rss_metadata.get("website_url", ""),
         }
 
         if show is None:
@@ -190,14 +251,30 @@ class GPodderImporter:
         self._show_cache[normalized_feed] = show
         return show
 
-    def _ensure_episode(self, show, rss_episode, *, fallback_audio_url="", fallback_duration=None, fallback_time=None):
+    def _ensure_episode(
+        self,
+        show,
+        rss_episode,
+        *,
+        fallback_audio_url="",
+        fallback_duration=None,
+        fallback_time=None,
+    ):
         """Create or update a podcast episode using RSS data or action fallbacks."""
         audio_url = rss_episode.get("audio_url") or fallback_audio_url
-        guid = rss_episode.get("guid") or audio_url or hashlib.md5(show.podcast_uuid.encode()).hexdigest()
+        guid = (
+            rss_episode.get("guid")
+            or audio_url
+            or hashlib.md5(
+                show.podcast_uuid.encode(), usedforsecurity=False
+            ).hexdigest()
+        )
 
         episode = PodcastEpisode.objects.filter(show=show, episode_uuid=guid).first()
         if episode is None and audio_url:
-            episode = PodcastEpisode.objects.filter(show=show, audio_url=audio_url).first()
+            episode = PodcastEpisode.objects.filter(
+                show=show, audio_url=audio_url
+            ).first()
 
         title = rss_episode.get("title") or "Unknown Episode"
         published = rss_episode.get("published") or fallback_time
@@ -212,6 +289,7 @@ class GPodderImporter:
                 published=published,
                 duration=duration,
                 audio_url=audio_url,
+                website_url=rss_episode.get("website_url", ""),
                 episode_number=rss_episode.get("episode_number"),
                 season_number=rss_episode.get("season_number"),
             )
@@ -223,11 +301,16 @@ class GPodderImporter:
                 "published": published,
                 "duration": duration,
                 "audio_url": audio_url,
+                "website_url": rss_episode.get("website_url", ""),
                 "episode_number": rss_episode.get("episode_number"),
                 "season_number": rss_episode.get("season_number"),
             }
             for field, value in updates.items():
-                if value is not None and value != "" and getattr(episode, field) != value:
+                if (
+                    value is not None
+                    and value != ""
+                    and getattr(episode, field) != value
+                ):
                     setattr(episode, field, value)
                     update_fields.append(field)
             if update_fields:
@@ -235,7 +318,7 @@ class GPodderImporter:
         return episode
 
     def _process_action(self, action, subscriptions):
-        """Apply a single GPodder play action to Yamtrack history."""
+        """Apply a single GPodder play action to Floppy history."""
         action_time = self._parse_action_timestamp(action)
         if action_time is None:
             return False
@@ -249,7 +332,11 @@ class GPodderImporter:
                 {},
                 show=self._show_cache.get(normalized_feed),
             )
-            subscription = {"feed_url": action.get("podcast") or normalized_feed, "show": fallback_show, "episode_map": {}}
+            subscription = {
+                "feed_url": action.get("podcast") or normalized_feed,
+                "show": fallback_show,
+                "episode_map": {},
+            }
             subscriptions[normalized_feed] = subscription
 
         show = subscription["show"]
@@ -287,17 +374,24 @@ class GPodderImporter:
             .select_related("episode", "show", "item")
             .order_by("-created_at")
         )
-        latest_in_progress = next((entry for entry in latest_entries if entry.end_date is None), None)
-        latest_completed = next((entry for entry in latest_entries if entry.end_date is not None), None)
+        latest_in_progress = next(
+            (entry for entry in latest_entries if entry.end_date is None), None
+        )
+        latest_completed = next(
+            (entry for entry in latest_entries if entry.end_date is not None), None
+        )
 
-        status_value = Status.COMPLETED.value if is_completed else Status.IN_PROGRESS.value
+        status_value = (
+            Status.COMPLETED.value if is_completed else Status.IN_PROGRESS.value
+        )
         provider_status = 3 if is_completed else 2
         progress_minutes = max(1, position_seconds // 60) if position_seconds > 0 else 0
 
         if latest_in_progress is not None:
             if (
                 latest_in_progress.played_up_to_seconds == position_seconds
-                and latest_in_progress.end_date == (action_time if is_completed else None)
+                and latest_in_progress.end_date
+                == (action_time if is_completed else None)
             ):
                 return False
             self._update_podcast_row(
@@ -312,11 +406,19 @@ class GPodderImporter:
             )
             return True
 
-        if latest_completed is not None and is_completed:
-            if self._is_duplicate_completion(latest_completed, position_seconds, action_time):
-                return False
+        if is_completed and any(
+            entry.end_date is not None
+            and self._is_duplicate_completion(entry, position_seconds, action_time)
+            for entry in latest_entries
+        ):
+            return False
 
-        if latest_completed is not None and not is_completed and latest_completed.end_date and action_time <= latest_completed.end_date:
+        if (
+            latest_completed is not None
+            and not is_completed
+            and latest_completed.end_date
+            and action_time <= latest_completed.end_date
+        ):
             return False
 
         Podcast.objects.create(
@@ -328,6 +430,7 @@ class GPodderImporter:
             progress=progress_minutes,
             played_up_to_seconds=position_seconds or None,
             last_seen_status=provider_status,
+            position_updated_at=timezone.now() if position_seconds else None,
             end_date=action_time if is_completed else None,
         )
         return True
@@ -349,12 +452,14 @@ class GPodderImporter:
         if episode.published:
             defaults["release_datetime"] = episode.published
 
-        item, _ = Item.objects.get_or_create(
+        item, created = Item.objects.get_or_create(
             media_id=episode.episode_uuid,
             source=Sources.GPODDER.value,
             media_type=MediaTypes.PODCAST.value,
             defaults=defaults,
         )
+        if created:
+            self.created_item_ids.append(item.id)
         update_fields = []
         if item.title != episode.title:
             item.title = episode.title
@@ -365,6 +470,9 @@ class GPodderImporter:
         if episode.published and item.release_datetime != episode.published:
             item.release_datetime = episode.published
             update_fields.append("release_datetime")
+        if show.image and item.image != show.image:
+            item.image = show.image
+            update_fields.append("image")
         if update_fields:
             item.save(update_fields=update_fields)
         return item
@@ -399,6 +507,12 @@ class GPodderImporter:
                 setattr(podcast, field, value)
                 update_fields.append(field)
 
+        # Keeps ?updated_since= delta sync on the playback progress API honest;
+        # progressed_at only monitors 'progress', not the seconds position.
+        if "played_up_to_seconds" in update_fields:
+            podcast.position_updated_at = timezone.now()
+            update_fields.append("position_updated_at")
+
         if update_fields:
             podcast.save(update_fields=update_fields)
 
@@ -411,7 +525,7 @@ class GPodderImporter:
         return candidates
 
     def _show_key(self, normalized_feed):
-        return f"gp_{hashlib.md5(normalized_feed.encode()).hexdigest()}"
+        return show_key_for_feed(normalized_feed)
 
     def _parse_action_timestamp(self, action):
         timestamp = action.get("timestamp")
@@ -421,7 +535,9 @@ class GPodderImporter:
         if parsed is None:
             return None
         if timezone.is_naive(parsed):
-            parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+            # gpodder.net API timestamps are UTC and often sent without a
+            # timezone offset; localize to UTC, not the server's local zone.
+            parsed = timezone.make_aware(parsed, UTC)
         return parsed
 
     def _has_listening_activity(self, action):
@@ -432,7 +548,10 @@ class GPodderImporter:
     def _is_completed(self, position_seconds, total_seconds):
         if total_seconds is None or total_seconds <= 0 or position_seconds <= 0:
             return False
-        significant_progress = position_seconds > 60 or position_seconds > total_seconds * 0.1
+        significant_progress = (
+            position_seconds > MIN_SIGNIFICANT_PROGRESS_SECONDS
+            or position_seconds > total_seconds * 0.1
+        )
         return significant_progress and position_seconds >= total_seconds - 5
 
     def _is_duplicate_action(self, action):
@@ -454,7 +573,10 @@ class GPodderImporter:
     def _is_duplicate_completion(self, podcast, position_seconds, action_time):
         if podcast.end_date is None:
             return False
-        if abs((action_time - podcast.end_date).total_seconds()) >= 300:
+        if (
+            abs((action_time - podcast.end_date).total_seconds())
+            >= DUPLICATE_COMPLETION_WINDOW_SECONDS
+        ):
             return False
         return (podcast.played_up_to_seconds or 0) == (position_seconds or 0)
 

@@ -7,8 +7,19 @@ from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
 
-from app.models import Item, MediaTypes, Sources
-from app.providers import tmdb
+from app import game_artwork
+from app.models import (
+    TV,
+    Episode,
+    GameArtwork,
+    Item,
+    MediaTypes,
+    MetadataProviderPreference,
+    PodcastShow,
+    Season,
+    Sources,
+)
+from app.providers import tmdb, tvdb
 
 User = get_user_model()
 
@@ -19,6 +30,255 @@ class SyncMetadataViewTests(TestCase):
         self.user = User.objects.create_user(**self.credentials)
         self.client.login(**self.credentials)
 
+    def test_sync_uses_selected_language_and_evicts_its_cached_payload(self):
+        """A localized refresh must not fetch or restore the instance language."""
+        self.user.metadata_language = "es-ES"
+        self.user.save(update_fields=["metadata_language"])
+        item = Item.objects.create(
+            media_id="238",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Godfather",
+            original_title="The Godfather",
+            localized_title="The Godfather",
+        )
+        for override in ("", "es-MX"):
+            with self.subTest(override=override):
+                MetadataProviderPreference.objects.update_or_create(
+                    user=self.user,
+                    item=item,
+                    defaults={"language": override},
+                )
+                language = override or "es-ES"
+                cache_key = tmdb._movie_cache_key(item.media_id, language)
+                cache.set(cache_key, {"title": "Stale translation"}, timeout=600)
+                metadata = {
+                    "title": "El padrino",
+                    "localized_title": "El padrino",
+                    "original_title": "The Godfather",
+                    "synopsis": "La historia de una familia.",
+                    "image": "https://example.com/poster.jpg",
+                    "details": {},
+                    "related": {},
+                }
+
+                def fetch(
+                    *args,
+                    expected_language=language,
+                    key=cache_key,
+                    payload=metadata,
+                    **kwargs,
+                ):
+                    self.assertEqual(kwargs["language"], expected_language)
+                    self.assertIsNone(cache.get(key))
+                    return payload
+
+                with (
+                    patch(
+                        "app.metadata_sync_views.services.get_media_metadata",
+                        side_effect=fetch,
+                    ),
+                    patch("app.metadata_sync_views._sync_plex_rating"),
+                    patch("app.views.Item.fetch_releases"),
+                    patch(
+                        "app.views.trakt_popularity_service.refresh_trakt_popularity"
+                    ),
+                    patch("app.views.credits.sync_item_credits_from_metadata"),
+                ):
+                    response = self.client.post(
+                        reverse(
+                            "sync_metadata",
+                            kwargs={
+                                "source": item.source,
+                                "media_type": item.media_type,
+                                "media_id": item.media_id,
+                            },
+                        ),
+                        {"next": "/"},
+                    )
+                self.assertEqual(response.status_code, 302)
+                item.refresh_from_db()
+                self.assertEqual(item.localized_title, "El padrino")
+                self.assertEqual(item.synopsis, metadata["synopsis"])
+
+    @patch("app.fork_services_podcast.podcast_rss.fetch_feed_from_rss")
+    def test_sync_metadata_on_a_podcast_show_uuid_rereads_the_feed(
+        self,
+        mock_feed,
+    ):
+        """Regression for issue #1014: the button 404'd on every podcast show.
+
+        A podcast route addresses a show by podcast_uuid, which only ever
+        resolved as an episode uuid, so the sync answered
+        "Podcast episode with ID gp_... not found". A show also has no Item row
+        of its own, so the generic path must not run and mint one.
+        """
+        show = PodcastShow.objects.create(
+            podcast_uuid="gp_75aa1669b361ba1e0a22d07adddfb7f1",
+            source=Sources.GPODDER.value,
+            title="The Jeff Gerstmann Show",
+            rss_feed_url="https://feeds.megaphone.fm/QCD5913450294",
+        )
+        mock_feed.return_value = (
+            {
+                "title": "The Jeff Gerstmann Show",
+                "website_url": "https://example.com/jeff",
+            },
+            [],
+        )
+
+        response = self.client.post(
+            reverse(
+                "sync_metadata",
+                kwargs={
+                    "source": Sources.GPODDER.value,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "media_id": show.podcast_uuid,
+                },
+            ),
+            {"next": "/"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        messages = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertIn("Metadata synced successfully.", messages)
+
+        show.refresh_from_db()
+        self.assertEqual(show.website_url, "https://example.com/jeff")
+        self.assertFalse(
+            Item.objects.filter(media_id=show.podcast_uuid).exists(),
+            "the show uuid must not gain an Item row of its own",
+        )
+
+    @patch(
+        "app.fork_services_podcast.podcast_rss.fetch_feed_from_rss",
+        side_effect=requests.exceptions.ConnectionError("boom"),
+    )
+    def test_sync_metadata_on_a_podcast_show_survives_an_unreachable_feed(
+        self,
+        _mock_feed,
+    ):
+        show = PodcastShow.objects.create(
+            podcast_uuid="gp_unreachable",
+            source=Sources.GPODDER.value,
+            title="Unreachable",
+            rss_feed_url="https://example.com/gone.xml",
+        )
+
+        response = self.client.post(
+            reverse(
+                "sync_metadata",
+                kwargs={
+                    "source": Sources.GPODDER.value,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "media_id": show.podcast_uuid,
+                },
+            ),
+            {"next": "/"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+    @patch("app.tasks_imdb.refresh_imdb_game_credits_from_datasets.apply_async")
+    @patch("app.metadata_sync_views._sync_plex_rating")
+    @patch("app.views.Item.fetch_releases")
+    @patch("app.views.game_length_services.refresh_game_lengths")
+    @patch("app.views.services.get_media_metadata")
+    def test_sync_metadata_reopens_the_artwork_lookup_for_igdb_games(
+        self,
+        mock_get_media_metadata,
+        _mock_refresh_game_lengths,
+        _mock_fetch_releases,
+        _mock_sync_plex_rating,
+        _mock_refresh_imdb_credits,
+    ):
+        """The new providers must be asked again after a manual refresh.
+
+        A game page that found nothing waits hours before asking again, so a
+        refresh that left the stored lookup alone looked like it did nothing.
+        """
+        mock_get_media_metadata.return_value = {
+            "media_id": "325609",
+            "title": "Dispatch",
+            "media_type": MediaTypes.GAME.value,
+            "source": Sources.IGDB.value,
+            "image": "https://example.com/dispatch.jpg",
+            "details": {"format": "Main game"},
+            "genres": [],
+            "related": {},
+        }
+        row = GameArtwork.objects.create(
+            source=Sources.IGDB.value,
+            media_id="325609",
+            backdrop_url="https://images.igdb.com/a.jpg",
+            backdrop_provider="igdb",
+        )
+        other = GameArtwork.objects.create(
+            source=Sources.IGDB.value,
+            media_id="1",
+            backdrop_url="https://images.igdb.com/b.jpg",
+            backdrop_provider="igdb",
+        )
+        cache.set("igdb_carousel_v4_325609", {"video": None, "photos": []}, 60)
+        url = reverse(
+            "sync_metadata",
+            kwargs={
+                "source": Sources.IGDB.value,
+                "media_type": MediaTypes.GAME.value,
+                "media_id": "325609",
+            },
+        )
+
+        response = self.client.post(url, {"next": "/"})
+
+        self.assertEqual(response.status_code, 302)
+        row.refresh_from_db()
+        other.refresh_from_db()
+        self.assertTrue(game_artwork.is_stale(row))
+        self.assertFalse(game_artwork.is_stale(other))
+        self.assertIsNone(cache.get("igdb_carousel_v4_325609"))
+
+    @patch("app.tasks_imdb.refresh_imdb_game_credits_from_datasets.apply_async")
+    @patch("app.metadata_sync_views._sync_plex_rating")
+    @patch("app.views.Item.fetch_releases")
+    @patch("app.views.game_length_services.refresh_game_lengths")
+    @patch("app.views.services.get_media_metadata")
+    def test_sync_metadata_survives_an_artwork_failure(
+        self,
+        mock_get_media_metadata,
+        _mock_refresh_game_lengths,
+        _mock_fetch_releases,
+        _mock_sync_plex_rating,
+        _mock_refresh_imdb_credits,
+    ):
+        mock_get_media_metadata.return_value = {
+            "media_id": "325609",
+            "title": "Dispatch",
+            "media_type": MediaTypes.GAME.value,
+            "source": Sources.IGDB.value,
+            "image": "https://example.com/dispatch.jpg",
+            "details": {"format": "Main game"},
+            "genres": [],
+            "related": {},
+        }
+
+        with patch("app.game_artwork.expire", side_effect=RuntimeError("db down")):
+            response = self.client.post(
+                reverse(
+                    "sync_metadata",
+                    kwargs={
+                        "source": Sources.IGDB.value,
+                        "media_type": MediaTypes.GAME.value,
+                        "media_id": "325609",
+                    },
+                ),
+                {"next": "/"},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Item.objects.filter(media_id="325609").exists())
+
+    @patch("app.tasks_imdb.refresh_imdb_game_credits_from_datasets.apply_async")
     @patch("app.metadata_sync_views._sync_plex_rating")
     @patch("app.views.Item.fetch_releases")
     @patch("app.views.game_length_services.refresh_game_lengths")
@@ -29,6 +289,7 @@ class SyncMetadataViewTests(TestCase):
         mock_refresh_game_lengths,
         mock_fetch_releases,
         mock_sync_plex_rating,
+        _mock_refresh_imdb_credits,
     ):
         mock_get_media_metadata.return_value = {
             "media_id": "325609",
@@ -164,7 +425,15 @@ class SyncMetadataViewTests(TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(item.genres, ["Comedy", "Anime"])
-        mock_upsert_provider_links.assert_called_once()
+        # A second upsert may fire for the user's preferred provider; the
+        # source-provider upsert is the one this test cares about.
+        mock_upsert_provider_links.assert_any_call(
+            item,
+            mock_get_media_metadata.return_value,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.TV.value,
+            season_number=None,
+        )
         mock_refresh_trakt_popularity.assert_called_once()
         mock_sync_item_credits.assert_called_once()
         mock_fetch_releases.assert_called_once()
@@ -242,6 +511,100 @@ class SyncMetadataViewTests(TestCase):
         self.assertEqual(tv_item.library_media_type, MediaTypes.SEASON.value)
         self.assertEqual(anime_item.library_media_type, MediaTypes.ANIME.value)
 
+    @patch("app.metadata_sync_views.history_cache.invalidate_history_cache")
+    @patch("app.metadata_sync_views._sync_plex_rating")
+    @patch("app.views.Item.fetch_releases")
+    @patch("app.services.metadata_sync.trakt_popularity_service.refresh_trakt_popularity")
+    @patch(
+        "app.metadata_sync_views.metadata_resolution.get_preferred_provider",
+        return_value=Sources.TVDB.value,
+    )
+    @patch("app.metadata_sync_views.metadata_resolution.upsert_provider_links")
+    @patch("app.metadata_sync_views.tmdb.process_episodes")
+    @patch("app.metadata_sync_views.services.get_media_metadata")
+    def test_sync_metadata_repairs_episode_title_and_history_cache(
+        self,
+        mock_get_media_metadata,
+        mock_process_episodes,
+        _mock_upsert_provider_links,
+        _mock_get_preferred_provider,
+        _mock_refresh_trakt_popularity,
+        _mock_fetch_releases,
+        _mock_sync_plex_rating,
+        mock_invalidate_history_cache,
+    ):
+        """Season sync repairs stale episode titles without breaking history."""
+        tv_item = Item.objects.create(
+            media_id="81189",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Breaking Bad",
+        )
+        tv = TV.objects.create(item=tv_item, user=self.user)
+        season_item = Item.objects.create(
+            media_id="81189",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=1,
+            title="Breaking Bad",
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv,
+        )
+        episode_item = Item.objects.create(
+            media_id="81189",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=1,
+            episode_number=1,
+            title="Breaking Bad",
+        )
+        Episode.objects.create(item=episode_item, related_season=season)
+
+        mock_get_media_metadata.return_value = {
+            "media_id": "81189",
+            "source": Sources.TVDB.value,
+            "media_type": MediaTypes.SEASON.value,
+            "title": "Breaking Bad Season 1",
+            "image": "https://example.com/season.jpg",
+            "details": {},
+            "related": {},
+            "episodes": [{"episode_number": 1}],
+        }
+        mock_process_episodes.return_value = [
+            {
+                "episode_number": 1,
+                "title": "Pilot from TVDB",
+                "image": "https://example.com/episode.jpg",
+                "air_date": None,
+            },
+        ]
+
+        response = self.client.post(
+            reverse(
+                "sync_metadata",
+                kwargs={
+                    "source": Sources.TVDB.value,
+                    "media_type": MediaTypes.SEASON.value,
+                    "media_id": "81189",
+                    "season_number": 1,
+                },
+            ),
+            {"next": "/"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        episode_item.refresh_from_db()
+        self.assertEqual(episode_item.title, "Pilot from TVDB")
+        self.assertIsNone(episode_item.original_title)
+        self.assertEqual(episode_item.localized_title, "Pilot from TVDB")
+        mock_invalidate_history_cache.assert_called_once_with(
+            self.user.id,
+            force=True,
+        )
+
     @patch("app.views.services.get_media_metadata")
     def test_sync_metadata_restores_cached_entry_and_returns_error_for_htmx_failures(
         self,
@@ -278,3 +641,309 @@ class SyncMetadataViewTests(TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("could not be reached", messages[0].lower())
         self.assertIn("cached data has been kept", messages[0].lower())
+
+    def test_sync_metadata_invalidates_versioned_tvdb_series_and_season_keys(self):
+        """TVDB refreshes should clear normalized, raw, and season cache entries."""
+        media_id = "81189"
+        season_number = 1
+        cache_keys = tvdb.metadata_cache_keys(media_id, season_number)
+        primary_key = tvdb._season_cache_key(
+            media_id,
+            season_number,
+            MediaTypes.TV.value,
+            tvdb._preferred_language_code(),
+        )
+        for cache_key in cache_keys:
+            cache.set(cache_key, {"cached": True}, timeout=600)
+
+        metadata = {
+            "media_id": media_id,
+            "source": Sources.TVDB.value,
+            "media_type": MediaTypes.SEASON.value,
+            "title": "Breaking Bad Season 1",
+            "image": "https://example.com/season.jpg",
+            "details": {},
+            "related": {},
+            "episodes": [],
+        }
+        with (
+            patch(
+                "app.metadata_sync_views.services.get_media_metadata",
+                return_value=metadata,
+            ),
+            patch("app.metadata_sync_views.metadata_resolution.upsert_provider_links"),
+            patch(
+                "app.metadata_sync_views.metadata_resolution.get_preferred_provider",
+                return_value=Sources.TVDB.value,
+            ),
+            patch("app.metadata_sync_views.cache.delete_many") as mock_delete_many,
+            patch("app.metadata_sync_views._sync_plex_rating"),
+            patch("app.views.Item.fetch_releases"),
+            patch("app.views.trakt_popularity_service.refresh_trakt_popularity"),
+        ):
+            response = self.client.post(
+                reverse(
+                    "sync_metadata",
+                    kwargs={
+                        "source": Sources.TVDB.value,
+                        "media_type": MediaTypes.SEASON.value,
+                        "media_id": media_id,
+                        "season_number": season_number,
+                    },
+                ),
+                {"next": "/"},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        mock_delete_many.assert_called_once()
+        deleted_keys = mock_delete_many.call_args.args[0]
+        # The refresh reads its TTL from the first key, so the one this request
+        # is actually about has to lead; the rest are order-independent.
+        self.assertEqual(deleted_keys[0], primary_key)
+        self.assertEqual(set(deleted_keys), set(cache_keys))
+
+    def test_tvdb_refresh_keys_reach_language_qualified_cache_entries(self):
+        """TVDB refresh helpers should evict the keys used by localized fetches."""
+        from app import metadata_utils
+
+        language = "es"
+        keys = metadata_utils.provider_metadata_cache_keys(
+            Sources.TVDB.value,
+            MediaTypes.SEASON.value,
+            "81189",
+            season_number=1,
+            language=language,
+        )
+        expected_keys = {
+            tvdb._cache_key(
+                MediaTypes.TV.value,
+                "81189",
+                tvdb._preferred_language_code(language),
+            ),
+            tvdb._season_cache_key("81189", 1, MediaTypes.TV.value, language),
+            tvdb._series_extended_cache_key("81189", language),
+            tvdb._cache_key(
+                "series_extended",
+                MediaTypes.TV.value,
+                "81189",
+                tvdb._preferred_language_code(language),
+            ),
+            tvdb._series_episode_translations_cache_key("81189", language),
+        }
+
+        self.assertTrue(expected_keys.issubset(keys))
+        for key in expected_keys:
+            cache.set(key, {"cached": True}, timeout=600)
+
+        cache.delete_many(keys)
+
+        for key in expected_keys:
+            self.assertIsNone(cache.get(key))
+
+    @patch("app.metadata_sync_views._sync_plex_rating")
+    @patch("app.views.Item.fetch_releases")
+    @patch("app.views.services.get_media_metadata")
+    def test_sync_metadata_forces_live_refetch_on_next_detail_view(
+        self,
+        mock_get_media_metadata,
+        mock_fetch_releases,
+        mock_sync_plex_rating,
+    ):
+        """The detail page right after a sync must not fall back to the
+        Item-only stub, which drops score/cast/recommendations (#931).
+        """
+        full_metadata = {
+            "media_id": "603",
+            "title": "The Matrix",
+            "media_type": MediaTypes.MOVIE.value,
+            "source": Sources.TMDB.value,
+            "image": "https://example.com/matrix.jpg",
+            "synopsis": "A hacker learns the truth about reality.",
+            "genres": ["Action"],
+            "score": 8.2,
+            "score_count": 24000,
+            "cast": [{"name": "Keanu Reeves", "character": "Neo"}],
+            "crew": [],
+            "studios_full": [],
+            "details": {"release_date": "1999-03-31"},
+            "related": {},
+        }
+        mock_get_media_metadata.return_value = full_metadata
+
+        sync_response = self.client.post(
+            reverse(
+                "sync_metadata",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "media_id": "603",
+                },
+            ),
+            {"next": "/"},
+        )
+        self.assertEqual(sync_response.status_code, 302)
+
+        item = Item.objects.get(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+        )
+        self.assertIsNotNone(item.metadata_fetched_at)
+        mock_get_media_metadata.reset_mock()
+
+        detail_response = self.client.get(
+            reverse(
+                "media_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "media_id": "603",
+                    "title": "the-matrix",
+                },
+            ),
+        )
+
+        self.assertEqual(detail_response.status_code, 200)
+        mock_get_media_metadata.assert_called_once()
+        self.assertContains(detail_response, "8.2")
+
+    @patch("app.metadata_sync_views._sync_plex_rating")
+    @patch("app.views.Item.fetch_releases")
+    @patch("app.views.services.get_media_metadata")
+    def test_synced_item_keeps_score_and_links_after_force_live_window_expires(
+        self,
+        mock_get_media_metadata,
+        mock_fetch_releases,
+        mock_sync_plex_rating,
+    ):
+        """Issue #1077: the rating chip and external links vanished about a
+        minute after a sync, once the force-live marker expired and the detail
+        shell fell back to the stored Item.
+        """
+        Item.objects.create(
+            media_id="603",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="The Matrix",
+            image="https://example.com/matrix.jpg",
+            provider_external_ids={
+                "imdb_id": "tt0133093",
+                "wikidata_id": "Q83495",
+            },
+        )
+        mock_get_media_metadata.return_value = {
+            "media_id": "603",
+            "title": "The Matrix",
+            "media_type": MediaTypes.MOVIE.value,
+            "source": Sources.TMDB.value,
+            "image": "https://example.com/matrix.jpg",
+            "synopsis": "A hacker learns the truth about reality.",
+            "genres": ["Action"],
+            "score": 8.2,
+            "score_count": 24000,
+            "external_links": {"IMDb": "https://www.imdb.com/title/tt0133093/"},
+            "cast": [],
+            "crew": [],
+            "studios_full": [],
+            "details": {"release_date": "1999-03-31"},
+            "related": {},
+        }
+
+        sync_response = self.client.post(
+            reverse(
+                "sync_metadata",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "media_id": "603",
+                },
+            ),
+            {"next": "/"},
+        )
+        self.assertEqual(sync_response.status_code, 302)
+
+        # The force-live marker lasts 60 seconds; after that the shell serves
+        # stored metadata and must still carry the rating and the links.
+        cache.clear()
+        mock_get_media_metadata.reset_mock()
+
+        detail_response = self.client.get(
+            reverse(
+                "media_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "media_id": "603",
+                    "title": "the-matrix",
+                },
+            ),
+        )
+
+        self.assertEqual(detail_response.status_code, 200)
+        mock_get_media_metadata.assert_not_called()
+        self.assertEqual(detail_response.context["media"]["score"], 8.2)
+        self.assertEqual(detail_response.context["media"]["score_count"], 24000)
+        external_section = next(
+            section
+            for section in detail_response.context["detail_link_sections"]
+            if section["title"] == "External links"
+        )
+        self.assertEqual(
+            {entry["label"] for entry in external_section["entries"]},
+            {"Letterboxd", "IMDb", "Wikidata"},
+        )
+
+    @patch("app.metadata_sync_views._sync_plex_rating")
+    @patch("app.views.Item.fetch_releases")
+    @patch("app.views.services.get_media_metadata")
+    def test_sync_metadata_keeps_stored_page_count_for_non_books(
+        self,
+        mock_get_media_metadata,
+        mock_fetch_releases,
+        mock_sync_plex_rating,
+    ):
+        """Only books resolve a page count during a sync, so a manga's stored
+        count must survive instead of being nulled (#1077).
+        """
+        Item.objects.create(
+            media_id="11",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.MANGA.value,
+            title="Naruto",
+            image="https://example.com/naruto.jpg",
+            number_of_pages=700,
+        )
+        mock_get_media_metadata.return_value = {
+            "media_id": "11",
+            "title": "Naruto",
+            "media_type": MediaTypes.MANGA.value,
+            "source": Sources.MAL.value,
+            "image": "https://example.com/naruto.jpg",
+            "synopsis": "A ninja story.",
+            "genres": ["Action"],
+            "cast": [],
+            "crew": [],
+            "studios_full": [],
+            "details": {},
+            "related": {},
+        }
+
+        response = self.client.post(
+            reverse(
+                "sync_metadata",
+                kwargs={
+                    "source": Sources.MAL.value,
+                    "media_type": MediaTypes.MANGA.value,
+                    "media_id": "11",
+                },
+            ),
+            {"next": "/"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        item = Item.objects.get(
+            media_id="11",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.MANGA.value,
+        )
+        self.assertEqual(item.number_of_pages, 700)

@@ -25,7 +25,9 @@ def _format_detail_activity_duration(total_minutes, suffix):
     return f"{total_minutes}min {suffix}"
 
 
-def _build_detail_activity_subtitle(media_type, media_metadata, current_instance=None, play_stats=None):
+def _build_detail_activity_subtitle(
+    media_type, media_metadata, current_instance=None, play_stats=None
+):
     """Return a shared subtitle payload for tracked detail pages."""
     if not current_instance and not play_stats:
         return None
@@ -38,8 +40,16 @@ def _build_detail_activity_subtitle(media_type, media_metadata, current_instance
         if value in (None, ""):
             return None
         progress_text = f"Progress: {value}"
-        if include_max and max_progress:
-            progress_text += f"/{max_progress}"
+        # The total has to be in the same unit as the value: listening time
+        # for an audiobook, and none at all next to a percentage.
+        unit = getattr(current_instance, "progress_unit", None)
+        if include_max and max_progress and unit != "percentage":
+            total = (
+                helpers.minutes_to_hhmm(max_progress)
+                if unit == "minutes"
+                else max_progress
+            )
+            progress_text += f"/{total}"
         return progress_text
 
     date_start = (
@@ -70,7 +80,9 @@ def _build_detail_activity_subtitle(media_type, media_metadata, current_instance
         total_plays = play_stats.get("total_plays")
         if not total_plays:
             return None
-        primary_text = "Watched once" if total_plays == 1 else f"Watched {total_plays} times"
+        primary_text = (
+            "Watched once" if total_plays == 1 else f"Watched {total_plays} times"
+        )
         duration_text = _format_detail_activity_duration(
             play_stats.get("total_minutes"),
             "watched",
@@ -83,6 +95,10 @@ def _build_detail_activity_subtitle(media_type, media_metadata, current_instance
         primary_text = build_progress_text(
             getattr(current_instance, "formatted_progress", None),
             include_max=True,
+        )
+        duration_text = _format_detail_activity_duration(
+            play_stats.get("total_minutes"),
+            "read",
         )
     elif media_type == MediaTypes.GAME.value:
         progress_value = (
@@ -171,11 +187,10 @@ def _build_detail_activity_state(
             last_played = None
 
             # Iterate through all seasons and episodes
-            seasons = current_instance.seasons.all().select_related("item").prefetch_related(
-                "episodes__item",
-            )
+            # Chaining select_related would bypass the prefetch cache (1 query per season).
+            seasons = current_instance.seasons.all()
             for season in seasons:
-                episodes = season.episodes.all().select_related("item")
+                episodes = season.episodes.all()
                 for episode in episodes:
                     # Only count episodes that have been watched (have end_date)
                     if not episode.end_date:
@@ -183,7 +198,9 @@ def _build_detail_activity_state(
 
                     # Get runtime for this episode
                     try:
-                        runtime_minutes = stats._calculate_episode_time_from_cache(episode, logger)
+                        runtime_minutes = stats._calculate_episode_time_from_cache(
+                            episode, logger
+                        )
                         if runtime_minutes > 0:
                             total_minutes += runtime_minutes
                             episode_count += 1
@@ -267,7 +284,7 @@ def _build_detail_activity_state(
                     days_played.update(stats._get_entry_play_dates(entry))
                 total_days = len(days_played)
                 if total_days:
-                    avg_minutes = int(round(total_minutes_for_avg / total_days))
+                    avg_minutes = round(total_minutes_for_avg / total_days)
                 else:
                     avg_minutes = 0
                 play_stats["avg_time_per_day"] = helpers.minutes_to_hhmm(avg_minutes)
@@ -325,8 +342,7 @@ def _build_detail_activity_state(
                         },
                     )
             elif media_type == MediaTypes.PODCAST.value:
-                total_progress_seconds = int(aggregated_progress or 0)
-                total_minutes = total_progress_seconds // 60
+                total_minutes = int(aggregated_progress or 0)
                 completed_entries = sum(
                     1
                     for entry in user_medias
@@ -342,6 +358,15 @@ def _build_detail_activity_state(
                 )
             else:
                 play_stats["total_plays"] = int(aggregated_progress or 0)
+                if media_type in (
+                    MediaTypes.BOOK.value,
+                    MediaTypes.COMIC.value,
+                    MediaTypes.MANGA.value,
+                ):
+                    # Time spent reading, over every read of this title.
+                    play_stats["total_minutes"] = sum(
+                        getattr(entry, "reading_time", 0) or 0 for entry in user_medias
+                    )
 
         activity_subtitle = _build_detail_activity_subtitle(
             media_type,
@@ -440,11 +465,47 @@ def _normalize_detail_episode_actions(episodes):
     return normalized_episodes
 
 
+def attach_unwatched_ratings(episodes, user, media_metadata):
+    """Let an unwatched episode of a tracked season be rated from its row.
+
+    Adds ``rating_season_id`` (the season the rating belongs to) and
+    ``unwatched_score`` (a rating-only row's score, if any) to each episode
+    dict that has no play. Does nothing when the season is not tracked.
+    """
+    from app.models import Episode, Season
+
+    if not getattr(user, "is_authenticated", False):
+        return episodes
+    season = Season.objects.filter(
+        user=user,
+        item__media_id=str(media_metadata.get("media_id")),
+        item__source=media_metadata.get("source"),
+        item__season_number=media_metadata.get("season_number"),
+    ).first()
+    if season is None:
+        return episodes
+    scores = dict(
+        Episode.ratings.filter(related_season=season, rating_only=True).values_list(
+            "item__episode_number",
+            "score",
+        ),
+    )
+    for episode in episodes:
+        if not isinstance(episode, dict) or episode.get("all_history"):
+            continue
+        episode["rating_season_id"] = season.id
+        episode["unwatched_score"] = scores.get(episode.get("episode_number"))
+    return episodes
+
+
 def _should_queue_game_lengths_refresh(detail_item):
     """Return whether a background game-length refresh should be queued."""
     if not detail_item:
         return False
-    if detail_item.source != Sources.IGDB.value or detail_item.media_type != MediaTypes.GAME.value:
+    if (
+        detail_item.source != Sources.IGDB.value
+        or detail_item.media_type != MediaTypes.GAME.value
+    ):
         return False
     if not detail_item.provider_game_lengths:
         return True
@@ -465,7 +526,9 @@ def _get_game_lengths_refresh_lock(detail_item, *, force=False, fetch_hltb=True)
     if refresh_lock is None:
         return None
 
-    if refresh_lock is True or game_length_services.is_game_lengths_refresh_lock_stale(refresh_lock):
+    if refresh_lock is True or game_length_services.is_game_lengths_refresh_lock_stale(
+        refresh_lock
+    ):
         cache.delete(lock_key)
         return None
     return refresh_lock
@@ -481,7 +544,10 @@ def _queue_game_lengths_refresh(detail_item, *, force=False, fetch_hltb=True):
         force=force,
         fetch_hltb=fetch_hltb,
     )
-    if _get_game_lengths_refresh_lock(detail_item, force=force, fetch_hltb=fetch_hltb) is not None:
+    if (
+        _get_game_lengths_refresh_lock(detail_item, force=force, fetch_hltb=fetch_hltb)
+        is not None
+    ):
         return False
 
     lock_payload = game_length_services.build_game_lengths_refresh_lock(
@@ -493,7 +559,12 @@ def _queue_game_lengths_refresh(detail_item, *, force=False, fetch_hltb=True):
         lock_payload,
         timeout=game_length_services.GAME_LENGTHS_REFRESH_TTL,
     ):
-        if _get_game_lengths_refresh_lock(detail_item, force=force, fetch_hltb=fetch_hltb) is not None:
+        if (
+            _get_game_lengths_refresh_lock(
+                detail_item, force=force, fetch_hltb=fetch_hltb
+            )
+            is not None
+        ):
             return False
         if not cache.add(
             lock_key,
@@ -527,7 +598,8 @@ def _annotate_home_card_images(media_items):
     season_items = [
         media
         for media in media_items
-        if getattr(getattr(media, "item", None), "media_type", None) == MediaTypes.SEASON.value
+        if getattr(getattr(media, "item", None), "media_type", None)
+        == MediaTypes.SEASON.value
     ]
     if season_items:
         BasicMedia.objects._fix_missing_season_images(season_items)

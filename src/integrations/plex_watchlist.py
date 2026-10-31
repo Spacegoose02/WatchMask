@@ -1,4 +1,4 @@
-"""Sync Plex Discover watchlist items into Yamtrack Planning entries."""
+"""Sync Plex Discover watchlist items into Floppy Planning entries."""
 
 import logging
 from collections import defaultdict
@@ -10,6 +10,7 @@ from django.utils import timezone
 from app.mixins import disable_fetch_releases
 from app.models import TV, Item, MediaTypes, Movie, Sources, Status
 from app.providers import services, tmdb
+from integrations import external_references
 from integrations import plex as plex_api
 from integrations.imports.helpers import MediaImportError
 from integrations.models import PlexWatchlistSyncItem
@@ -22,24 +23,31 @@ WATCHLIST_PAGE_SIZE = 100
 
 
 class PlexWatchlistSyncService:
-    """Synchronize a user's Plex Discover watchlist into Yamtrack."""
+    """Synchronize a user's Plex Discover watchlist into Floppy."""
 
     def __init__(self, user, account):
+        """Store the extra keyword arguments this form needs."""
         self.user = user
         self.account = account
         self.counts = defaultdict(int)
         self.warnings: list[str] = []
         self.source_username = ""
         self.source_account_id = ""
+        self.source_server_id = ""
 
     def sync(self) -> tuple[dict[str, int], str]:
         """Run the watchlist sync and return counts plus warning text."""
         if not self.account or not self.account.plex_token:
-            raise MediaImportError("Plex is not connected for this user.")
+            msg = "Plex is not connected for this user."
+            raise MediaImportError(msg)
 
         self.counts = defaultdict(int)
         self.warnings = []
-        self.source_username, self.source_account_id = self._ensure_source_identity()
+        (
+            self.source_username,
+            self.source_account_id,
+            self.source_server_id,
+        ) = self._ensure_source_identity()
         seen_item_ids: set[int] = set()
 
         with disable_fetch_releases():
@@ -53,23 +61,31 @@ class PlexWatchlistSyncService:
         warning_text = "\n".join(dict.fromkeys(self.warnings))
         return dict(self.counts), warning_text
 
-    def _ensure_source_identity(self) -> tuple[str, str]:
+    def _ensure_source_identity(self) -> tuple[str, str, str]:
         """Return and persist the best-known connected Plex account identity."""
         username = (self.account.plex_username or "").strip()
         account_id = str(self.account.plex_account_id or "").strip()
 
+        server_id = str(self.account.machine_identifier or "").strip()
         if username and account_id:
-            return username, account_id
+            return username, account_id, server_id
 
         try:
             account_data = plex_api.fetch_account(self.account.plex_token)
         except plex_api.PlexAuthError as exc:
-            raise MediaImportError("Plex token expired; reconnect and try again.") from exc
+            msg = "Plex token expired; reconnect and try again."
+            raise MediaImportError(msg) from exc
         except plex_api.PlexClientError as exc:
-            raise MediaImportError(f"Could not read Plex account details: {exc}") from exc
+            msg = f"Could not read Plex account details: {exc}"
+            raise MediaImportError(msg) from exc
 
         username = username or (account_data.get("username") or "").strip()
         account_id = account_id or str(account_data.get("id") or "").strip()
+        server_id = server_id or str(
+            account_data.get("machineIdentifier")
+            or account_data.get("machine_identifier")
+            or "",
+        ).strip()
 
         updated_fields = []
         if username and username != self.account.plex_username:
@@ -81,7 +97,7 @@ class PlexWatchlistSyncService:
         if updated_fields:
             self.account.save(update_fields=updated_fields)
 
-        return username, account_id
+        return username, account_id, server_id
 
     def _fetch_watchlist_entries(self) -> list[dict]:
         """Fetch the full watchlist from Plex Discover."""
@@ -96,9 +112,11 @@ class PlexWatchlistSyncService:
                     size=WATCHLIST_PAGE_SIZE,
                 )
             except plex_api.PlexAuthError as exc:
-                raise MediaImportError("Plex token expired; reconnect and try again.") from exc
+                msg = "Plex token expired; reconnect and try again."
+                raise MediaImportError(msg) from exc
             except plex_api.PlexClientError as exc:
-                raise MediaImportError(f"Could not fetch Plex watchlist: {exc}") from exc
+                msg = f"Could not fetch Plex watchlist: {exc}"
+                raise MediaImportError(msg) from exc
 
             if not page_entries:
                 break
@@ -111,7 +129,7 @@ class PlexWatchlistSyncService:
         return entries
 
     def _sync_entry(self, entry: dict, seen_item_ids: set[int]) -> int | None:
-        """Sync a single watchlist entry into Yamtrack."""
+        """Sync a single watchlist entry into Floppy."""
         entry = self._hydrate_entry_with_external_ids(entry)
         raw_type = str(entry.get("type") or "").strip().lower()
         if raw_type == "movie":
@@ -126,7 +144,19 @@ class PlexWatchlistSyncService:
 
         guids = self._normalize_guid_list(entry.get("Guid") or entry.get("guid"))
         external_ids = plex_api.extract_external_ids_from_guids(guids)
-        tmdb_id = self._resolve_tmdb_id(media_type, external_ids, entry)
+        reference = external_references.lookup_plex_reference(
+            self.user,
+            self.account,
+            entry,
+            media_type,
+            payload=entry,
+        )
+        if reference and reference.review_status == (
+            external_references.ExternalReferenceReviewStatus.IGNORED.value
+        ):
+            self.counts["skipped_ignored"] += 1
+            return None
+        tmdb_id = self._resolve_tmdb_id(media_type, external_ids, entry, reference)
         if not tmdb_id:
             self.counts["skipped_missing_ids"] += 1
             self._warn(
@@ -155,6 +185,26 @@ class PlexWatchlistSyncService:
             entry=entry,
             created_media=created_media,
         )
+        identity = external_references.plex_identity(entry)
+        if identity:
+            external_references.save_observation(
+                self.user,
+                "plex",
+                external_references.plex_source_account(
+                    self.account,
+                    machine_identifier=self.source_server_id,
+                    payload=entry,
+                ),
+                *identity,
+                media_type,
+                matched_item=item,
+                metadata={
+                    "title": entry.get("title"),
+                    "year": entry.get("year"),
+                    "rating_key": entry.get("ratingKey") or entry.get("ratingkey"),
+                    "guid": external_ids.get("plex_guid"),
+                },
+            )
         return item.id
 
     def _hydrate_entry_with_external_ids(self, entry: dict) -> dict:
@@ -169,9 +219,12 @@ class PlexWatchlistSyncService:
             return entry
 
         try:
-            detail_entry = plex_api.fetch_watchlist_metadata(self.account.plex_token, rating_key)
+            detail_entry = plex_api.fetch_watchlist_metadata(
+                self.account.plex_token, rating_key
+            )
         except plex_api.PlexAuthError as exc:
-            raise MediaImportError("Plex token expired; reconnect and try again.") from exc
+            msg = "Plex token expired; reconnect and try again."
+            raise MediaImportError(msg) from exc
         except plex_api.PlexClientError as exc:
             self._warn(
                 f"Could not load Plex watchlist metadata for {entry.get('title') or rating_key}: {exc}",
@@ -207,8 +260,13 @@ class PlexWatchlistSyncService:
         media_type: str,
         external_ids: dict[str, str],
         entry: dict,
+        reference=None,
     ) -> str | None:
         """Resolve the TMDB ID from Plex GUIDs or TMDB find lookups."""
+        target = external_references.reference_target(reference)
+        if target and target.media_type == media_type:
+            return str(target.media_id)
+
         tmdb_id = external_ids.get("tmdb_id")
         if tmdb_id:
             return str(tmdb_id)
@@ -229,7 +287,13 @@ class PlexWatchlistSyncService:
             if media_type == MediaTypes.MOVIE.value:
                 candidates = find_results.get("movie_results") or []
             else:
-                candidates = find_results.get("tv_results") or find_results.get("tv_episode_results") or []
+                candidates = find_results.get("tv_results") or []
+                if not candidates:
+                    candidates = [
+                        {"id": result.get("show_id")}
+                        for result in find_results.get("tv_episode_results") or []
+                        if result.get("show_id")
+                    ]
 
             if not candidates:
                 continue
@@ -240,7 +304,9 @@ class PlexWatchlistSyncService:
 
         return None
 
-    def _fetch_tmdb_metadata(self, media_type: str, tmdb_id: str, entry: dict) -> dict | None:
+    def _fetch_tmdb_metadata(
+        self, media_type: str, tmdb_id: str, entry: dict
+    ) -> dict | None:
         """Fetch TMDB metadata for the resolved item."""
         try:
             return services.get_media_metadata(
@@ -294,10 +360,14 @@ class PlexWatchlistSyncService:
 
     def _get_or_create_user_media(self, model_class, item: Item):
         """Return the user's tracked media row, creating a Planning row if needed."""
-        media_obj = model_class.objects.filter(
-            user=self.user,
-            item=item,
-        ).order_by("created_at").first()
+        media_obj = (
+            model_class.objects.filter(
+                user=self.user,
+                item=item,
+            )
+            .order_by("created_at")
+            .first()
+        )
         if media_obj:
             return media_obj, False
 
@@ -310,10 +380,14 @@ class PlexWatchlistSyncService:
                 notes="",
             )
         except IntegrityError:
-            media_obj = model_class.objects.filter(
-                user=self.user,
-                item=item,
-            ).order_by("created_at").first()
+            media_obj = (
+                model_class.objects.filter(
+                    user=self.user,
+                    item=item,
+                )
+                .order_by("created_at")
+                .first()
+            )
             if media_obj is None:  # pragma: no cover - defensive
                 raise
             return media_obj, False
@@ -336,8 +410,10 @@ class PlexWatchlistSyncService:
             user=self.user,
             item=item,
             source_username=self.source_username,
+            source_server_id=self.source_server_id,
             defaults={
                 "source_account_id": self.source_account_id,
+                "source_server_id": self.source_server_id,
                 "plex_rating_key": rating_key,
                 "plex_guid": plex_guid,
                 "tmdb_id": str(external_ids.get("tmdb_id") or ""),
@@ -355,6 +431,7 @@ class PlexWatchlistSyncService:
         updated_fields = []
         desired_values = {
             "source_account_id": self.source_account_id,
+            "source_server_id": self.source_server_id,
             "plex_rating_key": rating_key,
             "plex_guid": plex_guid,
             "tmdb_id": str(external_ids.get("tmdb_id") or ""),
@@ -378,20 +455,27 @@ class PlexWatchlistSyncService:
 
     def _reconcile_removals(self, seen_item_ids: set[int]) -> None:
         """Deactivate ledger rows that disappeared from the current watchlist."""
-        stale_items = PlexWatchlistSyncItem.objects.filter(
-            user=self.user,
-            source_username=self.source_username,
-            is_active=True,
-        ).exclude(
-            item_id__in=seen_item_ids,
-        ).select_related("item")
+        stale_items = (
+            PlexWatchlistSyncItem.objects.filter(
+                user=self.user,
+                source_username=self.source_username,
+                source_server_id=self.source_server_id,
+                is_active=True,
+            )
+            .exclude(
+                item_id__in=seen_item_ids,
+            )
+            .select_related("item")
+        )
 
         now = timezone.now()
         for sync_item in stale_items:
             removed_media = False
             if sync_item.created_by_sync:
                 media_obj = self._get_media_instance(sync_item.item)
-                if media_obj and self._can_remove_synced_media(sync_item.item, media_obj):
+                if media_obj and self._can_remove_synced_media(
+                    sync_item.item, media_obj
+                ):
                     media_obj.delete()
                     removed_media = True
                     self.counts["removed"] += 1
@@ -406,7 +490,11 @@ class PlexWatchlistSyncService:
     def _get_media_instance(self, item: Item):
         """Return the tracked Movie/TV row for the given item, if any."""
         if item.media_type == MediaTypes.MOVIE.value:
-            return Movie.objects.filter(user=self.user, item=item).order_by("created_at").first()
+            return (
+                Movie.objects.filter(user=self.user, item=item)
+                .order_by("created_at")
+                .first()
+            )
         if item.media_type == MediaTypes.TV.value:
             return TV.objects.filter(user=self.user, item=item).first()
         return None
@@ -432,10 +520,7 @@ class PlexWatchlistSyncService:
             return False
         if getattr(media_obj, "start_date", None) is not None:
             return False
-        if getattr(media_obj, "end_date", None) is not None:
-            return False
-
-        return True
+        return getattr(media_obj, "end_date", None) is None
 
     def _warn(self, message: str) -> None:
         """Collect a warning without duplicating format logic in callers."""

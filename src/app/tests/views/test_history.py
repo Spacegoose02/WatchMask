@@ -2,9 +2,10 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
-from django.utils import timezone
+from django.utils import formats, timezone
 
 from app import history_cache
 from app.models import (
@@ -28,6 +29,8 @@ from app.models import (
     Music,
     Person,
     PersonGender,
+    Podcast,
+    PodcastShow,
     Season,
     Sources,
     Status,
@@ -36,15 +39,38 @@ from app.models import (
 )
 
 
+def _begin_model_metadata_patches():
+    """Start the provider patches and return them for the caller to stop.
+
+    `setUpTestData` runs as a classmethod with no `addCleanup`, so a class-level
+    fixture needs to start and stop these around its own object creation. Test
+    bodies keep using `_start_model_metadata_patches`.
+    """
+    patchers = [
+        patch(
+            "app.models.item.providers.services.get_media_metadata",
+            return_value={"max_progress": 1},
+        ),
+        patch(
+            "app.models.media.providers.services.get_media_metadata",
+            return_value={"max_progress": 1},
+        ),
+        patch("app.models.Item.fetch_releases"),
+    ]
+    for patcher in patchers:
+        patcher.start()
+    return patchers
+
+
 def _start_model_metadata_patches(test_case):
     """Prevent history view tests from making provider calls during model saves."""
     mock_item_media_metadata = patch(
         "app.models.item.providers.services.get_media_metadata",
-        return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
+        return_value={"max_progress": 1},
     )
     mock_media_media_metadata = patch(
         "app.models.media.providers.services.get_media_metadata",
-        return_value={"max_progress": 1, "related": {"seasons": []}, "episodes": []},
+        return_value={"max_progress": 1},
     )
     mock_fetch_releases = patch("app.models.Item.fetch_releases")
     mock_item_media_metadata.start()
@@ -162,6 +188,619 @@ class HistoryModalViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, ">9.5<", html=False)
 
+    def test_in_progress_movie_history_shows_the_whole_chain(self):
+        """Records written before the finish stay in the timeline (issue #1278)."""
+        response = self.client.get(
+            reverse(
+                "history_modal",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.MOVIE.value,
+                    "media_id": "238",
+                },
+            ),
+        )
+
+        # One entry for the in-progress creation, one for the finish.
+        self.assertEqual(len(response.context["timeline"]), 2)
+
+
+def _descriptions(entry):
+    return [change["description"] for change in entry["changes"]]
+
+
+@patch(
+    "app.providers.services.get_media_metadata",
+    return_value={
+        "season/1": {"episodes": [{"episode_number": 1}, {"episode_number": 2}]},
+        "max_progress": 2,
+    },
+)
+class EpisodeHistoryModalTests(TestCase):
+    """An in-progress episode play is listed, so it can be edited (issue #1278)."""
+
+    def setUp(self):
+        """Track one episode: a finished play, then an in-progress one."""
+        self.credentials = {"username": "test", "password": "12345"}
+        self.user = get_user_model().objects.create_user(**self.credentials)
+        self.client.login(**self.credentials)
+        with patch(
+            "app.providers.services.get_media_metadata",
+            return_value={"season/1": {"episodes": [{"episode_number": 1}]}},
+        ):
+            tv_item = Item.objects.create(
+                media_id="123",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.TV.value,
+                title="Show",
+            )
+            tv = TV.objects.create(item=tv_item, user=self.user)
+            season_item = Item.objects.create(
+                media_id="123",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.SEASON.value,
+                title="Show",
+                season_number=1,
+            )
+            self.season = Season.objects.create(
+                item=season_item,
+                user=self.user,
+                related_tv=tv,
+                status=Status.IN_PROGRESS.value,
+            )
+            self.episode_item = Item.objects.create(
+                media_id="123",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.EPISODE.value,
+                title="Show",
+                season_number=1,
+                episode_number=1,
+            )
+            self.finished_play = Episode.objects.create(
+                item=self.episode_item,
+                related_season=self.season,
+                end_date=timezone.now() - timedelta(days=30),
+            )
+            self.started_at = timezone.now() - timedelta(hours=1)
+            self.in_progress_play = Episode.objects.create(
+                item=self.episode_item,
+                related_season=self.season,
+                status=Status.IN_PROGRESS.value,
+                start_date=self.started_at,
+                end_date=None,
+            )
+
+    def _history_modal(self):
+        return self.client.get(
+            reverse(
+                "history_modal",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.EPISODE.value,
+                    "media_id": "123",
+                    "season_number": 1,
+                    "episode_number": 1,
+                },
+            ),
+        )
+
+    def test_in_progress_play_is_listed_and_editable(self, _mock_metadata):
+        """Without an entry the play has no edit or delete control."""
+        response = self._history_modal()
+
+        entries = {
+            entry["instance_id"]: entry for entry in response.context["timeline"]
+        }
+        self.assertIn(self.in_progress_play.id, entries)
+        self.assertContains(response, f"instance_id={self.in_progress_play.id}")
+
+    def test_instances_are_numbered_in_the_order_they_were_added(
+        self,
+        _mock_metadata,
+    ):
+        """Numbering must not depend on where a database sorts NULL end dates."""
+        response = self._history_modal()
+
+        numbers = {
+            entry["instance_id"]: entry["media_entry_number"]
+            for entry in response.context["timeline"]
+        }
+        self.assertEqual(numbers[self.finished_play.id], 1)
+        self.assertEqual(numbers[self.in_progress_play.id], 2)
+
+    def test_in_progress_play_reads_as_started_not_finished(self, _mock_metadata):
+        """The open play has no end date, so it must not claim a finish."""
+        response = self._history_modal()
+
+        entry = next(
+            entry
+            for entry in response.context["timeline"]
+            if entry["instance_id"] == self.in_progress_play.id
+        )
+        descriptions = _descriptions(entry)
+        self.assertTrue(any(d.startswith("Started on") for d in descriptions))
+        self.assertNotIn("Finished without date", descriptions)
+
+    def test_finished_play_keeps_its_plain_timeline(self, _mock_metadata):
+        """A normal play shows its finish date and no status line."""
+        response = self._history_modal()
+
+        entry = next(
+            entry
+            for entry in response.context["timeline"]
+            if entry["instance_id"] == self.finished_play.id
+        )
+        descriptions = _descriptions(entry)
+        self.assertTrue(any(d.startswith("Finished on") for d in descriptions))
+        self.assertFalse(any(d.startswith("Marked as") for d in descriptions))
+
+    def test_finishing_the_play_is_recorded(self, _mock_metadata):
+        """Completing the open play adds a finish entry to its timeline."""
+        self.in_progress_play.status = Status.COMPLETED.value
+        self.in_progress_play.end_date = timezone.now()
+        self.in_progress_play.save()
+
+        response = self._history_modal()
+
+        descriptions = [
+            description
+            for entry in response.context["timeline"]
+            if entry["instance_id"] == self.in_progress_play.id
+            for description in _descriptions(entry)
+        ]
+        self.assertTrue(any(d.startswith("Started on") for d in descriptions))
+        self.assertTrue(any(d.startswith("Finished on") for d in descriptions))
+
+
+class PodcastHistoryModalTests(TestCase):
+    """Pocket Casts sync writes in-progress records the modal keeps hidden."""
+
+    def setUp(self):
+        """Track one podcast episode still in progress."""
+        _start_model_metadata_patches(self)
+        self.credentials = {"username": "test", "password": "12345"}
+        self.user = get_user_model().objects.create_user(**self.credentials)
+        self.client.login(**self.credentials)
+        item = Item.objects.create(
+            media_id="podcast-episode",
+            source=Sources.POCKETCASTS.value,
+            media_type=MediaTypes.PODCAST.value,
+            title="Podcast Episode",
+        )
+        show = PodcastShow.objects.create(podcast_uuid="show", title="Show")
+        Podcast.objects.create(
+            item=item,
+            user=self.user,
+            show=show,
+            status=Status.IN_PROGRESS.value,
+            progress=10,
+        )
+
+    def test_in_progress_sync_records_stay_hidden(self):
+        """Only records with an end date describe a listen."""
+        response = self.client.get(
+            reverse(
+                "history_modal",
+                kwargs={
+                    "source": Sources.POCKETCASTS.value,
+                    "media_type": MediaTypes.PODCAST.value,
+                    "media_id": "podcast-episode",
+                },
+            ),
+        )
+
+        self.assertEqual(response.context["timeline"], [])
+
+
+class SessionHistoryModalTests(TestCase):
+    """Test the in-place, day-grouped session history fragment."""
+
+    def setUp(self):
+        """Create a user and log in with provider work disabled."""
+        _start_model_metadata_patches(self)
+        self.credentials = {"username": "session-history", "password": "12345"}
+        self.user = get_user_model().objects.create_user(**self.credentials)
+        self.client.login(**self.credentials)
+        self.base_time = timezone.now().replace(second=0, microsecond=0)
+
+    def _url(self, **params):
+        return reverse("activity_sessions_modal"), params
+
+    def _create_item(
+        self,
+        media_type,
+        media_id,
+        title,
+        source=Sources.MANUAL.value,
+        **extra,
+    ):
+        return Item.objects.create(
+            media_id=media_id,
+            source=source,
+            media_type=media_type,
+            title=title,
+            image="http://example.com/poster.jpg",
+            runtime_minutes=42,
+            **extra,
+        )
+
+    def test_modal_accepts_each_detail_filter_shape(self):
+        """Each detail-page querystring shape returns the modal fragment."""
+        movie_item = self._create_item(MediaTypes.MOVIE.value, "movie", "Movie")
+        Movie.objects.create(
+            item=movie_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            end_date=self.base_time,
+        )
+
+        tv_item = self._create_item(MediaTypes.TV.value, "show", "Show")
+        tv = TV.objects.create(item=tv_item, user=self.user)
+        season_item = self._create_item(
+            MediaTypes.SEASON.value,
+            "show",
+            "Season",
+            season_number=1,
+        )
+        season = Season.objects.create(item=season_item, related_tv=tv, user=self.user)
+        episode_item = self._create_item(
+            MediaTypes.EPISODE.value,
+            "show",
+            "Episode",
+            season_number=1,
+            episode_number=1,
+        )
+        Episode.objects.create(
+            item=episode_item,
+            related_season=season,
+            end_date=self.base_time,
+        )
+
+        game_item = self._create_item(MediaTypes.GAME.value, "game", "Game")
+        Game.objects.create(
+            item=game_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            progress=30,
+            start_date=self.base_time - timedelta(minutes=30),
+            end_date=self.base_time,
+        )
+
+        show = PodcastShow.objects.create(
+            podcast_uuid="session-history-show",
+            title="Podcast Show",
+        )
+        podcast_item = self._create_item(
+            MediaTypes.PODCAST.value,
+            "podcast-episode",
+            "Podcast Episode",
+        )
+        Podcast.objects.create(
+            item=podcast_item,
+            user=self.user,
+            show=show,
+            status=Status.COMPLETED.value,
+            progress=20,
+            end_date=self.base_time,
+        )
+
+        artist = Artist.objects.create(name="Session Artist")
+        album = Album.objects.create(title="Session Album", artist=artist)
+        track = Track.objects.create(album=album, title="Session Track", duration_ms=180000)
+        music_item = self._create_item(MediaTypes.MUSIC.value, "music-track", "Track")
+        Music.objects.create(
+            item=music_item,
+            user=self.user,
+            album=album,
+            artist=artist,
+            track=track,
+            status=Status.COMPLETED.value,
+            progress=1,
+            end_date=self.base_time,
+        )
+
+        book_item = self._create_item(MediaTypes.BOOK.value, "book", "Book")
+        Book.objects.create(
+            item=book_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            end_date=self.base_time,
+        )
+
+        cases = (
+            {
+                "media_type": MediaTypes.MOVIE.value,
+                "media_id": "movie",
+                "source": Sources.MANUAL.value,
+            },
+            {
+                "media_type": MediaTypes.TV.value,
+                "media_id": "show",
+                "source": Sources.MANUAL.value,
+            },
+            {
+                "media_type": MediaTypes.TV.value,
+                "media_id": "show",
+                "source": Sources.MANUAL.value,
+                "season_number": 1,
+            },
+            {
+                "media_type": MediaTypes.GAME.value,
+                "media_id": "game",
+                "source": Sources.MANUAL.value,
+                "logging_style": "sessions",
+            },
+            {"media_type": MediaTypes.PODCAST.value, "podcast_show": show.id},
+            {"album": album.id},
+            {
+                "media_type": MediaTypes.BOOK.value,
+                "media_id": "book",
+                "source": Sources.MANUAL.value,
+            },
+        )
+        for params in cases:
+            with self.subTest(params=params):
+                response = self.client.get(*self._url(**params))
+                self.assertEqual(response.status_code, 200)
+                self.assertTemplateUsed(
+                    response,
+                    "app/components/session_history_modal.html",
+                )
+
+    def test_episode_modal_filters_both_season_and_episode_number(self):
+        """An episode action must not show neighboring episodes or seasons."""
+        tv_item = self._create_item(MediaTypes.TV.value, "scoped-show", "Show")
+        tv = TV.objects.create(item=tv_item, user=self.user)
+        for season_number in (1, 2):
+            season_item = self._create_item(
+                MediaTypes.SEASON.value,
+                "scoped-show",
+                "Season",
+                season_number=season_number,
+            )
+            season = Season.objects.create(
+                item=season_item, related_tv=tv, user=self.user,
+            )
+            for episode_number in (1, 2):
+                episode_item = self._create_item(
+                    MediaTypes.EPISODE.value,
+                    "scoped-show",
+                    f"Episode {episode_number}",
+                    season_number=season_number,
+                    episode_number=episode_number,
+                )
+                Episode.objects.create(
+                    item=episode_item,
+                    related_season=season,
+                    end_date=self.base_time,
+                    notes=f"unique-note-s{season_number}e{episode_number}",
+                )
+
+        response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.TV.value,
+                media_id="scoped-show",
+                source=Sources.MANUAL.value,
+                season_number=1,
+                episode_number=2,
+            ),
+        )
+        self.assertContains(response, "unique-note-s1e2")
+        for excluded in ("unique-note-s1e1", "unique-note-s2e1", "unique-note-s2e2"):
+            self.assertNotContains(response, excluded)
+
+    def test_movie_repeat_rows_include_notes_scores_and_all_markers(self):
+        """Repeated movie instances remain separate rows across their days."""
+        item = self._create_item(MediaTypes.MOVIE.value, "repeat-movie", "Repeat Movie")
+        first = Movie.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            score=7,
+            notes="First viewing note",
+            end_date=self.base_time - timedelta(days=1),
+        )
+        second = Movie.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            score=8,
+            notes="Second viewing note",
+            end_date=self.base_time,
+        )
+
+        response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.MOVIE.value,
+                media_id=item.media_id,
+                source=item.source,
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        days = response.context["history_days"]
+        self.assertEqual([len(day["entries"]) for day in days], [1, 1])
+        self.assertEqual(
+            response.context["marker_days"],
+            sorted(day["date"].isoformat() for day in days),
+        )
+        body = response.content.decode()
+        self.assertIn("First viewing note", body)
+        self.assertIn("Second viewing note", body)
+        self.assertIn(">7<", body)
+        self.assertIn(">8<", body)
+        self.assertIn(f'"instance_id": "{first.id}"', body)
+        self.assertIn(f'"instance_id": "{second.id}"', body)
+
+    def test_episode_game_notes_and_long_note_snippet_render(self):
+        """Rows show current notes/scores and truncate long plain-text notes."""
+        item = self._create_item(MediaTypes.GAME.value, "noted-game", "Noted Game")
+        Game.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            progress=45,
+            score=9.5,
+            notes="x" * 200,
+            start_date=self.base_time - timedelta(minutes=45),
+            end_date=self.base_time,
+        )
+        response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.GAME.value,
+                media_id=item.media_id,
+                source=item.source,
+                logging_style="sessions",
+            ),
+        )
+        self.assertContains(response, ">9.5<", html=False)
+        self.assertContains(response, "Show more", html=False)
+        self.assertContains(response, "…", html=False)
+        self.assertContains(response, 'x-show="noteExpanded"', html=False)
+
+    def test_session_history_stats_cover_filtered_gaps_streaks_and_weekdays(self):
+        """Stats describe only the filtered item's dated activity."""
+        item = self._create_item(MediaTypes.MOVIE.value, "stats-movie", "Stats Movie")
+        other_item = self._create_item(
+            MediaTypes.MOVIE.value,
+            "stats-other-movie",
+            "Other Movie",
+        )
+        local_today = timezone.localtime(self.base_time).date()
+        monday = local_today - timedelta(days=local_today.weekday() + 14)
+        active_dates = (monday, monday + timedelta(days=1), monday + timedelta(days=3), monday + timedelta(days=7))
+        for active_date in active_dates:
+            days_ago = (local_today - active_date).days
+            Movie.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.COMPLETED.value,
+                end_date=self.base_time - timedelta(days=days_ago),
+            )
+        Movie.objects.create(
+            item=other_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            end_date=self.base_time,
+        )
+
+        response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.MOVIE.value,
+                media_id=item.media_id,
+                source=item.source,
+            ),
+        )
+
+        stats = {stat["label"]: stat["value"] for stat in response.context["session_history_stats"]}
+        self.assertEqual(stats["Active days"], "4")
+        self.assertEqual(stats["Activity entries"], "4")
+        self.assertEqual(stats["Tracked time"], "2h 48min")
+        self.assertEqual(stats["Average per active day"], "42min")
+        self.assertEqual(stats["Average gap"], "2.3 days")
+        self.assertEqual(stats["Longest streak"], "2 days")
+        self.assertEqual(stats["Most active weekday"], formats.date_format(monday, "l"))
+        self.assertContains(response, "At a glance", html=False)
+        self.assertContains(response, "data-calendar-component", html=False)
+        self.assertContains(response, "showMonthsView", html=False)
+        self.assertContains(response, "showYearsView", html=False)
+        self.assertContains(response, "calendarDayIsInteractive", html=False)
+
+    def test_session_history_stats_ignore_undated_entries_for_calendar_metrics(self):
+        """Undated rows count as activity but do not create calendar dates."""
+        item = self._create_item(MediaTypes.BOOK.value, "stats-book", "Stats Book")
+        dated = Book.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            end_date=self.base_time,
+        )
+        Book.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+
+        response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.BOOK.value,
+                media_id=item.media_id,
+                source=item.source,
+            ),
+        )
+
+        stats = {stat["label"]: stat["value"] for stat in response.context["session_history_stats"]}
+        self.assertEqual(stats["Active days"], "1")
+        self.assertEqual(stats["Activity entries"], "2")
+        self.assertEqual(stats["Tracked time"], "0min")
+        self.assertEqual(stats["Average per active day"], "0min")
+        self.assertEqual(stats["Average gap"], "—")
+        self.assertEqual(stats["Longest streak"], "1 day")
+        self.assertEqual(
+            stats["Most active weekday"],
+            formats.date_format(dated.end_date, "l"),
+        )
+
+    def test_undated_history_is_grouped_and_other_users_are_excluded(self):
+        """Single-item filters include the unknown-date group but stay user-scoped."""
+        item = self._create_item(MediaTypes.BOOK.value, "undated-book", "Undated Book")
+        Book.objects.create(item=item, user=self.user, status=Status.COMPLETED.value)
+
+        response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.BOOK.value,
+                media_id=item.media_id,
+                source=item.source,
+            ),
+        )
+        self.assertContains(response, "Unknown date", html=False)
+        self.assertIsNone(response.context["history_days"][-1]["date"])
+        # The unknown-date group must not read "Unknown Unknown date".
+        self.assertNotContains(response, ">Unknown</span>", html=False)
+
+        other_item = self._create_item(MediaTypes.BOOK.value, "other-book", "Other Book")
+        other_user = get_user_model().objects.create_user(
+            username="session-history-other",
+            password="12345",
+        )
+        Book.objects.create(
+            item=other_item,
+            user=other_user,
+            status=Status.COMPLETED.value,
+            end_date=self.base_time,
+        )
+        other_response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.BOOK.value,
+                media_id=other_item.media_id,
+                source=other_item.source,
+            ),
+        )
+        self.assertFalse(other_response.context["history_days"])
+
+    @patch("app.history_views.SESSION_HISTORY_MAX_DAYS", 1)
+    def test_history_cap_shows_full_history_link(self):
+        """The marker set uses all days while rendering only the capped prefix."""
+        item = self._create_item(MediaTypes.BOOK.value, "capped-book", "Capped Book")
+        for days_ago in (0, 1):
+            Book.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.COMPLETED.value,
+                end_date=self.base_time - timedelta(days=days_ago),
+            )
+        response = self.client.get(
+            *self._url(
+                media_type=MediaTypes.BOOK.value,
+                media_id=item.media_id,
+                source=item.source,
+            ),
+        )
+        self.assertEqual(len(response.context["history_days"]), 1)
+        self.assertEqual(len(response.context["marker_days"]), 2)
+        self.assertEqual(len(response.context["visible_marker_days"]), 1)
+        self.assertContains(response, "View History", html=False)
+
 
 class DeleteHistoryRecordViewTests(TestCase):
     """Test the delete history record view."""
@@ -247,15 +886,127 @@ class DeleteHistoryRecordViewTests(TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    @patch("app.history_cache_reader.schedule_history_day_cache_coverage")
+    @patch("app.history_cache_lifecycle.schedule_history_refresh", return_value=True)
+    def test_delete_history_record_evicts_cached_day_before_refresh(
+        self,
+        mock_schedule_history_refresh,
+        _mock_schedule_history_day_cache_coverage,
+    ):
+        """A deleted play must not survive while its async cache refresh waits."""
+        cache.clear()
+        logging_style = "repeats"
+        earlier_time = self.movie.end_date - timedelta(days=400)
+        earlier_movie = Movie.objects.create(
+            item=self.item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            progress=1,
+            start_date=earlier_time,
+            end_date=earlier_time,
+        )
+        earlier_history = earlier_movie.history.first()
+        earlier_history.history_user = self.user
+        earlier_history.save(update_fields=["history_user"])
+
+        later_day_key = history_cache.history_day_key(self.movie.end_date)
+        earlier_day_key = history_cache.history_day_key(earlier_movie.end_date)
+        history_cache.refresh_history_cache(
+            self.user.id,
+            logging_style=logging_style,
+            day_keys=[later_day_key, earlier_day_key],
+        )
+        later_cache_key = history_cache._day_cache_key(
+            self.user.id,
+            logging_style,
+            later_day_key,
+        )
+        earlier_cache_key = history_cache._day_cache_key(
+            self.user.id,
+            logging_style,
+            earlier_day_key,
+        )
+        self.assertTrue(cache.get(later_cache_key)["entries"])
+        self.assertTrue(cache.get(earlier_cache_key)["entries"])
+        mock_schedule_history_refresh.reset_mock()
+
+        response = self.client.delete(
+            reverse(
+                "delete_history_record",
+                kwargs={
+                    "media_type": MediaTypes.MOVIE.value,
+                    "history_id": self.history_id,
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(cache.get(later_cache_key))
+        for logging_style in ("sessions", "repeats"):
+            mock_schedule_history_refresh.assert_any_call(
+                self.user.id,
+                logging_style,
+                warm_days=0,
+                day_keys=[later_day_key],
+            )
+
+        later_page = self.client.get(
+            reverse("history")
+            + f"?year={self.movie.end_date.year}&m={self.movie.end_date.month}",
+        )
+        self.assertEqual(later_page.status_code, 200)
+        self.assertFalse(
+            any(
+                entry["title"] == "Test Movie"
+                for day in later_page.context["history_days"]
+                for entry in day["entries"]
+            ),
+        )
+
+        earlier_page = self.client.get(
+            reverse("history")
+            + f"?year={earlier_movie.end_date.year}&m={earlier_movie.end_date.month}",
+        )
+        self.assertEqual(earlier_page.status_code, 200)
+        self.assertTrue(
+            any(
+                entry["title"] == "Test Movie"
+                for day in earlier_page.context["history_days"]
+                for entry in day["entries"]
+            ),
+        )
+
 
 class HistoryMonthViewTests(TestCase):
     """Test unfiltered history month page behavior."""
 
+    credentials = {"username": "month-view", "password": "12345"}
+
+    @classmethod
+    def setUpTestData(cls):
+        """Build the fixture once for the class rather than once per test.
+
+        This class spent 7.0s of its 22.0s re-creating the same user, show,
+        season and episode for every test method. Django rolls each test back
+        to this state, so building it here is equivalent and 20x cheaper.
+        """
+        patchers = _begin_model_metadata_patches()
+        try:
+            cls._build_fixture()
+        finally:
+            for patcher in reversed(patchers):
+                patcher.stop()
+
     def setUp(self):
+        # Patches and login stay per-test: the test client is per-test, and the
+        # test bodies save models too.
         _start_model_metadata_patches(self)
-        self.credentials = {"username": "month-view", "password": "12345"}
-        self.user = get_user_model().objects.create_user(**self.credentials)
         self.client.login(**self.credentials)
+        cache.clear()
+
+    @classmethod
+    def _build_fixture(cls):
+        cls.user = get_user_model().objects.create_user(**cls.credentials)
         now = timezone.now()
 
         item = Item.objects.create(
@@ -267,7 +1018,7 @@ class HistoryMonthViewTests(TestCase):
         )
         Movie.objects.create(
             item=item,
-            user=self.user,
+            user=cls.user,
             status=Status.COMPLETED.value,
             progress=1,
             start_date=now,
@@ -283,7 +1034,7 @@ class HistoryMonthViewTests(TestCase):
         )
         tv = TV.objects.create(
             item=tv_item,
-            user=self.user,
+            user=cls.user,
             status=Status.COMPLETED.value,
         )
         season_item = Item.objects.create(
@@ -296,7 +1047,7 @@ class HistoryMonthViewTests(TestCase):
         )
         season = Season.objects.create(
             item=season_item,
-            user=self.user,
+            user=cls.user,
             related_tv=tv,
             status=Status.COMPLETED.value,
         )
@@ -309,11 +1060,12 @@ class HistoryMonthViewTests(TestCase):
             season_number=1,
             episode_number=1,
         )
-        Episode.objects.create(
-            item=episode_item,
-            related_season=season,
-            end_date=now,
-        )
+        with cls.captureOnCommitCallbacks(execute=True):
+            Episode.objects.create(
+                item=episode_item,
+                related_season=season,
+                end_date=now,
+            )
 
     def test_default_month_view_does_not_bootstrap_cache_status_poll(self):
         response = self.client.get(reverse("history"))
@@ -322,6 +1074,63 @@ class HistoryMonthViewTests(TestCase):
         self.assertFalse(response.context["history_refreshing"])
         self.assertNotContains(response, "checkCacheStatus", html=False)
         self.assertNotContains(response, "/api/cache-status/", html=False)
+
+    def test_month_nav_puts_older_months_left_and_newer_months_right(self):
+        """Past is on the left and future on the right, like the Calendar."""
+        response = self.client.get(reverse("history") + "?year=2020&m=6")
+        html = response.content.decode()
+
+        older = html.index("?year=2020&m=5")
+        newer = html.index("?year=2020&m=7")
+        back_a_year = html.index("?year=2019&m=6")
+        current_month = html.index(f"?year={response.context['current_year']}&m=")
+
+        self.assertLess(back_a_year, older)
+        self.assertLess(older, html.index("<h2", older))
+        self.assertLess(html.index("<h2", older), newer)
+        self.assertLess(newer, current_month)
+
+    def test_history_passes_media_type_from_query_into_context(self):
+        response = self.client.get(
+            reverse("history"),
+            {"media_type": MediaTypes.MOVIE.value},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["media_type"], MediaTypes.MOVIE.value)
+
+    def test_history_drops_invalid_media_type_from_query(self):
+        response = self.client.get(
+            reverse("history"),
+            {"media_type": "not-a-media-type"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.context["media_type"])
+
+    def test_history_keeps_a_non_movie_media_type_in_the_search_bar(self):
+        """A game's history link must not leave the search bar on TV shows.
+
+        Regression for the history button on a game detail page, which links to
+        ?media_type=game&...&logging_style=sessions. Without the media type in
+        context the bar falls back to last_search_type, which defaults to TV.
+        """
+        response = self.client.get(
+            reverse("history"),
+            {
+                "media_type": MediaTypes.GAME.value,
+                "media_id": "1877",
+                "source": "igdb",
+                "logging_style": "sessions",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["media_type"], MediaTypes.GAME.value)
+        # base.html renders the navbar's current type into selectedType; the
+        # dropdown list below it always contains every type, so assert on the
+        # selection itself rather than on the presence of "tv" anywhere.
+        self.assertContains(
+            response,
+            "selectedType: { display: 'Games', value: 'game' }",
+        )
 
     def test_media_type_month_view_uses_cached_month_days(self):
         response = self.client.get(
@@ -335,6 +1144,217 @@ class HistoryMonthViewTests(TestCase):
         self.assertContains(response, "Month View Movie")
         self.assertNotContains(response, "Month View Episode")
         self.assertContains(response, "media_type=movie", html=False)
+
+    def test_media_type_month_view_multi_select(self):
+        response = self.client.get(
+            reverse("history"),
+            {
+                "media_type": f"{MediaTypes.MOVIE.value},{MediaTypes.TV.value}",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["use_month_view"])
+        self.assertContains(response, "Month View Movie")
+        self.assertContains(response, "Month View Episode")
+
+    def test_media_type_multi_select_bypasses_month_cache(self):
+        now = timezone.now()
+        start_date = (now - timedelta(days=1)).date().isoformat()
+        end_date = (now + timedelta(days=1)).date().isoformat()
+
+        response = self.client.get(
+            reverse("history"),
+            {
+                "media_type": f"{MediaTypes.MOVIE.value},{MediaTypes.TV.value}",
+                "start-date": start_date,
+                "end-date": end_date,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.context["use_month_view"])
+        self.assertContains(response, "Month View Movie")
+        self.assertContains(response, "Month View Episode")
+
+    def _cache_large_history_day(self, *, keep_count=0, total_count=None):
+        """Create and cache many same-day movie entries for pagination tests."""
+        total_count = total_count or history_cache.HISTORY_ENTRIES_PER_DAY_PAGE + 5
+        # Entries are spaced a second apart; keep them all on one local day even
+        # when the suite runs in the first seconds after midnight.
+        local_now = timezone.localtime()
+        day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        now = max(local_now, day_start + timedelta(seconds=total_count))
+        for index in range(total_count):
+            item = Item.objects.create(
+                media_id=f"large-history-{index}",
+                source=Sources.MANUAL.value,
+                media_type=MediaTypes.MOVIE.value,
+                title=f"Large History {index:03d}",
+                image=f"http://example.com/large-history-{index}.jpg",
+                genres=["keep"] if index >= total_count - keep_count else ["skip"],
+            )
+            played_at = now - timedelta(seconds=index)
+            Movie.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.COMPLETED.value,
+                progress=1,
+                start_date=played_at,
+                end_date=played_at,
+            )
+
+        cache.clear()
+        day_key = history_cache.history_day_key(now)
+        day_payload = history_cache._build_and_cache_history_day(
+            self.user,
+            day_key,
+            logging_style_override="repeats",
+        )
+        return day_key, len(day_payload["entries"])
+
+    def test_large_month_day_renders_bounded_page_and_loads_more(self):
+        day_key, total_entries = self._cache_large_history_day()
+
+        response = self.client.get(reverse("history"))
+
+        self.assertEqual(response.status_code, 200)
+        day = next(
+            day
+            for day in response.context["history_days"]
+            if day["day_key"] == day_key
+        )
+        self.assertEqual(
+            day["entry_count"],
+            total_entries,
+        )
+        self.assertEqual(
+            len(day["entries"]),
+            history_cache.HISTORY_ENTRIES_PER_DAY_PAGE,
+        )
+        self.assertTrue(day["has_more"])
+        self.assertContains(response, "Load more")
+        self.assertNotContains(response, "Large History 034")
+
+        fragment = self.client.get(
+            reverse("history_day_fragment", kwargs={"day_key": day_key}),
+            {"entry_offset": history_cache.HISTORY_ENTRIES_PER_DAY_PAGE},
+        )
+
+        self.assertEqual(fragment.status_code, 200)
+        self.assertContains(fragment, "Large History 034")
+        self.assertContains(fragment, "Large History 030")
+        self.assertNotContains(fragment, "Large History 000")
+        self.assertNotContains(fragment, "Load more")
+
+    def test_history_day_fragment_filters_before_pagination(self):
+        day_key, _total_entries = self._cache_large_history_day(
+            keep_count=5,
+            total_count=history_cache.HISTORY_ENTRIES_PER_DAY_PAGE + 5,
+        )
+        music_item = Item.objects.create(
+            media_id="large-history-music",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.MUSIC.value,
+            title="Large History Music",
+            image="http://example.com/large-history-music.jpg",
+            genres=["keep"],
+        )
+        played_at = timezone.now()
+        Music.objects.create(
+            item=music_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            progress=1,
+            start_date=played_at,
+            end_date=played_at,
+        )
+        cache.clear()
+        history_cache._build_and_cache_history_day(
+            self.user,
+            day_key,
+            logging_style_override="repeats",
+        )
+
+        response = self.client.get(
+            reverse("history"),
+            {"genre": "keep", "media_type": MediaTypes.MOVIE.value},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        day = next(
+            day
+            for day in response.context["history_days"]
+            if day["day_key"] == day_key
+        )
+        self.assertEqual(day["entry_count"], 5)
+        self.assertEqual(len(day["entries"]), 5)
+        self.assertEqual(
+            {entry["title"] for entry in day["entries"]},
+            {f"Large History {index:03d}" for index in range(30, 35)},
+        )
+        self.assertNotContains(response, "Large History Music")
+        self.assertNotContains(response, "Load more")
+
+    def test_history_day_fragment_rejects_invalid_day_and_offset(self):
+        invalid_day = self.client.get(
+            reverse("history_day_fragment", kwargs={"day_key": "20261301"}),
+        )
+        self.assertEqual(invalid_day.status_code, 400)
+
+        day_key, total_entries = self._cache_large_history_day()
+        out_of_range_offset = self.client.get(
+            reverse("history_day_fragment", kwargs={"day_key": day_key}),
+            {"entry_offset": total_entries + 1},
+        )
+        self.assertEqual(out_of_range_offset.status_code, 400)
+
+        invalid_offset = self.client.get(
+            reverse("history_day_fragment", kwargs={"day_key": "20260101"}),
+            {"entry_offset": "not-an-integer"},
+        )
+        self.assertEqual(invalid_offset.status_code, 400)
+
+        negative_offset = self.client.get(
+            reverse("history_day_fragment", kwargs={"day_key": "20260101"}),
+            {"entry_offset": -1},
+        )
+        self.assertEqual(negative_offset.status_code, 400)
+
+    def test_history_day_fragment_does_not_expose_another_users_day(self):
+        other_user = get_user_model().objects.create_user(
+            username="history-other-user",
+            password="12345",
+        )
+        played_at = timezone.now() - timedelta(days=120)
+        item = Item.objects.create(
+            media_id="foreign-history",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Foreign History Entry",
+            image="http://example.com/foreign-history.jpg",
+        )
+        Movie.objects.create(
+            item=item,
+            user=other_user,
+            status=Status.COMPLETED.value,
+            progress=1,
+            start_date=played_at,
+            end_date=played_at,
+        )
+        day_key = history_cache.history_day_key(played_at)
+        history_cache._build_and_cache_history_day(
+            other_user,
+            day_key,
+            logging_style_override="repeats",
+        )
+
+        response = self.client.get(
+            reverse("history_day_fragment", kwargs={"day_key": day_key}),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("Foreign History Entry", response.content.decode())
 
     def _create_movie_history(self, item, older_played_at, newer_played_at):
         Movie.objects.create(
@@ -441,7 +1461,10 @@ class HistoryMonthViewTests(TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertFalse(response.context["use_month_view"])
                 self.assertEqual(
-                    sum(len(day.get("entries", [])) for day in response.context["history_days"]),
+                    sum(
+                        len(day.get("entries", []))
+                        for day in response.context["history_days"]
+                    ),
                     2,
                 )
                 self.assertEqual(
@@ -567,19 +1590,35 @@ class MusicScoreHistoryInvalidationTests(TestCase):
 class HistoryViewPersonFilterTests(TestCase):
     """Test person-based filtering on the history page."""
 
+    credentials = {"username": "test", "password": "12345"}
+
+    @classmethod
+    def setUpTestData(cls):
+        """Build this class's fixture once instead of once per test."""
+        patchers = _begin_model_metadata_patches()
+        try:
+            cls.user = get_user_model().objects.create_user(**cls.credentials)
+            cls._build_fixture()
+        finally:
+            for patcher in reversed(patchers):
+                patcher.stop()
+
     def setUp(self):
+        # Per-test: the patches cover the test bodies' own saves, and the
+        # test client is rebuilt for every test.
         _start_model_metadata_patches(self)
-        self.credentials = {"username": "test", "password": "12345"}
-        self.user = get_user_model().objects.create_user(**self.credentials)
         self.client.login(**self.credentials)
-        self.person = Person.objects.create(
+
+    @classmethod
+    def _build_fixture(cls):
+        cls.person = Person.objects.create(
             source=Sources.TMDB.value,
             source_person_id="900",
             name="Filter Person",
             gender=PersonGender.MALE.value,
         )
 
-        self.movie_item = Item.objects.create(
+        cls.movie_item = Item.objects.create(
             media_id="m1",
             source=Sources.MANUAL.value,
             media_type=MediaTypes.MOVIE.value,
@@ -587,16 +1626,16 @@ class HistoryViewPersonFilterTests(TestCase):
             image="http://example.com/m1.jpg",
         )
         Movie.objects.create(
-            item=self.movie_item,
-            user=self.user,
+            item=cls.movie_item,
+            user=cls.user,
             status=Status.COMPLETED.value,
             progress=1,
             start_date=timezone.now(),
             end_date=timezone.now(),
         )
         ItemPersonCredit.objects.create(
-            item=self.movie_item,
-            person=self.person,
+            item=cls.movie_item,
+            person=cls.person,
             role_type=CreditRoleType.CAST.value,
             role="Lead",
         )
@@ -610,7 +1649,7 @@ class HistoryViewPersonFilterTests(TestCase):
         )
         Movie.objects.create(
             item=other_movie_item,
-            user=self.user,
+            user=cls.user,
             status=Status.COMPLETED.value,
             progress=1,
             start_date=timezone.now(),
@@ -626,7 +1665,7 @@ class HistoryViewPersonFilterTests(TestCase):
         )
         tv = TV.objects.create(
             item=tv_item,
-            user=self.user,
+            user=cls.user,
             status=Status.COMPLETED.value,
         )
         season_item = Item.objects.create(
@@ -639,7 +1678,7 @@ class HistoryViewPersonFilterTests(TestCase):
         )
         season = Season.objects.create(
             item=season_item,
-            user=self.user,
+            user=cls.user,
             related_tv=tv,
             status=Status.COMPLETED.value,
         )
@@ -659,7 +1698,7 @@ class HistoryViewPersonFilterTests(TestCase):
         )
         ItemPersonCredit.objects.create(
             item=tv_item,
-            person=self.person,
+            person=cls.person,
             role_type=CreditRoleType.CAST.value,
             role="Lead",
         )
@@ -673,7 +1712,7 @@ class HistoryViewPersonFilterTests(TestCase):
         )
         other_tv = TV.objects.create(
             item=other_tv_item,
-            user=self.user,
+            user=cls.user,
             status=Status.COMPLETED.value,
         )
         other_season_item = Item.objects.create(
@@ -686,7 +1725,7 @@ class HistoryViewPersonFilterTests(TestCase):
         )
         other_season = Season.objects.create(
             item=other_season_item,
-            user=self.user,
+            user=cls.user,
             related_tv=other_tv,
             status=Status.COMPLETED.value,
         )
@@ -704,7 +1743,6 @@ class HistoryViewPersonFilterTests(TestCase):
             related_season=other_season,
             end_date=timezone.now(),
         )
-
     @staticmethod
     def _credit(person, role="Lead", sort_order=0):
         return {
@@ -724,7 +1762,9 @@ class HistoryViewPersonFilterTests(TestCase):
                 },
             )
 
-    def _create_tmdb_tv_show(self, media_id, title, studio, show_credits, seasons, base_time):
+    def _create_tmdb_tv_show(
+        self, media_id, title, studio, show_credits, seasons, base_time
+    ):
         tv_item = Item.objects.create(
             media_id=media_id,
             source=Sources.TMDB.value,
@@ -789,8 +1829,10 @@ class HistoryViewPersonFilterTests(TestCase):
                     media_id=media_id,
                     source=Sources.TMDB.value,
                     media_type=MediaTypes.EPISODE.value,
-                    title=episode_spec.get("title") or f"{title} Episode {season_number}-{episode_number}",
-                    image=episode_spec.get("image") or f"http://example.com/{media_id}-s{season_number}e{episode_number}.jpg",
+                    title=episode_spec.get("title")
+                    or f"{title} Episode {season_number}-{episode_number}",
+                    image=episode_spec.get("image")
+                    or f"http://example.com/{media_id}-s{season_number}e{episode_number}.jpg",
                     season_number=season_number,
                     episode_number=episode_number,
                     runtime_minutes=episode_spec.get("runtime_minutes", 45),
@@ -798,7 +1840,8 @@ class HistoryViewPersonFilterTests(TestCase):
                 Episode.objects.create(
                     item=episode_item,
                     related_season=season,
-                    end_date=base_time + timedelta(minutes=episode_spec.get("offset_minutes", 0)),
+                    end_date=base_time
+                    + timedelta(minutes=episode_spec.get("offset_minutes", 0)),
                 )
                 for credit in episode_spec.get("credits", []):
                     ItemPersonCredit.objects.create(
@@ -936,7 +1979,13 @@ class HistoryViewPersonFilterTests(TestCase):
             role_type=CreditRoleType.CAST.value,
             role="Episode-level non-match",
         )
-        self._mark_tmdb_credits_current(tv_item, season_item, episode_item_match, episode_item_exclude, episode_item_fallback)
+        self._mark_tmdb_credits_current(
+            tv_item,
+            season_item,
+            episode_item_match,
+            episode_item_exclude,
+            episode_item_fallback,
+        )
 
         response = self.client.get(
             reverse("history") + "?person_source=tmdb&person_id=900",
@@ -952,7 +2001,9 @@ class HistoryViewPersonFilterTests(TestCase):
         self.assertIn("Fallback To Show Credit", titles)
         self.assertIn("Episode Specific Exclusion", titles)
 
-    def test_history_tmdb_person_filter_excludes_high_order_show_guest_from_other_episodes(self):
+    def test_history_tmdb_person_filter_excludes_high_order_show_guest_from_other_episodes(
+        self,
+    ):
         target_person = Person.objects.create(
             source=Sources.TMDB.value,
             source_person_id="990",
@@ -1057,7 +2108,13 @@ class HistoryViewPersonFilterTests(TestCase):
             role_type=CreditRoleType.CAST.value,
             role="Guest Star",
         )
-        self._mark_tmdb_credits_current(tv_item, season_item, episode_item_match, episode_item_exclude, episode_item_fallback)
+        self._mark_tmdb_credits_current(
+            tv_item,
+            season_item,
+            episode_item_match,
+            episode_item_exclude,
+            episode_item_fallback,
+        )
 
         response = self.client.get(
             reverse("history") + "?person_source=tmdb&person_id=990",
@@ -1332,11 +2389,18 @@ class HistoryViewPersonFilterTests(TestCase):
         )
 
         expectations = {
-            "9801": {"History Stable Woman": {"History Stable Ensemble Episode 1-1", "History Stable Ensemble Episode 2-1"}},
+            "9801": {
+                "History Stable Woman": {
+                    "History Stable Ensemble Episode 1-1",
+                    "History Stable Ensemble Episode 2-1",
+                }
+            },
             "9803": {"History Left Man": {"History Leaving Cast Episode 1-1"}},
             "9806": {"History Join Man": {"History Joining Cast Episode 2-1"}},
             "9809": {"History Guest Woman": {"History Guest Star Show Episode 1-1"}},
-            "9813": {"History Fallback Man": {"History Mixed Fallback Show Episode 2-1"}},
+            "9813": {
+                "History Fallback Man": {"History Mixed Fallback Show Episode 2-1"}
+            },
         }
 
         for person_id, person_expectations in expectations.items():
@@ -1356,12 +2420,28 @@ class HistoryViewPersonFilterTests(TestCase):
 class HistoryViewAuthorFilterTests(TestCase):
     """Test author-based reading filters on the history page."""
 
+    credentials = {"username": "author-filter-user", "password": "12345"}
+
+    @classmethod
+    def setUpTestData(cls):
+        """Build this class's fixture once instead of once per test."""
+        patchers = _begin_model_metadata_patches()
+        try:
+            cls.user = get_user_model().objects.create_user(**cls.credentials)
+            cls._build_fixture()
+        finally:
+            for patcher in reversed(patchers):
+                patcher.stop()
+
     def setUp(self):
+        # Per-test: the patches cover the test bodies' own saves, and the
+        # test client is rebuilt for every test.
         _start_model_metadata_patches(self)
-        self.credentials = {"username": "author-filter-user", "password": "12345"}
-        self.user = get_user_model().objects.create_user(**self.credentials)
         self.client.login(**self.credentials)
-        self.person = Person.objects.create(
+
+    @classmethod
+    def _build_fixture(cls):
+        cls.person = Person.objects.create(
             source=Sources.OPENLIBRARY.value,
             source_person_id="OL1A",
             name="Open Author",
@@ -1370,7 +2450,7 @@ class HistoryViewAuthorFilterTests(TestCase):
 
         now = timezone.now()
 
-        self.book_item = Item.objects.create(
+        cls.book_item = Item.objects.create(
             media_id="OL123M",
             source=Sources.OPENLIBRARY.value,
             media_type=MediaTypes.BOOK.value,
@@ -1378,21 +2458,21 @@ class HistoryViewAuthorFilterTests(TestCase):
             image="http://example.com/book.jpg",
         )
         Book.objects.create(
-            user=self.user,
-            item=self.book_item,
+            user=cls.user,
+            item=cls.book_item,
             status=Status.COMPLETED.value,
             progress=350,
             start_date=now,
             end_date=now,
         )
         ItemPersonCredit.objects.create(
-            item=self.book_item,
-            person=self.person,
+            item=cls.book_item,
+            person=cls.person,
             role_type=CreditRoleType.AUTHOR.value,
             role="Author",
         )
 
-        self.comic_item = Item.objects.create(
+        cls.comic_item = Item.objects.create(
             media_id="comic-1",
             source=Sources.OPENLIBRARY.value,
             media_type=MediaTypes.COMIC.value,
@@ -1400,21 +2480,21 @@ class HistoryViewAuthorFilterTests(TestCase):
             image="http://example.com/comic.jpg",
         )
         Comic.objects.create(
-            user=self.user,
-            item=self.comic_item,
+            user=cls.user,
+            item=cls.comic_item,
             status=Status.COMPLETED.value,
             progress=10,
             start_date=now,
             end_date=now,
         )
         ItemPersonCredit.objects.create(
-            item=self.comic_item,
-            person=self.person,
+            item=cls.comic_item,
+            person=cls.person,
             role_type=CreditRoleType.AUTHOR.value,
             role="Writer",
         )
 
-        self.manga_item = Item.objects.create(
+        cls.manga_item = Item.objects.create(
             media_id="manga-1",
             source=Sources.OPENLIBRARY.value,
             media_type=MediaTypes.MANGA.value,
@@ -1422,21 +2502,21 @@ class HistoryViewAuthorFilterTests(TestCase):
             image="http://example.com/manga.jpg",
         )
         Manga.objects.create(
-            user=self.user,
-            item=self.manga_item,
+            user=cls.user,
+            item=cls.manga_item,
             status=Status.COMPLETED.value,
             progress=50,
             start_date=now,
             end_date=now,
         )
         ItemPersonCredit.objects.create(
-            item=self.manga_item,
-            person=self.person,
+            item=cls.manga_item,
+            person=cls.person,
             role_type=CreditRoleType.AUTHOR.value,
             role="Author",
         )
 
-        self.uncredited_book_item = Item.objects.create(
+        cls.uncredited_book_item = Item.objects.create(
             media_id="OL999M",
             source=Sources.OPENLIBRARY.value,
             media_type=MediaTypes.BOOK.value,
@@ -1444,14 +2524,13 @@ class HistoryViewAuthorFilterTests(TestCase):
             image="http://example.com/other-book.jpg",
         )
         Book.objects.create(
-            user=self.user,
-            item=self.uncredited_book_item,
+            user=cls.user,
+            item=cls.uncredited_book_item,
             status=Status.COMPLETED.value,
             progress=200,
             start_date=now,
             end_date=now,
         )
-
     def test_history_person_filter_includes_credited_reading_entries(self):
         response = self.client.get(
             reverse("history") + "?person_source=openlibrary&person_id=OL1A",
@@ -1468,7 +2547,18 @@ class HistoryViewAuthorFilterTests(TestCase):
         self.assertIn("Credited Manga", titles)
         self.assertNotIn("Uncredited Book", titles)
 
-    def test_history_without_person_filter_does_not_include_reading_entries(self):
+    def test_history_without_person_filter_is_not_narrowed_to_credited_entries(self):
+        """Unfiltered history shows every read, credited to this person or not.
+
+        This asserted the opposite until reading types were put on the History
+        timeline generally rather than only under a matching filter (see
+        'feat(history): show books, comics, manga, and flat anime on the
+        History timeline'). The old assertion outlived that change because the
+        cached month view renders only indexed days and reading days were
+        never indexed, so the entries stayed invisible on the default view.
+        What the person filter does is narrow to credited items, which is what
+        the sibling test above covers.
+        """
         response = self.client.get(reverse("history"))
 
         self.assertEqual(response.status_code, 200)
@@ -1477,7 +2567,8 @@ class HistoryViewAuthorFilterTests(TestCase):
             for day in response.context["history_days"]
             for entry in day.get("entries", [])
         ]
-        self.assertNotIn("Credited Book", titles)
+        self.assertIn("Credited Book", titles)
+        self.assertIn("Uncredited Book", titles)
 
 
 class HistoryImpliedGenreFilterTests(TestCase):

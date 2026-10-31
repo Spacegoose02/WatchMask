@@ -1,17 +1,8 @@
-function trackModalCurrentTimeSegment(input) {
-  if (input?.value && input.value.includes("T")) {
-    return input.value.split("T")[1].slice(0, 5);
-  }
-
-  return new Date(new Date().getTime() - new Date().getTimezoneOffset() * 60000)
-    .toISOString()
-    .slice(11, 16);
-}
-
 function trackModalDispatchInputEvents(input) {
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
 }
+window.trackModalDispatchInputEvents = trackModalDispatchInputEvents;
 
 function trackModalParseProgressMinutes(value) {
   if (!value) {
@@ -91,6 +82,24 @@ function trackModalClearAutoFilledField(form, fieldName) {
     // Ignore Alpine lookup failures and still update the DOM field value.
   }
 }
+window.trackModalClearAutoFilledField = trackModalClearAutoFilledField;
+
+// The user chose "no end date" (the clear button or None): stop defaulting it.
+function trackModalMarkEndCleared(form) {
+  if (!form || !window.Alpine) {
+    return;
+  }
+
+  try {
+    const data = Alpine.$data(form);
+    if (data && "endCleared" in data) {
+      data.endCleared = true;
+    }
+  } catch {
+    // Ignore Alpine lookup failures; the end date just keeps its default.
+  }
+}
+window.trackModalMarkEndCleared = trackModalMarkEndCleared;
 
 function trackModalFormatLocalDateTime(date) {
   const year = date.getFullYear();
@@ -117,59 +126,6 @@ function trackModalParseLocalDateTime(value) {
 
   return new Date(year, month - 1, day, hours, minutes, 0, 0);
 }
-
-window.applyTrackModalReleaseDate = function applyTrackModalReleaseDate(
-  button,
-  releaseDate,
-  fieldName,
-  runtimeMinutes,
-) {
-  if (!button || !releaseDate) {
-    return;
-  }
-
-  const container = button.closest(".relative");
-  const input =
-    container?.querySelector(`[name="${fieldName}"]`) ||
-    container?.querySelector("input");
-  if (!input) {
-    return;
-  }
-
-  input.value =
-    input.type === "datetime-local"
-      ? `${releaseDate}T${trackModalCurrentTimeSegment(input)}`
-      : releaseDate;
-
-  const form = button.closest("form");
-  trackModalClearAutoFilledField(form, fieldName);
-  trackModalDispatchInputEvents(input);
-
-  const parsedRuntimeMinutes = Number.parseInt(runtimeMinutes, 10);
-  const startDateInput = form?.querySelector('[name="start_date"]');
-  if (
-    fieldName !== "end_date" ||
-    !Number.isFinite(parsedRuntimeMinutes) ||
-    parsedRuntimeMinutes <= 0 ||
-    !startDateInput ||
-    startDateInput === input ||
-    input.type !== "datetime-local" ||
-    startDateInput.type !== "datetime-local"
-  ) {
-    return;
-  }
-
-  const endDateTime = trackModalParseLocalDateTime(input.value);
-  if (!endDateTime) {
-    return;
-  }
-
-  startDateInput.value = trackModalFormatLocalDateTime(
-    new Date(endDateTime.getTime() - parsedRuntimeMinutes * 60000),
-  );
-  trackModalClearAutoFilledField(form, "start_date");
-  trackModalDispatchInputEvents(startDateInput);
-};
 
 function trackModalResolveElement(target) {
   if (typeof target === "string") {
@@ -201,6 +157,12 @@ function trackModalGetStateKeyFromExpression(expression) {
   return null;
 }
 
+// A modal teleported to <body> is no longer a DOM descendant of the element
+// that owns its Alpine state; Alpine records the way back on the teleported root.
+function trackModalParent(node) {
+  return (node._x_teleportBack || node).parentElement;
+}
+
 function trackModalFindStateTarget(target) {
   const element = trackModalResolveElement(target);
   if (!element || !window.Alpine) {
@@ -216,14 +178,14 @@ function trackModalFindStateTarget(target) {
       if (stateKey) {
         let host = node;
         while (host && !host.hasAttribute?.("x-data")) {
-          host = host.parentElement;
+          host = trackModalParent(host);
         }
         if (host) {
           return { host, stateKey };
         }
       }
     }
-    node = node.parentElement;
+    node = trackModalParent(node);
   }
 
   node = element;
@@ -246,7 +208,7 @@ function trackModalFindStateTarget(target) {
         // Ignore Alpine lookup failures and keep searching.
       }
     }
-    node = node.parentElement;
+    node = trackModalParent(node);
   }
 
   return null;
@@ -314,8 +276,9 @@ function trackModalCreateToast(detail) {
     <p class="text-sm font-medium flex-1"></p>
     <button type="button"
             class="text-current opacity-70 hover:opacity-100 transition-opacity cursor-pointer"
-            aria-label="Dismiss notification">x</button>
+            aria-label="">x</button>
   `;
+  toast.querySelector("button").setAttribute("aria-label", gettext("Dismiss notification"));
   toast.querySelector("p").textContent = message;
   toast
     .querySelector("button")
@@ -342,32 +305,6 @@ function trackModalCreateToast(detail) {
   return toast;
 }
 
-window.clearTrackModalDate = function clearTrackModalDate(button, fieldName) {
-  const input = button
-    .closest(".relative")
-    ?.querySelector(`[name="${fieldName}"]`);
-  if (!input) {
-    return;
-  }
-  input.value = "";
-  const form = button.closest("form");
-  trackModalClearAutoFilledField(form, fieldName);
-  if (fieldName === "start_date" && form) {
-    if (window.Alpine) {
-      try {
-        Alpine.$data(form).manualStartDate = false;
-      } catch {
-        // Ignore Alpine lookup failures.
-      }
-    }
-    const sentinel = form.querySelector('[name="start_date_cleared"]');
-    if (sentinel) {
-      sentinel.value = "1";
-    }
-  }
-  trackModalDispatchInputEvents(input);
-};
-
 window.closeTrackModal = function closeTrackModal(target) {
   return trackModalSetOpen(target, false);
 };
@@ -388,6 +325,14 @@ window.showTrackToast = function showTrackToast(detail) {
 };
 
 function trackModalHandleClose(event) {
+  const requestElement = event.detail?.elt;
+  const operationField = requestElement?.querySelector?.(
+    '[name="watch_operation_id"]',
+  );
+  if (operationField && event.detail?.watchOperationId) {
+    operationField.value = event.detail.watchOperationId;
+  }
+
   const formId = event.detail?.formId;
   if (formId) {
     const form = document.getElementById(formId);
@@ -413,9 +358,13 @@ function trackModalHandleToast(event) {
   window.showTrackToast(event.detail || {});
 }
 
-document.addEventListener("closeModal", trackModalHandleClose);
-document.addEventListener("openModal", trackModalHandleOpen);
-document.addEventListener("showToast", trackModalHandleToast);
+// Bind once: this script is re-evaluated on boosted (hx-boost) navigation.
+if (!window.__floppyMediaStatusDateHandlerBound) {
+  window.__floppyMediaStatusDateHandlerBound = true;
+  document.addEventListener("closeModal", trackModalHandleClose);
+  document.addEventListener("openModal", trackModalHandleOpen);
+  document.addEventListener("showToast", trackModalHandleToast);
+}
 
 document.addEventListener("alpine:init", () => {
   Alpine.data("mediaForm", () => ({
@@ -423,7 +372,13 @@ document.addEventListener("alpine:init", () => {
       start_date: false,
       end_date: false,
     },
+    suppressStatusDateAutofill: false,
     manualStartDate: false,
+    // The End date stays empty until the user acts: it is only filled in on
+    // save (or when Progress needs it). endCleared records an explicit "no end
+    // date" (the clear button or None).
+    isNewForm: false,
+    endCleared: false,
     // Track original values to detect intentionally empty dates
     original: {
       status: null,
@@ -441,7 +396,8 @@ document.addEventListener("alpine:init", () => {
         progressField.type !== "text" ||
         !startDateField ||
         !endDateField ||
-        this.manualStartDate
+        this.manualStartDate ||
+        (startDateField.value && !this.autoFilled.start_date)
       ) {
         return;
       }
@@ -461,6 +417,12 @@ document.addEventListener("alpine:init", () => {
         return;
       }
 
+      if (!endDateField.value && this.shouldDefaultEndDate()) {
+        endDateField.value = this.getCurrentDateTime(endDateField);
+        this.autoFilled.end_date = true;
+        trackModalDispatchInputEvents(endDateField);
+      }
+
       const endDateTime = trackModalParseLocalDateTime(endDateField.value);
       if (!endDateTime) {
         return;
@@ -478,6 +440,22 @@ document.addEventListener("alpine:init", () => {
       trackModalDispatchInputEvents(startDateField);
     },
 
+    // Whether saving with an empty End date should record "now". Same cases the
+    // modal used to pre-fill: a new entry, or an edit whose status changed to
+    // Completed / In progress. An explicit "no end date" always wins.
+    shouldDefaultEndDate() {
+      const statusField = this.$el.querySelector('[name="status"]');
+      const endDateField = this.$el.querySelector('[name="end_date"]');
+      if (!statusField || !endDateField || this.endCleared) {
+        return false;
+      }
+      const status = statusField.value;
+      if (status !== "Completed" && status !== "In progress") {
+        return false;
+      }
+      return this.isNewForm || status !== this.original.status;
+    },
+
     init() {
       const statusField = this.$el.querySelector('[name="status"]');
       const endDateField = this.$el.querySelector('[name="end_date"]');
@@ -485,8 +463,13 @@ document.addEventListener("alpine:init", () => {
       const progressField = this.$el.querySelector('[name="progress"]');
       const instanceIdField = this.$el.querySelector('[name="instance_id"]');
 
-      // Check if this is a new form (no instance_id) vs editing existing record
-      const isNewForm = !instanceIdField || !instanceIdField.value;
+      // Check if this is a new form vs editing an existing record. Media forms
+      // carry an instance_id; music/podcast trackers have none, so the modal
+      // marks them with data-existing-instance instead (#1377).
+      const isNewForm =
+        (!instanceIdField || !instanceIdField.value) &&
+        !("existingInstance" in this.$el.dataset);
+      this.isNewForm = isNewForm;
 
       // Store original values for edit forms
       if (!isNewForm) {
@@ -520,6 +503,11 @@ document.addEventListener("alpine:init", () => {
             // Ensure novalidate is set right before submission
             form.setAttribute("novalidate", "novalidate");
             form.noValidate = true;
+
+            // An untouched End date saves as now (unless it was cleared on purpose).
+            if (endDateField && !endDateField.value && this.shouldDefaultEndDate()) {
+              endDateField.value = this.getCurrentDateTime(endDateField);
+            }
 
             // Remove required from date fields one more time
             if (endDateField) {
@@ -566,27 +554,8 @@ document.addEventListener("alpine:init", () => {
         }
       }
 
-      // Initial load handling - only auto-fill for new forms
-      // For existing records, respect the saved values (even if empty)
-      if (
-        isNewForm &&
-        statusField &&
-        statusField.value === "Completed" &&
-        endDateField &&
-        !endDateField.value
-      ) {
-        endDateField.value = this.getCurrentDateTime(endDateField);
-        this.autoFilled.end_date = true;
-      } else if (
-        isNewForm &&
-        statusField &&
-        statusField.value === "In progress" &&
-        endDateField &&
-        !endDateField.value
-      ) {
-        endDateField.value = this.getCurrentDateTime(endDateField);
-        this.autoFilled.end_date = true;
-      }
+      // The End date is not pre-filled on open, so the Just Finished and Start
+      // Now shortcuts stay available (see shouldDefaultEndDate).
       if (isNewForm && statusField && statusField.value === "In progress") {
         this.syncStartDateFromProgress();
       }
@@ -596,46 +565,24 @@ document.addEventListener("alpine:init", () => {
         statusField.addEventListener("change", (e) => {
           const status = e.target.value;
 
+          if (this.suppressStatusDateAutofill) {
+            return;
+          }
+
           // Clear previously auto-filled fields when status changes
           if (this.autoFilled.start_date && startDateField) {
             startDateField.value = "";
             this.autoFilled.start_date = false;
+            trackModalDispatchInputEvents(startDateField);
           }
           if (this.autoFilled.end_date && endDateField) {
             endDateField.value = "";
             this.autoFilled.end_date = false;
+            trackModalDispatchInputEvents(endDateField);
           }
 
-          // For edit forms: don't auto-fill if returning to original status
-          // where the date was intentionally left empty
-          const isReturningToOriginalCompleted =
-            status === "Completed" &&
-            this.original.status === "Completed" &&
-            this.original.end_date === null;
-
-          const isReturningToOriginalInProgress =
-            status === "In progress" &&
-            this.original.status === "In progress" &&
-            this.original.end_date === null;
-
-          // Set new dates based on new status
-          if (
-            status === "Completed" &&
-            endDateField &&
-            !endDateField.value &&
-            !isReturningToOriginalCompleted
-          ) {
-            endDateField.value = this.getCurrentDateTime(endDateField);
-            this.autoFilled.end_date = true;
-          } else if (
-            status === "In progress" &&
-            endDateField &&
-            !endDateField.value &&
-            !isReturningToOriginalInProgress
-          ) {
-            endDateField.value = this.getCurrentDateTime(endDateField);
-            this.autoFilled.end_date = true;
-          }
+          // A new status re-arms the default End date.
+          this.endCleared = false;
 
           if (status === "Completed" || status === "In progress") {
             this.syncStartDateFromProgress();
@@ -646,16 +593,15 @@ document.addEventListener("alpine:init", () => {
 
     getCurrentDateTime(field) {
       const date = new Date();
+      const isDateTime =
+        field.type === "datetime-local" || field.dataset.trackTime === "true";
 
-      if (field.type === "datetime-local") {
+      if (isDateTime) {
         return new Date(date.getTime() - date.getTimezoneOffset() * 60000)
           .toISOString()
           .slice(0, 16);
-      } else if (field.type === "date") {
-        return date.toISOString().slice(0, 10);
       }
 
-      // Fallback to date format
       return date.toISOString().slice(0, 10);
     },
   }));

@@ -1,12 +1,21 @@
+from urllib.parse import quote
+
 from django.conf import settings
 from django.db.models import Q
 from django.http import HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, render
 from django.views.decorators.http import require_GET
 
-from app import credits, helpers, statistics_cache
+from app import (
+    credits,  # noqa: A004  # app.credits module, not the site builtin
+    helpers,
+    statistics_cache,
+)
+from app.media_list_filters import media_list_entries_for_items
 from app.media_list_views import build_filter_data_from_items
 from app.models import (
+    TV,
+    BasicMedia,
     Book,
     Comic,
     CreditRoleType,
@@ -16,12 +25,58 @@ from app.models import (
     MediaTypes,
     Movie,
     Sources,
+    Status,
     Studio,
 )
-from app.providers import comicvine, hardcover, igdb, mangaupdates, openlibrary, tmdb
+from app.providers import (
+    comicvine,
+    hardcover,
+    igdb,
+    mangabaka,
+    mangaupdates,
+    openlibrary,
+    services,
+    tmdb,
+    tvdb,
+)
 from users.models import MediaSortChoices
 
 logger = __import__("logging").getLogger(__name__)
+
+
+def attach_card_media(user, entries, source):
+    """Give each credit entry the item and tracking row the shared media card reads.
+
+    A title the viewer has an Item for uses it, with their tracking row loaded the
+    library's way, so the card shows their rating, status, progress and hover
+    actions. Any other title is shown from the provider's data, like search results.
+    """
+    tracked_items = {
+        entry["tracked_item"].pk: entry["tracked_item"]
+        for entry in entries
+        if entry.get("tracked_item")
+    }
+    media_by_item_id = {}
+    if tracked_items and user.is_authenticated:
+        rows_by_type = {}
+        for loaded in media_list_entries_for_items(user, list(tracked_items.values())):
+            if loaded.media is not None:
+                media_by_item_id[loaded.item.pk] = loaded.media
+                rows_by_type.setdefault(loaded.item.media_type, []).append(
+                    loaded.media,
+                )
+        for media_type, rows in rows_by_type.items():
+            BasicMedia.objects.annotate_max_progress(rows, media_type)
+    for entry in entries:
+        tracked_item = entry.get("tracked_item")
+        entry["media"] = media_by_item_id.get(tracked_item.pk) if tracked_item else None
+        if entry["media"] is not None:
+            entry["card_item"] = entry["media"].item
+        else:
+            entry["card_item"] = tracked_item or {
+                **entry,
+                "source": entry.get("source") or source,
+            }
 
 
 @require_GET
@@ -36,35 +91,65 @@ def person_detail(request, source, person_id, name):
                 MediaTypes.MOVIE.value,
                 MediaTypes.TV.value,
             ),
-            "source_url": lambda person_id_value: f"https://www.themoviedb.org/person/{person_id_value}",
+            "source_url": lambda person_id_value: (
+                f"https://www.themoviedb.org/person/{person_id_value}"
+            ),
+            "is_author": False,
+        },
+        Sources.TVDB.value: {
+            "fetcher": tvdb.person,
+            "entries_key": "filmography",
+            "tracked_media_types": (MediaTypes.TV.value,),
+            "source_url": lambda person_id_value: (
+                f"https://www.thetvdb.com/dereferrer/person/{person_id_value}"
+            ),
             "is_author": False,
         },
         Sources.HARDCOVER.value: {
             "fetcher": hardcover.author_profile,
             "entries_key": "bibliography",
             "tracked_media_types": (MediaTypes.BOOK.value,),
-            "source_url": lambda person_id_value: f"https://hardcover.app/authors/{person_id_value}",
+            "source_url": lambda person_id_value: (
+                f"https://hardcover.app/authors/{person_id_value}"
+            ),
             "is_author": True,
         },
         Sources.OPENLIBRARY.value: {
             "fetcher": openlibrary.author_profile,
             "entries_key": "bibliography",
             "tracked_media_types": (MediaTypes.BOOK.value,),
-            "source_url": lambda person_id_value: f"https://openlibrary.org/authors/{person_id_value}",
+            "source_url": lambda person_id_value: (
+                f"https://openlibrary.org/authors/{person_id_value}"
+            ),
             "is_author": True,
         },
         Sources.COMICVINE.value: {
             "fetcher": comicvine.person_profile,
             "entries_key": "bibliography",
             "tracked_media_types": (MediaTypes.COMIC.value,),
-            "source_url": lambda person_id_value: f"https://comicvine.gamespot.com/person/4040-{person_id_value}/",
+            "source_url": lambda person_id_value: (
+                f"https://comicvine.gamespot.com/person/4040-{person_id_value}/"
+            ),
             "is_author": True,
         },
         Sources.MANGAUPDATES.value: {
             "fetcher": mangaupdates.author_profile,
             "entries_key": "bibliography",
             "tracked_media_types": (MediaTypes.MANGA.value,),
-            "source_url": lambda person_id_value: f"https://www.mangaupdates.com/authors.html?id={person_id_value}",
+            "source_url": lambda person_id_value: (
+                f"https://www.mangaupdates.com/authors.html?id={person_id_value}"
+            ),
+            "is_author": True,
+        },
+        Sources.MANGABAKA.value: {
+            "fetcher": mangabaka.author_profile,
+            "entries_key": "bibliography",
+            "tracked_media_types": (MediaTypes.MANGA.value,),
+            # MangaBaka has no author pages (/author and /staff 404), so the
+            # search for the credited name is the closest real destination.
+            "source_url": lambda person_id_value: (
+                "https://mangabaka.org/search?q=" + quote(person_id_value)
+            ),
             "is_author": True,
         },
     }
@@ -72,7 +157,10 @@ def person_detail(request, source, person_id, name):
     if not source_config:
         return HttpResponseBadRequest("Person pages are not available for this source.")
 
-    person_metadata = source_config["fetcher"](person_id) or {}
+    # A viewer is waiting: a rate-limited provider fails fast instead of
+    # holding the request through long retry waits.
+    with services.interactive_request_scope():
+        person_metadata = source_config["fetcher"](person_id) or {}
     person = credits.upsert_person_profile(source, person_id, person_metadata)
 
     person_id_str = str(person_id)
@@ -121,19 +209,24 @@ def person_detail(request, source, person_id, name):
                 "year": raw_entry.get("year"),
                 "role": raw_entry.get("role") or "",
                 "department": raw_entry.get("department") or "",
-                "credit_type": raw_entry.get("credit_type") or ("author" if is_author else ""),
+                "credit_type": raw_entry.get("credit_type")
+                or ("author" if is_author else ""),
                 "sort_order": raw_entry.get("sort_order", index),
             },
         )
 
     if is_author and not filmography:
-        fallback_items = Item.objects.filter(
-            source=source,
-            media_type__in=media_types_for_source,
-            person_credits__role_type=CreditRoleType.AUTHOR.value,
-            person_credits__person__source=source,
-            person_credits__person__source_person_id=person_id_str,
-        ).order_by("title").distinct()
+        fallback_items = (
+            Item.objects.filter(
+                source=source,
+                media_type__in=media_types_for_source,
+                person_credits__role_type=CreditRoleType.AUTHOR.value,
+                person_credits__person__source=source,
+                person_credits__person__source_person_id=person_id_str,
+            )
+            .order_by("title")
+            .distinct()
+        )
         for index, item in enumerate(fallback_items):
             filmography.append(
                 {
@@ -158,7 +251,9 @@ def person_detail(request, source, person_id, name):
             if dept and dept not in seen_media[media_key]["all_departments"]:
                 seen_media[media_key]["all_departments"].append(dept)
         else:
-            entry["all_departments"] = [entry["department"]] if entry.get("department") else []
+            entry["all_departments"] = (
+                [entry["department"]] if entry.get("department") else []
+            )
             seen_media[media_key] = entry
     filmography = list(seen_media.values())
 
@@ -179,8 +274,7 @@ def person_detail(request, source, person_id, name):
         if tracked_filters:
             tracked_items = Item.objects.filter(source=source).filter(tracked_filters)
             tracked_item_map = {
-                (item.media_type, str(item.media_id)): item
-                for item in tracked_items
+                (item.media_type, str(item.media_id)): item for item in tracked_items
             }
 
     credited_tracked_items_by_key = {}
@@ -198,7 +292,11 @@ def person_detail(request, source, person_id, name):
                     item__person_credits__person__source=source,
                     item__person_credits__person__source_person_id=person_id_str,
                 )
-                .filter(Q(start_date__isnull=False) | Q(end_date__isnull=False))
+                .filter(
+                    Q(start_date__isnull=False)
+                    | Q(end_date__isnull=False)
+                    | Q(status=Status.COMPLETED.value)
+                )
                 .select_related("item")
                 .distinct()
             )
@@ -263,7 +361,7 @@ def person_detail(request, source, person_id, name):
                 item__source=source,
                 item__media_type=MediaTypes.MOVIE.value,
                 item__media_id__in=watched_movie_media_ids,
-            ).exclude(start_date__isnull=True, end_date__isnull=True)
+            ).filter(Q(end_date__isnull=False) | Q(status=Status.COMPLETED.value))
             watched_media_keys.update(
                 (media_type, str(media_id))
                 for media_type, media_id in watched_movies.values_list(
@@ -273,18 +371,31 @@ def person_detail(request, source, person_id, name):
             )
 
         if watched_tv_media_ids:
-            watched_tv = Episode.objects.filter(
+            watched_tv = Episode.all_objects.filter(
                 related_season__user=request.user,
-                end_date__isnull=False,
                 related_season__related_tv__item__source=source,
                 related_season__related_tv__item__media_type=MediaTypes.TV.value,
                 related_season__related_tv__item__media_id__in=watched_tv_media_ids,
-            )
+            ).filter(Q(end_date__isnull=False) | Q(status=Status.COMPLETED.value))
             watched_media_keys.update(
                 (media_type, str(media_id))
                 for media_type, media_id in watched_tv.values_list(
                     "related_season__related_tv__item__media_type",
                     "related_season__related_tv__item__media_id",
+                ).distinct()
+            )
+            completed_tv = TV.objects.filter(
+                user=request.user,
+                item__source=source,
+                item__media_type=MediaTypes.TV.value,
+                item__media_id__in=watched_tv_media_ids,
+                status=Status.COMPLETED.value,
+            )
+            watched_media_keys.update(
+                (media_type, str(media_id))
+                for media_type, media_id in completed_tv.values_list(
+                    "item__media_type",
+                    "item__media_id",
                 ).distinct()
             )
 
@@ -294,7 +405,11 @@ def person_detail(request, source, person_id, name):
                 item__source=source,
                 item__media_type=MediaTypes.BOOK.value,
                 item__media_id__in=watched_book_media_ids,
-            ).filter(Q(start_date__isnull=False) | Q(end_date__isnull=False))
+            ).filter(
+                Q(start_date__isnull=False)
+                | Q(end_date__isnull=False)
+                | Q(status=Status.COMPLETED.value)
+            )
             watched_media_keys.update(
                 (media_type, str(media_id))
                 for media_type, media_id in watched_books.values_list(
@@ -309,7 +424,11 @@ def person_detail(request, source, person_id, name):
                 item__source=source,
                 item__media_type=MediaTypes.COMIC.value,
                 item__media_id__in=watched_comic_media_ids,
-            ).filter(Q(start_date__isnull=False) | Q(end_date__isnull=False))
+            ).filter(
+                Q(start_date__isnull=False)
+                | Q(end_date__isnull=False)
+                | Q(status=Status.COMPLETED.value)
+            )
             watched_media_keys.update(
                 (media_type, str(media_id))
                 for media_type, media_id in watched_comics.values_list(
@@ -324,7 +443,11 @@ def person_detail(request, source, person_id, name):
                 item__source=source,
                 item__media_type=MediaTypes.MANGA.value,
                 item__media_id__in=watched_manga_media_ids,
-            ).filter(Q(start_date__isnull=False) | Q(end_date__isnull=False))
+            ).filter(
+                Q(start_date__isnull=False)
+                | Q(end_date__isnull=False)
+                | Q(status=Status.COMPLETED.value)
+            )
             watched_media_keys.update(
                 (media_type, str(media_id))
                 for media_type, media_id in watched_manga.values_list(
@@ -380,7 +503,9 @@ def person_detail(request, source, person_id, name):
                 seen_watched_media.add(media_key)
 
     watched_movie_count = sum(
-        1 for media_type, _ in watched_media_keys if media_type == MediaTypes.MOVIE.value
+        1
+        for media_type, _ in watched_media_keys
+        if media_type == MediaTypes.MOVIE.value
     )
     watched_show_count = sum(
         1 for media_type, _ in watched_media_keys if media_type == MediaTypes.TV.value
@@ -388,7 +513,8 @@ def person_detail(request, source, person_id, name):
     watched_book_count = sum(
         1
         for media_type, _ in watched_media_keys
-        if media_type in (
+        if media_type
+        in (
             MediaTypes.BOOK.value,
             MediaTypes.COMIC.value,
             MediaTypes.MANGA.value,
@@ -396,11 +522,15 @@ def person_detail(request, source, person_id, name):
     )
 
     # Collect filter options from the full unfiltered filmography.
-    all_departments = sorted({
-        dept
-        for e in filmography
-        for dept in e.get("all_departments", ([e["department"]] if e.get("department") else []))
-    })
+    all_departments = sorted(
+        {
+            dept
+            for e in filmography
+            for dept in e.get(
+                "all_departments", ([e["department"]] if e.get("department") else [])
+            )
+        }
+    )
     all_filmography_years = sorted(
         {e["year"] for e in filmography if e.get("year")}, reverse=True
     )
@@ -414,7 +544,7 @@ def person_detail(request, source, person_id, name):
     filter_collection = request.GET.get("collection", "all")
     # Use the same sort key names as MediaSortChoices for consistency with the
     # rest of the app. "release_date" desc is the default provider ordering.
-    _PERSON_VALID_SORTS = {
+    person_valid_sorts = {
         MediaSortChoices.RELEASE_DATE.value,
         MediaSortChoices.TITLE.value,
         MediaSortChoices.CRITIC_RATING.value,
@@ -422,18 +552,19 @@ def person_detail(request, source, person_id, name):
         "votes",
     }
     sort_by = request.GET.get("sort", MediaSortChoices.RELEASE_DATE.value)
-    if sort_by not in _PERSON_VALID_SORTS:
+    if sort_by not in person_valid_sorts:
         sort_by = MediaSortChoices.RELEASE_DATE.value
     sort_dir = request.GET.get("direction", "")
     if sort_dir not in {"asc", "desc"}:
         sort_dir = "asc" if sort_by == MediaSortChoices.TITLE.value else "desc"
 
     def _apply_common_filters(entries):
-        """Filters that work on all filmography entries (year + department)."""
+        """Build the filters that apply to every filmography entry."""
         result = entries
         if filter_department:
             result = [
-                e for e in result
+                e
+                for e in result
                 if filter_department in e.get("all_departments", [e.get("department")])
             ]
         if filter_year:
@@ -441,43 +572,50 @@ def person_detail(request, source, person_id, name):
         return result
 
     def _apply_watched_filters(entries):
-        """Filters that require tracked_item data; only applied to watched entries."""
+        """Build the filters that need tracked_item data, for watched entries only."""
         result = entries
         if filter_genre:
             result = [
-                e for e in result
-                if filter_genre in (getattr(e.get("tracked_item"), "genres", None) or [])
+                e
+                for e in result
+                if filter_genre
+                in (getattr(e.get("tracked_item"), "genres", None) or [])
             ]
         if filter_implied_genre:
             result = [
-                e for e in result
-                if filter_implied_genre in (
-                    getattr(e.get("tracked_item"), "implied_genres", None) or []
-                )
+                e
+                for e in result
+                if filter_implied_genre
+                in (getattr(e.get("tracked_item"), "implied_genres", None) or [])
             ]
         if filter_source:
             result = [
-                e for e in result
+                e
+                for e in result
                 if getattr(e.get("tracked_item"), "source", None) == filter_source
             ]
         if filter_rating == "rated":
             result = [
-                e for e in result
+                e
+                for e in result
                 if getattr(e.get("tracked_item"), "score", None) is not None
             ]
         elif filter_rating == "not_rated":
             result = [
-                e for e in result
+                e
+                for e in result
                 if getattr(e.get("tracked_item"), "score", None) is None
             ]
         if filter_collection == "collected":
             result = [
-                e for e in result
+                e
+                for e in result
                 if getattr(e.get("tracked_item"), "in_collection", False)
             ]
         elif filter_collection == "not_collected":
             result = [
-                e for e in result
+                e
+                for e in result
                 if not getattr(e.get("tracked_item"), "in_collection", False)
             ]
         return result
@@ -491,12 +629,15 @@ def person_detail(request, source, person_id, name):
     def _apply_sort(entries):
         rev = sort_dir == "desc"
         if sort_by == MediaSortChoices.TITLE.value:
-            return sorted(entries, key=lambda e: e.get("title", "").lower(), reverse=rev)
+            return sorted(
+                entries, key=lambda e: e.get("title", "").lower(), reverse=rev
+            )
         if sort_by == MediaSortChoices.CRITIC_RATING.value:
             return _sort_with_nulls_last(entries, lambda e: e.get("vote_average"), rev)
         if sort_by == MediaSortChoices.POPULARITY.value:
             return _sort_with_nulls_last(entries, lambda e: e.get("popularity"), rev)
         if sort_by == "votes":
+
             def _vote_count_key(e):
                 vc = e.get("vote_count")
                 if vc is None:
@@ -504,12 +645,18 @@ def person_detail(request, source, person_id, name):
                     if item is not None:
                         vc = item.provider_rating_count
                 return vc
+
             return _sort_with_nulls_last(entries, _vote_count_key, rev)
-        # release_date: entries arrive from provider already sorted newest-first;
-        # asc reverses to oldest-first (chronological).
-        if sort_dir == "asc":
-            return list(reversed(entries))
-        return entries
+        # release_date: sort on the entries' own dates. TMDB happens to return
+        # newest-first, but the author providers (MangaBaka, Hardcover,
+        # OpenLibrary) return search-relevance order and carry only `year`.
+        def _date_key(e):
+            for field in ("release_date", "first_air_date", "year"):
+                if e.get(field):
+                    return str(e[field])
+            return None
+
+        return _sort_with_nulls_last(entries, _date_key, rev)
 
     # Collect tracked items from the unfiltered watched list for filter option building.
     watched_items_for_filter_data = [
@@ -548,7 +695,10 @@ def person_detail(request, source, person_id, name):
         else [
             (MediaSortChoices.RELEASE_DATE.value, MediaSortChoices.RELEASE_DATE.label),
             (MediaSortChoices.TITLE.value, MediaSortChoices.TITLE.label),
-            (MediaSortChoices.CRITIC_RATING.value, MediaSortChoices.CRITIC_RATING.label),
+            (
+                MediaSortChoices.CRITIC_RATING.value,
+                MediaSortChoices.CRITIC_RATING.label,
+            ),
             (MediaSortChoices.POPULARITY.value, MediaSortChoices.POPULARITY.label),
             ("votes", "Votes"),
         ]
@@ -565,9 +715,13 @@ def person_detail(request, source, person_id, name):
 
     # Years: merge watched-item years with years from the full unfiltered filmography
     # so the year filter covers films not yet tracked by the user.
-    watched_years = {int(y["value"]) for y in filter_data["years"] if y["value"].isdigit()}
+    watched_years = {
+        int(y["value"]) for y in filter_data["years"] if y["value"].isdigit()
+    }
     combined_years = sorted(watched_years | set(all_filmography_years), reverse=True)
     filter_data["years"] = [{"value": str(y), "label": str(y)} for y in combined_years]
+
+    attach_card_media(request.user, [*watched_filmography, *filmography], source)
 
     context = {
         "user": request.user,
@@ -600,7 +754,9 @@ def person_detail(request, source, person_id, name):
         "person_detail_url": request.path,
     }
     if request.headers.get("HX-Request"):
-        return render(request, "app/components/person_filmography_fragment.html", context)
+        return render(
+            request, "app/components/person_filmography_fragment.html", context
+        )
     return render(request, "app/person_detail.html", context)
 
 
@@ -615,9 +771,7 @@ def studio_detail(request, source, studio_id, name):
     )
 
     studio_profile = (
-        igdb.company_profile(studio_id)
-        if source == Sources.IGDB.value
-        else None
+        igdb.company_profile(studio_id) if source == Sources.IGDB.value else None
     )
 
     local_titles = []
@@ -677,7 +831,6 @@ def studio_detail(request, source, studio_id, name):
         }
         tracked_items = Item.objects.filter(
             source=source,
-            media_type=MediaTypes.GAME.value,
             media_id__in=game_ids,
         )
         tracked_item_map = {
@@ -710,11 +863,19 @@ def studio_detail(request, source, studio_id, name):
         studio_developed_count = studio_details.get("developed_count")
         studio_published_count = studio_details.get("published_count")
 
+    attach_card_media(request.user, credited_titles, source)
+
+    media_types_present = {entry.get("media_type") for entry in credited_titles}
+    credited_media_type = (
+        media_types_present.pop() if len(media_types_present) == 1 else None
+    )
+
     context = {
         "user": request.user,
         "studio": studio,
         "source": source,
         "credited_titles": credited_titles,
+        "credited_media_type": credited_media_type,
         "studio_description": studio_description,
         "studio_source_url": studio_source_url,
         "studio_founded": studio_founded,

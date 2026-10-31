@@ -1,3 +1,5 @@
+
+{% load i18n %}
 {% load humanize %}
 {% comment %}
 HTMX polling fragment for the Trakt series graph inner content.
@@ -9,16 +11,16 @@ HTMX stops automatically — same pattern as prefetch_artist_covers.
 {% endcomment %}
 <div id="trakt-series-graph-{{ source }}-{{ media_id }}"
      {% if poll_for_graph %}
-       hx-get="{% url 'trakt_series_graph_fragment' source=source media_id=media_id %}"
+       hx-get="{% url 'trakt_series_graph_fragment' source=source media_id=media_id %}?attempt={{ next_attempt }}"
        hx-trigger="every 5s [document.visibilityState === 'visible']"
        hx-target="this"
        hx-swap="outerHTML"
      {% endif %}>
 
   <div class="mb-2 flex items-center justify-between gap-3">
-    <div class="text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">Series Graph</div>
+    <div class="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--color-text-muted)]">{% translate "Series Graph" %}</div>
     {% if poll_for_graph %}
-      <div class="text-xs text-gray-500">Fetching remaining episodes…</div>
+      <div class="text-xs text-[var(--color-text-muted)]">{% translate "Fetching remaining episodes…" %}</div>
     {% endif %}
   </div>
 
@@ -29,17 +31,17 @@ HTMX stops automatically — same pattern as prefetch_artist_covers.
 
       <div></div>
       {% for season in graph_data.seasons %}
-        <div class="text-center text-[11px] font-semibold text-gray-400">{{ season.label }}</div>
+        <div class="text-center text-[11px] font-semibold text-[var(--color-text-muted)]">{{ season.label }}</div>
       {% endfor %}
 
       {% for ep_row in graph_data.episode_rows %}
-        <div class="flex items-center justify-end pr-1 text-[11px] text-gray-500 select-none">
+        <div class="flex items-center justify-end pr-1 text-[11px] text-[var(--color-text-muted)] select-none">
           {% if ep_row.ep %}{{ graph_data.row_label|default:"E" }}{{ ep_row.ep }}{% endif %}
         </div>
         {% for cell in ep_row.cells %}
           {% if cell.color %}
             <div class="rounded-lg py-3 text-center text-[13px] font-bold leading-none cursor-default"
-                 title="{{ cell.score }} · {{ cell.votes|intcomma }} vote{{ cell.votes|pluralize }}"
+                 title="{% blocktranslate trimmed with value_1=cell.score value_2=cell.votes|intcomma count count=cell.votes %}{{ value_1 }} · {{ value_2 }} vote{% plural %}{{ value_1 }} · {{ value_2 }} votes{% endblocktranslate %}"
                  style="background-color: {{ cell.color }}; color: {% if cell.score >= 6.0 and cell.score < 8.0 %}rgba(0,0,0,0.8){% else %}#ffffff{% endif %};">
               {{ cell.score }}
             </div>
@@ -54,16 +56,16 @@ HTMX stops automatically — same pattern as prefetch_artist_covers.
 
   {% else %}
 
-    <div class="flex items-center gap-2 py-5 px-1 text-xs text-gray-500">
+    <div class="flex items-center gap-2 py-5 px-1 text-xs text-[var(--color-text-muted)]">
       {% if poll_for_graph %}
         <span class="flex gap-1">
           <span class="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-500" style="animation-delay:0ms"></span>
           <span class="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-500" style="animation-delay:150ms"></span>
           <span class="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-500" style="animation-delay:300ms"></span>
         </span>
-        Building series graph…
+        {% translate "Building series graph…" %}
       {% else %}
-        Visit a season page to start building.
+        {% translate "Visit a season page to start building." %}
       {% endif %}
     </div>
 

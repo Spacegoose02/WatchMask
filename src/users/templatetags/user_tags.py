@@ -1,13 +1,119 @@
+import re
 from datetime import datetime
 
 from django import template
 from django.templatetags.static import static
 from django.utils import formats, timezone
 from django.utils.html import format_html
+from django.utils.safestring import mark_safe
+from django.utils.translation import gettext, gettext_noop, ngettext
 
+from users import currency
+from users.appearance import (
+    BASIC_THEME_KEYS,
+    THEME_PRESETS,
+    custom_theme_css,
+    resolved_detail_layouts,
+)
+from users.media_tags import MEDIA_TAG_KEYS, MEDIA_TAGS
 from users.models import DateFormatChoices, TimeFormatChoices
 
 register = template.Library()
+
+
+_IMPORT_MEDIA_LABELS = {
+    "TV Show": (gettext_noop("TV Show"), gettext_noop("TV Shows")),
+    "TV Season": (gettext_noop("TV Season"), gettext_noop("TV Seasons")),
+    "Episode": (gettext_noop("Episode"), gettext_noop("Episodes")),
+    "Movie": (gettext_noop("Movie"), gettext_noop("Movies")),
+    "Book": (gettext_noop("Book"), gettext_noop("Books")),
+    "Anime": (gettext_noop("Anime title"), gettext_noop("Anime titles")),
+    "Manga": (gettext_noop("Manga title"), gettext_noop("Manga titles")),
+    "Game": (gettext_noop("Game"), gettext_noop("Games")),
+    "Comic": (gettext_noop("Comic"), gettext_noop("Comics")),
+    "Comic Issue": (gettext_noop("Comic Issue"), gettext_noop("Comic Issues")),
+    "Board Game": (gettext_noop("Board Game"), gettext_noop("Board Games")),
+    "Music": (gettext_noop("Music item"), gettext_noop("Music items")),
+    "Podcast": (gettext_noop("Podcast"), gettext_noop("Podcasts")),
+    "list": (gettext_noop("list"), gettext_noop("lists")),
+    "collection entry": (
+        gettext_noop("collection entry"),
+        gettext_noop("collection entries"),
+    ),
+    "collection entries": (
+        gettext_noop("collection entry"),
+        gettext_noop("collection entries"),
+    ),
+}
+
+
+@register.filter
+def translate_import_summary(value):
+    """Localize legacy English import summaries stored by background tasks."""
+    if not value:
+        return value
+
+    exact = {
+        "No media was imported.": gettext("No media was imported."),
+        "This task was cancelled before it finished.": gettext(
+            "This task was cancelled before it finished."
+        ),
+        "Unexpected error occurred while processing the task.": gettext(
+            "Unexpected error occurred while processing the task."
+        ),
+    }
+    if value in exact:
+        return exact[value]
+
+    match = re.fullmatch(r"Imported (.+)\.", str(value))
+    if not match:
+        return gettext(value)
+
+    raw_parts = re.split(r",\s*|\s+and\s+", match.group(1))
+    translated = []
+    total = 0
+    for part in raw_parts:
+        item = re.fullmatch(r"(\d+)\s+(.+)", part)
+        if not item:
+            translated.append(part)
+            continue
+        count = int(item.group(1))
+        total += count
+        english_label = item.group(2)
+        labels = _IMPORT_MEDIA_LABELS.get(english_label)
+        if labels is None:
+            labels = _IMPORT_MEDIA_LABELS.get(english_label.removesuffix("s"))
+        label = (
+            gettext(labels[0 if count == 1 else 1])
+            if labels
+            else gettext(english_label)
+        )
+        translated.append(f"{count} {label}")
+
+    if len(translated) > 1:
+        joined = gettext("%(head)s and %(tail)s") % {
+            "head": ", ".join(translated[:-1]),
+            "tail": translated[-1],
+        }
+    else:
+        joined = translated[0]
+    return ngettext(
+        "Imported %(items)s.",
+        "Imported %(items)s.",
+        total,
+    ) % {"items": joined}
+
+
+@register.simple_tag
+def explicit_theme_classes():
+    """Return the authoritative set of classes replaced by the theme toggle."""
+    return " ".join(theme for theme in THEME_PRESETS if theme != "system")
+
+
+@register.filter
+def is_basic_theme(theme):
+    """Return whether the compact light/dark switcher may change this theme."""
+    return theme in BASIC_THEME_KEYS
 
 
 @register.filter
@@ -33,17 +139,37 @@ SOURCES_CONFIG = {
         "name": "AniList",
         "logo": static("img/anilist-logo.svg"),
     },
+    "mangabaka": {
+        "name": "MangaBaka",
+        "logo": static("img/mangabaka-logo.png"),
+    },
     "simkl": {
         "name": "SIMKL",
         "logo": static("img/simkl-logo.png"),
     },
+    # Source key stays "yamtrack": it is persisted on import records and the
+    # CSV format is shared with upstream Yamtrack.
     "yamtrack": {
-        "name": "Watchmask / Yamtrack",
+        "name": "Watchmask",
         "logo": static("favicon/apple-touch-icon.png"),
+    },
+    # Display-only entry: same "yamtrack" import backend/CSV format as above,
+    # shown as a separate source tile for users importing a Yamtrack export.
+    "yamtrack_native": {
+        "name": "Yamtrack",
+        "logo": static("img/yamtrack-logo.png"),
     },
     "hltb": {
         "name": "HowLongToBeat",
         "logo": static("img/hltb-logo.png"),
+    },
+    "playnite": {
+        "name": "Playnite",
+        "logo": static("img/playnite-logo.svg"),
+    },
+    "grouvee": {
+        "name": "Grouvee",
+        "logo": static("img/grouvee_logo.png"),
     },
     "imdb": {
         "name": "IMDB",
@@ -53,9 +179,21 @@ SOURCES_CONFIG = {
         "name": "Steam",
         "logo": static("img/steam-logo.ico"),
     },
+    "xbox": {
+        "name": "Xbox",
+        "logo": static("img/xbox-logo.svg"),
+    },
+    "psn": {
+        "name": "PlayStation",
+        "logo": static("img/playstation-logo.svg"),
+    },
     "goodreads": {
         "name": "Goodreads",
         "logo": static("img/logo-goodreads.svg"),
+    },
+    "mdblist": {
+        "name": "MDBList",
+        "logo": static("img/mdblist-logo.png"),
     },
     "plex": {
         "name": "Plex",
@@ -73,6 +211,22 @@ SOURCES_CONFIG = {
         "name": "Storyteller",
         "logo": static("img/storyteller-logo.svg"),
     },
+    "kavita": {
+        "name": "Kavita",
+        "logo": static("img/kavita-logo.svg"),
+    },
+    "komga": {
+        "name": "Komga",
+        "logo": static("img/komga-logo.svg"),
+    },
+    "koreader": {
+        "name": "KOReader",
+        "logo": static("img/koreader-logo.svg"),
+    },
+    "stremio": {
+        "name": "Stremio",
+        "logo": static("img/stremio-logo.svg"),
+    },
     "pocketcasts": {
         "name": "Pocket Casts",
         "logo": static("img/pocketcasts-logo.svg"),
@@ -85,9 +239,49 @@ SOURCES_CONFIG = {
         "name": "Last.fm",
         "logo": static("img/lastfm-logo.png"),
     },
+    "koito": {
+        "name": "Koito",
+        "logo": static("img/koito-logo.svg"),
+    },
+    "tmdb": {
+        "name": "TMDB",
+        "logo": static("img/tmdb-logo.png"),
+    },
+    "tvdb": {
+        "name": "TheTVDB",
+        "logo": static("img/tvdb-logo.png"),
+    },
+    "igdb": {
+        "name": "IGDB",
+        "logo": static("img/igdb-logo.png"),
+    },
+    "opencritic": {
+        "name": "OpenCritic",
+        "logo": static("img/opencritic-logo.svg"),
+    },
     "hardcover": {
         "name": "Hardcover",
         "logo": static("img/hardcover-logo.png"),
+    },
+    "letterboxd": {
+        "name": "Letterboxd",
+        "logo": static("img/letterboxd-logo.png"),
+    },
+    "storygraph": {
+        "name": "StoryGraph",
+        "logo": static("img/storygraph-logo.svg"),
+    },
+    "youtube": {
+        "name": "YouTube",
+        "logo": static("img/youtube-logo.svg"),
+    },
+    "tvtime": {
+        "name": "TV Time",
+        "logo": static("img/tvtime-logo.png"),
+    },
+    "wetrakr": {
+        "name": "WeTrakr",
+        "logo": static("img/wetrakr-logo.svg"),
     },
     "radarr": {
         "name": "Radarr",
@@ -97,7 +291,26 @@ SOURCES_CONFIG = {
         "name": "Sonarr",
         "logo": static("img/plex-logo.svg"),
     },
+    "mylar": {
+        "name": "Mylar3",
+        "logo": static("img/mylar-logo.png"),
+    },
+    "kapowarr": {
+        "name": "Kapowarr",
+        "logo": static("img/kapowarr-logo.png"),
+    },
+    "gcd": {
+        "name": "Grand Comics Database",
+        "logo": static("img/gcd-logo.png"),
+    },
 }
+
+
+@register.filter
+def source_name(slug):
+    """Return a source's display name (e.g. "plex" -> "Plex") for plain-text use."""
+    info = SOURCES_CONFIG.get(slug)
+    return info["name"] if info else slug
 
 
 @register.simple_tag
@@ -105,7 +318,7 @@ def source_display(source_name):
     """Generate HTML display for a media source with logo and name."""
     info = SOURCES_CONFIG.get(source_name)
     if not info:
-        return ""
+        return format_html('<h4 class="font-medium">{}</h4>', source_name)
 
     html = f"""
         <div class="flex items-center">
@@ -121,7 +334,7 @@ def source_display(source_name):
 def date_format_display(format_value):
     """Display the human-readable name for date format values."""
     format_display_map = {
-        "system_default": "System default (locale) — Aug 12, 2025 / 12 Aug 2025",
+        "system_default": "System default — Aug 12, 2025 / 12 Aug 2025",
         "iso_8601": "ISO 8601 — 2025-08-12",
         "month_d_yyyy": "Month D, YYYY — Aug 12, 2025",
         "d_mon_yyyy": "D Mon YYYY — 12 Aug 2025",
@@ -134,10 +347,57 @@ def date_format_display(format_value):
 
 
 @register.filter
+def theme_display(theme_value):
+    """Display the human-readable name for theme values."""
+    preset = THEME_PRESETS.get(theme_value)
+    return preset["label"] if preset else theme_value
+
+
+@register.simple_tag
+def custom_theme_style(user):
+    """Return validated inline theme tokens for the custom preset."""
+    if not getattr(user, "is_authenticated", False) or user.theme != "custom":
+        return ""
+    return custom_theme_css(user.custom_theme)
+
+
+@register.simple_tag
+def detail_section_attrs(user, family, zone, section, visibility_only=False):
+    """Return safe server-rendered visibility and order attributes."""
+    layouts = resolved_detail_layouts(
+        getattr(user, "detail_page_layouts", {}) if user.is_authenticated else {}
+    )
+    section_order = layouts.get(family, {}).get(zone, [])
+    if section not in section_order:
+        return format_html('data-detail-section="{}" hidden', section)
+    if visibility_only:
+        return format_html('data-detail-section="{}"', section)
+    return format_html(
+        'data-detail-section="{}" style="order: {}"',
+        section,
+        section_order.index(section),
+    )
+
+
+@register.simple_tag
+def detail_layout_family(media_type):
+    """Map generic media types to their shared detail layout family."""
+    if media_type in {"tv", "anime", "season"}:
+        return "series"
+    if media_type in {"game", "boardgame"}:
+        return "game"
+    if media_type == "comic":
+        return "comic"
+    if media_type == "podcast":
+        return "podcast"
+    return "media"
+
+
+@register.filter
 def time_format_display(format_value):
     """Display the human-readable name for time format values."""
     format_display_map = {
-        "system_default": "System default (locale) — 6:45 PM / 18:45",
+        "system_default": "System default — 6:45 PM / 18:45",
         "h_mm_ampm": "12-hour (h:mm AM/PM) — 6:45 PM",
         "hh_mm_ampm": "12-hour, leading zero (hh:mm AM/PM) — 06:45 PM",
         "hh_mm": "24-hour (HH:mm) — 18:45",
@@ -147,8 +407,17 @@ def time_format_display(format_value):
 
 
 @register.filter
+def user_uses_12_hour_format(user):
+    """Return whether the user's time format preference is 12-hour."""
+    return getattr(user, "time_format", None) in (
+        TimeFormatChoices.H_MM_AMPM,
+        TimeFormatChoices.HH_MM_AMPM,
+    )
+
+
+@register.filter
 def user_date_format(date, user):
-    """Format a date according to user's date format preference."""
+    """Use the preferred date layout with month names in the active UI language."""
     if not date or not user:
         return ""
 
@@ -157,7 +426,7 @@ def user_date_format(date, user):
         if isinstance(date, str):
             try:
                 # Try to parse the date string
-                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                date_obj = datetime.strptime(date, "%Y-%m-%d")  # noqa: DTZ007  # date-only value; no timezone applies
                 date = timezone.make_aware(date_obj, timezone.get_current_timezone())
             except (ValueError, TypeError):
                 # If parsing fails, return the original string
@@ -173,9 +442,9 @@ def user_date_format(date, user):
         if user.date_format == DateFormatChoices.ISO_8601:
             return local_dt.strftime("%Y-%m-%d")
         if user.date_format == DateFormatChoices.MONTH_D_YYYY:
-            return local_dt.strftime("%b %d, %Y")
+            return formats.date_format(local_dt, "M d, Y")
         if user.date_format == DateFormatChoices.D_MON_YYYY:
-            return local_dt.strftime("%d %b %Y")
+            return formats.date_format(local_dt, "d M Y")
         if user.date_format == DateFormatChoices.M_D_YYYY:
             return f"{local_dt.month}/{local_dt.day}/{local_dt.year}"
         if user.date_format == DateFormatChoices.D_M_YYYY:
@@ -185,15 +454,15 @@ def user_date_format(date, user):
         if user.date_format == DateFormatChoices.YYYY_MM_DD:
             return f"{local_dt.year}/{local_dt.month:02d}/{local_dt.day:02d}"
         if user.date_format == DateFormatChoices.LONG_EU:
-            return f"{local_dt.day} {local_dt.strftime('%b')}, {local_dt.year}"
+            return formats.date_format(local_dt, "j M, Y")
         # Default to system format
         return formats.date_format(local_dt, "DATE_FORMAT")
 
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, OverflowError):
         # Fallback to default format if there's an error
         try:
             return formats.date_format(date, "DATE_FORMAT")
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, OverflowError):
             # If all else fails, return the original value as a string
             return str(date)
 
@@ -215,11 +484,11 @@ def user_time_format(datetime_obj, user):
         local_dt = timezone.localtime(datetime_obj)
         return _format_time_by_preference(local_dt, user, formats)
 
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, OverflowError):
         # Fallback to default format if there's an error
         try:
             return formats.date_format(datetime_obj, "TIME_FORMAT")
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, OverflowError):
             # If all else fails, return the original value as a string
             return str(datetime_obj)
 
@@ -229,15 +498,22 @@ def _parse_datetime_string(datetime_obj):
     if isinstance(datetime_obj, str):
         try:
             # Try to parse common datetime formats
-            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"]:
+            for fmt in [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M",
+                "%H:%M:%S",
+                "%H:%M",
+            ]:
                 try:
-                    return datetime.strptime(datetime_obj, fmt)
+                    return datetime.strptime(datetime_obj, fmt)  # noqa: DTZ007  # date-only value; no timezone applies
                 except ValueError:
                     continue
             # If we can't parse the string, return it as-is
-            return datetime_obj
         except (ValueError, TypeError):
             # If parsing fails, return the original string
+            return datetime_obj
+        else:
             return datetime_obj
     return datetime_obj
 
@@ -275,11 +551,45 @@ def user_datetime_format(datetime_obj, user):
 
         date_part = user_date_format(datetime_obj, user)
         time_part = user_time_format(datetime_obj, user)
-        return f"{date_part} {time_part}"
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, OverflowError):
         # Fallback to default format if there's an error
         try:
             return formats.date_format(datetime_obj, "DATETIME_FORMAT")
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, OverflowError):
             # If all else fails, return the original value as a string
             return str(datetime_obj)
+    else:
+        return f"{date_part} {time_part}"
+
+
+@register.simple_tag(takes_context=True)
+def user_price(context, amount):
+    """Format a collection price in the user's currency (#1100)."""
+    code = currency.resolve_currency(context.get("user"), context.get("request"))
+    return currency.format_price(amount, code)
+
+
+@register.simple_tag
+def media_tag_choices(keys=""):
+    """Return the media type filter options, limited to ``keys`` when given.
+
+    ``keys`` is a space-separated list so a page can offer only the groups it
+    has cards for. The options keep the canonical order from MEDIA_TAGS.
+    """
+    wanted = set(keys.split()) if keys else None
+    return [
+        {"key": key, "label": gettext(label)}
+        for key, label in MEDIA_TAGS
+        if wanted is None or key in wanted
+    ]
+
+
+@register.filter
+def media_tag_list(tags):
+    """Render media tag keys as a JS array literal that is safe in an attribute.
+
+    Single quotes keep it valid inside a double-quoted Alpine expression, and
+    unknown keys are dropped so nothing user-controlled can reach the page.
+    """
+    keys = [tag for tag in tags or [] if tag in MEDIA_TAG_KEYS]
+    return mark_safe("[" + ", ".join(f"'{key}'" for key in keys) + "]")  # noqa: S308

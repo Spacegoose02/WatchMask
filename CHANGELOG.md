@@ -4,6 +4,49 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
+## Unreleased: rebased on Floppy v26.10.29+
+
+Watchmask now sits on top of current [Floppy](https://github.com/dannyvfilms/Floppy)
+(`latest` at 928bc40, 31 Oct 2026) instead of the 10 July snapshot it was
+forked from. That brings in about 2,300 Floppy commits, including:
+
+- A shared library-query engine that pages the media list, API, smart lists,
+  list pages and Home shelves in SQL.
+- New covering indexes (items by media type, Media by user and dates,
+  episodes by season and date, Discover candidates, calendar events).
+- SQLite tuning: per-connection cache and mmap, `IMMEDIATE` transactions,
+  daily `PRAGMA optimize`, and bounded background verification at startup.
+- Lists that no longer load every item to render menus or pages, and smart
+  list rules evaluated in the background.
+- Home renders only a warm first group and loads the rest per row.
+- Statistics kept warm by a durable background sync.
+- Redis cache compression and single-flight cache rebuilds.
+- Bounded Celery memory, staged large imports, and many new integrations and
+  sync paths (incremental watched/progress sync API, rating sync-back, MAL
+  sync, Komga, Kavita, Hardcover, Kapowarr, Mylar3 and more).
+
+### Watchmask changes carried over
+
+- Cinemask requests and the BingeBandit integration (webhook tracking,
+  history import, Play/Resume buttons, library badges, Continue Watching).
+- Watchmask name and raccoon logo, docker image
+  `ghcr.io/spacegoose02/watchmask`.
+- HTMX polling pauses in hidden tabs; background Celery runs under `nice`.
+- Board games and the standalone TV seasons section are switched off
+  by default. Each user can turn them back on under Settings.
+
+### Upgrade notes
+
+- Back up your database first. This release runs Floppy's migrations from
+  July to October (several hundred, including index builds), which can take
+  a while on a large SQLite database.
+- Watchmask's own integrations migrations keep their names and are joined to
+  Floppy's chain by `integrations.0064_merge_watchmask_integrations`, so an
+  existing Watchmask database upgrades in place.
+- The background web process count and memory defaults now follow Floppy's
+  host-size tiers; see `docs/deployment.md` if you had tuned
+  `WEB_CONCURRENCY` or `GUNICORN_THREADS`.
+
 ## v26.10.31
 
 ### New

@@ -1,30 +1,42 @@
+import json
+import logging
+from contextlib import suppress
 from datetime import UTC, date
+from urllib.parse import urlencode
 from uuid import uuid4
 
+from django.apps import apps
 from django.conf import settings
 from django.shortcuts import render
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.utils.timezone import datetime
+from django.utils.translation import gettext_noop
 from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_GET
 
-from app import custom_metadata, helpers
+from app import cover_views, custom_metadata, helpers, history_processor
 from app import statistics as stats
+from app.collection_views import build_collection_modal_context
 from app.discover_views import _build_track_modal_discover_tab_context
 from app.forms import BulkEpisodeTrackForm, get_form_class
 from app.models import (
     Anime,
     BasicMedia,
+    HardcoverEditionPreference,
     Item,
     MediaTypes,
     MetadataProviderPreference,
     Sources,
     Status,
 )
-from app.providers import services
-from app.services import bulk_episode_tracking, metadata_resolution
+from app.providers import hardcover, services, tmdb
+from app.services import bulk_episode_tracking, library_migration, metadata_resolution
+from app.services.metadata_fallback import stored_metadata_fallback
+
+RUNTIME_UNKNOWN_AIRED = 999998  # aired but runtime unknown
+logger = logging.getLogger(__name__)
 
 
 class _EmptyHistoryProxy:
@@ -102,7 +114,10 @@ def _episode_domain_template_payload(domain):
                 "episode_title": episode["episode_title"],
                 "selector_label": episode.get("selector_label", ""),
                 "existing_play_count": episode["existing_play_count"],
-                "air_date": episode["air_date"].isoformat() if episode["air_date"] else "",
+                "runtime_minutes": episode.get("runtime_minutes") or "",
+                "air_date": episode["air_date"].isoformat()
+                if episode["air_date"]
+                else "",
             }
             for episode in episodes
         ]
@@ -135,7 +150,14 @@ def _track_modal_field_groups(form, *, hidden_field_names, metadata_field_names=
     metadata_field_names = metadata_field_names or set()
     ordered_general_field_names = [
         field_name
-        for field_name in ("score", "status", "progress", "start_date", "end_date")
+        for field_name in (
+            "score",
+            "status",
+            "progress",
+            "reading_time",
+            "start_date",
+            "end_date",
+        )
         if field_name in form.fields
     ]
     remaining_general_field_names = [
@@ -149,7 +171,8 @@ def _track_modal_field_groups(form, *, hidden_field_names, metadata_field_names=
     return {
         "general_fields": [
             form[field_name]
-            for field_name in ordered_general_field_names + remaining_general_field_names
+            for field_name in ordered_general_field_names
+            + remaining_general_field_names
         ],
         "metadata_fields": [
             form[field_name]
@@ -170,15 +193,15 @@ def _track_modal_release_date_shortcut(*candidates):
         if not candidate:
             continue
         if isinstance(candidate, dict):
-            candidate = helpers.extract_release_datetime(candidate)
+            candidate = helpers.extract_release_datetime(candidate)  # noqa: PLW2901  # deliberate in-loop normalisation
         elif isinstance(candidate, str):
-            candidate = parse_date(candidate[:10])
+            candidate = parse_date(candidate[:10])  # noqa: PLW2901  # deliberate in-loop normalisation
 
         if not candidate:
             continue
         if isinstance(candidate, datetime):
             if timezone.is_aware(candidate):
-                candidate = timezone.localtime(candidate)
+                candidate = timezone.localtime(candidate)  # noqa: PLW2901  # deliberate in-loop normalisation
             return candidate.date().isoformat()
         if isinstance(candidate, date):
             return candidate.isoformat()
@@ -186,10 +209,7 @@ def _track_modal_release_date_shortcut(*candidates):
 
 
 def _track_modal_release_runtime_minutes(media_type, *candidates):
-    """Return a trusted runtime in minutes for release-date start-date backfill."""
-    if media_type != MediaTypes.MOVIE.value:
-        return ""
-
+    """Return a trusted runtime in minutes for date shortcuts."""
     for candidate in candidates:
         if not candidate:
             continue
@@ -214,10 +234,109 @@ def _track_modal_release_runtime_minutes(media_type, *candidates):
         elif isinstance(runtime_minutes, float):
             runtime_minutes = int(runtime_minutes)
 
-        if isinstance(runtime_minutes, int) and 0 < runtime_minutes < 999998:
+        if (
+            isinstance(runtime_minutes, int)
+            and 0 < runtime_minutes < RUNTIME_UNKNOWN_AIRED
+        ):
             return str(runtime_minutes)
 
     return ""
+
+
+def _track_modal_date_suggestion(label, iso_date, runtime_minutes="", extras=()):
+    """Normalize a labeled date suggestion for the shared date/time picker.
+
+    ``extras`` are further ``{"label", "date"}`` quick dates offered next to it.
+    """
+    return {
+        "label": label,
+        "date": iso_date or "",
+        "runtime_minutes": runtime_minutes or "",
+        "extras": list(extras),
+    }
+
+
+def _library_panel_url(source, media_type, media_id, season_number, episode_number):
+    """Return the URL that lazy-loads Radarr/Sonarr/Seerr details for a title."""
+    query = urlencode(
+        {
+            key: value
+            for key, value in (
+                ("season_number", season_number),
+                ("episode_number", episode_number),
+            )
+            if value is not None
+        },
+    )
+    url = reverse("library_panel", args=[source, media_type, media_id])
+    return f"{url}?{query}" if query else url
+
+
+RELEASE_TYPE_SHORTCUT_LABELS = {
+    "digital": gettext_noop("Digital release"),
+    "physical": gettext_noop("Physical release"),
+}
+
+
+def _track_modal_other_release_dates(media_type, item, user):
+    """Return a movie's stored digital and physical dates for the user's region.
+
+    Read from the calendar's events, so opening the modal never calls a provider.
+    """
+    if media_type != MediaTypes.MOVIE.value or item is None:
+        return []
+
+    from events.models import Event
+
+    events = (
+        Event.objects.filter(item=item, region=user.watch_provider_region)
+        .exclude(release_type="")
+        .order_by("release_type", "datetime")
+    )
+    return [
+        {
+            "label": RELEASE_TYPE_SHORTCUT_LABELS[event.release_type],
+            "date": event.datetime.date().isoformat(),
+        }
+        for event in events
+    ]
+
+
+def _tags_tab_context(item, user):
+    """Return the shared tag editor context for an item-backed track modal."""
+    if item is None:
+        return {"tags_tab_available": False}
+
+    from app.tag_views import _user_tags_for_item
+
+    return {
+        "tags_tab_available": True,
+        "tags_item": item,
+        "user_tags": _user_tags_for_item(user, item),
+        "preview_genres_json": json.dumps(list(item.genres or [])),
+        "preview_implied_genres_json": json.dumps(
+            list(getattr(item, "implied_genres", None) or []),
+        ),
+        "tag_surface": "track",
+    }
+
+
+def _rewatch_action(media, media_type):
+    """Return the rewatch action offered for a tracked show or season, if any.
+
+    Only finished entries can start a pass; an open one can always be ended.
+    """
+    if media is None or media_type not in {
+        MediaTypes.TV.value,
+        MediaTypes.SEASON.value,
+    }:
+        return None
+
+    if media.is_rewatching:
+        return {"action": "stop", "label": gettext_noop("End rewatch")}
+    if media.status == Status.COMPLETED.value:
+        return {"action": "start", "label": gettext_noop("Rewatch")}
+    return None
 
 
 def _render_standard_track_modal(
@@ -226,6 +345,7 @@ def _render_standard_track_modal(
     media_type,
     media_id,
     season_number=None,
+    episode_number=None,
     *,
     form_override=None,
     bulk_form_override=None,
@@ -237,32 +357,65 @@ def _render_standard_track_modal(
     """Build and render the standard media track modal context."""
     instance_id = request.GET.get("instance_id") or request.POST.get("instance_id")
     if instance_id:
-        media = BasicMedia.objects.get_media(
-            request.user,
-            media_type,
-            instance_id,
-        )
+        model = apps.get_model(app_label="app", model_name=media_type)
+        try:
+            media = BasicMedia.objects.get_media(
+                request.user,
+                media_type,
+                instance_id,
+            )
+        except model.DoesNotExist:
+            media = None
+            instance_id = None
     elif request.GET.get("is_create"):
         media = None
     else:
-        user_medias = BasicMedia.objects.filter_media(
-            request.user,
-            media_id,
-            media_type,
-            source,
-            season_number=season_number,
-        )
-        media = user_medias.first()
+        media = None
+        # A season tracked under a different identity bucket (e.g. via the
+        # show's TV identity) must still resolve here, so the modal receives
+        # the correct instance_id instead of trying to create a duplicate
+        # row on save — see #623.
+        if media_type == MediaTypes.SEASON.value and season_number is not None:
+            media = metadata_resolution.find_tracked_season(
+                request.user,
+                media_id,
+                source,
+                int(season_number),
+            )
+        if media is None:
+            user_medias = BasicMedia.objects.filter_media(
+                request.user,
+                media_id,
+                media_type,
+                source,
+                season_number=season_number,
+                episode_number=episode_number,
+            )
+            if request.GET.get("focus") == "notes":
+                # The Notes shortcut edits the entry the detail page treats as
+                # current, resolved now so it stays right after a new entry.
+                media = max(user_medias, key=helpers.entry_activity_key, default=None)
+            else:
+                media = user_medias.first()
         if media:
             instance_id = media.id
+
+    if media_type == MediaTypes.EPISODE.value and media:
+        season_number = media.item.season_number
+        episode_number = media.item.episode_number
 
     initial_data = {
         "media_id": media_id,
         "source": source,
         "media_type": media_type,
         "season_number": season_number,
+        "episode_number": episode_number,
         "instance_id": instance_id,
     }
+    if media_type == MediaTypes.EPISODE.value and media:
+        # Editing an episode watch can also save the current form as a new
+        # entry. Give that create operation its own stable idempotency key.
+        initial_data["watch_operation_id"] = uuid4()
     route_identity_media_type = None
     route_library_media_type = None
 
@@ -288,24 +441,26 @@ def _render_standard_track_modal(
             MediaTypes.MANGA.value,
         ):
             if media_type == MediaTypes.BOOK.value:
-                if media.item.number_of_pages:
-                    max_progress = media.item.number_of_pages
+                if media.item.book_max_progress:
+                    max_progress = media.item.book_max_progress
+                elif media.item.format == "audiobook":
+                    max_progress = None
                 else:
                     try:
-                        metadata = services.get_media_metadata(
-                            media.item.media_type,
-                            media.item.media_id,
-                            media.item.source,
-                        )
+                        with services.interactive_request_scope():
+                            metadata = services.get_media_metadata(
+                                media.item.media_type,
+                                media.item.media_id,
+                                media.item.source,
+                            )
                         number_of_pages = metadata.get("max_progress") or metadata.get(
                             "details",
                             {},
                         ).get("number_of_pages")
                         if number_of_pages:
                             media.item.number_of_pages = number_of_pages
-                            media.item.save(update_fields=["number_of_pages"])
                             max_progress = number_of_pages
-                    except Exception:
+                    except Exception:  # noqa: S110  # deliberate best-effort; failure is non-fatal here
                         pass
             else:
                 media_list = [media]
@@ -321,12 +476,47 @@ def _render_standard_track_modal(
                 percentage = round((media.progress / max_progress) * 100, 1)
                 initial_data["progress"] = percentage
     else:
-        metadata = services.get_media_metadata(
-            media_type,
-            media_id,
-            source,
-            [season_number],
-        )
+        language = metadata_resolution.metadata_language_default(request.user)
+        try:
+            with services.interactive_request_scope():
+                metadata = services.get_media_metadata(
+                    media_type,
+                    media_id,
+                    source,
+                    [season_number],
+                    episode_number=episode_number,
+                    language=language,
+                )
+        except services.ProviderAPIError:
+            if media_type != MediaTypes.EPISODE.value:
+                raise
+            # The provider can list an episode in its season yet 404 the
+            # episode itself; the season payload still names it.
+            logger.warning(
+                "Falling back to season metadata for media_id=%s S%sE%s",
+                media_id,
+                season_number,
+                episode_number,
+            )
+            with services.interactive_request_scope():
+                metadata = dict(
+                    services.get_media_metadata(
+                        MediaTypes.SEASON.value,
+                        media_id,
+                        source,
+                        [season_number],
+                        language=language,
+                    ),
+                )
+            metadata["episode_title"] = next(
+                (
+                    episode.get("name") or episode.get("title")
+                    for episode in metadata.get("episodes") or []
+                    if isinstance(episode, dict)
+                    and str(episode.get("episode_number")) == str(episode_number)
+                ),
+                None,
+            )
         base_metadata = metadata
         title = metadata["title"]
         route_identity_media_type = metadata.get("identity_media_type")
@@ -342,6 +532,7 @@ def _render_standard_track_modal(
                 identity_media_type=route_identity_media_type,
             ),
             "season_number": season_number,
+            "episode_number": episode_number,
         }
         if metadata_resolution.is_grouped_anime_route(
             media_type,
@@ -354,15 +545,62 @@ def _render_standard_track_modal(
 
         # Suggest "In progress" if the user already has an in-progress entry for this media
         if request.user.is_authenticated:
-            existing_in_progress = BasicMedia.objects.filter_media(
-                request.user,
-                media_id,
-                media_type,
-                source,
-                season_number=season_number,
-            ).filter(status=Status.IN_PROGRESS.value).exists()
-            if existing_in_progress:
+            existing_in_progress = (
+                BasicMedia.objects.filter_media(
+                    request.user,
+                    media_id,
+                    media_type,
+                    source,
+                    season_number=season_number,
+                )
+                .filter(status=Status.IN_PROGRESS.value)
+                .exists()
+            )
+            # An episode form logs a watch, so it keeps the Completed default.
+            if media_type != MediaTypes.EPISODE.value:
+                initial_data["status"] = helpers.default_status_for_new_entry(
+                    has_in_progress_entry=existing_in_progress,
+                )
+            elif existing_in_progress:
                 initial_data["status"] = Status.IN_PROGRESS.value
+
+    title_subtitle = ""
+    if media_type == MediaTypes.EPISODE.value and episode_number is not None:
+        episode_metadata = base_metadata or {}
+        if not episode_metadata.get("episode_title") and media:
+            # The tracked path does no provider work of its own; the episode
+            # payload is cached, so this is a cache hit in the common case.
+            try:
+                with services.interactive_request_scope():
+                    episode_metadata = services.get_media_metadata(
+                        media_type,
+                        media_id,
+                        source,
+                        [season_number],
+                        episode_number=episode_number,
+                        language=metadata_resolution.metadata_language_default(
+                            request.user,
+                            metadata_item,
+                        ),
+                    )
+            except services.ProviderAPIError:
+                logger.warning(
+                    "Could not resolve episode title for media_id=%s S%sE%s",
+                    media_id,
+                    season_number,
+                    episode_number,
+                )
+                episode_metadata = {}
+        episode_name = episode_metadata.get("episode_title")
+        show_title = episode_metadata.get("title") or (
+            media.item.title if media else ""
+        )
+        episode_label = f"S{season_number}E{episode_number}"
+        if episode_name:
+            title = episode_name
+            title_subtitle = f"{show_title} · {episode_label}"
+        else:
+            title = f"{show_title} {episode_label}".strip()
 
     if route_identity_media_type:
         initial_data["identity_media_type"] = route_identity_media_type
@@ -370,7 +608,11 @@ def _render_standard_track_modal(
         initial_data["library_media_type"] = route_library_media_type
     if "image_url" not in initial_data:
         preferred_image = None
-        if metadata_item and metadata_item.image and metadata_item.image != settings.IMG_NONE:
+        if (
+            metadata_item
+            and metadata_item.image
+            and metadata_item.image != settings.IMG_NONE
+        ):
             preferred_image = metadata_item.image
         elif (
             base_metadata
@@ -418,6 +660,8 @@ def _render_standard_track_modal(
         "source",
         "media_id",
         "season_number",
+        "episode_number",
+        "watch_operation_id",
         "start_date_cleared",
     }
     metadata_field_names = {"image_url"}
@@ -437,17 +681,32 @@ def _render_standard_track_modal(
     grouped_preview_target = None
     can_update_metadata_provider = False
     can_migrate_grouped_anime = False
+    library_move_context = None
     metadata_provider_mapping_status = "identity"
     metadata_provider_options = []
 
     if media_type in (MediaTypes.TV.value, MediaTypes.ANIME.value):
         if base_metadata is None:
-            base_metadata = services.get_media_metadata(
-                media_type,
-                media_id,
-                source,
-                [season_number],
-            )
+            try:
+                base_metadata = services.get_media_metadata(
+                    media_type,
+                    media_id,
+                    source,
+                    [season_number],
+                    language=metadata_resolution.metadata_language_default(
+                        request.user,
+                        metadata_item,
+                    ),
+                )
+            except services.ProviderAPIError:
+                if metadata_item is None:
+                    raise
+                logger.warning(
+                    "Falling back to stored metadata for tracking modal media_id=%s "
+                    "due to provider API error",
+                    media_id,
+                )
+                base_metadata = stored_metadata_fallback(metadata_item)
         metadata_resolution_result = metadata_resolution.resolve_detail_metadata(
             request.user,
             item=metadata_item,
@@ -455,15 +714,18 @@ def _render_standard_track_modal(
             media_id=media_id,
             source=source,
             base_metadata=base_metadata,
+            persist_links=False,
         )
         display_provider = metadata_resolution_result.display_provider
         identity_provider = metadata_resolution_result.identity_provider
         grouped_preview = metadata_resolution_result.grouped_preview
         grouped_preview_target = metadata_resolution_result.grouped_preview_target
         metadata_provider_mapping_status = metadata_resolution_result.mapping_status
-        metadata_provider_options = metadata_resolution.available_metadata_provider_options(
-            media_type,
-            identity_provider=identity_provider,
+        metadata_provider_options = (
+            metadata_resolution.available_metadata_provider_options(
+                media_type,
+                identity_provider=identity_provider,
+            )
         )
         can_migrate_grouped_anime = bool(
             metadata_item is not None
@@ -473,10 +735,14 @@ def _render_standard_track_modal(
             and grouped_preview
             and Anime.objects.filter(user=request.user, item=metadata_item).exists()
         )
-    elif metadata_item is not None and custom_metadata.supports_custom_provider(media_type):
-        metadata_provider_options = metadata_resolution.available_metadata_provider_options(
-            media_type,
-            identity_provider=identity_provider,
+    elif metadata_item is not None and custom_metadata.supports_custom_provider(
+        media_type
+    ):
+        metadata_provider_options = (
+            metadata_resolution.available_metadata_provider_options(
+                media_type,
+                identity_provider=identity_provider,
+            )
         )
         preference = MetadataProviderPreference.objects.filter(
             user=request.user,
@@ -495,6 +761,54 @@ def _render_standard_track_modal(
         metadata_item is not None and metadata_provider_options
     )
 
+    can_update_metadata_language = bool(
+        metadata_item is not None
+        and identity_provider in {Sources.TMDB.value, Sources.TVDB.value}
+    )
+    metadata_language_options = []
+    selected_metadata_language = ""
+    if can_update_metadata_language:
+        try:
+            metadata_language_options = tmdb.metadata_languages()
+        except Exception as exc:  # pragma: no cover - defensive provider fallback
+            logger.warning("Could not load TMDB metadata languages: %s", exc)
+            metadata_language_options = [
+                ("", f"Server Default ({settings.TMDB_LANG})"),
+            ]
+        language_preference = MetadataProviderPreference.objects.filter(
+            user=request.user,
+            item=metadata_item,
+        ).first()
+        if language_preference:
+            selected_metadata_language = language_preference.language
+
+    can_manage_hardcover_edition = bool(
+        media_type == MediaTypes.BOOK.value and source == Sources.HARDCOVER.value
+    )
+
+    if metadata_item is not None:
+        library_move_context = library_migration.get_move_context(
+            request.user,
+            metadata_item,
+        )
+
+    hardcover_selected_edition = None
+    if can_manage_hardcover_edition and metadata_item is not None:
+        preference = HardcoverEditionPreference.objects.filter(
+            user=request.user,
+            item=metadata_item,
+        ).first()
+        if preference:
+            with suppress(Exception):
+                hardcover_selected_edition = next(
+                    (
+                        edition
+                        for edition in hardcover.editions(media_id, user=request.user)
+                        if edition["id"] == preference.edition_id
+                    ),
+                    None,
+                )
+
     manual_metadata_form = None
     can_edit_custom_metadata = bool(
         metadata_item is not None
@@ -507,11 +821,26 @@ def _render_standard_track_modal(
             prefix="metadata",
         )
 
+    can_change_cover = bool(
+        metadata_item is not None
+        and request.user.is_authenticated
+        and cover_views.user_has_item(request.user, metadata_item)
+    )
+
     metadata_tab_available = bool(
-        metadata_fields
+        can_change_cover
+        or metadata_fields
         or can_update_metadata_provider
+        or can_update_metadata_language
         or can_migrate_grouped_anime
+        or library_move_context
         or manual_metadata_form
+        or can_manage_hardcover_edition
+        or (
+            metadata_item is not None
+            and media_type in (MediaTypes.MOVIE.value, MediaTypes.TV.value)
+        )
+        or (media_type == MediaTypes.TV.value and media is not None)
     )
 
     episode_plays_domain = bulk_episode_tracking.build_episode_play_domain(
@@ -531,12 +860,16 @@ def _render_standard_track_modal(
             or request.POST.get("return_url", "")
             or request.POST.get("next", "")
         )
-    home_row_id = request.GET.get("home_row_id") or request.POST.get("home_row_id") or ""
+    home_row_id = (
+        request.GET.get("home_row_id") or request.POST.get("home_row_id") or ""
+    )
     if episode_plays_tab_available:
         if bulk_form_override is not None:
             episode_plays_form = bulk_form_override
         else:
-            bulk_initial = _bulk_episode_form_initial_data(return_url, episode_plays_domain)
+            bulk_initial = _bulk_episode_form_initial_data(
+                return_url, episode_plays_domain
+            )
             bulk_initial["instance_id"] = instance_id or ""
             episode_plays_form = BulkEpisodeTrackForm(
                 initial=bulk_initial,
@@ -565,9 +898,24 @@ def _render_standard_track_modal(
         ),
         base_metadata,
     )
+    other_release_dates = _track_modal_other_release_dates(
+        media_type,
+        metadata_item,
+        request.user,
+    )
+    date_suggestion = _track_modal_date_suggestion(
+        # Name the theatrical date once a digital or physical one sits beside it.
+        gettext_noop("Theatrical release") if other_release_dates else "Release Date",
+        release_date_shortcut,
+        release_date_runtime_minutes,
+        other_release_dates,
+    )
+    rewatch_action = _rewatch_action(media, media_type)
+
     context = {
         "user": request.user,
         "title": title,
+        "title_subtitle": title_subtitle,
         "media_type": media_type,
         "form": form,
         "media": media,
@@ -586,26 +934,64 @@ def _render_standard_track_modal(
         "metadata_provider_mapping_status": metadata_provider_mapping_status,
         "metadata_provider_options": metadata_provider_options,
         "can_update_metadata_provider": can_update_metadata_provider,
+        "can_update_metadata_language": can_update_metadata_language,
+        "metadata_language_options": metadata_language_options,
+        "selected_metadata_language": selected_metadata_language,
+        "can_manage_hardcover_edition": can_manage_hardcover_edition,
+        "hardcover_edition_media_id": media_id
+        if can_manage_hardcover_edition
+        else None,
+        "hardcover_selected_edition": hardcover_selected_edition,
+        "hardcover_edition_id_hint": (
+            request.GET.get("edition_id") if can_manage_hardcover_edition else None
+        ),
         "can_migrate_grouped_anime": can_migrate_grouped_anime,
+        "can_move_library_item": bool(library_move_context),
+        "library_move_context": library_move_context,
         "metadata_tab_available": metadata_tab_available,
         "metadata_item": metadata_item,
+        "match_item": metadata_item,
+        "tv_provider_switch_target": (
+            library_migration.tv_provider_switch_target(request.user, metadata_item)
+            if metadata_item is not None
+            else None
+        ),
+        "current_instance": media,
         "general_hidden_fields": hidden_fields,
         "general_fields": general_fields,
         "general_submit_formaction": (
-            f"{reverse('media_save')}?next={return_url}"
-            + (f"&home_row_id={home_row_id}" if home_row_id else "")
+            f"{reverse('episode_save')}?next={return_url}"
+            if media_type == MediaTypes.EPISODE.value
+            else (
+                f"{reverse('media_save')}?next={return_url}"
+                + (f"&home_row_id={home_row_id}" if home_row_id else "")
+            )
         ),
         "general_delete_formaction": f"{reverse('media_delete')}?next={return_url}",
+        "general_rewatch_formaction": (
+            f"{reverse('media_rewatch')}?action={rewatch_action['action']}"
+            f"&next={return_url}"
+            if rewatch_action
+            else ""
+        ),
+        "general_rewatch_label": rewatch_action["label"] if rewatch_action else "",
+        "general_rewatch_action": rewatch_action["action"] if rewatch_action else "",
+        "general_rewatch_started_at": (
+            getattr(media, "rewatch_started_at", None) if rewatch_action else None
+        ),
         "general_existing_instance": media,
+        "episode_save_as_new": bool(
+            media_type == MediaTypes.EPISODE.value and media,
+        ),
         "metadata_fields": metadata_fields,
         "image_field": image_field,
+        "can_change_cover": can_change_cover,
         "image_save_item_id": (
             metadata_item.id
             if media and metadata_item and not can_edit_custom_metadata
             else None
         ),
-        "release_date_shortcut": release_date_shortcut,
-        "release_date_runtime_minutes": release_date_runtime_minutes,
+        "date_suggestion": date_suggestion,
         "manual_metadata_form": manual_metadata_form,
         "manual_metadata_formaction": (
             reverse("update_manual_item_metadata", args=[metadata_item.id])
@@ -617,6 +1003,7 @@ def _render_standard_track_modal(
         "track_action_update": track_action_update,
         "initial_active_tab": initial_active_tab,
         "notes_count": notes_count,
+        "notes_focus": request.GET.get("focus") == "notes",
         "episode_plays_tab_available": episode_plays_tab_available,
         "episode_plays_form": episode_plays_form,
         "episode_plays_formaction": reverse("episode_bulk_save"),
@@ -624,12 +1011,58 @@ def _render_standard_track_modal(
         "episode_plays_submit_label": "Save plays",
         "episode_plays_domain": _episode_domain_template_payload(episode_plays_domain),
         "episode_plays_mode_notice": (
-            episode_plays_domain.get("mode_notice", "")
-            if episode_plays_domain
-            else ""
+            episode_plays_domain.get("mode_notice", "") if episode_plays_domain else ""
         ),
         "episode_plays_domain_script_id": f"{track_form_id}-episode-domain",
+        "collection_tab_available": False,
+        "collection_context": None,
     }
+    context.update(_tags_tab_context(metadata_item, request.user))
+    context["status_history_tab_available"] = bool(
+        media is not None
+        and media_type in (MediaTypes.TV.value, MediaTypes.SEASON.value),
+    )
+    context["status_changes"] = (
+        history_processor.status_change_log(
+            media,
+            limit=history_processor.STATUS_HISTORY_TAB_LENGTH,
+        )
+        if context["status_history_tab_available"]
+        else []
+    )
+    koreader_account = getattr(request.user, "koreader_account", None)
+    context["show_koreader_document_field"] = bool(
+        media_type == MediaTypes.BOOK.value
+        and koreader_account
+        and koreader_account.is_connected,
+    )
+    context["koreader_document_id"] = ""
+    if context["show_koreader_document_field"] and metadata_item:
+        from integrations.koreader_links import get_document_hash_for_item
+
+        context["koreader_document_id"] = get_document_hash_for_item(
+            request.user,
+            metadata_item,
+        )
+    if (
+        (media_type == MediaTypes.EPISODE.value and episode_number is not None)
+        or (media_type == MediaTypes.SEASON.value and season_number is not None)
+        or media_type in (MediaTypes.MOVIE.value, MediaTypes.TV.value)
+    ):
+        context["collection_tab_available"] = True
+        if source in (Sources.TMDB.value, Sources.TVDB.value):
+            context["library_panel_url"] = _library_panel_url(
+                source, media_type, media_id, season_number, episode_number
+            )
+        context["collection_context"] = build_collection_modal_context(
+            request,
+            source,
+            media_type,
+            media_id,
+            season_number=season_number,
+            episode_number=episode_number,
+            metadata=base_metadata,
+        )
     context.update(_build_track_modal_discover_tab_context(request.user, metadata_item))
     response = render(
         request,
@@ -665,6 +1098,9 @@ def _render_podcast_show_track_modal(
             or request.POST.get("return_url", "")
             or request.POST.get("next", "")
         )
+    home_row_id = (
+        request.GET.get("home_row_id") or request.POST.get("home_row_id") or ""
+    )
 
     if form_override is not None:
         form = form_override
@@ -721,6 +1157,7 @@ def _render_podcast_show_track_modal(
             "general_fields": field_groups["general_fields"],
             "general_submit_formaction": (
                 f"{reverse('podcast_show_save')}?next={return_url}"
+                + (f"&home_row_id={home_row_id}" if home_row_id else "")
             ),
             "general_delete_formaction": (
                 f"{reverse('podcast_show_delete')}?next={return_url}"
@@ -728,8 +1165,7 @@ def _render_podcast_show_track_modal(
             "general_existing_instance": tracker,
             "image_field": None,
             "image_save_item_id": None,
-            "release_date_shortcut": "",
-            "release_date_runtime_minutes": "",
+            "date_suggestion": _track_modal_date_suggestion("Release Date", ""),
             "track_form_id": track_form_id,
             "track_action_update": track_action_update,
             "initial_active_tab": initial_active_tab,
@@ -773,17 +1209,41 @@ def track_modal(
         request.GET.get("standard_modal") == "1"
         or request.POST.get("standard_modal") == "1"
     )
+    episode_number = request.GET.get("episode_number")
+    if episode_number is not None:
+        try:
+            episode_number = int(episode_number)
+        except (TypeError, ValueError):
+            episode_number = None
+
+    # A list card for an album carries the album page's id, which is not a
+    # recording; the album has its own tracking form.
+    if media_type == MediaTypes.MUSIC.value and source == Sources.MUSICBRAINZ.value:
+        from app.music_album_views import album_track_modal
+        from app.services.music import album_for_media_id
+
+        album = album_for_media_id(media_id, user=request.user)
+        if album:
+            return album_track_modal(request, album.id)
 
     # Handle podcast shows (identified by podcast_uuid)
     if (
         not standard_modal
         and media_type == MediaTypes.PODCAST.value
-        and source in {Sources.POCKETCASTS.value, Sources.GPODDER.value}
+        and source
+        in {
+            Sources.POCKETCASTS.value,
+            Sources.GPODDER.value,
+            Sources.AUDIOBOOKSHELF.value,
+            Sources.MANUAL.value,
+        }
     ):
-        from app.models import PodcastEpisode, PodcastShow
+        from app.models import PodcastEpisode
+        from app.services.podcast_import import resolve_show_for_media_id
 
-        # Check if this is a show (podcast_uuid) or an episode (episode_uuid)
-        show = PodcastShow.objects.filter(podcast_uuid=media_id).first()
+        # Check if this is a show (podcast_uuid or an iTunes search id) or an
+        # episode (episode_uuid).
+        show = resolve_show_for_media_id(media_id, source=source)
         if show:
             return _render_podcast_show_track_modal(request, show)
 
@@ -793,25 +1253,30 @@ def track_modal(
             from app.models import Podcast
 
             show = episode.show
+            request.GET.get("instance_id")
 
             # Get all Podcast entries for this episode to aggregate history
             # Each Podcast entry has its own history, so we need to combine them
-            all_podcasts = list(Podcast.objects.filter(
-                user=request.user,
-                show=show,
-                episode=episode,
-            ).order_by("-end_date"))
+            all_podcasts = list(
+                Podcast.objects.filter(
+                    user=request.user,
+                    show=show,
+                    episode=episode,
+                ).order_by("-end_date")
+            )
 
-            # Get or create Item for this episode
-            item, _ = Item.objects.get_or_create(
+            # Render without creating a tracking Item during this GET.
+            item = Item.objects.filter(
                 media_id=episode.episode_uuid,
                 source=source,
                 media_type=media_type,
-                defaults={
-                    "title": episode.title,
-                    "image": show.image or settings.IMG_NONE,
-                    "runtime_minutes": (episode.duration // 60) if episode.duration else None,
-                },
+            ).first() or Item(
+                media_id=episode.episode_uuid,
+                source=source,
+                media_type=media_type,
+                title=episode.title,
+                image=show.image or settings.IMG_NONE,
+                runtime_minutes=(episode.duration // 60) if episode.duration else None,
             )
 
             # Create adapter objects to match template expectations
@@ -821,11 +1286,20 @@ def track_modal(
                 def __init__(self, episode):
                     self.title = episode.title
                     self.track_number = episode.episode_number
-                    self.duration_formatted = self._format_duration(episode.duration) if episode.duration else None
+                    self.duration_formatted = (
+                        self._format_duration(episode.duration)
+                        if episode.duration
+                        else None
+                    )
+                    self.runtime_minutes = (
+                        episode.duration // 60 if episode.duration else ""
+                    )
                     self.musicbrainz_recording_id = None  # Not used for podcasts
                     self.id = episode.id
                     self.published = episode.published  # For "Published date" button
-                    self.episode_uuid = episode.episode_uuid  # For form submission when music is None
+                    self.episode_uuid = (
+                        episode.episode_uuid
+                    )  # For form submission when music is None
 
                 def _format_duration(self, seconds):
                     """Format duration in seconds to MM:SS or H:MM:SS."""
@@ -847,23 +1321,27 @@ def track_modal(
             # Create a wrapper object that aggregates history from all podcast entries
             # This allows the template to show all history records like music does
             if all_podcasts:
-                from django.utils import timezone
-
                 # Aggregate all history records from all podcast entries
                 # Only include history records with end_date (completed plays)
                 all_history = []
                 for podcast in all_podcasts:
                     # Only include history records with end_date (completed plays)
-                    history = podcast.history.filter(end_date__isnull=False) if hasattr(podcast.history, "filter") else [h for h in podcast.history.all() if h.end_date]
+                    history = (
+                        podcast.history.filter(end_date__isnull=False)
+                        if hasattr(podcast.history, "filter")
+                        else [h for h in podcast.history.all() if h.end_date]
+                    )
                     # Convert queryset to list if needed to ensure proper evaluation
-                    if hasattr(history, "__iter__") and not isinstance(history, (list, tuple)):
+                    if hasattr(history, "__iter__") and not isinstance(
+                        history, (list, tuple)
+                    ):
                         history = list(history)
                     all_history.extend(history)
 
                 # Sort by end_date descending (most recent first) for display
                 # The template filter will re-sort if needed
                 all_history.sort(
-                    key=lambda x: x.end_date if x.end_date else datetime.min.replace(tzinfo=UTC),
+                    key=lambda x: x.end_date or datetime.min.replace(tzinfo=UTC),
                     reverse=True,
                 )
 
@@ -897,6 +1375,7 @@ def track_modal(
                     @property
                     def history(self):
                         """Return a queryset-like object that aggregates all history."""
+
                         class HistoryProxy:
                             def __init__(self, history_list):
                                 self._history = history_list
@@ -911,7 +1390,12 @@ def track_modal(
                                 # Simple filtering for history_user
                                 if "history_user" in kwargs:
                                     user = kwargs["history_user"]
-                                    filtered = [h for h in self._history if getattr(h, "history_user", None) == user or getattr(h, "history_user", None) is None]
+                                    filtered = [
+                                        h
+                                        for h in self._history
+                                        if getattr(h, "history_user", None) == user
+                                        or getattr(h, "history_user", None) is None
+                                    ]
                                     return HistoryProxy(filtered)
                                 return self
 
@@ -920,12 +1404,18 @@ def track_modal(
                                 if order == "end_date":
                                     sorted_list = sorted(
                                         self._history,
-                                        key=lambda x: x.end_date if x.end_date else datetime.min.replace(tzinfo=UTC),
+                                        key=lambda x: (
+                                            x.end_date
+                                            or datetime.min.replace(tzinfo=UTC)
+                                        ),
                                     )
                                 elif order == "-end_date":
                                     sorted_list = sorted(
                                         self._history,
-                                        key=lambda x: x.end_date if x.end_date else datetime.min.replace(tzinfo=UTC),
+                                        key=lambda x: (
+                                            x.end_date
+                                            or datetime.min.replace(tzinfo=UTC)
+                                        ),
                                         reverse=True,
                                     )
                                 else:
@@ -943,8 +1433,12 @@ def track_modal(
                 "app/components/fill_track_song.html",
                 {
                     "user": request.user,
-                    "album": PodcastShowAdapter(show),  # Use show as "album" for template compatibility
-                    "track": PodcastEpisodeAdapter(episode),  # Use episode as "track" for template compatibility
+                    "album": PodcastShowAdapter(
+                        show
+                    ),  # Use show as "album" for template compatibility
+                    "track": PodcastEpisodeAdapter(
+                        episode
+                    ),  # Use episode as "track" for template compatibility
                     "music": podcast,  # Use podcast as "music" for template compatibility
                     "request": request,
                     "csrf_token": request.META.get("CSRF_COOKIE", ""),
@@ -959,5 +1453,6 @@ def track_modal(
         media_type,
         media_id,
         season_number=season_number,
+        episode_number=episode_number,
         track_action_update=track_action_update,
     )

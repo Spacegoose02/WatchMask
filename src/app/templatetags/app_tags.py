@@ -1,21 +1,283 @@
+import calendar
+import re
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from pathlib import Path
+from uuid import uuid4
 
 from django import template
 from django.conf import settings
-from django.urls import reverse
+from django.urls import reverse as _django_reverse
 from django.utils import formats, timezone
 from django.utils.dateparse import parse_date
 from django.utils.html import format_html
+from django.utils.translation import (
+    get_language,
+    get_language_info,
+    ngettext,
+    npgettext,
+    pgettext,
+)
+from django.utils.translation import gettext as _
 from unidecode import unidecode
 
-from app import config, helpers
+from app import card_surfaces, checkin, config, helpers, image_cache, track_actions
 from app.models import Item, MediaTypes, Sources, Status
+from app.providers import tmdb
 from app.services import metadata_resolution
-from users.models import TimeFormatChoices
+from app.stats_music import COUNTRY_NAME_MAP
+from users.media_type_chips import media_type_chip_preferences
+from users.models import ALL_SEARCH_TYPE, HISTORY_VIEW_TYPE, TimeFormatChoices
 from users.templatetags.user_tags import user_date_format, user_time_format
 
+
+@lru_cache(maxsize=8192)
+def _reverse_cached(viewname, kwargs_items):
+    return _django_reverse(viewname, kwargs=dict(kwargs_items))
+
+
+def reverse(viewname, kwargs=None, **rest):
+    """Resolve URLs; a card grid repeats the same few thousand names."""
+    if kwargs and not rest:
+        try:
+            return _reverse_cached(viewname, tuple(sorted(kwargs.items())))
+        except TypeError:  # unhashable kwarg value
+            pass
+    return _django_reverse(viewname, kwargs=kwargs, **rest)
+
+
 register = template.Library()
+COUNTRY_CODE_LENGTH = 2
+COUNTRY_CODE_BY_NAME = {
+    name.casefold(): code for code, name in COUNTRY_NAME_MAP.items()
+}
+
+
+@register.simple_tag
+def detail_promoted_facts(media_type, details):
+    """Pick existing provider facts for the desktop carousel summary."""
+    details = details if isinstance(details, dict) else {}
+    fields_by_type = {
+        MediaTypes.TV.value: (
+            ("status", _("Series status")),
+            ("format", _("Format")),
+            ("air_dates", _("Air dates")),
+            ("total_runtime", _("Total runtime")),
+            ("locale", _("Languages and country")),
+        ),
+        MediaTypes.MOVIE.value: (
+            ("format", _("Format")),
+            ("release_date", _("Release date")),
+            ("status", _("Release status")),
+            ("runtime", _("Runtime")),
+            ("certification", _("Certification")),
+            ("locale", _("Languages and country")),
+        ),
+        MediaTypes.SEASON.value: (
+            ("air_dates", _("Air dates")),
+            ("episodes", _("Episodes")),
+            ("total_runtime", _("Total runtime")),
+        ),
+        MediaTypes.GAME.value: (
+            ("release_date", _("Release date")),
+            ("platforms", _("Platforms")),
+            ("format", _("Format")),
+        ),
+    }
+    fields = []
+    suppressed_keys = set()
+    for key, default_label in fields_by_type.get(media_type, ()):
+        label = default_label
+        if key == "locale":
+            languages = details.get("languages")
+            country = details.get("country")
+            if not languages and not country:
+                continue
+            value = {"languages": languages, "country": country}
+            suppressed_keys.update(("languages", "country"))
+        elif key == "air_dates":
+            value = (details.get("first_air_date"), details.get("last_air_date"))
+            if not any(value):
+                continue
+            suppressed_keys.update(("first_air_date", "last_air_date"))
+        else:
+            value = details.get(key)
+            if value is None or value in ("", []):
+                continue
+            if (
+                media_type == MediaTypes.TV.value
+                and key == "format"
+                and details.get("status")
+            ):
+                suppressed_keys.add(key)
+                continue
+            suppressed_keys.add(key)
+            if media_type == MediaTypes.MOVIE.value and key == "runtime":
+                suppressed_keys.add("total_runtime")
+            if (
+                media_type == MediaTypes.TV.value
+                and key == "status"
+                and details.get("format")
+            ):
+                label = _("%(format)s series status") % {"format": _(details["format"])}
+        fields.append({"key": key, "label": label, "value": value})
+    return {"fields": fields, "suppressed_keys": suppressed_keys}
+
+
+@register.filter
+def translate_detail_value(value):
+    """Translate dynamic media-detail values while preserving their data."""
+    if value is None:
+        return _("Unknown")
+
+    text = str(value)
+    season_match = re.fullmatch(r"(Spring|Summer|Fall|Winter)\s+(\d{4})", text)
+    if season_match:
+        season, year = season_match.groups()
+        return _("%(season)s %(year)s") % {"season": _(season), "year": year}
+
+    broadcast_match = re.fullmatch(
+        r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)(\s+.+)",
+        text,
+    )
+    if broadcast_match:
+        weekday, remainder = broadcast_match.groups()
+        return f"{_(weekday)}{remainder}"
+
+    players_match = re.fullmatch(r"(\d+(?:-\d+)?)\s+players?", text, re.IGNORECASE)
+    if players_match:
+        return _("%(count)s players") % {"count": players_match.group(1)}
+
+    return _(text)
+
+
+@register.filter
+def country_code(value):
+    """Compact known country names to their ISO alpha-2 code."""
+    if not value:
+        return ""
+    text = str(value).strip()
+    if len(text) == COUNTRY_CODE_LENGTH and text.isalpha():
+        return text.upper()
+    return COUNTRY_CODE_BY_NAME.get(text.casefold(), text)
+
+
+# Built-in source labels are stored lowercase ("plex"); these need casing that
+# a plain capitalize would get wrong. Anything else with no capitals is
+# capitalized, and text a user typed ("Theatre") is shown as typed.
+ENTRY_SOURCE_LABELS = {
+    "anilist": "AniList",
+    "imdb": "IMDb",
+    "lastfm": "Last.fm",
+    "listenbrainz": "ListenBrainz",
+    "myanimelist": "MyAnimeList",
+    "simkl": "SIMKL",
+}
+
+
+@register.filter
+def entry_source_label(value):
+    """Return a display label for a media entry's source."""
+    text = str(value or "").strip()
+    if text != text.lower():
+        return text
+    return ENTRY_SOURCE_LABELS.get(text) or text.replace("_", " ").capitalize()
+
+
+@register.filter
+def translate_language_code(value):
+    """Return the localized language name for an ISO language code."""
+    if not value:
+        return _("Unknown")
+    try:
+        return get_language_info(str(value).replace("_", "-"))["name_translated"]
+    except KeyError:
+        return str(value)
+
+
+@register.filter
+def translate_activity_text(value, media_type=None):
+    """Translate dynamic activity counters shared by all detail pages."""
+    if not value:
+        return ""
+
+    text = str(value)
+    comparison_match = re.fullmatch(r"(Up|Down) (.+)", text)
+    if comparison_match:
+        direction, amount = comparison_match.groups()
+        message = _("Up %(value_1)s") if direction == "Up" else _("Down %(value_1)s")
+        return message % {"value_1": amount}
+
+    progress_match = re.fullmatch(r"Progress:\s*(.+)", text)
+    if progress_match:
+        return _("Progress: %(value_1)s") % {"value_1": progress_match.group(1)}
+
+    activity_match = re.fullmatch(
+        r"(Watched|Played|Listened|Read)\s+(once|\d+\s+times)",
+        text,
+        re.IGNORECASE,
+    )
+    if not activity_match:
+        return _(text)
+
+    verb = activity_match.group(1).title()
+    amount = activity_match.group(2).lower()
+    if verb == "Played" and media_type in {
+        MediaTypes.GAME.value,
+        MediaTypes.BOARDGAME.value,
+    }:
+        if amount == "once":
+            return pgettext("game activity", "Played once")
+        count = amount.split()[0]
+        return pgettext("game activity", "Played %(value_1)s times") % {
+            "value_1": count,
+        }
+
+    count = amount.split()[0]
+    if verb == "Watched":
+        if amount == "once":
+            return _("Watched once")
+        return _("Watched %(value_1)s times") % {"value_1": count}
+    if verb == "Listened":
+        if amount == "once":
+            return _("Listened once")
+        return _("Listened %(value_1)s times") % {"value_1": count}
+    if verb == "Read":
+        if amount == "once":
+            return _("Read once")
+        return _("Read %(value_1)s times") % {"value_1": count}
+    if amount == "once":
+        return _("Played once")
+    return _("Played %(value_1)s times") % {"value_1": count}
+
+
+@register.filter
+def translate_history_description(value):
+    """Translate dated descriptions that history_processor builds dynamically."""
+    if not value:
+        return ""
+
+    text = str(value)
+    dated_change = re.fullmatch(r"(Started|Finished) on\s+(.+)", text)
+    if not dated_change:
+        return _(text)
+
+    action, formatted_date = dated_change.groups()
+    if action == "Started":
+        return _("Started on %(date)s") % {"date": formatted_date}
+    return _("Finished on %(date)s") % {"date": formatted_date}
+
+
+@register.simple_tag
+def home_media_type_chip(user, media_type):
+    """Resolve one user's validated Home media-type label appearance."""
+    return media_type_chip_preferences(user, media_type)
+
+
+@register.simple_tag
+def watch_operation_id():
+    """Return private replay identity for one rendered first-party watch action."""
+    return str(uuid4())
 
 
 @register.simple_tag(takes_context=True)
@@ -26,7 +288,30 @@ def absolute_app_url(context, path):
 
 @register.simple_tag
 def djdt_enabled():
+    """Return the djdt enabled."""
     return getattr(settings, "ENABLE_DEBUG_TOOLBAR", False)
+
+
+@register.simple_tag
+def javascript_catalog_url():
+    """Return the translation catalog URL, versioned for long browser caching.
+
+    The catalog is a blocking script in every page's head. Keyed by release,
+    language and the compiled catalogs' mtime, the browser can keep it for a
+    year and still pick up a new release, a language switch or a recompile.
+    """
+    language = get_language() or settings.LANGUAGE_CODE
+    compiled_mtime = 0
+    for locale_dir in settings.LOCALE_PATHS:
+        for mo_file in Path(locale_dir).glob("*/LC_MESSAGES/djangojs.mo"):
+            try:
+                compiled_mtime = max(compiled_mtime, int(mo_file.stat().st_mtime))
+            except OSError:
+                continue
+    return (
+        f"{reverse('javascript-catalog')}"
+        f"?v={settings.VERSION}.{compiled_mtime}&l={language}"
+    )
 
 
 @register.simple_tag
@@ -37,24 +322,101 @@ def get_static_file_mtime(file_path):
         full_path = Path(static_dir) / file_path
         try:
             mtime = int(full_path.stat().st_mtime)
-            return f"?{mtime}"
         except OSError:
             continue
+        else:
+            return f"?{mtime}"
 
     # Fall back to STATIC_ROOT
     full_path = Path(settings.STATIC_ROOT) / file_path
     try:
         mtime = int(full_path.stat().st_mtime)
-        return f"?{mtime}"
     except OSError:
         # If file doesn't exist or can't be accessed
         return ""
+    else:
+        return f"?{mtime}"
+
+
+@register.filter
+def dict_get(dictionary, key):
+    """Look up a value in a dict by key, keyed by its string form."""
+    if not dictionary:
+        return None
+    return dictionary.get(str(key))
+
+
+@register.filter
+def newline_join(values):
+    """Join a list of strings with newlines, for round-tripping into a textarea."""
+    return "\n".join(values or [])
 
 
 @register.filter
 def no_underscore(arg1):
     """Return the title case of the string."""
     return arg1.replace("_", " ")
+
+
+@register.filter
+def image_url(value):
+    """Return a safe Floppy image proxy URL when external caching is enabled."""
+    return image_cache.rewrite_image_url(value)
+
+
+@register.simple_tag
+def episode_queue_url(item, media):
+    """Return the episode page the Up Next chip opens."""
+    queue = media.next_episode_queue
+    if queue.get("season_number") is None:
+        return ""
+    is_anime = item.media_type == MediaTypes.ANIME.value
+    return reverse(
+        "anime_episode_details" if is_anime else "episode_details",
+        kwargs={
+            "source": queue["source"],
+            "media_id": queue["media_id"],
+            "title": slug(item.title) or slug(str(queue["media_id"])) or "item",
+            "season_number": queue["season_number"],
+            "episode_number": queue["episode_number"],
+        },
+    )
+
+
+@register.simple_tag
+def episode_queue_label(media):
+    """Localize the Up Next chip when rendering, after the Home row cache."""
+    queue = media.next_episode_queue
+    if queue["released"]:
+        return f"{media.episodes_left} {_('Behind')}"
+    days = queue.get("days_until")
+    if days is None:
+        return _("Upcoming")
+    if days == 0:
+        return _("Today")
+    return f"{days} {ngettext('day', 'days', days)}"
+
+
+@register.filter
+def youtube_landscape_thumbnail(value):
+    """Prefer YouTube's high-resolution thumbnail for standard artwork."""
+    if not isinstance(value, str):
+        return value
+    return re.sub(
+        r"^(https://(?:i\.ytimg\.com|img\.youtube\.com)/vi/[A-Za-z0-9_-]{11}/)(?:hqdefault|mqdefault|sddefault)\.jpg$",
+        r"\1maxresdefault.jpg",
+        value,
+    )
+
+
+@register.filter
+def user_tag_names(item_tags, user):
+    """Return tag names from a prefetched ItemTag queryset, scoped to one user."""
+    if not item_tags or user is None:
+        return []
+    return [
+        item_tag.tag.name for item_tag in item_tags if item_tag.tag.user_id == user.id
+    ]
 
 
 @register.filter
@@ -133,19 +495,31 @@ def slug(arg1):
     Sometimes slugify removes all characters from a string, so we need to
     urlencode the special characters first.
     e.g Anime: 31687
+
+    The result must stay a single path segment, so "/" is encoded too and
+    the dot segments "." and ".." are replaced (e.g. episode title "/").
     """
     cleaned = template.defaultfilters.slugify(arg1)
     if cleaned == "":
         cleaned = template.defaultfilters.slugify(
-            template.defaultfilters.urlencode(unidecode(arg1)),
+            template.defaultfilters.urlencode(unidecode(arg1), ""),
         )
         if cleaned == "":
-            cleaned = template.defaultfilters.urlencode(unidecode(arg1))
+            cleaned = template.defaultfilters.urlencode(unidecode(arg1), "")
 
             if cleaned == "":
-                cleaned = template.defaultfilters.urlencode(arg1)
+                cleaned = template.defaultfilters.urlencode(arg1, "")
+
+    if cleaned in {".", ".."}:
+        cleaned = cleaned.replace(".", "2e")
 
     return cleaned
+
+
+@register.filter
+def minutes_hhmm(total_minutes):
+    """Format minutes as "1h 05min", or "45min" under an hour."""
+    return helpers.minutes_to_hhmm(total_minutes or 0)
 
 
 @register.filter
@@ -157,6 +531,19 @@ def date_format(datetime, user):
         user: User object to get preferred date format
     """
     return user_date_format(datetime, user)
+
+
+@register.filter
+def is_future_date(value):
+    """Only known dates after today represent unreleased episodes."""
+    if isinstance(value, str):
+        try:
+            value = parse_date(value)
+        except ValueError:
+            return False
+    if isinstance(value, datetime):
+        value = timezone.localtime(value).date() if timezone.is_aware(value) else value.date()
+    return isinstance(value, date) and value > timezone.localdate()
 
 
 @register.filter
@@ -233,6 +620,21 @@ def watched_count(history):
 
 
 @register.filter
+def rating_plays(episode):
+    """Return the plays a row's rating reads, ignoring any open rewatch pass.
+
+    A rating belongs to the episode rather than to one pass over it, so this
+    prefers the lifetime list and falls back to whatever the payload carries
+    (other media types only supply `history`).
+    """
+    if isinstance(episode, dict):
+        return episode.get("all_history") or episode.get("history") or []
+    return (
+        getattr(episode, "all_history", None) or getattr(episode, "history", None) or []
+    )
+
+
+@register.filter
 def score_display(score, user):
     """Format a score using the user's rating scale."""
     if score is None:
@@ -256,7 +658,7 @@ def match_percent(value):
     except (TypeError, ValueError):
         return None
     normalized = max(0.0, min(1.0, normalized))
-    return int(round(normalized * 100))
+    return round(normalized * 100)
 
 
 @register.filter
@@ -277,27 +679,58 @@ def source_readable(source):
 
 
 @register.filter
+def detail_link_url(sections, brand):
+    """Return the Links-dropdown URL for a provider, so rating chips can reuse it."""
+    brand = str(brand or "").lower()
+    for section in sections or ():
+        for entry in section["entries"]:
+            if entry.get("brand") == brand:
+                return entry["url"]
+    return ""
+
+
+@register.filter
 def media_type_readable(media_type):
     """Return the readable media type."""
-    return MediaTypes(media_type).label
+    return _(MediaTypes(media_type).label)
 
 
 @register.filter
 def media_type_readable_plural(media_type):
     """Return the readable media type in plural form."""
-    singular = MediaTypes(media_type).label
-
-    # Special cases that don't change in plural form
-    if singular.lower() in [MediaTypes.ANIME.value, MediaTypes.MANGA.value, MediaTypes.MUSIC.value]:
-        return singular
-
-    return f"{singular}s"
+    if media_type == ALL_SEARCH_TYPE:
+        return _("All")
+    # English suffixes do not produce correct plurals in other languages.
+    return {
+        MediaTypes.TV: _("TV Shows"),
+        MediaTypes.SEASON: _("TV Seasons"),
+        MediaTypes.EPISODE: _("Episodes"),
+        MediaTypes.MOVIE: _("Movies"),
+        MediaTypes.ANIME: _("Anime"),
+        MediaTypes.MANGA: _("Manga"),
+        MediaTypes.GAME: _("Games"),
+        MediaTypes.BOOK: _("Books"),
+        MediaTypes.COMIC: _("Comics"),
+        MediaTypes.COMIC_ISSUE: _("Comic Issues"),
+        MediaTypes.BOARDGAME: _("Board Games"),
+        MediaTypes.MUSIC: _("Music"),
+        MediaTypes.PODCAST: _("Podcasts"),
+        MediaTypes.VIDEO: _("Videos"),
+    }[MediaTypes(media_type)]
 
 
 @register.filter
 def media_status_readable(media_status):
     """Return the readable media status."""
-    return Status(media_status).label
+    if not media_status:
+        return _("No Status")
+    try:
+        return _(Status(media_status).label)
+    except ValueError:
+        # Imported/provider data can contain a metadata status that is not a
+        # user tracking status (for example, "Released"). Keep list pages
+        # renderable and preserve the value when no local label exists.
+        return str(media_status)
 
 
 @register.filter
@@ -309,7 +742,7 @@ def default_source(media_type):
 @register.filter
 def media_past_verb(media_type):
     """Return the past tense verb for the given media type."""
-    return config.get_verb(media_type, past_tense=True)
+    return _(config.get_verb(media_type, past_tense=True))
 
 
 @register.filter
@@ -337,11 +770,40 @@ def long_unit(media_type):
 
 
 @register.filter
+def progress_unit_label(media_type, count):
+    """Translate progress units for display without changing raw config units."""
+    labels = {
+        "Episode": npgettext("progress unit", "Episode", "Episodes", count),
+        "Chapter": npgettext("progress unit", "Chapter", "Chapters", count),
+        "Page": npgettext("progress unit", "Page", "Pages", count),
+        "Issue": npgettext("progress unit", "Issue", "Issues", count),
+        "Read": npgettext("progress unit", "Read", "Reads", count),
+        "Play": npgettext("progress unit", "Play", "Plays", count),
+        "Minute": npgettext("progress unit", "Minute", "Minutes", count),
+    }
+    unit = long_unit(media_type)
+    return labels.get(unit, unit)
+
+
+@register.filter
 def safe_attr(obj, attr):
     """Safely get an attribute from an object, returning None if it doesn't exist."""
     if obj is None:
         return None
     return getattr(obj, attr, None)
+
+
+@register.filter
+def safe_count(value):
+    """Coerce a value to an int for use as a blocktranslate 'count', defaulting to 0.
+
+    blocktranslate's count argument must be an int/float/Decimal; a non-numeric
+    value (e.g. bad provider metadata) would otherwise raise a TemplateSyntaxError.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _normalize_title_value(value):
@@ -412,7 +874,12 @@ def season_card_title(item):
 
     normalized_provider_title = _normalize_title_value(provider_title)
     normalized_fallback_title = _normalize_title_value(fallback_title)
-    if normalized_provider_title and normalized_provider_title != normalized_fallback_title:
+    if (
+        normalized_provider_title
+        and normalized_provider_title != normalized_fallback_title
+    ):
+        if normalized_fallback_title:
+            return f"{normalized_fallback_title}: {normalized_provider_title}"
         return normalized_provider_title
 
     try:
@@ -420,10 +887,11 @@ def season_card_title(item):
     except (TypeError, ValueError):
         season_number = None
 
-    if season_number == 0:
-        return "Specials"
     if season_number is not None:
-        return f"Season {season_number}"
+        season_str = "Specials" if season_number == 0 else f"Season {season_number}"
+        if normalized_fallback_title:
+            return f"{normalized_fallback_title} {season_str}"
+        return season_str
 
     return normalized_fallback_title or ""
 
@@ -509,9 +977,8 @@ def _resolve_studio_url_target(value):
     ):
         return _resolve_studio_url_target(nested_studio)
 
-    if (
-        getattr(value, "source_studio_id", None) is not None
-        and getattr(value, "name", None)
+    if getattr(value, "source_studio_id", None) is not None and getattr(
+        value, "name", None
     ):
         return value
     if getattr(value, "studio_id", None) is not None and getattr(value, "name", None):
@@ -596,6 +1063,36 @@ def music_album_url(album):
     )
 
 
+@register.filter
+def music_track_url(track):
+    """Return the canonical shared media-details URL for a music track."""
+    if track is None or isinstance(track, dict):
+        return ""
+
+    track_id = getattr(track, "id", None)
+    album = getattr(track, "album", None)
+    if track_id is None or album is None or getattr(album, "id", None) is None:
+        return ""
+
+    artist = getattr(album, "artist", None)
+    artist_id = getattr(artist, "id", None)
+    artist_name = getattr(artist, "name", None)
+    return reverse(
+        "music_track_details",
+        kwargs={
+            "artist_id": artist_id or 0,
+            "artist_slug": _music_slug(
+                artist_name or "Unknown Artist",
+                artist_id or "artist",
+            ),
+            "album_id": album.id,
+            "album_slug": _music_slug(album.title, album.id),
+            "track_id": track_id,
+            "track_slug": _music_slug(getattr(track, "title", ""), track_id),
+        },
+    )
+
+
 def _studio_slug(value, fallback):
     """Return a stable slug with a safe fallback for studio links."""
     normalized = slug(value or "")
@@ -651,7 +1148,10 @@ def release_year(item, media=None):
             return display_year
         release_dt = getattr(media.item, "release_datetime", None)
         if release_dt:
-            return timezone.localtime(release_dt).year
+            try:
+                return timezone.localtime(release_dt).year
+            except (OverflowError, ValueError, OSError):
+                pass
 
     if not item:
         return None
@@ -673,7 +1173,10 @@ def release_year(item, media=None):
 
     release_dt = getattr(item, "release_datetime", None)
     if release_dt:
-        return timezone.localtime(release_dt).year
+        try:
+            return timezone.localtime(release_dt).year
+        except (OverflowError, ValueError, OSError):
+            return None
 
     return None
 
@@ -689,12 +1192,16 @@ def get_search_media_types(user):
     """Return available media types for search based on user preferences."""
     # Handle anonymous users by returning all media types
     if not user or not user.is_authenticated:
-        enabled_types = [mt for mt in MediaTypes.values if mt != MediaTypes.EPISODE.value and mt != MediaTypes.SEASON.value]
+        enabled_types = [
+            mt
+            for mt in MediaTypes.values
+            if mt not in (MediaTypes.EPISODE.value, MediaTypes.SEASON.value)
+        ]
     else:
         enabled_types = user.get_enabled_media_types()
 
     # Filter and format the types for search
-    return [
+    search_types = [
         {
             "display": media_type_readable_plural(media_type),
             "value": media_type,
@@ -702,6 +1209,29 @@ def get_search_media_types(user):
         for media_type in enabled_types
         if media_type != MediaTypes.SEASON.value
     ]
+    if user and user.is_authenticated:
+        # Library-wide search across every enabled type (#1160).
+        search_types.insert(0, {"display": _("All"), "value": ALL_SEARCH_TYPE})
+    return search_types
+
+
+def _saved_views_by_type(user):
+    """Group the user's saved views by type, reading them once per request."""
+    if not user or not user.is_authenticated:
+        return {}
+    grouped = getattr(user, "_saved_views_by_type", None)
+    if grouped is None:
+        grouped = {}
+        for saved_view in user.saved_views.all():
+            grouped.setdefault(saved_view.media_type, []).append(saved_view)
+        user._saved_views_by_type = grouped
+    return grouped
+
+
+@register.simple_tag
+def get_history_saved_views(user):
+    """Return the user's saved History views for the sidebar."""
+    return _saved_views_by_type(user).get(HISTORY_VIEW_TYPE, [])
 
 
 @register.simple_tag
@@ -709,15 +1239,22 @@ def get_sidebar_media_types(user):
     """Return available media types for sidebar navigation based on user preferences."""
     # Handle anonymous users by returning all media types
     if not user or not user.is_authenticated:
-        enabled_types = [mt for mt in MediaTypes.values if mt != MediaTypes.EPISODE.value]
+        enabled_types = [
+            mt
+            for mt in MediaTypes.values
+            if mt not in (MediaTypes.EPISODE.value, MediaTypes.COMIC_ISSUE.value)
+        ]
     else:
-        enabled_types = user.get_enabled_media_types()
+        enabled_types = user.get_sidebar_media_types()
+
+    saved_views_by_type = _saved_views_by_type(user)
 
     # Format the types for sidebar
     return [
         {
             "media_type": media_type,
             "display_name": media_type_readable_plural(media_type),
+            "saved_views": saved_views_by_type.get(media_type, []),
         }
         for media_type in enabled_types
     ]
@@ -781,11 +1318,12 @@ def user_event_time(event, user):
         else:
             time_str = formats.date_format(local_dt, "TIME_FORMAT")
 
-        return f"at {time_str}"
     except (ValueError, TypeError, AttributeError):
         # Fallback to default format if there's an error
         local_dt = timezone.localtime(event.datetime)
         return f"at {local_dt.strftime('%H:%M')}"
+    else:
+        return f"at {time_str}"
 
 
 @register.filter
@@ -828,7 +1366,9 @@ def media_url(media):
     # Route override — used to route TV items to anime show pages, or season items
     # to anime season URLs when the parent show is anime
     route_media_type = (
-        media.get("route_media_type") if is_dict else getattr(media, "route_media_type", None)
+        media.get("route_media_type")
+        if is_dict
+        else getattr(media, "route_media_type", None)
     )
 
     source = media["source"] if is_dict else media.source
@@ -907,7 +1447,7 @@ def _untracked_season_next_episode_url(item, seasons, actual_media_type):
     season without a Season row. Untracked seasons are only visible through
     their calendar events (same source as _next_episode_air_date_value).
     """
-    from events.models import Event
+    from events.models import Event, released_q
 
     is_dict = isinstance(item, dict)
     media_id = item["media_id"] if is_dict else getattr(item, "media_id", None)
@@ -929,6 +1469,8 @@ def _untracked_season_next_episode_url(item, seasons, actual_media_type):
             content_number__isnull=False,
         )
         .exclude(item__season_number__in=tracked_season_numbers)
+        .exclude(datetime__year__lt=1900)
+        .filter(released_q("datetime", timezone.now()))
         .order_by("item__season_number", "content_number")
         .select_related("item")
         .first()
@@ -940,13 +1482,60 @@ def _untracked_season_next_episode_url(item, seasons, actual_media_type):
     slug_title = slug(title) or slug(str(media_id)) or "item"
     is_anime = actual_media_type == MediaTypes.ANIME.value
     url_name = "anime_episode_details" if is_anime else "episode_details"
-    return reverse(url_name, kwargs={
-        "source": source,
-        "media_id": media_id,
-        "title": slug_title,
-        "season_number": event.item.season_number,
-        "episode_number": event.content_number,
-    })
+    return reverse(
+        url_name,
+        kwargs={
+            "source": source,
+            "media_id": media_id,
+            "title": slug_title,
+            "season_number": event.item.season_number,
+            "episode_number": event.content_number,
+        },
+    )
+
+
+def _next_episode_number_for_season_item(item, media):
+    """Resolve a season-card target from locally known released episodes."""
+    if hasattr(media, "next_episode_number"):
+        return media.next_episode_number()
+
+    is_dict = isinstance(item, dict)
+    media_id = item["media_id"] if is_dict else getattr(item, "media_id", None)
+    source = item["source"] if is_dict else getattr(item, "source", None)
+    season_number = (
+        item["season_number"] if is_dict else getattr(item, "season_number", None)
+    )
+    if not media_id or not source or season_number is None:
+        return None
+
+    from events.models import Event, released_q
+
+    event_numbers = (
+        Event.objects.filter(
+            item__media_id=media_id,
+            item__source=source,
+            item__media_type=MediaTypes.SEASON.value,
+            item__season_number=season_number,
+            content_number__isnull=False,
+        )
+        .exclude(datetime__year__lt=1900)
+        .filter(released_q("datetime", timezone.now()))
+        .values_list("content_number", flat=True)
+    )
+    episode_numbers = sorted({int(number) for number in event_numbers})
+    if not episode_numbers:
+        max_progress = getattr(media, "max_progress", None)
+        try:
+            max_progress = int(max_progress)
+        except (TypeError, ValueError):
+            max_progress = None
+        if max_progress and max_progress > 0:
+            episode_numbers = range(1, max_progress + 1)
+
+    return tmdb.find_next_episode(
+        getattr(media, "progress", 0) or 0,
+        [{"episode_number": number} for number in episode_numbers],
+    )
 
 
 @register.simple_tag
@@ -958,11 +1547,15 @@ def next_episode_url(item, media):
     season is found via the already-prefetched seasons queryset.
     """
     is_dict = isinstance(item, dict)
-    actual_media_type = item["media_type"] if is_dict else getattr(item, "media_type", None)
+    actual_media_type = (
+        item["media_type"] if is_dict else getattr(item, "media_type", None)
+    )
 
     # ── Season card ──────────────────────────────────────────────────────────
     if actual_media_type == MediaTypes.SEASON.value:
-        season_number = item["season_number"] if is_dict else getattr(item, "season_number", None)
+        season_number = (
+            item["season_number"] if is_dict else getattr(item, "season_number", None)
+        )
         if season_number is None:
             return ""
         title = item["title"] if is_dict else getattr(item, "title", "")
@@ -972,19 +1565,25 @@ def next_episode_url(item, media):
             return ""
         slug_title = slug(title) or slug(str(media_id)) or "item"
         library_media_type = (
-            item.get("library_media_type", "") if is_dict else getattr(item, "library_media_type", "")
+            item.get("library_media_type", "")
+            if is_dict
+            else getattr(item, "library_media_type", "")
         )
         is_anime = library_media_type == MediaTypes.ANIME.value
         url_name = "anime_episode_details" if is_anime else "episode_details"
-        progress = getattr(media, "progress", None) or 0
-        next_ep = int(progress) + 1
-        return reverse(url_name, kwargs={
-            "source": source,
-            "media_id": media_id,
-            "title": slug_title,
-            "season_number": season_number,
-            "episode_number": next_ep,
-        })
+        next_ep = _next_episode_number_for_season_item(item, media)
+        if next_ep is None:
+            return ""
+        return reverse(
+            url_name,
+            kwargs={
+                "source": source,
+                "media_id": media_id,
+                "title": slug_title,
+                "season_number": season_number,
+                "episode_number": next_ep,
+            },
+        )
 
     # ── TV / Anime show card ─────────────────────────────────────────────────
     if actual_media_type in (MediaTypes.TV.value, MediaTypes.ANIME.value):
@@ -1006,27 +1605,32 @@ def next_episode_url(item, media):
                     kwargs={"media_id": media_id, "title": slug_title},
                 )
             return ""
-        # Seasons are already prefetched for TV home cards — no extra query
-        in_progress = [
-            s for s in seasons.all()
-            if getattr(s, "status", None) == Status.IN_PROGRESS.value
-            and getattr(getattr(s, "item", None), "season_number", 0) != 0
-        ]
-        if not in_progress:
+
+        next_episode_target = (
+            media.next_episode_target()
+            if hasattr(media, "next_episode_target")
+            else None
+        )
+        if next_episode_target is None:
             return _untracked_season_next_episode_url(item, seasons, actual_media_type)
-        season = min(in_progress, key=lambda s: s.item.season_number)
+
+        season, next_ep = next_episode_target
         season_item = season.item
-        slug_title = slug(season_item.title) or slug(str(season_item.media_id)) or "item"
+        slug_title = (
+            slug(season_item.title) or slug(str(season_item.media_id)) or "item"
+        )
         is_anime = actual_media_type == MediaTypes.ANIME.value
         url_name = "anime_episode_details" if is_anime else "episode_details"
-        next_ep = int(getattr(season, "progress", 0) or 0) + 1
-        return reverse(url_name, kwargs={
-            "source": season_item.source,
-            "media_id": season_item.media_id,
-            "title": slug_title,
-            "season_number": season_item.season_number,
-            "episode_number": next_ep,
-        })
+        return reverse(
+            url_name,
+            kwargs={
+                "source": season_item.source,
+                "media_id": season_item.media_id,
+                "title": slug_title,
+                "season_number": season_item.season_number,
+                "episode_number": next_ep,
+            },
+        )
 
     return ""
 
@@ -1038,28 +1642,35 @@ def media_view_url(view_name, media):
     if not is_dict and not hasattr(media, "source"):
         return ""
 
+    media_type = media["media_type"] if is_dict else media.media_type
+
     # Build kwargs using either dict access or object attribute
     kwargs = {
         "source": media["source"] if is_dict else media.source,
         "media_type": (
-            media.get("route_media_type") or media["media_type"]
+            media.get("route_media_type") or media_type
             if is_dict
-            else getattr(media, "route_media_type", None) or media.media_type
+            else getattr(media, "route_media_type", None) or media_type
         ),
         "media_id": str(media["media_id"] if is_dict else media.media_id),
     }
 
-    # Handle season/episode numbers if they exist
-    if is_dict:
-        if "season_number" in media:
-            kwargs["season_number"] = media["season_number"]
-        if "episode_number" in media:
-            kwargs["episode_number"] = media["episode_number"]
-    else:
-        season_number = getattr(media, "season_number", None)
-        episode_number = getattr(media, "episode_number", None)
+    # Providers may include season_number=0 on top-level TV/anime metadata.
+    # Only season and episode objects use those values as URL path segments.
+    if media_type in (MediaTypes.SEASON.value, MediaTypes.EPISODE.value):
+        season_number = (
+            media.get("season_number")
+            if is_dict
+            else getattr(media, "season_number", None)
+        )
         if season_number is not None:
             kwargs["season_number"] = season_number
+    if media_type == MediaTypes.EPISODE.value:
+        episode_number = (
+            media.get("episode_number")
+            if is_dict
+            else getattr(media, "episode_number", None)
+        )
         if episode_number is not None:
             kwargs["episode_number"] = episode_number
 
@@ -1070,6 +1681,35 @@ def media_view_url(view_name, media):
         kwargs.pop("season_number", None)
 
     return reverse(view_name, kwargs=kwargs)
+
+
+@register.simple_tag
+def item_slot_id(prefix, item):
+    """Return an id for a card slot that a save or score response swaps in place.
+
+    Built from the item's own identity (source, type, ids), so it is the same
+    on a card for something not tracked yet and in the response after saving.
+    Unlike component_id it ignores route_media_type, which is only set on
+    some cards (e.g. grouped anime in search), and it includes the source,
+    since two providers can share a media id.
+    """
+    is_dict = isinstance(item, dict)
+    if not is_dict and not hasattr(item, "media_type"):
+        return ""
+
+    def get(name):
+        return item.get(name) if is_dict else getattr(item, name, None)
+
+    parts = [
+        prefix,
+        get("source"),
+        get("media_type"),
+        get("media_id"),
+        get("season_number"),
+        get("episode_number"),
+    ]
+    slot_id = "-".join(str(part) for part in parts if part not in (None, ""))
+    return re.sub(r"[^A-Za-z0-9_-]", "-", slot_id)
 
 
 @register.simple_tag
@@ -1108,7 +1748,9 @@ def component_id(component_type, media, instance_id=None):
     if instance_id:
         component_id += f"-{instance_id}"
 
-    return component_id
+    # htmx resolves hx-target="#..." via querySelectorAll, so URL-shaped
+    # media IDs must not leave CSS selector punctuation in the component ID.
+    return re.sub(r"[^A-Za-z0-9_-]", "-", component_id)
 
 
 @register.simple_tag
@@ -1188,7 +1830,7 @@ def icon(name, is_active, extra_classes="w-5 h-5"):
         content = config.get_svg_icon(name)
     else:
         content = other_icons[name]
-    active_class = "text-indigo-400 " if is_active else ""
+    active_class = "text-[var(--color-link)] " if is_active else ""
 
     svg = base_svg.format(
         content=content,
@@ -1254,6 +1896,17 @@ def get_pagination_range(current_page, total_pages, window):
     return result
 
 
+# Day-count deltas (end_date - start_date) that identify named preset date
+# ranges. Each is one less than the calendar span, since both endpoints are
+# inclusive (e.g. "This Week" spans 7 days -> a 6-day difference).
+DAYS_DIFF_ONE_WEEK = 6
+DAYS_DIFF_ONE_MONTH = 29
+DAYS_DIFF_90_DAYS = 89
+DAYS_DIFF_6_MONTHS_MIN = 175
+DAYS_DIFF_6_MONTHS_MAX = 185
+DAYS_DIFF_ONE_YEAR = 364
+
+
 def _check_same_day_ranges(start_date, end_date, today):
     """Check for same-day date ranges like Today and Yesterday."""
     if start_date == end_date:
@@ -1267,7 +1920,7 @@ def _check_same_day_ranges(start_date, end_date, today):
 def _check_week_ranges(start_date, end_date, today):
     """Check for week-based date ranges."""
     days_diff = (end_date - start_date).days
-    if days_diff == 6:  # 7 days including start and end
+    if days_diff == DAYS_DIFF_ONE_WEEK:  # 7 days including start and end
         if start_date == today - timedelta(days=6):
             return "This Week"
         if start_date == today - timedelta(days=13):
@@ -1284,7 +1937,7 @@ def _check_month_ranges(start_date, end_date, today):
         return "This Month"
     if start_date == month_start and end_date == today - timedelta(days=1):
         return "This Month"
-    if days_diff == 29:  # 30 days including start and end
+    if days_diff == DAYS_DIFF_ONE_MONTH:  # 30 days including start and end
         if start_date == today - timedelta(days=29):
             return "This Month"
         if start_date == today - timedelta(days=59):
@@ -1298,15 +1951,15 @@ def _check_extended_ranges(start_date, end_date):
     days_diff = (end_date - start_date).days
 
     # Check for 90 days
-    if days_diff == 89:  # 90 days including start and end
+    if days_diff == DAYS_DIFF_90_DAYS:  # 90 days including start and end
         return "Last 90 Days"
 
     # Check for 6 months (approximately 180 days)
-    if 175 <= days_diff <= 185:
+    if DAYS_DIFF_6_MONTHS_MIN <= days_diff <= DAYS_DIFF_6_MONTHS_MAX:
         return "Last 6 Months"
 
     # Check for year ranges
-    if days_diff == 364:  # 365 days including start and end
+    if days_diff == DAYS_DIFF_ONE_YEAR:  # 365 days including start and end
         return "Last 12 Months"
 
     return None
@@ -1368,7 +2021,7 @@ def format_date_range_display(start_date, end_date):
     if hasattr(end_date, "date"):
         end_date = end_date.date()
 
-    today = date.today()
+    today = date.today()  # noqa: DTZ011  # plain calendar date, matching upstream behaviour
 
     # Check for predefined ranges
     predefined_range = _is_predefined_date_range(start_date, end_date, today)
@@ -1396,8 +2049,7 @@ def filter_media_types(entries, media_types_str):
         return entries
     media_types = {mt.strip().lower() for mt in media_types_str.split(",")}
     return [
-        entry for entry in entries
-        if entry.get("media_type", "").lower() in media_types
+        entry for entry in entries if entry.get("media_type", "").lower() in media_types
     ]
 
 
@@ -1418,7 +2070,8 @@ def exclude_media_types(entries, media_types_str):
         return entries
     media_types = {mt.strip().lower() for mt in media_types_str.split(",")}
     return [
-        entry for entry in entries
+        entry
+        for entry in entries
         if entry.get("media_type", "").lower() not in media_types
     ]
 
@@ -1454,7 +2107,8 @@ def filter_home_media_types(items, media_types_str):
         return items
     media_types = {mt.strip().lower() for mt in media_types_str.split(",")}
     return [
-        item for item in items
+        item
+        for item in items
         if getattr(getattr(item, "item", None), "media_type", "").lower() in media_types
     ]
 
@@ -1476,8 +2130,10 @@ def exclude_home_media_types(items, media_types_str):
         return items
     media_types = {mt.strip().lower() for mt in media_types_str.split(",")}
     return [
-        item for item in items
-        if getattr(getattr(item, "item", None), "media_type", "").lower() not in media_types
+        item
+        for item in items
+        if getattr(getattr(item, "item", None), "media_type", "").lower()
+        not in media_types
     ]
 
 
@@ -1492,14 +2148,201 @@ def show_media_score(rating, user):
     except (TypeError, ValueError):
         return True
 
-    hide_zero = getattr(user, "hide_zero_rating", False)
+    from users.card_metadata import hides_zero_rating
+
+    hide_zero = hides_zero_rating(user, None)
     return not hide_zero or rating_value > 0
+
+
+@register.simple_tag(takes_context=True)
+def score_is_visible(context, rating, media_type=None):
+    """Return whether ``rating`` should show for this card's media type."""
+    from users.card_metadata import hides_zero_rating, shows_score
+
+    user = context.get("user")
+    if media_type is None:
+        media_type = context.get("resolved_media_type")
+    item = context.get("item")
+    if media_type is None and item is not None:
+        media_type = getattr(item, "media_type", None)
+    if not shows_score(user, media_type):
+        return False
+    if rating is None:
+        return False
+    try:
+        rating_value = float(rating)
+    except (TypeError, ValueError):
+        return True
+    hide_zero = hides_zero_rating(user, media_type)
+    return not hide_zero or rating_value > 0
+
+
+@register.simple_tag(takes_context=True)
+def card_field_on(context, media_type, field_id):
+    """Return whether this type's profile includes ``field_id``."""
+    from users.card_metadata import field_enabled
+
+    user = context.get("user") or getattr(context.get("request"), "user", None)
+    return field_enabled(user, media_type, field_id)
+
+
+@register.simple_tag(takes_context=True)
+def card_subtitle_class(context, media_type=None):
+    """Return the always-visible subtitle class, or an empty string."""
+    from users.card_metadata import (
+        DISPLAY_ALWAYS,
+        DISPLAY_HOVER,
+        resolve_profile,
+        subtitle_display,
+    )
+
+    user = context.get("user") or getattr(context.get("request"), "user", None)
+    # A card-level always class would reveal lines the user set to hover.
+    lines = resolve_profile(user, media_type).get("lines") or []
+    if any(line.get("display") == DISPLAY_HOVER for line in lines):
+        return ""
+    if subtitle_display(user, media_type) == DISPLAY_ALWAYS:
+        return " media-card-subtitle-always"
+    return ""
+
+
+@register.simple_tag(takes_context=True)
+def card_title_classes(context, media_type=None):
+    """Return the saved title treatment as classes for a hand-rolled card.
+
+    Empty while the type keeps the default treatment, so those cards keep their
+    own title clamps until the user changes a title option.
+    """
+    from users.card_metadata import (
+        TITLE_LINE_ALL,
+        default_title_options,
+        resolve_profile,
+        title_options,
+    )
+
+    user = context.get("user") or getattr(context.get("request"), "user", None)
+    title = title_options(resolve_profile(user, media_type))
+    if title == default_title_options():
+        return ""
+    classes = [
+        f"media-card-title-{title['overflow']}",
+        f"media-card-title-{title['hover']}",
+    ]
+    if title["lines"] == TITLE_LINE_ALL:
+        classes += ["media-card-title-multiline", "media-card-title-lines-all"]
+    else:
+        classes.append(f"media-card-title-rest-{title['lines']}")
+        if title["lines"] > 1:
+            classes.append("media-card-title-multiline")
+    if title["hover_lines"] == TITLE_LINE_ALL:
+        classes.append("media-card-title-hover-all")
+    else:
+        classes.append(f"media-card-title-hover-{title['hover_lines']}")
+    return " " + " ".join(classes)
+
+
+@register.inclusion_tag("app/components/card_lines.html", takes_context=True)
+def card_lines(context, media_type, item=None, media=None):
+    """Render the enabled subtitle lines for one card."""
+    from users.card_metadata import card_lines as render_lines
+
+    user = context.get("user") or getattr(context.get("request"), "user", None)
+    return {"lines": render_lines(user, media_type, item, media)}
+
+
+@register.inclusion_tag("app/components/media_card.html", takes_context=True)
+def media_card(context, surface, **values):
+    """Render the shared media card as ``surface`` declares it.
+
+    See ``app.card_surfaces`` for the surfaces and the values a card accepts.
+    """
+    return card_surfaces.card_context(context.flatten(), surface, values)
+
+
+# Icons the detail action row may hold, in display order. Below 400px wide the
+# row keeps this many cells (the More menu is one of them) so each stays tappable.
+DETAIL_ROW_PHONE_CAP = 5
+
+
+@register.simple_tag(takes_context=True)
+def detail_action_row(context, media, media_type):
+    """Say which icons the detail action row shows, and which fold into More on phones.
+
+    Icons that cannot do anything for the item are left out: manual items have no
+    provider to sync with, Seerr needs a configured server and a TMDB movie or
+    show, and podcast shows keep their notes in their own tracker form.
+    """
+    request = context.get("request")
+    user = getattr(request, "user", None)
+    source = (
+        media.get("source")
+        if isinstance(media, dict)
+        else getattr(media, "source", None)
+    )
+    show = {
+        "link": bool(context.get("detail_link_sections")),
+        "tags": True,
+        "notes": not context.get("podcast_show"),
+        "lists": True,
+        "seerr": bool(
+            user
+            and user.seerr_url
+            and user.seerr_api_key
+            and user.seerr_user_id
+            and source == Sources.TMDB.value
+            and media_type in (MediaTypes.MOVIE.value, MediaTypes.TV.value),
+        ),
+        "history": True,
+        "sync": source != Sources.MANUAL.value,
+    }
+    shown = [key for key, on in show.items() if on]
+    # More takes the last icons, the ones used least, and is itself one cell.
+    overflow = (
+        shown[DETAIL_ROW_PHONE_CAP - 1 :] if len(shown) > DETAIL_ROW_PHONE_CAP else []
+    )
+    return {**show, "overflow": overflow}
+
+
+@register.simple_tag(takes_context=True)
+def media_track_actions(context, media_type, instance):
+    """Return the detail-page split button actions, and when their phase should refresh.
+
+    A running check-in changes its own button label (Pause becomes Finish, then
+    the movie completes), so the controls refresh at those moments.
+    """
+    request = context.get("request")
+    phase = checkin.phase(request.user, instance) if request and instance else None
+    reload_in = phase["reload_in"] if phase else None
+    # Grouped anime (TMDB/TVDB) is stored as a TV show, which holds one tracker,
+    # so the stored type decides the actions, not the route type.
+    item = getattr(instance, "item", None)
+    stored_type = getattr(item, "media_type", None) or media_type
+    return {
+        "actions": track_actions.track_actions(
+            stored_type,
+            instance.status if instance else None,
+            phase,
+        ),
+        "reload_ms": max(1, reload_in + checkin.SETTLE_DELAY_SECONDS) * 1000
+        if reload_in is not None
+        else None,
+    }
+
+
+@register.filter
+def month_abbreviation(value):
+    """Localize cached English heatmap month labels at render time."""
+    try:
+        number = list(calendar.month_abbr).index(str(value))
+    except ValueError:
+        return value
+    return formats.date_format(date(2000, number, 1), "M") if number else ""
 
 
 @register.filter
 def in_bingebandit_library(item, user):
     """Whether a TMDB movie or show is in the user's BingeBandit library."""
-    from integrations import bingebandit  # noqa: PLC0415
+    from integrations import bingebandit
 
     if (
         getattr(item, "source", None) != Sources.TMDB.value
@@ -1508,9 +2351,10 @@ def in_bingebandit_library(item, user):
     ):
         return False
     # Cached on the user for the rest of the request: a page renders many cards.
+    # library_item_ids is cached (empty for users without BingeBandit), so a
+    # warm list page adds no queries.
     item_ids = getattr(user, "_bingebandit_library_item_ids", None)
     if item_ids is None:
-        has_account = hasattr(user, "bingebandit_account")
-        item_ids = bingebandit.library_item_ids(user) if has_account else {}
-        user._bingebandit_library_item_ids = item_ids  # noqa: SLF001
+        item_ids = bingebandit.library_item_ids(user)
+        user._bingebandit_library_item_ids = item_ids
     return (item.media_type, str(item.media_id)) in item_ids

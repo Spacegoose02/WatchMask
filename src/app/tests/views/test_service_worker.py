@@ -23,22 +23,50 @@ class ServiceWorkerViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Content-Type"], "application/javascript")
 
+    def test_service_worker_is_available_without_login(self):
+        self.client.logout()
+
+        response = self.client.get(reverse("service_worker"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/javascript")
+
     def test_service_worker_sets_no_cache_headers_and_static_only_policy(self):
         response = self.client.get(reverse("service_worker"))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Service-Worker-Allowed"], "/")
-        self.assertEqual(response["Cache-Control"], "no-cache, no-store, must-revalidate")
+        self.assertEqual(
+            response["Cache-Control"], "no-cache, no-store, must-revalidate"
+        )
         self.assertEqual(response["Pragma"], "no-cache")
         self.assertEqual(response["Expires"], "0")
 
         body = response.content.decode()
-        self.assertIn('const CACHE_NAME = "watchmask-v1";', body)
+        self.assertIn('const CACHE_NAME = "floppy-v3";', body)
         self.assertIn("const isSameOrigin = url.origin === self.location.origin;", body)
-        self.assertIn('const isHtmxRequest = request.headers.get("HX-Request") === "true";', body)
+        self.assertIn(
+            'const isHtmxRequest = request.headers.get("HX-Request") === "true";', body
+        )
         self.assertIn('!url.pathname.startsWith("/static/")', body)
         self.assertIn("if (networkResponse.ok) {", body)
         self.assertIn("caches.match(request)", body)
+
+    def test_service_worker_leaves_app_routes_to_the_browser(self):
+        """App routes must fall through, not be repeated by the worker.
+
+        respondWith(fetch(request)) on the pass-through branch made the worker
+        repeat every app request, replaced the browser offline page with a
+        failed promise, and stopped navigation preload (#725).
+        """
+        body = self.client.get(reverse("service_worker")).content.decode()
+
+        self.assertNotIn("event.respondWith(fetch(request));", body)
+
+        # The static branch keeps respondWith, and falls back to the stored
+        # copy when the network is not available.
+        self.assertIn("event.respondWith(", body)
+        self.assertIn("ignoreSearch: true", body)
 
 
 class StaticJavascriptViewTests(TestCase):

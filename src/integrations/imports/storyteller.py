@@ -9,7 +9,7 @@ Storyteller exposes an OAuth device-code flow plus a small REST API:
 
 Each position carries a Readium locator whose
 ``locator.locations.totalProgression`` is the 0-1 reading fraction. We turn
-that into a Yamtrack book entry: in-progress while reading, and completed once
+that into a Floppy book entry: in-progress while reading, and completed once
 the fraction reaches the account's ``finished_threshold`` (default 0.95).
 """
 
@@ -30,8 +30,11 @@ from app import helpers as app_helpers
 from app.log_safety import exception_summary
 from app.models import MediaTypes, Sources, Status
 from app.providers import services
-from integrations.imports.helpers import MediaImportError, decrypt
+from app.services.synced_status import keep_held_status
+from integrations import connection_health, import_progress
+from integrations.imports.helpers import MediaImportError, decrypt_or_raise
 from integrations.models import StorytellerAccount
+from integrations.safe_fetch import send_to_self_hosted
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +74,16 @@ class StorytellerClient:
         return headers
 
     def _get(self, path: str):
-        response = requests.get(
-            self._url(path),
-            headers=self._headers(),
-            timeout=API_TIMEOUT,
-        )
+        try:
+            response = send_to_self_hosted(
+                requests.get,
+                self._url(path),
+                headers=self._headers(),
+                timeout=API_TIMEOUT,
+            )
+        except requests.RequestException as error:
+            msg = f"Could not reach Storyteller: {error}"
+            raise StorytellerClientError(msg) from error
         if response.status_code in (401, 403):
             msg = "Storyteller token is invalid or expired"
             raise StorytellerAuthError(msg)
@@ -86,7 +94,8 @@ class StorytellerClient:
 
     def start_device_auth(self) -> dict[str, Any]:
         """Begin the device authorization flow."""
-        response = requests.post(
+        response = send_to_self_hosted(
+            requests.post,
             self._url("/api/v2/device/start"),
             headers={**self._headers(), "content-type": "application/json"},
             data="{}",
@@ -99,7 +108,8 @@ class StorytellerClient:
 
     def poll_device_token(self, device_code: str):
         """Poll for the access token. Returns (data, status_code)."""
-        response = requests.post(
+        response = send_to_self_hosted(
+            requests.post,
             self._url("/api/v2/device/token"),
             headers={**self._headers(), "content-type": "application/json"},
             json={"device_code": device_code},
@@ -128,7 +138,7 @@ class StorytellerClient:
             return None
 
 
-def importer(identifier, user, mode):  # noqa: ARG001
+def importer(identifier, user, mode):
     """Import Storyteller reading progress for a user."""
     return StorytellerImporter(user).import_data()
 
@@ -149,7 +159,13 @@ class StorytellerImporter:
             msg = "Connect Storyteller before importing"
             raise MediaImportError(msg)
 
-        token = decrypt(self.account.auth_token)
+        try:
+            token = decrypt_or_raise(self.account.auth_token)
+        except MediaImportError as error:
+            # An unreadable stored token needs a reconnect as much as a rejected one.
+            self._mark_failed(str(error), auth=True)
+            raise
+
         self.client = StorytellerClient(self.account.server_url, token)
         self.warnings = []
         self.enable_provider_enrichment = not settings.TESTING
@@ -161,14 +177,16 @@ class StorytellerImporter:
 
         try:
             books = self.client.get_books()
-        except StorytellerAuthError as error:
-            self._mark_broken(str(error))
-            raise MediaImportError(str(error)) from error
         except StorytellerClientError as error:
-            self._mark_broken(str(error))
+            self._mark_failed(
+                str(error),
+                auth=isinstance(error, StorytellerAuthError),
+            )
             raise MediaImportError(str(error)) from error
 
-        for book in books:
+        total = len(books)
+        for i, book in enumerate(books, start=1):
+            import_progress.report(i, total, "Storyteller")
             uuid = book.get("uuid") or book.get("id")
             if not uuid:
                 continue
@@ -181,7 +199,7 @@ class StorytellerImporter:
                 try:
                     position = self.client.get_position(str(uuid))
                 except StorytellerAuthError as error:
-                    self._mark_broken(str(error))
+                    self._mark_failed(str(error), auth=True)
                     raise MediaImportError(str(error)) from error
 
             progression = self._extract_progression(position)
@@ -194,29 +212,12 @@ class StorytellerImporter:
                 imported_counts[MediaTypes.BOOK.value] += 1
 
         self.account.last_sync_at = timezone.now()
-        self.account.connection_broken = False
-        self.account.last_error_message = ""
-        self.account.save(
-            update_fields=[
-                "last_sync_at",
-                "connection_broken",
-                "last_error_message",
-                "updated_at",
-            ],
-        )
+        connection_health.record_success(self.account, extra_fields=["last_sync_at"])
 
         return dict(imported_counts), "\n".join(dict.fromkeys(self.warnings))
 
-    def _mark_broken(self, message: str):
-        self.account.connection_broken = True
-        self.account.last_error_message = message
-        self.account.save(
-            update_fields=[
-                "connection_broken",
-                "last_error_message",
-                "updated_at",
-            ],
-        )
+    def _mark_failed(self, message: str, *, auth: bool):
+        connection_health.record_failure(self.account, message, auth=auth)
 
     def _extract_progression(self, position):
         """Pull the 0-1 total progression fraction out of a position payload."""
@@ -299,7 +300,7 @@ class StorytellerImporter:
         position_time = self._position_timestamp(position)
         existing = (
             app.models.Book.objects.filter(user=self.user, item=item)
-            .only("start_date", "end_date", "notes")
+            .only("progress", "status", "start_date", "end_date", "notes")
             .first()
         )
         existing_start = existing.start_date if existing else None
@@ -318,13 +319,17 @@ class StorytellerImporter:
         media, _ = app.models.Book.objects.update_or_create(
             user=self.user,
             item=item,
-            defaults={
-                "progress": progress_value,
-                "status": status,
-                "start_date": start_date,
-                "end_date": end_date,
-                "notes": notes,
-            },
+            defaults=keep_held_status(
+                existing,
+                {
+                    "progress": progress_value,
+                    "status": status,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "notes": notes,
+                },
+                position_time,
+            ),
         )
         return media
 
@@ -560,7 +565,7 @@ class StorytellerImporter:
         """
         try:
             response = services.search(MediaTypes.BOOK.value, query, 1, provider_source)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.debug(
                 "Storyteller metadata search failed provider=%s error=%s",
                 provider_source,
@@ -581,7 +586,7 @@ class StorytellerImporter:
                     str(media_id),
                     provider_source,
                 )
-            except Exception as error:  # noqa: BLE001
+            except Exception as error:
                 logger.debug(
                     "Storyteller metadata fetch failed provider=%s error=%s",
                     provider_source,
@@ -595,11 +600,7 @@ class StorytellerImporter:
             verdict = self._author_verdict(authors, metadata)
             if verdict == "conflict":
                 continue
-            tier = (
-                (3 if self._has_cover(metadata) else 2)
-                if verdict == "match"
-                else 1
-            )
+            tier = (3 if self._has_cover(metadata) else 2) if verdict == "match" else 1
 
             if tier > best_tier:
                 best_tier = tier

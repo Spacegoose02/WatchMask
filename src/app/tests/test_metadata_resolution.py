@@ -2,6 +2,8 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import AnonymousUser
+from django.core.cache import cache
 from django.db.utils import OperationalError
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -17,6 +19,7 @@ from app.models import (
     Sources,
     Status,
 )
+from app.providers import credentials
 from app.services import metadata_resolution
 
 
@@ -24,10 +27,68 @@ class MetadataResolutionTests(TestCase):
     """Tests for per-user metadata provider resolution."""
 
     def setUp(self):
+        cache.clear()
         self.user = get_user_model().objects.create_user(
             username="resolver",
             password="pw12345",
         )
+
+    def test_metadata_language_default_falls_back_to_global_without_item(self):
+        """No item should mean the user's global language preference applies."""
+        self.user.metadata_language = "fr"
+
+        language = metadata_resolution.metadata_language_default(self.user)
+
+        self.assertEqual(language, "fr")
+
+    def test_metadata_language_default_falls_back_to_global_without_preference(self):
+        """An item with no stored language preference should use the global default."""
+        self.user.metadata_language = "fr"
+        item = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Breaking Bad",
+        )
+
+        language = metadata_resolution.metadata_language_default(self.user, item)
+
+        self.assertEqual(language, "fr")
+
+    def test_metadata_language_default_uses_item_override(self):
+        """A per-item language preference should win over the global default."""
+        self.user.metadata_language = "fr"
+        item = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Breaking Bad",
+        )
+        MetadataProviderPreference.objects.create(
+            user=self.user,
+            item=item,
+            language="ja",
+        )
+
+        language = metadata_resolution.metadata_language_default(self.user, item)
+
+        self.assertEqual(language, "ja")
+
+    def test_metadata_language_default_ignores_item_for_unauthenticated_user(self):
+        """An unauthenticated user should never trigger a preference lookup."""
+        item = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Breaking Bad",
+        )
+
+        language = metadata_resolution.metadata_language_default(
+            AnonymousUser(),
+            item,
+        )
+
+        self.assertEqual(language, metadata_resolution.settings.TMDB_LANG)
 
     def test_metadata_default_source_falls_back_when_tvdb_is_disabled(self):
         """TV defaults should fall back to TMDB when TVDB is unavailable."""
@@ -40,6 +101,75 @@ class MetadataResolutionTests(TestCase):
             )
 
         self.assertEqual(provider, Sources.TMDB.value)
+
+    @override_settings(GOOGLE_BOOKS_API_KEY="")
+    def test_googlebooks_is_hidden_without_an_api_key(self):
+        """Google Books should not be offered when the instance is unconfigured."""
+        sources = metadata_resolution.available_metadata_sources(MediaTypes.BOOK.value)
+
+        self.assertNotIn(Sources.GOOGLEBOOKS, sources)
+        self.assertFalse(metadata_resolution.provider_is_enabled("googlebooks"))
+
+    @override_settings(GOOGLE_BOOKS_API_KEY="google-key")
+    def test_googlebooks_is_available_with_an_api_key(self):
+        """Google Books should be offered when the instance key is present."""
+        sources = metadata_resolution.available_metadata_sources(MediaTypes.BOOK.value)
+
+        self.assertIn(Sources.GOOGLEBOOKS, sources)
+        self.assertTrue(metadata_resolution.provider_is_enabled("googlebooks"))
+
+    @override_settings(GOOGLE_BOOKS_API_KEY="google-key")
+    def test_books_keep_hardcover_as_the_default_source(self):
+        """Adding Google Books must not change the book default provider."""
+        self.assertEqual(
+            metadata_resolution.metadata_default_source(
+                self.user,
+                MediaTypes.BOOK.value,
+            ),
+            Sources.HARDCOVER.value,
+        )
+
+    @override_settings(HARDCOVER_API="")
+    def test_hardcover_is_hidden_without_a_token(self):
+        """Hardcover ships no default token, so it is opt-in (#1025)."""
+        sources = metadata_resolution.available_metadata_sources(MediaTypes.BOOK.value)
+
+        self.assertNotIn(Sources.HARDCOVER, sources)
+        self.assertFalse(metadata_resolution.provider_is_enabled("hardcover"))
+
+    @override_settings(HARDCOVER_API="")
+    def test_books_fall_back_to_open_library_without_a_hardcover_token(self):
+        """The reported bug: an unconfigured default left book search dead."""
+        self.assertEqual(
+            metadata_resolution.metadata_default_source(
+                self.user,
+                MediaTypes.BOOK.value,
+            ),
+            Sources.OPENLIBRARY.value,
+        )
+
+    @override_settings(HARDCOVER_API="")
+    def test_a_personal_token_puts_hardcover_back(self):
+        """A member with their own key is not held back by the instance."""
+        credentials.set_user("hardcover", self.user, {"api_key": "personal-token"})
+
+        self.assertTrue(
+            metadata_resolution.provider_is_enabled("hardcover", self.user),
+        )
+        self.assertIn(
+            Sources.HARDCOVER,
+            metadata_resolution.available_metadata_sources(
+                MediaTypes.BOOK.value,
+                self.user,
+            ),
+        )
+        self.assertEqual(
+            metadata_resolution.metadata_default_source(
+                self.user,
+                MediaTypes.BOOK.value,
+            ),
+            Sources.HARDCOVER.value,
+        )
 
     def test_get_tracking_media_type_keeps_season_and_episode_distinct_from_tv(self):
         """A season/episode route must not collapse to "tv" via identity_media_type.
@@ -131,7 +261,9 @@ class MetadataResolutionTests(TestCase):
             "title": "Breaking Bad (TVDB)",
             "image": "https://example.com/breaking-bad-tvdb.jpg",
             "source_url": "https://www.thetvdb.com/dereferrer/series/81189",
-            "external_links": {"TVDB": "https://www.thetvdb.com/dereferrer/series/81189"},
+            "external_links": {
+                "TVDB": "https://www.thetvdb.com/dereferrer/series/81189"
+            },
             "details": {"episodes": 999, "status": "Overlay"},
             "related": {"seasons": [{"season_number": 1}]},
         }
@@ -173,7 +305,9 @@ class MetadataResolutionTests(TestCase):
         self.assertEqual(item.source, Sources.TMDB.value)
 
     @override_settings(TVDB_API_KEY="test-tvdb-key")
-    def test_resolve_detail_metadata_defaults_to_tracking_source_without_preference(self):
+    def test_resolve_detail_metadata_defaults_to_tracking_source_without_preference(
+        self,
+    ):
         """Tracked titles should keep showing metadata from their own source by default."""
         item = Item.objects.create(
             media_id="52991",
@@ -380,6 +514,155 @@ class MetadataResolutionTests(TestCase):
             ).exists(),
         )
 
+    @patch("app.providers.tmdb.find")
+    @patch("app.services.metadata_resolution.anime_mapping.resolve_provider_id")
+    def test_resolve_provider_media_id_maps_mal_to_tmdb_via_tvdb(
+        self,
+        mock_resolve_provider_id,
+        mock_tmdb_find,
+    ):
+        """MAL anime should reuse exact TVDB IDs for TMDB resolution."""
+        item = Item.objects.create(
+            media_id="52991",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Frieren",
+        )
+        mock_resolve_provider_id.side_effect = lambda _mal_id, provider, **_kwargs: (
+            "407407" if provider == Sources.TVDB.value else None
+        )
+        mock_tmdb_find.return_value = {"tv_results": [{"id": 209867}]}
+
+        provider_media_id = metadata_resolution.resolve_provider_media_id(
+            item,
+            Sources.TMDB.value,
+            route_media_type=MediaTypes.ANIME.value,
+        )
+
+        self.assertEqual(provider_media_id, "209867")
+        mock_tmdb_find.assert_called_once_with("407407", "tvdb_id")
+        item.refresh_from_db()
+        self.assertEqual(item.provider_external_ids["tvdb_id"], "407407")
+        self.assertEqual(item.provider_external_ids["tmdb_id"], "209867")
+        self.assertTrue(
+            ItemProviderLink.objects.filter(
+                item=item,
+                provider=Sources.TMDB.value,
+                provider_media_id="209867",
+                provider_media_type=MediaTypes.TV.value,
+            ).exists(),
+        )
+
+    @patch("app.providers.tmdb.find")
+    @patch("app.services.metadata_resolution.anime_mapping.resolve_provider_id")
+    def test_resolve_provider_media_id_rejects_ambiguous_tvdb_lookup(
+        self,
+        mock_resolve_provider_id,
+        mock_tmdb_find,
+    ):
+        """An ambiguous external-ID response must not persist a guessed TMDB ID."""
+        item = Item.objects.create(
+            media_id="52991",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Frieren",
+        )
+        mock_resolve_provider_id.side_effect = lambda _mal_id, provider, **_kwargs: (
+            "407407" if provider == Sources.TVDB.value else None
+        )
+        mock_tmdb_find.return_value = {"tv_results": [{"id": 1}, {"id": 2}]}
+
+        provider_media_id = metadata_resolution.resolve_provider_media_id(
+            item,
+            Sources.TMDB.value,
+            route_media_type=MediaTypes.ANIME.value,
+        )
+
+        self.assertIsNone(provider_media_id)
+        self.assertFalse(
+            ItemProviderLink.objects.filter(
+                item=item,
+                provider=Sources.TMDB.value,
+            ).exists(),
+        )
+
+    @patch("app.providers.tmdb.find")
+    @patch("app.services.metadata_resolution.anime_mapping.resolve_provider_id")
+    def test_resolve_provider_media_id_tolerates_tmdb_lookup_failure(
+        self,
+        mock_resolve_provider_id,
+        mock_tmdb_find,
+    ):
+        """Provider enrichment must not make a MAL detail page unavailable."""
+        item = Item.objects.create(
+            media_id="52991",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Frieren",
+        )
+        mock_resolve_provider_id.side_effect = lambda _mal_id, provider, **_kwargs: (
+            "407407" if provider == Sources.TVDB.value else None
+        )
+        mock_tmdb_find.side_effect = metadata_resolution.services.ProviderAPIError(
+            Sources.TMDB.value,
+            RuntimeError("offline"),
+        )
+
+        provider_media_id = metadata_resolution.resolve_provider_media_id(
+            item,
+            Sources.TMDB.value,
+            route_media_type=MediaTypes.ANIME.value,
+        )
+
+        self.assertIsNone(provider_media_id)
+
+    @patch("app.providers.tmdb.find")
+    @patch("app.services.metadata_resolution.anime_mapping.resolve_provider_id")
+    def test_resolve_mal_tmdb_identity_maps_movie_via_imdb(
+        self,
+        mock_resolve_provider_id,
+        mock_tmdb_find,
+    ):
+        mock_resolve_provider_id.side_effect = lambda _mal_id, provider, **_kwargs: (
+            "tt0245429" if provider == Sources.IMDB.value else None
+        )
+        mock_tmdb_find.return_value = {"movie_results": [{"id": 129}]}
+
+        identity = metadata_resolution.resolve_mal_tmdb_identity("199")
+
+        self.assertEqual(
+            identity,
+            metadata_resolution.AnimeTMDBIdentity(
+                media_id="129",
+                media_type=MediaTypes.MOVIE.value,
+                imdb_id="tt0245429",
+            ),
+        )
+        mock_tmdb_find.assert_called_once_with("tt0245429", "imdb_id")
+
+        item = Item.objects.create(
+            media_id="199",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Spirited Away",
+        )
+        metadata_resolution.persist_mal_tmdb_identity(item, identity)
+        self.assertIsNone(
+            metadata_resolution.resolve_provider_media_id(
+                item,
+                Sources.TMDB.value,
+                route_media_type=MediaTypes.ANIME.value,
+            ),
+        )
+        self.assertTrue(
+            ItemProviderLink.objects.filter(
+                item=item,
+                provider=Sources.TMDB.value,
+                provider_media_id="129",
+                provider_media_type=MediaTypes.MOVIE.value,
+            ).exists(),
+        )
+
     @override_settings(TVDB_API_KEY="test-tvdb-key")
     @patch("app.services.metadata_resolution.services.get_media_metadata")
     def test_resolve_detail_metadata_adds_grouped_preview_target_for_flat_mal_anime(
@@ -461,7 +744,9 @@ class MetadataResolutionTests(TestCase):
                 "first_air_date": None,
             },
         )
-        self.assertTrue(result.grouped_preview["related"]["seasons"][0]["is_mapped_target"])
+        self.assertTrue(
+            result.grouped_preview["related"]["seasons"][0]["is_mapped_target"]
+        )
         self.assertEqual(
             result.grouped_preview["related"]["seasons"][0]["mapped_episode_start"],
             1,
@@ -470,6 +755,87 @@ class MetadataResolutionTests(TestCase):
             result.grouped_preview["related"]["seasons"][0]["mapped_episode_end"],
             28,
         )
+
+    @patch("app.services.metadata_resolution.anime_mapping.find_entries_for_mal_id")
+    @patch("app.services.metadata_resolution.services.get_media_metadata")
+    def test_resolve_detail_metadata_grouped_preview_target_falls_back_to_tvdb_mapping_for_tmdb(
+        self,
+        mock_get_media_metadata,
+        mock_find_entries,
+    ):
+        """TMDB display should still get a grouped target from a TVDB-only mapping entry.
+
+        Community mapping data (Kometa Anime-IDs) is TVDB-first: most entries carry
+        a tvdb_id/tvdb_season but no tmdb_*id field at all. Requiring an exact
+        provider-ID match on the entry meant picking TMDB as the display provider
+        could never produce a grouped_preview_target for those titles, so the
+        episode-cards section silently rendered nothing (#reported: "no episode
+        cards" after mapping MAL -> TMDB).
+        """
+        item = Item.objects.create(
+            media_id="31964",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="My Hero Academia",
+            image="https://example.com/mha.jpg",
+            provider_external_ids={"tmdb_id": "65930"},
+        )
+        MetadataProviderPreference.objects.create(
+            user=self.user,
+            item=item,
+            provider=Sources.TMDB.value,
+        )
+        mock_find_entries.return_value = [
+            {"tvdb_id": "305074", "tvdb_season": 1, "tvdb_epoffset": 0},
+        ]
+        base_metadata = {
+            "media_id": "31964",
+            "source": Sources.MAL.value,
+            "media_type": MediaTypes.ANIME.value,
+            "title": "My Hero Academia",
+            "image": "https://example.com/mha.jpg",
+            "details": {"episodes": 13},
+            "related": {},
+        }
+        mock_get_media_metadata.side_effect = [
+            {
+                "media_id": "65930",
+                "source": Sources.TMDB.value,
+                "media_type": MediaTypes.ANIME.value,
+                "title": "My Hero Academia",
+                "related": {"seasons": [{"season_number": 1}]},
+                "external_links": {},
+            },
+            {
+                "media_id": "65930",
+                "source": Sources.TMDB.value,
+                "media_type": MediaTypes.ANIME.value,
+                "title": "My Hero Academia",
+                "related": {
+                    "seasons": [{"season_number": 1, "episode_count": 13}],
+                },
+                "season/1": {
+                    "season_number": 1,
+                    "season_title": "Season 1",
+                    "details": {"episodes": 13},
+                },
+            },
+        ]
+
+        result = metadata_resolution.resolve_detail_metadata(
+            self.user,
+            item=item,
+            route_media_type=MediaTypes.ANIME.value,
+            media_id=item.media_id,
+            source=item.source,
+            base_metadata=base_metadata,
+        )
+
+        self.assertEqual(result.mapping_status, "mapped")
+        self.assertIsNotNone(result.grouped_preview_target)
+        self.assertEqual(result.grouped_preview_target["season_number"], 1)
+        self.assertEqual(result.grouped_preview_target["episode_start"], 1)
+        self.assertEqual(result.grouped_preview_target["episode_end"], 13)
 
     @patch("app.db_retry.time.sleep")
     @patch("app.services.metadata_resolution.ItemProviderLink.objects.update_or_create")
@@ -550,6 +916,27 @@ class MetadataResolutionTests(TestCase):
         )
         self.assertEqual(mock_update_or_create.call_count, 6)
 
+    @patch("app.services.metadata_resolution.anime_mapping.resolve_provider_series_id")
+    @patch("app.services.metadata_resolution.ItemProviderLink.objects.update_or_create")
+    def test_read_only_mapping_returns_id_without_persisting(self, upsert, resolve):
+        item = Item.objects.create(
+            media_id="52991",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Frieren",
+        )
+        resolve.return_value = "9350138"
+        self.assertEqual(
+            metadata_resolution.resolve_provider_media_id(
+                item,
+                Sources.TVDB.value,
+                route_media_type=MediaTypes.ANIME.value,
+                persist_links=False,
+            ),
+            "9350138",
+        )
+        upsert.assert_not_called()
+
     @patch("app.db_retry.time.sleep")
     @patch("app.services.metadata_resolution.ItemProviderLink.objects.update_or_create")
     def test_upsert_provider_links_required_mode_raises_on_lock(
@@ -593,6 +980,7 @@ class GetOrCreateTrackedSeasonItemTests(TestCase):
     """
 
     def setUp(self):
+        cache.clear()
         self.user = get_user_model().objects.create_user(
             username="dexter-watcher",
             password="pw12345",
@@ -899,3 +1287,320 @@ class GetOrCreateTrackedSeasonItemTests(TestCase):
             )
 
         self.assertEqual(resolved.pk, canonical.pk)
+
+
+class FindTrackedSeasonTests(TestCase):
+    """Regression tests for issue #623: cross-identity Season lookup.
+
+    find_tracked_season must find a tracked Season regardless of which
+    Item.library_media_type bucket it's attached to, since read (season
+    detail page) and write (media_save) paths must agree on "the" tracked
+    season for a show/season/user.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="naruto-watcher",
+            password="pw12345",
+        )
+
+    def test_returns_none_when_no_season_tracked(self):
+        resolved = metadata_resolution.find_tracked_season(
+            self.user,
+            "79824",
+            Sources.TVDB.value,
+            0,
+        )
+        self.assertIsNone(resolved)
+
+    def test_finds_season_tracked_via_other_bucket(self):
+        """A season tracked under the TV-identity bucket is still found from the anime route."""
+        tv_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Naruto Shippuden",
+            image="",
+            library_media_type=MediaTypes.TV.value,
+        )
+        tv_instance = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        season_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=0,
+            title="Naruto Shippuden",
+            image="",
+            library_media_type=MediaTypes.TV.value,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv_instance,
+            status=Status.COMPLETED.value,
+        )
+
+        resolved = metadata_resolution.find_tracked_season(
+            self.user,
+            "79824",
+            Sources.TVDB.value,
+            0,
+            library_media_type=MediaTypes.ANIME.value,
+        )
+
+        self.assertEqual(resolved.pk, season.pk)
+
+    def test_prefers_exact_bucket_match_over_other_bucket(self):
+        """When both buckets have a tracked row, the requested bucket wins."""
+        tv_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Naruto Shippuden",
+            image="",
+            library_media_type=MediaTypes.TV.value,
+        )
+        tv_instance = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        tv_bucket_season_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=0,
+            title="Naruto Shippuden",
+            image="",
+            library_media_type=MediaTypes.TV.value,
+        )
+        Season.objects.create(
+            item=tv_bucket_season_item,
+            user=self.user,
+            related_tv=tv_instance,
+            status=Status.IN_PROGRESS.value,
+        )
+
+        anime_tv_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Naruto Shippuden",
+            image="",
+            library_media_type=MediaTypes.ANIME.value,
+        )
+        anime_tv_instance = TV.objects.create(
+            item=anime_tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        anime_bucket_season_item = Item.objects.create(
+            media_id="79824",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.SEASON.value,
+            season_number=0,
+            title="Naruto Shippuden",
+            image="",
+            library_media_type=MediaTypes.ANIME.value,
+        )
+        anime_season = Season.objects.create(
+            item=anime_bucket_season_item,
+            user=self.user,
+            related_tv=anime_tv_instance,
+            status=Status.COMPLETED.value,
+        )
+
+        resolved = metadata_resolution.find_tracked_season(
+            self.user,
+            "79824",
+            Sources.TVDB.value,
+            0,
+            library_media_type=MediaTypes.ANIME.value,
+        )
+
+        self.assertEqual(resolved.pk, anime_season.pk)
+
+
+class FindExistingAnimeHomeTests(TestCase):
+    """Sticky anime routing, shared by webhooks and importers.
+
+    `ItemProviderLink` is global by design - it caches a content fact, not user
+    state - so the link lookup is unscoped while the tracking lookup must not
+    be. Getting that boundary wrong routes one user's import by another user's
+    library.
+    """
+
+    def setUp(self):
+        """Create two users and one TMDB-identified show."""
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="anime-home-user",
+            password="password",
+        )
+        self.other = get_user_model().objects.create_user(
+            username="anime-home-other",
+            password="password",
+        )
+
+    def _grouped_item(self):
+        return Item.objects.create(
+            media_id="209867",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.ANIME.value,
+            title="Frieren: Beyond Journey's End",
+            image="",
+        )
+
+    def _flat_item(self):
+        item = Item.objects.create(
+            media_id="52991",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Frieren: Beyond Journey's End",
+            image="",
+        )
+        ItemProviderLink.objects.create(
+            item=item,
+            provider=Sources.TMDB.value,
+            provider_media_type=MediaTypes.TV.value,
+            provider_media_id="209867",
+            episode_offset=0,
+        )
+        return item
+
+    def test_returns_none_without_any_identity(self):
+        """No TMDB or TVDB id means there is nothing to match on."""
+        self.assertIsNone(
+            metadata_resolution.find_existing_anime_home(self.user),
+        )
+
+    def test_finds_a_grouped_home(self):
+        """A tracked anime-bucket TV row is a grouped home."""
+        item = self._grouped_item()
+        TV.objects.create(item=item, user=self.user, status=Status.IN_PROGRESS.value)
+
+        self.assertEqual(
+            metadata_resolution.find_existing_anime_home(self.user, tmdb_id="209867"),
+            ("grouped", item),
+        )
+
+    def test_finds_a_flat_home_through_its_provider_link(self):
+        """A tracked MAL row linked to this show is a flat home."""
+        from app.models import Anime
+
+        item = self._flat_item()
+        Anime.objects.create(
+            item=item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=1,
+        )
+
+        self.assertEqual(
+            metadata_resolution.find_existing_anime_home(self.user, tmdb_id="209867"),
+            ("flat", item),
+        )
+
+    def test_grouped_wins_when_both_shapes_exist(self):
+        """A grouped home is the TV-shaped one; prefer it over a flat row."""
+        from app.models import Anime
+
+        grouped = self._grouped_item()
+        TV.objects.create(
+            item=grouped,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        flat = self._flat_item()
+        Anime.objects.create(
+            item=flat,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+            progress=1,
+        )
+
+        self.assertEqual(
+            metadata_resolution.find_existing_anime_home(self.user, tmdb_id="209867"),
+            ("grouped", grouped),
+        )
+
+    def test_another_users_library_does_not_route_this_user(self):
+        """Tracking is per user even though the link table is shared."""
+        item = self._grouped_item()
+        TV.objects.create(item=item, user=self.other, status=Status.IN_PROGRESS.value)
+
+        self.assertIsNone(
+            metadata_resolution.find_existing_anime_home(self.user, tmdb_id="209867"),
+        )
+
+    def test_an_untracked_item_is_not_a_home(self):
+        """An Item nobody tracks is not anybody's library."""
+        self._grouped_item()
+
+        self.assertIsNone(
+            metadata_resolution.find_existing_anime_home(self.user, tmdb_id="209867"),
+        )
+
+    def test_matches_on_tvdb_identity_too(self):
+        """A TVDB-sourced grouped row is found by its TVDB id."""
+        item = Item.objects.create(
+            media_id="424536",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.ANIME.value,
+            title="Frieren: Beyond Journey's End",
+            image="",
+        )
+        TV.objects.create(item=item, user=self.user, status=Status.IN_PROGRESS.value)
+
+        self.assertEqual(
+            metadata_resolution.find_existing_anime_home(
+                self.user,
+                tvdb_id="424536",
+            ),
+            ("grouped", item),
+        )
+
+
+class PrefersGroupedAnimeTests(TestCase):
+    """Storage shape follows the user's Anime Provider."""
+
+    def setUp(self):
+        """Create a user with anime enabled."""
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="prefers-grouped-user",
+            password="password",
+        )
+
+    def test_provider_decides_the_shape(self):
+        """TMDB and TVDB mean grouped rows; MAL means flat rows."""
+        cases = [
+            (Sources.TMDB.value, True),
+            (Sources.TVDB.value, True),
+            (Sources.MAL.value, False),
+        ]
+        for provider, expected in cases:
+            with self.subTest(provider=provider):
+                self.user.anime_metadata_source_default = provider
+                self.user.save(update_fields=["anime_metadata_source_default"])
+                self.assertIs(
+                    metadata_resolution.prefers_grouped_anime(self.user),
+                    expected,
+                )
+
+    def test_disabled_anime_library_never_prefers_grouped(self):
+        """With the Anime library off there is no grouped anime to prefer."""
+        self.user.anime_enabled = False
+        self.user.anime_metadata_source_default = Sources.TMDB.value
+        self.user.save(
+            update_fields=["anime_enabled", "anime_metadata_source_default"],
+        )
+
+        self.assertFalse(metadata_resolution.prefers_grouped_anime(self.user))

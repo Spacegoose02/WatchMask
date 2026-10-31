@@ -10,15 +10,17 @@ from django.conf import settings
 from app.discover import cache_repo
 from app.discover.schemas import CandidateItem
 from app.models import MediaTypes, Sources
-from app.providers import services
+from app.providers import credentials, services
 
 logger = logging.getLogger(__name__)
 
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
-TMDB_BASE_PARAMS = {
-    "api_key": settings.TMDB_API,
-    "language": settings.TMDB_LANG,
-}
+def tmdb_base_params():
+    """Return TMDB auth params, resolved per call so UI changes take effect."""
+    return {
+        "api_key": credentials.get("tmdb", "api_key"),
+        "language": settings.TMDB_LANG,
+    }
 
 TRENDING_TTL = 60 * 60
 CURRENT_CYCLE_TTL = 60 * 60
@@ -49,7 +51,7 @@ class TMDbDiscoverAdapter:
                 self.provider,
                 "GET",
                 f"{TMDB_BASE_URL}{endpoint}",
-                params={**TMDB_BASE_PARAMS, **params},
+                params={**tmdb_base_params(), **params},
             )
             cache_repo.set_api_cache(
                 self.provider,
@@ -58,8 +60,7 @@ class TMDbDiscoverAdapter:
                 response,
                 ttl_seconds=ttl_seconds,
             )
-            return response
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             if payload:
                 logger.warning(
                     "discover_tmdb_cache_fallback endpoint=%s error=%s",
@@ -67,7 +68,14 @@ class TMDbDiscoverAdapter:
                     error,
                 )
                 return payload
-            raise
+            logger.warning(
+                "discover_tmdb_request_failed endpoint=%s error=%s",
+                endpoint,
+                error,
+            )
+            return {"results": []}
+        else:
+            return response
 
     def _paginated_raw_results(
         self,
@@ -109,7 +117,9 @@ class TMDbDiscoverAdapter:
             return f"https://image.tmdb.org/t/p/w500{path}"
         return settings.IMG_NONE
 
-    def _normalize_results(self, media_type: str, results: list[dict], *, row_key: str) -> list[CandidateItem]:
+    def _normalize_results(
+        self, media_type: str, results: list[dict], *, row_key: str
+    ) -> list[CandidateItem]:
         genre_map = self._genre_id_to_name_map(media_type)
         candidates: list[CandidateItem] = []
         for item in results:
@@ -128,14 +138,21 @@ class TMDbDiscoverAdapter:
                     source=Sources.TMDB.value,
                     media_id=str(item.get("id", "")),
                     title=title,
-                    original_title=item.get("original_title") or item.get("original_name"),
+                    original_title=item.get("original_title")
+                    or item.get("original_name"),
                     localized_title=item.get("title") or item.get("name"),
                     image=self._poster_url(item.get("poster_path")),
                     release_date=release_date,
                     genres=genres,
-                    popularity=float(item["popularity"]) if item.get("popularity") is not None else None,
-                    rating=float(item["vote_average"]) if item.get("vote_average") is not None else None,
-                    rating_count=int(item["vote_count"]) if item.get("vote_count") is not None else None,
+                    popularity=float(item["popularity"])
+                    if item.get("popularity") is not None
+                    else None,
+                    rating=float(item["vote_average"])
+                    if item.get("vote_average") is not None
+                    else None,
+                    rating_count=int(item["vote_count"])
+                    if item.get("vote_count") is not None
+                    else None,
                     row_key=row_key,
                 ),
             )
@@ -160,6 +177,7 @@ class TMDbDiscoverAdapter:
         }
 
     def trending(self, media_type: str, *, limit: int = 50) -> list[CandidateItem]:
+        """Return the trending."""
         if media_type not in {MediaTypes.MOVIE.value, MediaTypes.TV.value}:
             return []
         payload = self._cache_request(
@@ -174,6 +192,7 @@ class TMDbDiscoverAdapter:
         )
 
     def top_rated(self, media_type: str, *, limit: int = 50) -> list[CandidateItem]:
+        """Return the top rated."""
         if media_type not in {MediaTypes.MOVIE.value, MediaTypes.TV.value}:
             return []
         payload = self._cache_request(
@@ -188,6 +207,7 @@ class TMDbDiscoverAdapter:
         )
 
     def upcoming(self, media_type: str, *, limit: int = 50) -> list[CandidateItem]:
+        """Return the upcoming."""
         if media_type == MediaTypes.MOVIE.value:
             payload = self._cache_request(
                 "/movie/upcoming",
@@ -201,7 +221,7 @@ class TMDbDiscoverAdapter:
             )
 
         if media_type == MediaTypes.TV.value:
-            today = date.today().isoformat()
+            today = date.today().isoformat()  # noqa: DTZ011  # provider filter uses a plain calendar date
             payload = self._cache_request(
                 "/discover/tv",
                 {
@@ -220,6 +240,7 @@ class TMDbDiscoverAdapter:
         return []
 
     def current_cycle(self, media_type: str, *, limit: int = 50) -> list[CandidateItem]:
+        """Return the current cycle."""
         if media_type == MediaTypes.MOVIE.value:
             payload = self._cache_request(
                 "/movie/now_playing",
@@ -246,7 +267,10 @@ class TMDbDiscoverAdapter:
 
         return []
 
-    def related(self, media_type: str, media_id: str, *, limit: int = 50) -> list[CandidateItem]:
+    def related(
+        self, media_type: str, media_id: str, *, limit: int = 50
+    ) -> list[CandidateItem]:
+        """Return the related."""
         if not media_id:
             return []
 
@@ -293,6 +317,7 @@ class TMDbDiscoverAdapter:
         *,
         limit: int = 100,
     ) -> list[CandidateItem]:
+        """Return the genre discovery."""
         if media_type not in {MediaTypes.MOVIE.value, MediaTypes.TV.value}:
             return []
 
@@ -332,23 +357,27 @@ class TMDbDiscoverAdapter:
         }
 
         try:
-            checks["trending_movie"] = bool(self.trending(MediaTypes.MOVIE.value, limit=1))
-        except Exception:  # noqa: BLE001
+            checks["trending_movie"] = bool(
+                self.trending(MediaTypes.MOVIE.value, limit=1)
+            )
+        except Exception:
             checks["trending_movie"] = False
 
         try:
             checks["trending_tv"] = bool(self.trending(MediaTypes.TV.value, limit=1))
-        except Exception:  # noqa: BLE001
+        except Exception:
             checks["trending_tv"] = False
 
         try:
-            checks["top_rated_movie"] = bool(self.top_rated(MediaTypes.MOVIE.value, limit=1))
-        except Exception:  # noqa: BLE001
+            checks["top_rated_movie"] = bool(
+                self.top_rated(MediaTypes.MOVIE.value, limit=1)
+            )
+        except Exception:
             checks["top_rated_movie"] = False
 
         try:
             checks["top_rated_tv"] = bool(self.top_rated(MediaTypes.TV.value, limit=1))
-        except Exception:  # noqa: BLE001
+        except Exception:
             checks["top_rated_tv"] = False
 
         return checks

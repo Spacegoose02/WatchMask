@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.crypto import get_random_string
@@ -62,10 +62,177 @@ class ImportDataViewTests(TestCase):
             HTTP_HX_REQUEST="true",
         )
 
-        self.assertEqual(response.status_code, 200)
+        # Idle: 286 tells htmx to stop polling, but the body is still swapped.
+        self.assertEqual(response.status_code, 286)
         self.assertTemplateUsed(response, "users/components/import_activity.html")
-        self.assertContains(response, "Active Periodic Imports")
-        self.assertContains(response, "Import History")
+        self.assertContains(response, "Active Periodic Imports", status_code=286)
+        self.assertContains(response, "Import History", status_code=286)
+
+    def test_import_activity_polling_pauses_while_details_open(self):
+        """An open failed-items/traceback section must not be refreshed away."""
+        response = self.client.get(reverse("import_data"))
+        self.assertContains(response, "[data-keep-open=true]", count=2)
+        self.assertContains(response, "shouldSwap = false")
+
+    def test_import_activity_marks_open_details(self):
+        """Result details expose their open state so the panel can skip refreshes."""
+        from integrations.models import ImportRun
+
+        ImportRun.objects.create(user=self.user, source="plex", status="finished")
+        TaskResult.objects.create(
+            task_id="task-errors",
+            task_name="Import from Plex",
+            task_kwargs=(f'{{"user_id": {self.user.id}}}'),
+            status="SUCCESS",
+            result='"Imported 1 Movies."',
+            traceback="Skipping Plex entry without external IDs: Heat",
+        )
+        response = self.client.get(
+            reverse("import_data_activity"),
+            HTTP_HX_REQUEST="true",
+        )
+        self.assertContains(response, ':data-keep-open="showDetails"', status_code=286)
+
+    def test_import_data_activity_keeps_polling_while_import_active(self):
+        """A pending/started task or running ImportRun keeps the poll alive."""
+        TaskResult.objects.create(
+            task_id="task-started",
+            task_name="Import from Trakt",
+            task_kwargs=(f'{{"user_id": {self.user.id}}}'),
+            status="STARTED",
+        )
+        with patch("users.models.AsyncResult") as async_result:
+            async_result.return_value.status = "STARTED"
+            response = self.client.get(
+                reverse("import_data_activity"),
+                HTTP_HX_REQUEST="true",
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_import_activity_shows_initial_reading_stage(self):
+        TaskResult.objects.create(
+            task_id="youtube-reading", task_name="Import from YouTube Takeout",
+            task_kwargs=f'{{"user_id": {self.user.id}}}', status="STARTED",
+        )
+        with patch("users.models.AsyncResult") as result, patch(
+            "integrations.import_progress.get_progress",
+            return_value={"current": 0, "total": None, "label": "Reading YouTube history"},
+        ):
+            result.return_value.status = "STARTED"
+            response = self.client.get(reverse("import_data_activity"), HTTP_HX_REQUEST="true")
+        self.assertContains(response, "Started")
+        self.assertContains(response, "Reading YouTube history")
+
+    def test_import_data_activity_keeps_polling_for_running_import_run(self):
+        """A running ImportRun keeps the poll alive."""
+        from integrations.models import ImportRun
+
+        ImportRun.objects.create(user=self.user, source="trakt", status="running")
+        response = self.client.get(
+            reverse("import_data_activity"),
+            HTTP_HX_REQUEST="true",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_import_data_activity_lists_media_by_import_source(self):
+        """Media is grouped by media type and import source."""
+        from app.models import Item, MediaTypes, Movie, Sources, Status
+        from integrations.models import ImportRun
+
+        trakt_runs = [
+            ImportRun.objects.create(user=self.user, source="trakt"),
+            ImportRun.objects.create(user=self.user, source="trakt"),
+        ]
+        for index, run in enumerate(trakt_runs):
+            item = Item.objects.create(
+                media_id=f"bulk-delete-movie-{index}",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.MOVIE.value,
+                title=f"Bulk Delete Movie {index}",
+            )
+            Movie.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.COMPLETED.value,
+                import_run=run,
+            )
+
+        simkl_run = ImportRun.objects.create(user=self.user, source="simkl")
+        simkl_item = Item.objects.create(
+            media_id="bulk-delete-movie-simkl",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Bulk Delete Movie from Simkl",
+        )
+        Movie.objects.create(
+            item=simkl_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            import_run=simkl_run,
+        )
+
+        response = self.client.get(
+            reverse("import_data_activity"),
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertContains(response, "Imported Media by Source")
+        self.assertContains(response, "Movie · 2 items")
+        self.assertContains(response, "Movie · 1 item")
+        self.assertEqual(response.content.decode().count("Movie · 2 items"), 1)
+        self.assertContains(
+            response,
+            reverse("bulk_delete_by_import_source", args=["movie", "trakt"]),
+        )
+        self.assertContains(
+            response,
+            reverse("bulk_delete_by_import_source", args=["movie", "simkl"]),
+        )
+
+    def test_import_data_activity_media_summary_query_count_is_flat(self):
+        """Media summary should not issue one COUNT query per import source (N+1 guard)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from app.models import Item, MediaTypes, Movie, Sources, Status
+        from integrations.models import ImportRun
+
+        for index, source in enumerate(["trakt", "simkl", "plex", "lastfm", "yamtrack"]):
+            run = ImportRun.objects.create(user=self.user, source=source)
+            item = Item.objects.create(
+                media_id=f"n1-guard-movie-{index}",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.MOVIE.value,
+                title=f"N+1 Guard Movie {index}",
+            )
+            Movie.objects.create(
+                item=item,
+                user=self.user,
+                status=Status.COMPLETED.value,
+                import_run=run,
+            )
+
+        with CaptureQueriesContext(connection) as few_sources:
+            self.client.get(reverse("import_data_activity"), HTTP_HX_REQUEST="true")
+
+        extra_run = ImportRun.objects.create(user=self.user, source="steam")
+        extra_item = Item.objects.create(
+            media_id="n1-guard-movie-extra",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="N+1 Guard Movie Extra",
+        )
+        Movie.objects.create(
+            item=extra_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+            import_run=extra_run,
+        )
+
+        with CaptureQueriesContext(connection) as more_sources:
+            self.client.get(reverse("import_data_activity"), HTTP_HX_REQUEST="true")
+
+        self.assertEqual(len(few_sources.captured_queries), len(more_sources.captured_queries))
 
     def test_import_data_shows_lastfm_history_status_and_action(self):
         """Last.fm card should render history backfill status and rerun controls."""
@@ -86,22 +253,94 @@ class ImportDataViewTests(TestCase):
         self.assertContains(response, "Page 2 of 6")
         self.assertContains(response, "Reimport full history")
 
-    def test_import_data_renders_trakt_profile_dropdown(self):
-        """The Trakt card should use a dropdown for public/private profile selection."""
+    def test_file_upload_forms_disclose_one_time_import_and_ignore_frequency(self):
+        """Uploads run once whatever Import Frequency says: never disabled, badged One-time."""
+        html = self.client.get(reverse("import_data")).content.decode()
+        badge = ">One-time</span>"
+        upload_routes = (
+            "import_trakt_export_file",
+            "import_yamtrack",
+            "import_clz",
+            "import_hltb",
+            "import_playnite",
+            "import_grouvee",
+            "import_imdb",
+            "import_goodreads",
+            "import_hardcover",
+            "import_storygraph",
+            "import_youtube_takeout",
+            "import_wetrakr",
+            "import_tvtime",
+        )
+        for route in upload_routes:
+            with self.subTest(route=route):
+                action = f'action="{reverse(route)}"'
+                self.assertIn(action, html)
+                start = html.index(action)
+                form_start = html.rindex("<form", 0, start)
+                form = html[form_start : html.index("</form>", start)]
+                modal_start = html.rindex('x-show="activeModal ===', 0, form_start)
+                self.assertIn(badge, html[modal_start:form_start])
+                self.assertNotIn("importFrequency", form.replace('x-model="importFrequency"', ""))
+
+    @override_settings(
+        TRAKT_API="test-client-id", TRAKT_API_SECRET="test-client-secret"
+    )
+    def test_import_data_renders_trakt_profile_dropdown_when_configured(self):
+        """With TRAKT_API/SECRET set, the Trakt card offers the public/private dropdown."""
         response = self.client.get(reverse("import_data"))
 
-        self.assertContains(response, 'x-data="{ traktProfileType: \'public\' }"', html=False)
-        self.assertContains(response, '<label class="block text-sm text-gray-300 mb-2">Profile</label>', html=False)
-        self.assertContains(response, '<option value="public">Public profile</option>', html=False)
-        self.assertContains(response, '<option value="private">Private profile (OAuth)</option>', html=False)
+        self.assertContains(
+            response, "x-data=\"{ traktProfileType: 'public' }\"", html=False
+        )
+        self.assertContains(
+            response,
+            '<label class="block text-sm text-[var(--color-text-secondary)] mb-2">Profile</label>',
+            html=False,
+        )
+        self.assertContains(
+            response, '<option value="public">Public profile</option>', html=False
+        )
+        self.assertContains(
+            response,
+            '<option value="private">Private profile (OAuth)</option>',
+            html=False,
+        )
 
-    def test_import_data_renders_trakt_collection_csv_upload(self):
-        """The Trakt card should offer a collection-only CSV upload fallback."""
+    @override_settings(TRAKT_API="", TRAKT_API_SECRET="")
+    def test_import_data_hides_trakt_public_private_when_unconfigured(self):
+        """Without TRAKT_API/SECRET, only the data-export fallback should render."""
         response = self.client.get(reverse("import_data"))
 
-        self.assertContains(response, reverse("import_trakt_collection_csv"))
-        self.assertContains(response, "trakt_collection_csv")
-        self.assertContains(response, "Select Collection CSV File")
+        self.assertContains(
+            response, "x-data=\"{ traktProfileType: 'csv' }\"", html=False
+        )
+        self.assertNotContains(
+            response, '<option value="public">Public profile</option>', html=False
+        )
+        self.assertNotContains(
+            response,
+            '<option value="private">Private profile (OAuth)</option>',
+            html=False,
+        )
+        self.assertContains(response, "Select Export File", html=False)
+
+    def test_import_data_renders_playnite_upload(self):
+        """The import page should expose Playnite's library CSV upload."""
+        response = self.client.get(reverse("import_data"))
+
+        self.assertContains(response, reverse("import_playnite"))
+        self.assertContains(response, 'name="playnite_csv"', html=False)
+        self.assertContains(response, "Import a Playnite library CSV backup.")
+
+    def test_import_data_renders_trakt_export_upload(self):
+        """The Trakt card should offer a data-export file upload fallback."""
+        response = self.client.get(reverse("import_data"))
+
+        self.assertContains(response, reverse("import_trakt_export_file"))
+        self.assertContains(response, "trakt_export")
+        self.assertContains(response, ".zip,.json,.csv")
+        self.assertContains(response, "Select Export File")
 
     @patch("users.views.plex.list_sections")
     @patch("users.views.plex.fetch_account")
@@ -213,6 +452,11 @@ class ImportDataViewTests(TestCase):
                         "title": "Movies",
                         "server_name": "Living Room",
                         "type": "movie",
+                        # Added so the import form can offer (and pre-select)
+                        # audiobook routing for a music library.
+                        "is_music": False,
+                        "audiobook_hint": False,
+                        "content_kind": "auto",
                     },
                 ],
                 "error": "",
@@ -223,3 +467,27 @@ class ImportDataViewTests(TestCase):
         self.assertEqual(self.user.plex_account.sections[0]["title"], "Movies")
         self.assertIsNotNone(self.user.plex_account.sections_refreshed_at)
         mock_list_sections.assert_called_once_with(self.plex_token)
+
+    def test_arr_cards_show_connected_only_for_a_working_instance(self):
+        """The Radarr/Sonarr/Mylar3 cards read their instance lists, not an account."""
+        from integrations.imports.helpers import encrypt
+        from integrations.models import MylarInstance, RadarrInstance, SonarrInstance
+
+        RadarrInstance.objects.create(
+            user=self.user, base_url="https://radarr.local", api_key=encrypt("k")
+        )
+        SonarrInstance.objects.create(
+            user=self.user,
+            base_url="https://sonarr.local",
+            api_key=encrypt("k"),
+            connection_broken=True,
+        )
+        MylarInstance.objects.create(
+            user=self.user, base_url="https://mylar.local", api_key=encrypt("k")
+        )
+
+        response = self.client.get(reverse("import_data"))
+
+        self.assertTrue(response.context["radarr_connected"])
+        self.assertFalse(response.context["sonarr_connected"])
+        self.assertTrue(response.context["mylar_connected"])

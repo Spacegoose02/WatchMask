@@ -6,7 +6,7 @@ import requests
 from django.conf import settings
 from django.core.cache import cache
 
-from app import helpers
+from app import helpers, request_timing
 from app.models import MediaTypes, Sources
 from app.providers import services
 
@@ -25,6 +25,7 @@ def handle_error(error):
     )
 
 
+@request_timing.timed_provider_call
 def search(query, page):
     """Search for podcasts using iTunes API."""
     cache_key = (
@@ -49,7 +50,7 @@ def search(query, page):
                 ITUNES_API_BASE,
                 params=params,
                 headers={"User-Agent": USER_AGENT},
-                timeout=settings.REQUEST_TIMEOUT,
+                timeout=services.request_timeout(),
             )
             response.raise_for_status()
             response_data = response.json()
@@ -64,10 +65,16 @@ def search(query, page):
                 continue
 
             # Get title from collectionName (preferred) or trackName
-            title = item.get("collectionName") or item.get("trackName", "Unknown Podcast")
+            title = item.get("collectionName") or item.get(
+                "trackName", "Unknown Podcast"
+            )
 
             # Get image URL - prefer artworkUrl600, fallback to artworkUrl100
-            image = item.get("artworkUrl600") or item.get("artworkUrl100") or settings.IMG_NONE
+            image = (
+                item.get("artworkUrl600")
+                or item.get("artworkUrl100")
+                or settings.IMG_NONE
+            )
 
             results.append(
                 {
@@ -91,6 +98,7 @@ def search(query, page):
     return data
 
 
+@request_timing.timed_provider_call
 def lookup_by_itunes_id(itunes_collection_id):
     """Look up podcast metadata by iTunes collection ID.
 
@@ -119,7 +127,7 @@ def lookup_by_itunes_id(itunes_collection_id):
                 ITUNES_LOOKUP_BASE,
                 params=params,
                 headers={"User-Agent": USER_AGENT},
-                timeout=settings.REQUEST_TIMEOUT,
+                timeout=services.request_timeout(),
             )
             response.raise_for_status()
             response_data = response.json()
@@ -130,7 +138,17 @@ def lookup_by_itunes_id(itunes_collection_id):
         if not results:
             raise services.ProviderAPIError(
                 Sources.POCKETCASTS.value,
-                type("obj", (object,), {"response": type("obj", (object,), {"status_code": 404, "text": "Podcast not found"})()}),
+                type(
+                    "obj",
+                    (object,),
+                    {
+                        "response": type(
+                            "obj",
+                            (object,),
+                            {"status_code": 404, "text": "Podcast not found"},
+                        )()
+                    },
+                ),
                 "Podcast not found in iTunes",
             )
 
@@ -143,7 +161,8 @@ def lookup_by_itunes_id(itunes_collection_id):
 
         data = {
             "feed_url": item.get("feedUrl", ""),
-            "title": item.get("collectionName") or item.get("trackName", "Unknown Podcast"),
+            "title": item.get("collectionName")
+            or item.get("trackName", "Unknown Podcast"),
             "author": item.get("artistName", ""),
             "artwork_url": item.get("artworkUrl600") or item.get("artworkUrl100") or "",
             "description": description,

@@ -62,7 +62,7 @@ class BingeBanditImporter(TraktImporter):
                 self._process_row(row)
             except MediaImportError:
                 raise
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.exception("Skipping BingeBandit history row")
                 self.warnings.append(
                     f"{row.get('title') or 'Unknown title'}: skipped a watch entry "

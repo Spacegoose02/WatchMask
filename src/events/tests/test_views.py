@@ -1,16 +1,18 @@
 import calendar
-from datetime import date, timedelta
+from datetime import UTC, date, timedelta
 from unittest.mock import patch
 
+import icalendar
 from django.contrib.auth import get_user_model
 from django.contrib.messages import get_messages
+from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
 from app import models as app_models
-from app.models import TV, Item, MediaTypes, Movie, Season, Sources, Status
-from events.models import Event
+from app.models import TV, Anime, Item, MediaTypes, Movie, Season, Sources, Status
+from events.models import Event, SentinelDatetime
 
 
 class CalendarViewTests(TestCase):
@@ -269,7 +271,6 @@ class CalendarViewTests(TestCase):
         self.assertEqual(len(release_dict[20]), 1)  # One event on the 20th
         self.assertEqual(response.context["selected_day"], today.day)
 
-
     @patch("events.models.Event.objects.get_user_events")
     @patch.object(get_user_model(), "update_preference")
     def test_calendar_list_uses_podcast_show_image_when_item_image_missing(
@@ -314,6 +315,256 @@ class CalendarViewTests(TestCase):
         rendered = response.content.decode()
         self.assertIn("https://example.com/show-art.jpg", rendered)
 
+    @patch("events.models.Event.objects.get_user_events")
+    @patch.object(get_user_model(), "update_preference")
+    def test_calendar_shows_available_statuses_and_status_data_attribute(
+        self,
+        mock_update_preference,
+        mock_get_user_events,
+    ):
+        """Calendar context and markup should expose each release's tracked status."""
+        mock_update_preference.return_value = "grid"
+
+        movie_item = Item.objects.create(
+            media_id="movie-1",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Planned Movie",
+            image="https://example.com/movie.jpg",
+        )
+        Movie.objects.create(
+            item=movie_item,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+
+        today = timezone.localdate()
+        event = Event(
+            item=movie_item,
+            datetime=timezone.make_aware(
+                timezone.datetime(today.year, today.month, 15, 12, 0),
+            ),
+        )
+        mock_get_user_events.return_value = [event]
+
+        response = self.client.get(reverse("calendar"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.context["available_statuses_by_type"],
+            {MediaTypes.MOVIE.value: [Status.PLANNING.value]},
+        )
+        self.assertIn(
+            f'data-release-status="{Status.PLANNING.value}"',
+            response.content.decode(),
+        )
+
+    @patch("events.models.Event.objects.get_user_events")
+    @patch.object(get_user_model(), "update_preference")
+    def test_calendar_untracked_season_event_has_empty_status(
+        self,
+        mock_update_preference,
+        mock_get_user_events,
+    ):
+        """An event on a season the user has no row for must not render "None".
+
+        The client-side status filter hides any non-empty status that is not
+        selected, so the literal "None" made a newly announced season vanish
+        (#1531).
+        """
+        mock_update_preference.return_value = "grid"
+
+        season_item = Item.objects.create(
+            media_id="253391",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Sheriff Country",
+            image="https://example.com/season.jpg",
+            season_number=2,
+        )
+        today = timezone.localdate()
+        mock_get_user_events.return_value = [
+            Event(
+                item=season_item,
+                content_number=1,
+                datetime=timezone.make_aware(
+                    timezone.datetime(today.year, today.month, 15, 12, 0),
+                ),
+            ),
+        ]
+
+        response = self.client.get(reverse("calendar"))
+
+        content = response.content.decode()
+        self.assertIn('data-release-status=""', content)
+        self.assertNotIn('data-release-status="None"', content)
+
+    @patch("events.models.Event.objects.get_user_events")
+    @patch.object(get_user_model(), "update_preference")
+    def test_calendar_scopes_available_statuses_per_media_type(
+        self,
+        mock_update_preference,
+        mock_get_user_events,
+    ):
+        """Statuses for one media type should not appear under another type."""
+        mock_update_preference.return_value = "grid"
+
+        movie_item = Item.objects.create(
+            media_id="movie-1",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Planned Movie",
+        )
+        Movie.objects.create(
+            item=movie_item,
+            user=self.user,
+            status=Status.PLANNING.value,
+        )
+        anime_item = Item.objects.create(
+            media_id="anime-1",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Completed Anime",
+        )
+        Anime.objects.create(
+            item=anime_item,
+            user=self.user,
+            status=Status.COMPLETED.value,
+        )
+
+        today = timezone.localdate()
+        mock_get_user_events.return_value = [
+            Event(
+                item=movie_item,
+                datetime=timezone.make_aware(
+                    timezone.datetime(today.year, today.month, 15, 12, 0),
+                ),
+            ),
+            Event(
+                item=anime_item,
+                datetime=timezone.make_aware(
+                    timezone.datetime(today.year, today.month, 16, 12, 0),
+                ),
+            ),
+        ]
+
+        response = self.client.get(reverse("calendar"))
+
+        self.assertEqual(
+            response.context["available_statuses_by_type"],
+            {
+                MediaTypes.MOVIE.value: [Status.PLANNING.value],
+                MediaTypes.ANIME.value: [Status.COMPLETED.value],
+            },
+        )
+        self.assertIn(MediaTypes.MOVIE.value, response.context["filter_media_types"])
+        self.assertIn(MediaTypes.ANIME.value, response.context["filter_media_types"])
+        self.assertIn(
+            Status.PLANNING.value,
+            response.context["filter_statuses_by_type"][MediaTypes.ANIME.value],
+        )
+
+    @patch("events.models.Event.objects.get_user_events")
+    @patch.object(get_user_model(), "update_preference")
+    def test_calendar_omits_media_type_without_resolvable_status(
+        self,
+        mock_update_preference,
+        mock_get_user_events,
+    ):
+        """Types with no tracked release status should still expose filter options."""
+        mock_update_preference.return_value = "grid"
+
+        movie_item = Item.objects.create(
+            media_id="untracked-movie-1",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Untracked Movie",
+        )
+        today = timezone.localdate()
+        mock_get_user_events.return_value = [
+            Event(
+                item=movie_item,
+                datetime=timezone.make_aware(
+                    timezone.datetime(today.year, today.month, 15, 12, 0),
+                ),
+            ),
+        ]
+
+        response = self.client.get(reverse("calendar"))
+
+        self.assertNotIn(
+            MediaTypes.MOVIE.value,
+            response.context["available_statuses_by_type"],
+        )
+        self.assertIn(
+            MediaTypes.MOVIE.value,
+            response.context["filter_statuses_by_type"],
+        )
+
+    @patch("events.models.Event.objects.get_user_events")
+    @patch.object(get_user_model(), "update_preference")
+    def test_calendar_filter_media_types_include_enabled_types_without_releases(
+        self,
+        mock_update_preference,
+        mock_get_user_events,
+    ):
+        """Enabled media types should remain in the filter even without month releases."""
+        mock_update_preference.return_value = "grid"
+        mock_get_user_events.return_value = []
+
+        self.user.game_enabled = False
+        self.user.save(update_fields=["game_enabled"])
+
+        response = self.client.get(reverse("calendar"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(MediaTypes.GAME.value, response.context["filter_media_types"])
+        self.assertNotIn(
+            MediaTypes.GAME.value,
+            response.context["available_media_types"],
+        )
+        self.assertIn(MediaTypes.MOVIE.value, response.context["filter_media_types"])
+        self.assertNotIn(
+            MediaTypes.MOVIE.value,
+            response.context["available_media_types"],
+        )
+
+    @patch("events.models.Event.objects.get_user_events")
+    @patch.object(get_user_model(), "update_preference")
+    def test_calendar_filter_media_types_include_season_when_tv_enabled(
+        self,
+        mock_update_preference,
+        mock_get_user_events,
+    ):
+        """Season releases should stay filterable when TV Shows is enabled, even if TV Seasons is disabled."""
+        mock_update_preference.return_value = "grid"
+
+        season_item = Item.objects.create(
+            media_id="tv-season-1",
+            source=Sources.MANUAL.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Episodic Show",
+            season_number=1,
+        )
+        today = timezone.localdate()
+        mock_get_user_events.return_value = [
+            Event(
+                item=season_item,
+                datetime=timezone.make_aware(
+                    timezone.datetime(today.year, today.month, 15, 12, 0),
+                ),
+            ),
+        ]
+
+        self.user.tv_enabled = True
+        self.user.season_enabled = False
+        self.user.save(update_fields=["tv_enabled", "season_enabled"])
+
+        response = self.client.get(reverse("calendar"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(MediaTypes.SEASON.value, response.context["filter_media_types"])
+
     @patch("events.tasks.reload_calendar.delay")
     def test_reload_calendar(self, mock_reload_task):
         """Test the reload_calendar view."""
@@ -345,6 +596,8 @@ class DownloadCalendarViewTests(TestCase):
 
     def setUp(self):
         """Set up test data."""
+        # The rendered feed is cached per user; rolled-back test users reuse ids.
+        cache.clear()
         self.credentials = {"username": "caluser", "password": "testpassword"}
         self.user = get_user_model().objects.create_user(**self.credentials)
 
@@ -430,6 +683,36 @@ class DownloadCalendarViewTests(TestCase):
         self.assertIn("Export Season", body)
         self.assertNotIn("Export Movie", body)
 
+    def test_download_calendar_filters_selected_status(self):
+        """Only events whose own tracked status matches should be exported."""
+        export_events = Event.objects.filter(
+            id__in=[self.movie_event.id, self.season_event.id],
+        )
+        with patch(
+            "events.views.Event.objects.get_user_events",
+            return_value=export_events,
+        ):
+            planning_response = self.client.get(
+                reverse("download_calendar", kwargs={"token": self.user.token}),
+                {"status": [Status.PLANNING.value]},
+            )
+            in_progress_response = self.client.get(
+                reverse("download_calendar", kwargs={"token": self.user.token}),
+                {"status": [Status.IN_PROGRESS.value]},
+            )
+
+        self.assertEqual(planning_response.status_code, 200)
+        planning_body = planning_response.content.decode()
+        self.assertIn("Export Movie", planning_body)
+        self.assertIn("Export Season", planning_body)
+
+        # Neither item's own status is In Progress, even though the related
+        # TV show's status is - confirms per-item, not per-show, filtering.
+        self.assertEqual(in_progress_response.status_code, 200)
+        in_progress_body = in_progress_response.content.decode()
+        self.assertNotIn("Export Movie", in_progress_body)
+        self.assertNotIn("Export Season", in_progress_body)
+
     def test_download_calendar_invalid_token_returns_401(self):
         """Unknown export tokens should be rejected."""
         response = self.client.get(
@@ -467,6 +750,107 @@ class DownloadCalendarViewTests(TestCase):
         self.assertIn("Export Movie", body)
         self.assertIn("Export Season", body)
 
+    def test_download_calendar_uses_all_day_event_for_sentinel_time(self):
+        """Events with an unknown release time should export as all-day."""
+        # download_calendar only returns events within a rolling
+        # [now-30d, now+90d] window, so the target date must be relative to
+        # "now" rather than a hardcoded date -- a fixed date eventually
+        # drifts outside that window and the event silently disappears from
+        # the query instead of failing the assertion it was meant to check.
+        target_date = (timezone.now() + timedelta(days=1)).date()
+        sentinel_dt = timezone.datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            SentinelDatetime.HOUR,
+            SentinelDatetime.MINUTE,
+            SentinelDatetime.SECOND,
+            SentinelDatetime.MICROSECOND,
+            tzinfo=UTC,
+        )
+        self.movie_event.datetime = sentinel_dt
+        self.movie_event.save()
+
+        response = self.client.get(
+            reverse("download_calendar", kwargs={"token": self.user.token}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        start_str = target_date.strftime("%Y%m%d")
+        end_str = (target_date + timedelta(days=1)).strftime("%Y%m%d")
+        self.assertIn(f"DTSTART;VALUE=DATE:{start_str}", body)
+        self.assertIn(f"DTEND;VALUE=DATE:{end_str}", body)
+        self.assertNotIn(f"DTSTART:{start_str}T115959Z", body)
+
+    def test_download_calendar_keeps_timed_event_for_known_time(self):
+        """Events with a known release time should keep a timed DTSTART/DTEND."""
+        target_date = (timezone.now() + timedelta(days=1)).date()
+        known_dt = timezone.datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            7,
+            0,
+            0,
+            tzinfo=UTC,
+        )
+        self.movie_event.datetime = known_dt
+        self.movie_event.save()
+
+        response = self.client.get(
+            reverse("download_calendar", kwargs={"token": self.user.token}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        expected = known_dt.strftime("%Y%m%dT%H%M%SZ")
+        self.assertIn(f"DTSTART:{expected}", body)
+        self.assertIn(f"DTEND:{expected}", body)
+
+    def test_download_calendar_feed_parses_with_escaped_and_folded_summaries(self):
+        """The hand-written feed round-trips through a real iCalendar parser.
+
+        Summaries with characters that need escaping, non-ASCII text and a
+        title long enough to fold must come back exactly as stored, and no
+        physical line may exceed 75 octets.
+        """
+        titles = [
+            "Comma, Semicolon; Backslash \\ and\nNewline",
+            "Ünïcödé 映画 " * 8,
+            "A very long title " * 12,
+        ]
+        Event.objects.filter(pk=self.season_event.pk).delete()
+        for index, title in enumerate(titles):
+            item = Item.objects.create(
+                media_id=f"escape-{index}",
+                source=Sources.MANUAL.value,
+                media_type=MediaTypes.MOVIE.value,
+                title=title,
+                image="https://example.com/movie.jpg",
+            )
+            Movie.objects.create(item=item, user=self.user, status=Status.PLANNING.value)
+            Event.objects.create(item=item, datetime=timezone.now())
+
+        response = self.client.get(
+            reverse("download_calendar", kwargs={"token": self.user.token}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        for physical_line in response.content.decode().split("\r\n"):
+            self.assertLessEqual(len(physical_line.encode()), 75)
+        calendar_file = icalendar.Calendar.from_ical(response.content)
+        summaries = {
+            str(component["SUMMARY"])
+            for component in calendar_file.walk("VEVENT")
+        }
+        self.assertLessEqual(set(titles), summaries)
+        self.assertEqual(str(calendar_file["VERSION"]), "2.0")
+        self.assertEqual(str(calendar_file["PRODID"]), "-//Floppy//EN")
+        for component in calendar_file.walk("VEVENT"):
+            self.assertTrue(component["UID"])
+            self.assertTrue(component["DTSTAMP"].dt)
+
     def test_download_calendar_allows_head_requests(self):
         """HEAD requests should be accepted for calendar clients."""
         response = self.client.head(
@@ -493,3 +877,21 @@ class DownloadCalendarViewTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 405)
+
+
+class CalendarFeedCacheTests(TestCase):
+    """Calendar apps poll the feed; a repeat fetch reuses the rendered file."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(username="feedcache")
+
+    def test_repeat_fetch_skips_the_event_query(self):
+        url = reverse("download_calendar", kwargs={"token": self.user.token})
+        self.assertEqual(self.client.get(url).status_code, 200)
+
+        with self.assertNumQueries(1):  # the token lookup only
+            response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"BEGIN:VCALENDAR", response.content)

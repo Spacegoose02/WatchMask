@@ -28,16 +28,17 @@ def validate_music_library(user):
         dict with validation metrics
     """
     music_entries = Music.objects.filter(user=user).select_related(
-        "item", "artist", "album", "track",
+        "item",
+        "artist",
+        "album",
+        "track",
     )
 
     total_music_entries = music_entries.count()
 
     # Count unique tracks (distinct by item.media_id + item.source)
     unique_tracks = (
-        music_entries.values("item__media_id", "item__source")
-        .distinct()
-        .count()
+        music_entries.values("item__media_id", "item__source").distinct().count()
     )
 
     # Count Music entries with Track model links
@@ -59,18 +60,28 @@ def validate_music_library(user):
     #   * Check if validation ran before enrichment completed
     #   * Check if new Music entries were added between runs
     #   * Both functions should show the same counts for the same Music entry set
-    artist_ids = music_entries.exclude(artist_id__isnull=True).values_list(
-        "artist_id", flat=True,
-    ).distinct()
+    artist_ids = (
+        music_entries.exclude(artist_id__isnull=True)
+        .values_list(
+            "artist_id",
+            flat=True,
+        )
+        .distinct()
+    )
 
     artists = Artist.objects.filter(id__in=artist_ids)
     artists_with_mbid = artists.exclude(musicbrainz_id__isnull=True).count()
     total_artists = artists.count()
 
     # Get album statistics
-    album_ids = music_entries.exclude(album_id__isnull=True).values_list(
-        "album_id", flat=True,
-    ).distinct()
+    album_ids = (
+        music_entries.exclude(album_id__isnull=True)
+        .values_list(
+            "album_id",
+            flat=True,
+        )
+        .distinct()
+    )
 
     albums = Album.objects.filter(id__in=album_ids)
     albums_with_tracks = albums.filter(tracks_populated=True).count()
@@ -120,14 +131,10 @@ def validate_music_library(user):
                 else 0
             ),
             "artist_mbid": (
-                (artists_with_mbid / total_artists * 100)
-                if total_artists > 0
-                else 0
+                (artists_with_mbid / total_artists * 100) if total_artists > 0 else 0
             ),
             "album_tracks": (
-                (albums_with_tracks / total_albums * 100)
-                if total_albums > 0
-                else 0
+                (albums_with_tracks / total_albums * 100) if total_albums > 0 else 0
             ),
         },
     }
@@ -145,9 +152,7 @@ def count_user_tracks(user):
 
     # Count unique tracks (distinct by item.media_id + item.source)
     unique_tracks = (
-        music_entries.values("item__media_id", "item__source")
-        .distinct()
-        .count()
+        music_entries.values("item__media_id", "item__source").distinct().count()
     )
 
     # Count Music entries linked to Track model
@@ -176,22 +181,35 @@ def get_enrichment_status(user):
     Returns information about what has been enriched and what's missing.
     """
     music_entries = Music.objects.filter(user=user).select_related(
-        "item", "artist", "album", "track",
+        "item",
+        "artist",
+        "album",
+        "track",
     )
 
     # Artists with/without MBIDs
-    artist_ids = music_entries.exclude(artist_id__isnull=True).values_list(
-        "artist_id", flat=True,
-    ).distinct()
+    artist_ids = (
+        music_entries.exclude(artist_id__isnull=True)
+        .values_list(
+            "artist_id",
+            flat=True,
+        )
+        .distinct()
+    )
 
     artists = Artist.objects.filter(id__in=artist_ids)
     artists_with_mbid = artists.exclude(musicbrainz_id__isnull=True)
     artists_without_mbid = artists.filter(musicbrainz_id__isnull=True)
 
     # Albums with/without populated tracks
-    album_ids = music_entries.exclude(album_id__isnull=True).values_list(
-        "album_id", flat=True,
-    ).distinct()
+    album_ids = (
+        music_entries.exclude(album_id__isnull=True)
+        .values_list(
+            "album_id",
+            flat=True,
+        )
+        .distinct()
+    )
 
     albums = Album.objects.filter(id__in=album_ids)
     albums_with_tracks = albums.filter(tracks_populated=True)
@@ -220,7 +238,11 @@ def get_enrichment_status(user):
             "with_tracks": albums_with_tracks.count(),
             "without_tracks": albums_without_tracks.count(),
             "without_tracks_list": [
-                {"id": a.id, "title": a.title, "artist": a.artist.name if a.artist else "Unknown"}
+                {
+                    "id": a.id,
+                    "title": a.title,
+                    "artist": a.artist.name if a.artist else "Unknown",
+                }
                 for a in albums_without_tracks[:20]  # Limit to first 20
             ],
         },
@@ -240,7 +262,10 @@ def get_missing_linkages(user):
     Returns breakdown of what's missing.
     """
     music_entries = Music.objects.filter(user=user).select_related(
-        "item", "artist", "album", "track",
+        "item",
+        "artist",
+        "album",
+        "track",
     )
 
     missing_track = music_entries.filter(track__isnull=True)
@@ -267,7 +292,7 @@ def get_missing_linkages(user):
 
 
 def compare_plex_track_count(user, plex_track_count=None):
-    """Compare Yamtrack track counts with Plex data.
+    """Compare Floppy track counts with Plex data.
 
     Args:
         user: Django User instance
@@ -279,7 +304,7 @@ def compare_plex_track_count(user, plex_track_count=None):
     validation = validate_music_library(user)
 
     result = {
-        "yamtrack": {
+        "floppy": {
             "total_music_entries": validation["total_music_entries"],
             "unique_tracks": validation["unique_tracks"],
             "tracks_with_plays": validation["with_plays"],
@@ -292,8 +317,7 @@ def compare_plex_track_count(user, plex_track_count=None):
         }
         result["comparison"] = {
             "difference": validation["unique_tracks"] - plex_track_count,
-            "yamtrack_higher": validation["unique_tracks"] > plex_track_count,
+            "floppy_higher": validation["unique_tracks"] > plex_track_count,
         }
 
     return result
-

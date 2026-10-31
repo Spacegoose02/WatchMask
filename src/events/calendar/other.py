@@ -3,7 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app import config
-from app.models import MediaTypes, Sources
+from app.models import MediaTypes, Movie, Sources
 from app.providers import services
 from events.models import Event
 
@@ -13,7 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 def process_other(item, events_bulk):
-    """Process other types of items and add events to the event list."""
+    """Process other types of items and add events to the event list.
+
+    Returns True when the item was successfully checked (including when there was
+    nothing to schedule), False when the provider call failed. Callers use this to
+    decide whether to record the check, so a failed fetch is retried rather than
+    being suppressed by the staleness window.
+    """
     logger.info("Fetching releases for %s", item)
     try:
         metadata = services.get_media_metadata(
@@ -26,7 +32,7 @@ def process_other(item, events_bulk):
             "Failed to fetch metadata for %s",
             item,
         )
-        return
+        return False
 
     date_key = config.get_date_key(item.media_type)
     content_number = metadata["max_progress"]
@@ -50,7 +56,7 @@ def process_other(item, events_bulk):
                     item,
                     selected_date_value,
                 )
-                return
+                return True
         else:
             content_datetime = datetime.min.replace(tzinfo=ZoneInfo("UTC"))
 
@@ -64,6 +70,9 @@ def process_other(item, events_bulk):
                 datetime=content_datetime,
             ),
         )
+
+        if item.media_type == MediaTypes.MOVIE.value:
+            events_bulk.extend(movie_release_type_events(item, metadata))
 
     elif (
         item.media_type == MediaTypes.GAME.value
@@ -79,7 +88,7 @@ def process_other(item, events_bulk):
                 item,
                 selected_date_value,
             )
-            return
+            return True
 
         events_bulk.append(
             Event(
@@ -98,3 +107,46 @@ def process_other(item, events_bulk):
                 datetime=content_datetime,
             ),
         )
+
+    return True
+
+
+def movie_release_type_events(item, metadata):
+    """Return digital and physical release events for the users' regions.
+
+    Those dates differ per country, so only the regions of users tracking the
+    movie get events. Users without a region have none.
+    """
+    release_types = metadata.get("release_types") or {}
+    if not release_types:
+        return []
+
+    regions = set(
+        Movie.objects.filter(item=item)
+        .exclude(user__watch_provider_region__in=["", "UNSET"])
+        .values_list("user__watch_provider_region", flat=True),
+    )
+
+    events = []
+    for region in sorted(regions):
+        for release_type, release_date in (release_types.get(region) or {}).items():
+            try:
+                content_datetime = date_parser(release_date)
+            except ValueError:
+                logger.warning(
+                    "Invalid %s release date for %s: %s",
+                    release_type,
+                    item,
+                    release_date,
+                )
+                continue
+            events.append(
+                Event(
+                    item=item,
+                    content_number=None,
+                    datetime=content_datetime,
+                    release_type=release_type,
+                    region=region,
+                ),
+            )
+    return events

@@ -1,17 +1,42 @@
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 from django.contrib.auth import get_user_model
 from django.template.loader import render_to_string
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.client import RequestFactory
 from django.urls import reverse
 from django.utils import timezone
 
 from app import config
-from app.models import Album, Artist, Item, MediaTypes, Sources, Studio
+from app.models import (
+    Album,
+    Artist,
+    BasicMedia,
+    Book,
+    Item,
+    MediaTypes,
+    Sources,
+    Status,
+    Studio,
+    Track,
+)
 from app.templatetags import app_tags
 from users.models import DateFormatChoices, TimeFormatChoices
+
+
+class FutureDateTests(SimpleTestCase):
+    def test_only_known_dates_after_today_are_future(self):
+        today = timezone.localdate()
+        for value in (None, "", "invalid", "2026-02-30", today, today - timedelta(days=1)):
+            with self.subTest(value=value):
+                self.assertFalse(app_tags.is_future_date(value))
+        tomorrow = today + timedelta(days=1)
+        self.assertTrue(app_tags.is_future_date(tomorrow))
+        self.assertTrue(app_tags.is_future_date(tomorrow.isoformat()))
+        self.assertTrue(app_tags.is_future_date(datetime.combine(tomorrow, datetime.min.time(), tzinfo=UTC)))
 
 
 class AppTagsTests(TestCase):
@@ -104,6 +129,14 @@ class AppTagsTests(TestCase):
             "no underscores here",
         )
 
+    def test_watch_operation_id_returns_fresh_uuid(self):
+        """Each rendered first-party watch control receives a fresh UUID."""
+        first = app_tags.watch_operation_id()
+        second = app_tags.watch_operation_id()
+
+        self.assertEqual(str(UUID(first)), first)
+        self.assertNotEqual(first, second)
+
     def test_slug(self):
         """Test the slug filter."""
         # Test normal slugification
@@ -114,6 +147,29 @@ class AppTagsTests(TestCase):
         self.assertEqual(app_tags.slug("★★★"), "%E2%98%85%E2%98%85%E2%98%85")
         self.assertEqual(app_tags.slug("[Oshi no Ko]"), "oshi-no-ko")
         self.assertEqual(app_tags.slug("_____"), "_____")
+
+    def test_slug_is_one_path_segment(self):
+        """Titles made of path characters still produce a usable URL segment."""
+        self.assertEqual(app_tags.slug("/"), "2f")
+        self.assertEqual(app_tags.slug("//"), "2f2f")
+        self.assertEqual(app_tags.slug("."), "2e")
+        self.assertEqual(app_tags.slug(".."), "2e2e")
+        self.assertEqual(app_tags.slug("..."), "...")
+
+    def test_media_url_episode_titled_slash(self):
+        """An episode titled "/" links to its page instead of raising (#1322)."""
+        episode = {
+            "media_type": MediaTypes.EPISODE.value,
+            "source": Sources.TMDB.value,
+            "media_id": "1411",
+            "title": "/",
+            "season_number": 3,
+            "episode_number": 17,
+        }
+
+        url = app_tags.media_url(episode)
+
+        self.assertEqual(url, "/details/tmdb/tv/1411/2f/season/3/episode/17")
 
     def test_title_preserve_acronyms(self):
         """Test acronym-preserving title casing."""
@@ -147,6 +203,10 @@ class AppTagsTests(TestCase):
                 expected = f"{singular}s"
 
             self.assertEqual(app_tags.media_type_readable_plural(media_type), expected)
+
+    def test_media_status_readable_preserves_unknown_provider_status(self):
+        """Provider metadata statuses must not break tracking-status rendering."""
+        self.assertEqual(app_tags.media_status_readable("Released"), "Released")
 
     def test_default_source(self):
         """Test the default_source filter."""
@@ -202,6 +262,22 @@ class AppTagsTests(TestCase):
 
             # Check that it returns a non-empty string
             self.assertTrue(isinstance(result, str))
+
+    @override_settings(TIME_ZONE="America/New_York")
+    def test_release_year_handles_year_one_sentinel_datetime(self):
+        """release_year must not raise OverflowError for a year-0001 release_datetime.
+
+        A negative UTC offset (e.g. America/New_York) underflows below
+        datetime.MINYEAR when converting the sentinel to local time.
+        """
+        item = Item(
+            media_id="118340",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Test Movie",
+            release_datetime=datetime(1, 1, 1, tzinfo=UTC),
+        )
+        self.assertIsNone(app_tags.release_year(item))
 
     def test_natural_day(self):
         """Test the natural_day filter."""
@@ -285,7 +361,9 @@ class AppTagsTests(TestCase):
         )
 
     @patch("app.templatetags.app_tags.date")
-    def test_format_date_range_display_prefers_this_month_over_last_7_days(self, mock_date):
+    def test_format_date_range_display_prefers_this_month_over_last_7_days(
+        self, mock_date
+    ):
         """Month-to-date ranges should keep the month label even when they span 7 days."""
         today = timezone.datetime(2026, 5, 7).date()
         mock_date.today.return_value = today
@@ -353,6 +431,27 @@ class AppTagsTests(TestCase):
                     "artist_slug": "short-name",
                     "album_id": 17,
                     "album_slug": "live-at-home",
+                },
+            ),
+        )
+
+    def test_music_track_url_returns_nested_canonical_details_path(self):
+        """Music tracks should resolve under their album on the shared route."""
+        artist = Artist.objects.create(name="The Amazing Artist")
+        album = Album.objects.create(title="First Record", artist=artist)
+        track = Track.objects.create(album=album, title="Opening Song")
+
+        self.assertEqual(
+            app_tags.music_track_url(track),
+            reverse(
+                "music_track_details",
+                kwargs={
+                    "artist_id": artist.id,
+                    "artist_slug": "the-amazing-artist",
+                    "album_id": album.id,
+                    "album_slug": "first-record",
+                    "track_id": track.id,
+                    "track_slug": "opening-song",
                 },
             ),
         )
@@ -425,7 +524,6 @@ class AppTagsTests(TestCase):
                 "user": self.user,
                 "title": item.title,
                 "show_status_chip": False,
-                "show_progress_chip": False,
             },
             request=request,
         )
@@ -442,6 +540,102 @@ class AppTagsTests(TestCase):
             ),
             content,
         )
+
+    def _render_book_card(self, *, status, progress, percentage=False, audiobook=False):
+        """Render media_card.html for a book and return its markup."""
+        item = Item.objects.create(
+            media_id=f"book-card-{status}-{audiobook}",
+            source=Sources.OPENLIBRARY.value,
+            media_type=MediaTypes.BOOK.value,
+            title="Card Book",
+            image="http://example.com/book.jpg",
+            release_datetime=datetime(2020, 1, 1, tzinfo=UTC),
+            format="audiobook" if audiobook else "",
+            runtime_minutes=600 if audiobook else None,
+            number_of_pages=None if audiobook else 350,
+        )
+        self.user.book_comic_manga_progress_percentage = percentage
+        self.user.save(update_fields=["book_comic_manga_progress_percentage"])
+
+        media = Book.objects.create(
+            item=item, user=self.user, status=status, progress=progress
+        )
+        BasicMedia.objects.annotate_max_progress([media], MediaTypes.BOOK.value)
+
+        request = self.request_factory.get("/library")
+        request.user = self.user
+        return render_to_string(
+            "app/components/media_card.html",
+            {
+                "item": item,
+                "media": media,
+                "user": self.user,
+                "title": item.title,
+                "show_status_chip": False,
+                "from_grid": True,
+            },
+            request=request,
+        )
+
+    def test_media_card_shows_book_progress_when_dropped(self):
+        """A dropped book keeps showing how far the reader got."""
+        content = self._render_book_card(status=Status.DROPPED.value, progress=120)
+
+        self.assertIn("120/350 pages", content)
+
+    def test_media_card_shows_book_progress_when_paused(self):
+        """A paused book keeps showing how far the reader got."""
+        content = self._render_book_card(status=Status.PAUSED.value, progress=120)
+
+        self.assertIn("120/350 pages", content)
+
+    def test_media_card_shows_percentage_without_raw_total(self):
+        """Percentage mode renders a bare percentage, never '34% / 350'."""
+        content = self._render_book_card(
+            status=Status.DROPPED.value, progress=120, percentage=True
+        )
+
+        self.assertIn("34%", content)
+        self.assertNotIn("% /", content)
+        self.assertNotIn("350", content)
+
+    def test_media_card_shows_audiobook_progress_as_listening_time(self):
+        """Audiobooks read as h/min on both sides of the slash, never as pages."""
+        content = self._render_book_card(
+            status=Status.IN_PROGRESS.value, progress=150, audiobook=True
+        )
+
+        self.assertIn("2h 30min/10h 00min", content)
+        self.assertNotIn("pages", content)
+
+    def test_media_card_shows_audiobook_percentage(self):
+        """The percentage preference applies to audiobooks too."""
+        content = self._render_book_card(
+            status=Status.IN_PROGRESS.value,
+            progress=150,
+            percentage=True,
+            audiobook=True,
+        )
+
+        self.assertIn("25%", content)
+
+    def test_genres_cell_falls_back_to_plain_text_for_blank_media_type(self):
+        """Genres cell shouldn't crash reversing 'medialist' for a blank media_type."""
+        item = Item(
+            media_id="blank-type-1",
+            source=Sources.TMDB.value,
+            media_type="",
+            title="Legacy Item",
+            genres=["Drama"],
+        )
+
+        content = render_to_string(
+            "app/components/cells/media_genres_cell.html",
+            {"media": SimpleNamespace(item=item)},
+        )
+
+        self.assertIn("Drama", content)
+        self.assertNotIn("<a href", content)
 
     def test_progress_changer_uses_episode_label_for_tv_and_season(self):
         """Quick progress controls should use episode labels for TV-derived progress."""
@@ -507,7 +701,6 @@ class AppTagsTests(TestCase):
                 "title": item.title,
                 "from_grid": True,
                 "show_status_chip": False,
-                "show_progress_chip": False,
             },
             request=request,
         )
@@ -574,8 +767,68 @@ class AppTagsTests(TestCase):
             content,
         )
 
-    def test_history_card_episode_edit_uses_track_modal(self):
-        """Episode history cards should open the track modal so ratings can be edited."""
+    def test_history_modal_actions_are_visible_on_touch_and_keyboard_focus(self):
+        """History actions remain discoverable without a mouse hover."""
+        request = self.request_factory.get("/media/movie/238")
+        request.user = self.user
+        content = render_to_string(
+            "app/components/fill_history.html",
+            {
+                "edit_modal_url": "/track-modal/movie/238",
+                "entry": None,
+                "media_type": MediaTypes.MOVIE.value,
+                "return_url": "/media/movie/238",
+                "timeline": [
+                    SimpleNamespace(
+                        id=12,
+                        instance_id=34,
+                        date=timezone.now(),
+                        media_entry_number=1,
+                        changes=["Completed"],
+                    ),
+                ],
+                "user": self.user,
+            },
+            request=request,
+        )
+
+        self.assertEqual(content.count("pointer-coarse:opacity-100"), 2)
+        self.assertEqual(content.count("focus-visible:opacity-100"), 2)
+        self.assertIn('hx-confirm="Delete this activity entry? This cannot be undone."', content)
+
+    def test_media_card_touch_reveal_respects_overlay_preference_and_bulk_selection(self):
+        """The card handler yields to immediate navigation and bulk selection."""
+        self.user.clickable_media_cards = True
+        request = self.request_factory.get("/media")
+        request.user = self.user
+        content = render_to_string(
+            "app/components/media_card.html",
+            {
+                "item": self.tv_item,
+                "media": SimpleNamespace(
+                    album=None,
+                    artist=None,
+                    status=None,
+                    progress=None,
+                    next_event=None,
+                    episodes_left=0,
+                ),
+                "user": self.user,
+                "title": self.tv_item.title,
+                "from_grid": True,
+                "show_status_chip": False,
+                "enable_bulk_select": True,
+            },
+            request=request,
+        )
+
+        self.assertIn("media-card-hide-overlay", content)
+        self.assertIn("this.selectMode", content)
+        self.assertIn("flex-wrap", content)
+        self.assertIn("gap-2.5", content)
+
+    def test_history_card_episode_shows_watched_status_and_uses_track_modal(self):
+        """Episode history cards show watched status and open the track modal."""
         item = Item.objects.create(
             media_id="episode-history-1",
             source=Sources.TMDB.value,
@@ -588,34 +841,33 @@ class AppTagsTests(TestCase):
         request = self.request_factory.get("/history")
         request.user = self.user
 
+        context = {
+            "entry": SimpleNamespace(
+                media_type=MediaTypes.EPISODE.value,
+                album=None,
+                item=item,
+                poster=item.image,
+                status=None,
+                runtime_display=None,
+                display_title=item.title,
+                title=item.title,
+                played_at_local=timezone.now(),
+                time_range_display="6:00 PM",
+                play_count=1,
+                progress_display=None,
+                episode_label="S1E2",
+                episode_code="S1E2",
+                show=None,
+                score=8,
+                entry_key="episode-entry-1",
+                instance_id=7,
+            ),
+            "card_class": "search-result-card",
+            "history_mode": "activity",
+            "user": self.user,
+        }
         content = render_to_string(
-            "app/components/history_card.html",
-            {
-                "entry": SimpleNamespace(
-                    media_type=MediaTypes.EPISODE.value,
-                    album=None,
-                    item=item,
-                    poster=item.image,
-                    status=None,
-                    runtime_display=None,
-                    display_title=item.title,
-                    title=item.title,
-                    played_at_local=timezone.now(),
-                    time_range_display="6:00 PM",
-                    play_count=1,
-                    progress_display=None,
-                    episode_label="S1E2",
-                    episode_code="S1E2",
-                    show=None,
-                    score=8,
-                    entry_key="episode-entry-1",
-                    instance_id=7,
-                ),
-                "card_class": "search-result-card",
-                "history_mode": "activity",
-                "user": self.user,
-            },
-            request=request,
+            "app/components/history_card.html", context, request=request
         )
 
         expected_track_url = reverse(
@@ -631,6 +883,17 @@ class AppTagsTests(TestCase):
         self.assertIn('"instance_id": "7"', content)
         self.assertIn('"standard_modal": "1"', content)
         self.assertNotIn('hx-get="/history_modal/', content)
+        self.assertIn("media-status-chip", content)
+        self.assertIn("Status: Completed", content)
+        self.assertIn('aria-hidden="true"', content)
+
+        release_content = render_to_string(
+            "app/components/history_card.html",
+            {**context, "history_mode": "release"},
+            request=request,
+        )
+        self.assertNotIn("media-status-chip", release_content)
+        self.assertNotIn("Status: Completed", release_content)
 
     def test_history_card_teleports_alt_title_tooltip(self):
         """History cards should teleport alternate-title tooltips outside the clipped shell."""
@@ -757,6 +1020,100 @@ class AppTagsTests(TestCase):
         )
         self.assertEqual(app_tags.component_id("card", candidate_like), "card-tv-1668")
 
+        # Podcast media_ids contain ":" (e.g. "itunes:12345"), which is invalid
+        # inside a CSS id selector used by hx-target="#...". It must be
+        # sanitized so htmx doesn't throw a querySelectorAll SyntaxError (#502).
+        podcast_like = SimpleNamespace(
+            media_type=MediaTypes.PODCAST.value,
+            media_id="itunes:1247343210",
+        )
+        podcast_id = app_tags.component_id("track", podcast_like, 4)
+        self.assertNotIn(":", podcast_id)
+        self.assertEqual(podcast_id, "track-podcast-itunes-1247343210-4")
+
+        # URL-shaped podcast media IDs must produce valid CSS selectors (#949).
+        podcast_url_like = SimpleNamespace(
+            media_type=MediaTypes.PODCAST.value,
+            media_id="https://api.spreaker.com/episode/74415563",
+        )
+        podcast_url_id = app_tags.component_id("history", podcast_url_like)
+        self.assertEqual(
+            podcast_url_id,
+            "history-podcast-https---api-spreaker-com-episode-74415563",
+        )
+        self.assertRegex(podcast_url_id, r"^[A-Za-z0-9_-]+$")
+
+    def test_season_card_title(self):
+        """Test the season_card_title tag includes the parent show title (#1060)."""
+        # Numbered season, object input
+        self.assertEqual(
+            app_tags.season_card_title(self.season_item),
+            "Test TV Show Season 1",
+        )
+
+        # Numbered season, dict input
+        self.assertEqual(
+            app_tags.season_card_title(self.season_dict),
+            "Test TV Show Season 1",
+        )
+
+        # Specials (season 0), object input
+        specials_item = Item(
+            media_id="1668",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Test TV Show",
+            season_number=0,
+        )
+        self.assertEqual(
+            app_tags.season_card_title(specials_item),
+            "Test TV Show Specials",
+        )
+
+        # Specials (season 0), dict input
+        specials_dict = {**self.season_dict, "season_number": 0}
+        self.assertEqual(
+            app_tags.season_card_title(specials_dict),
+            "Test TV Show Specials",
+        )
+
+        # Named provider/arc title, object input
+        arc_item = SimpleNamespace(
+            title="Test TV Show",
+            season_number=1,
+            season_title="Indigo League",
+        )
+        self.assertEqual(
+            app_tags.season_card_title(arc_item),
+            "Test TV Show: Indigo League",
+        )
+
+        # Named provider/arc title, dict input
+        arc_dict = {
+            "title": "Test TV Show",
+            "season_number": 1,
+            "season_title": "Indigo League",
+        }
+        self.assertEqual(
+            app_tags.season_card_title(arc_dict),
+            "Test TV Show: Indigo League",
+        )
+
+        # Missing fallback title falls back to the bare season string
+        no_title_item = SimpleNamespace(title="", season_number=2, season_title=None)
+        self.assertEqual(app_tags.season_card_title(no_title_item), "Season 2")
+
+        # Missing fallback title with a named arc falls back to the bare arc title
+        no_title_arc_item = SimpleNamespace(
+            title="",
+            season_number=1,
+            season_title="Indigo League",
+        )
+        self.assertEqual(
+            app_tags.season_card_title(no_title_arc_item),
+            "Indigo League",
+        )
+
     def test_media_view_url(self):
         """Test the media_view_url tag."""
         # Test with object for TV
@@ -845,6 +1202,26 @@ class AppTagsTests(TestCase):
             expected_tv_modal,
         )
 
+        # TMDB includes season_number=0 on top-level anime metadata. It is not
+        # a season route and must not become /lists_modal/.../<id>/0.
+        anime_dict = {
+            "source": Sources.TMDB.value,
+            "media_type": MediaTypes.ANIME.value,
+            "media_id": "83611",
+            "season_number": 0,
+        }
+        self.assertEqual(
+            app_tags.media_view_url("lists_modal", anime_dict),
+            reverse(
+                "lists_modal",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_type": MediaTypes.ANIME.value,
+                    "media_id": "83611",
+                },
+            ),
+        )
+
     def test_unicode_icon(self):
         """Test the unicode_icon tag for all media types."""
         # Test all media types from MediaTypes
@@ -928,17 +1305,17 @@ class NextEpisodeUrlTests(TestCase):
             image="http://example.com/tv-s1.jpg",
             season_number=1,
         )
-        # Completing the season fans out through the provider; keep it offline
-        with patch(
-            "app.providers.services.get_media_metadata",
-            return_value={"max_progress": None, "related": {"seasons": []}, "episodes": []},
-        ):
-            Season.objects.create(
-                item=season_item,
-                user=self.user,
-                related_tv=tv,
-                status=Status.COMPLETED.value,
-            )
+        # Create as PLANNING then flip via update() so the fixture does not
+        # trigger the completed-on-create fan-out (which fetches metadata).
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv,
+            status=Status.PLANNING.value,
+        )
+        Season.objects.filter(pk=season.pk).update(
+            status=Status.COMPLETED.value,
+        )
         return tv_item, tv
 
     def test_tv_show_falls_back_to_untracked_season_events(self):
@@ -1010,3 +1387,889 @@ class NextEpisodeUrlTests(TestCase):
                 kwargs={"media_id": "51553", "title": "witch-hat-atelier"},
             ),
         )
+
+    def _create_tv_with_season_stuck_planning(
+        self,
+        media_id="90210",
+        season_number=1,
+        watched_episodes=5,
+    ):
+        """Return a TV show whose tracked season has real progress but a
+        stale PLANNING status (as left behind by a failed metadata fetch
+        during Episode.save, e.g. a bulk import — see issue #517).
+        """
+        from app.models import TV, Episode, Season, Status
+        from app.providers.services import ProviderAPIError
+
+        tv_item = Item.objects.create(
+            media_id=media_id,
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Stuck Planning TV",
+            image="http://example.com/tv.jpg",
+        )
+        tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        season_item = Item.objects.create(
+            media_id=media_id,
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Stuck Planning TV",
+            image=f"http://example.com/tv-s{season_number}.jpg",
+            season_number=season_number,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv,
+            status=Status.PLANNING.value,
+        )
+        from events.models import Event
+
+        for episode_number in range(1, watched_episodes + 2):
+            Event.objects.create(
+                item=season_item,
+                content_number=episode_number,
+                datetime=timezone.now(),
+            )
+        for episode_number in range(1, watched_episodes + 1):
+            episode_item = Item.objects.create(
+                media_id=media_id,
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.EPISODE.value,
+                season_number=season_number,
+                episode_number=episode_number,
+                title=f"Episode {episode_number}",
+                image="",
+            )
+            # Episode.save() tries a provider metadata fetch to sync the
+            # season's status; force it to fail (as it does in production
+            # when the metadata call errors during a bulk import), leaving
+            # the season's raw status untouched at PLANNING despite this
+            # real watch progress.
+            with patch(
+                "app.models.tv.providers.services.get_media_metadata",
+                side_effect=ProviderAPIError("tmdb", Exception("boom")),
+            ):
+                Episode.objects.create(
+                    item=episode_item,
+                    related_season=season,
+                    end_date=timezone.now(),
+                )
+        season.refresh_from_db()
+        self.assertEqual(season.status, Status.PLANNING.value)
+        return tv_item, tv, season_item
+
+    def test_tv_show_uses_derived_status_for_only_season_stuck_planning(self):
+        """A single season with real progress but stale PLANNING status still
+        routes to its own next episode, not the untracked-season fallback.
+        """
+        tv_item, tv, season_item = self._create_tv_with_season_stuck_planning(
+            season_number=1,
+            watched_episodes=5,
+        )
+
+        url = app_tags.next_episode_url(tv_item, tv)
+
+        self.assertEqual(
+            url,
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": season_item.media_id,
+                    "title": "stuck-planning-tv",
+                    "season_number": 1,
+                    "episode_number": 6,
+                },
+            ),
+        )
+
+    def test_tv_show_does_not_skip_to_next_season_when_current_stuck_planning(self):
+        """A completed earlier season shouldn't cause the button to skip past
+        a later, still-in-progress season whose status is stuck at PLANNING.
+        """
+        from app.models import Episode, Season, Status
+        from app.providers.services import ProviderAPIError
+
+        tv_item, tv = self._create_tv_with_completed_season(media_id="90211")
+        season_item = Item.objects.create(
+            media_id="90211",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Untracked Next Season TV",
+            image="http://example.com/tv-s2.jpg",
+            season_number=2,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv,
+            status=Status.PLANNING.value,
+        )
+        from events.models import Event
+
+        for episode_number in range(1, 5):
+            Event.objects.create(
+                item=season_item,
+                content_number=episode_number,
+                datetime=timezone.now(),
+            )
+        for episode_number in (1, 2, 3):
+            episode_item = Item.objects.create(
+                media_id="90211",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.EPISODE.value,
+                season_number=2,
+                episode_number=episode_number,
+                title=f"Episode {episode_number}",
+                image="",
+            )
+            with patch(
+                "app.models.tv.providers.services.get_media_metadata",
+                side_effect=ProviderAPIError("tmdb", Exception("boom")),
+            ):
+                Episode.objects.create(
+                    item=episode_item,
+                    related_season=season,
+                    end_date=timezone.now(),
+                )
+        season.refresh_from_db()
+        self.assertEqual(season.status, Status.PLANNING.value)
+
+        url = app_tags.next_episode_url(tv_item, tv)
+
+        self.assertEqual(
+            url,
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "90211",
+                    "title": "untracked-next-season-tv",
+                    "season_number": 2,
+                    "episode_number": 4,
+                },
+            ),
+        )
+
+    def test_tv_show_uses_next_tracked_season_after_completed_season(self):
+        """A completed season must not produce a nonexistent trailing episode."""
+        from app.models import Episode, Season, Status
+        from app.providers.services import ProviderAPIError
+        from events.models import Event
+
+        tv_item, tv = self._create_tv_with_completed_season(media_id="202851")
+        season_item = Item.objects.create(
+            media_id="202851",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Big Boys",
+            image="http://example.com/tv-s2.jpg",
+            season_number=2,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv,
+            status=Status.PLANNING.value,
+        )
+        for episode_number in (1, 2):
+            Event.objects.create(
+                item=season_item,
+                content_number=episode_number,
+                datetime=timezone.now(),
+            )
+        episode_item = Item.objects.create(
+            media_id="202851",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=2,
+            episode_number=1,
+            title="Big Boys",
+            image="",
+        )
+        with patch(
+            "app.models.tv.providers.services.get_media_metadata",
+            side_effect=ProviderAPIError("tmdb", Exception("boom")),
+        ):
+            Episode.objects.create(
+                item=episode_item,
+                related_season=season,
+                end_date=timezone.now(),
+            )
+
+        url = app_tags.next_episode_url(tv_item, tv)
+
+        self.assertEqual(
+            url,
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "202851",
+                    "title": "big-boys",
+                    "season_number": 2,
+                    "episode_number": 2,
+                },
+            ),
+        )
+
+    def test_tv_show_starts_next_planned_season_after_completed_season(self):
+        """Deleting the first play of a tracked next season still shows S1E1."""
+        from app.models import Episode, Season, Status
+        from app.providers.services import ProviderAPIError
+        from events.models import Event
+
+        tv_item, tv = self._create_tv_with_completed_season(media_id="202851")
+        season_item = Item.objects.create(
+            media_id="202851",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Big Boys",
+            image="http://example.com/tv-s2.jpg",
+            season_number=2,
+        )
+        season = Season.objects.create(
+            item=season_item,
+            user=self.user,
+            related_tv=tv,
+            status=Status.PLANNING.value,
+        )
+        for episode_number in (1, 2):
+            Event.objects.create(
+                item=season_item,
+                content_number=episode_number,
+                datetime=timezone.now(),
+            )
+        episode_item = Item.objects.create(
+            media_id="202851",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            season_number=2,
+            episode_number=1,
+            title="Big Boys",
+            image="",
+        )
+        with patch(
+            "app.models.tv.providers.services.get_media_metadata",
+            side_effect=ProviderAPIError("tmdb", Exception("boom")),
+        ):
+            Episode.objects.create(
+                item=episode_item,
+                related_season=season,
+                end_date=timezone.now(),
+            )
+        Episode.objects.filter(item=episode_item, related_season=season).delete()
+
+        self.assertEqual(
+            app_tags.next_episode_url(tv_item, tv),
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "202851",
+                    "title": "big-boys",
+                    "season_number": 2,
+                    "episode_number": 1,
+                },
+            ),
+        )
+
+    def test_tv_show_does_not_link_past_last_known_episode(self):
+        """A fully watched season without a next event has no Next ep link."""
+        from app.models import TV, Season, Status
+        from events.models import Event
+
+        tv_item, tv, _season_item = self._create_tv_with_season_stuck_planning(
+            media_id="2382",
+            watched_episodes=5,
+        )
+
+        season = Season.objects.get(related_tv=tv)
+        Season.objects.filter(pk=season.pk).update(status=Status.COMPLETED.value)
+        TV.objects.filter(pk=tv.pk).update(status=Status.COMPLETED.value)
+        Event.objects.filter(item=season.item, content_number=6).delete()
+        tv.refresh_from_db()
+        season.refresh_from_db()
+
+        self.assertEqual(app_tags.next_episode_url(tv_item, tv), "")
+
+    def test_tv_show_uses_later_episode_when_only_later_season_is_tracked(self):
+        """The resolver stays on a tracked later season instead of season one."""
+        tv_item, tv, _season_item = self._create_tv_with_season_stuck_planning(
+            media_id="2352",
+            season_number=3,
+            watched_episodes=17,
+        )
+
+        url = app_tags.next_episode_url(tv_item, tv)
+
+        self.assertEqual(
+            url,
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "2352",
+                    "title": "stuck-planning-tv",
+                    "season_number": 3,
+                    "episode_number": 18,
+                },
+            ),
+        )
+
+    def _create_issue_567_tv(self, media_id, title, seasons, statuses=None):
+        """Create the watched/released episode shape from issue #567.
+
+        `statuses` overrides the derived season status per season number, for
+        the paused-season shapes reported in issue #634.
+        """
+        from app.models import TV, Episode, Season, Status
+        from app.providers.services import ProviderAPIError
+        from events.models import Event
+
+        tv_item = Item.objects.create(
+            media_id=media_id,
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title=title,
+            image="",
+        )
+        tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+
+        for season_number, (watched, available) in seasons.items():
+            season_item = Item.objects.create(
+                media_id=media_id,
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.SEASON.value,
+                title=title,
+                image="",
+                season_number=season_number,
+            )
+            season = Season.objects.create(
+                item=season_item,
+                user=self.user,
+                related_tv=tv,
+                status=Status.PLANNING.value,
+            )
+            for episode_number in range(1, available + 1):
+                Event.objects.create(
+                    item=season_item,
+                    content_number=episode_number,
+                    datetime=timezone.now(),
+                )
+            for episode_number in range(1, watched + 1):
+                episode_item = Item.objects.create(
+                    media_id=media_id,
+                    source=Sources.TMDB.value,
+                    media_type=MediaTypes.EPISODE.value,
+                    season_number=season_number,
+                    episode_number=episode_number,
+                    title=title,
+                    image="",
+                )
+                with patch(
+                    "app.models.tv.providers.services.get_media_metadata",
+                    side_effect=ProviderAPIError("tmdb", Exception("boom")),
+                ):
+                    Episode.objects.create(
+                        item=episode_item,
+                        related_season=season,
+                        end_date=timezone.now(),
+                    )
+            if watched == available:
+                Season.objects.filter(pk=season.pk).update(
+                    status=Status.COMPLETED.value,
+                )
+
+            override = (statuses or {}).get(season_number)
+            if override is not None:
+                Season.objects.filter(pk=season.pk).update(status=override)
+
+        return tv_item, tv
+
+    def test_issue_567_examples_resolve_to_expected_next_episode(self):
+        """All six reported examples resolve from the same episode contract."""
+        cases = (
+            ("202851", "Big Boys", {1: (6, 6), 2: (1, 2)}, (2, 2)),
+            ("2352", "The Nanny", {3: (17, 18)}, (3, 18)),
+            ("90282", "The Morning Show", {1: (10, 10), 2: (3, 4)}, (2, 4)),
+            ("69050", "Riverdale", {1: (3, 4)}, (1, 4)),
+            ("2382", "Freaks and Geeks", {1: (5, 5)}, None),
+            (
+                "18202",
+                "Cougar Town",
+                {1: (5, 5), 2: (5, 5), 3: (5, 5), 4: (5, 5), 5: (5, 5), 6: (1, 2)},
+                (6, 2),
+            ),
+        )
+
+        for media_id, title, seasons, expected in cases:
+            with self.subTest(title=title):
+                tv_item, tv = self._create_issue_567_tv(media_id, title, seasons)
+                url = app_tags.next_episode_url(tv_item, tv)
+
+                if expected is None:
+                    self.assertEqual(url, "")
+                    continue
+
+                season_number, episode_number = expected
+                self.assertEqual(
+                    url,
+                    reverse(
+                        "episode_details",
+                        kwargs={
+                            "source": Sources.TMDB.value,
+                            "media_id": media_id,
+                            "title": title.lower().replace(" ", "-"),
+                            "season_number": season_number,
+                            "episode_number": episode_number,
+                        },
+                    ),
+                )
+
+    def test_issue_634_paused_season_is_the_next_episode_target(self):
+        """A paused season the user is partway through is still watchable next."""
+        from app.models import Status
+
+        cases = (
+            # Freaks and Geeks: the only season is paused at 5 of 18.
+            (
+                "2382",
+                "Freaks and Geeks",
+                {1: (5, 18)},
+                {1: Status.PAUSED.value},
+                (1, 6),
+            ),
+            # Big Boys: completed S1, paused S2 at 1 of 6, planned S3.
+            (
+                "202851",
+                "Big Boys",
+                {1: (6, 6), 2: (1, 6), 3: (0, 6)},
+                {2: Status.PAUSED.value},
+                (2, 2),
+            ),
+        )
+
+        for media_id, title, seasons, statuses, expected in cases:
+            with self.subTest(title=title):
+                tv_item, tv = self._create_issue_567_tv(
+                    media_id,
+                    title,
+                    seasons,
+                    statuses=statuses,
+                )
+                season_number, episode_number = expected
+
+                self.assertEqual(
+                    app_tags.next_episode_url(tv_item, tv),
+                    reverse(
+                        "episode_details",
+                        kwargs={
+                            "source": Sources.TMDB.value,
+                            "media_id": media_id,
+                            "title": title.lower().replace(" ", "-"),
+                            "season_number": season_number,
+                            "episode_number": episode_number,
+                        },
+                    ),
+                )
+
+    def test_paused_season_does_not_outrank_later_in_progress_season(self):
+        """Pausing a season and moving on keeps the later season as the target."""
+        from app.models import Status
+
+        tv_item, tv = self._create_issue_567_tv(
+            "69050",
+            "Riverdale",
+            {1: (3, 6), 2: (2, 6)},
+            statuses={1: Status.PAUSED.value},
+        )
+
+        self.assertEqual(
+            app_tags.next_episode_url(tv_item, tv),
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "69050",
+                    "title": "riverdale",
+                    "season_number": 2,
+                    "episode_number": 3,
+                },
+            ),
+        )
+
+    def test_paused_season_does_not_hand_off_to_next_planned_season(self):
+        """A paused season blocks the planning continuation that follows it."""
+        from app.models import Status
+
+        tv_item, tv = self._create_issue_567_tv(
+            "90282",
+            "The Morning Show",
+            {1: (10, 10), 2: (3, 6), 3: (0, 6)},
+            statuses={2: Status.PAUSED.value},
+        )
+
+        self.assertEqual(
+            app_tags.next_episode_url(tv_item, tv),
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "90282",
+                    "title": "the-morning-show",
+                    "season_number": 2,
+                    "episode_number": 4,
+                },
+            ),
+        )
+
+    def test_fully_watched_paused_season_still_starts_next_planned_season(self):
+        """A caught-up paused season hands off like any other finished season."""
+        from app.models import Status
+
+        tv_item, tv = self._create_issue_567_tv(
+            "18202",
+            "Cougar Town",
+            {1: (6, 6), 2: (0, 6)},
+            statuses={1: Status.PAUSED.value},
+        )
+
+        self.assertEqual(
+            app_tags.next_episode_url(tv_item, tv),
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "18202",
+                    "title": "cougar-town",
+                    "season_number": 2,
+                    "episode_number": 1,
+                },
+            ),
+        )
+
+    def test_dropped_season_is_still_skipped(self):
+        """Dropped seasons stay transparent to the next-episode target."""
+        from app.models import Status
+
+        tv_item, tv = self._create_issue_567_tv(
+            "2352",
+            "The Nanny",
+            {1: (6, 6), 2: (2, 6), 3: (0, 6)},
+            statuses={2: Status.DROPPED.value},
+        )
+
+        self.assertEqual(
+            app_tags.next_episode_url(tv_item, tv),
+            reverse(
+                "episode_details",
+                kwargs={
+                    "source": Sources.TMDB.value,
+                    "media_id": "2352",
+                    "title": "the-nanny",
+                    "season_number": 3,
+                    "episode_number": 1,
+                },
+            ),
+        )
+
+
+class SafeCountFilterTests(TestCase):
+    """Test the safe_count template filter used as blocktranslate's count arg."""
+
+    def test_passes_through_int(self):
+        self.assertEqual(app_tags.safe_count(5), 5)
+
+    def test_coerces_numeric_string(self):
+        self.assertEqual(app_tags.safe_count("7"), 7)
+
+    def test_none_defaults_to_zero(self):
+        self.assertEqual(app_tags.safe_count(None), 0)
+
+    def test_non_numeric_string_defaults_to_zero(self):
+        self.assertEqual(app_tags.safe_count("TBA"), 0)
+
+
+class DetailPromotedFactsTests(TestCase):
+    def test_media_type_field_priority_and_missing_values(self):
+        details_by_type = {
+            MediaTypes.TV.value: {
+                "format": "TV",
+                "first_air_date": "2022-02-03",
+                "last_air_date": "2026-09-16",
+                "status": "Returning Series",
+                "runtime": "48m",
+                "total_runtime": "25h 34min",
+                "episodes": 32,
+                "country": "United States of America",
+                "languages": ["English"],
+            },
+            MediaTypes.MOVIE.value: {
+                "format": "Movie",
+                "release_date": "1991-11-21",
+                "status": "Released",
+                "runtime": "1h 15min",
+                "certification": "PG",
+                "country": "United States of America",
+                "languages": ["English"],
+            },
+            MediaTypes.SEASON.value: {
+                "first_air_date": "2022-02-03",
+                "last_air_date": "2022-03-31",
+                "episodes": 8,
+                "runtime": "47m",
+                "total_runtime": "6h 16min",
+            },
+            MediaTypes.GAME.value: {
+                "release_date": "2025-03-18",
+                "platforms": ["Windows", "PlayStation 5"],
+                "format": "Main Game",
+            },
+        }
+        expected_keys = {
+            MediaTypes.TV.value: [
+                "status",
+                "air_dates",
+                "total_runtime",
+                "locale",
+            ],
+            MediaTypes.MOVIE.value: [
+                "format",
+                "release_date",
+                "status",
+                "runtime",
+                "certification",
+                "locale",
+            ],
+            MediaTypes.SEASON.value: [
+                "air_dates",
+                "episodes",
+                "total_runtime",
+            ],
+            MediaTypes.GAME.value: ["release_date", "platforms", "format"],
+        }
+
+        for media_type, details in details_by_type.items():
+            with self.subTest(media_type=media_type):
+                promotion = app_tags.detail_promoted_facts(media_type, details)
+                self.assertEqual(
+                    [field["key"] for field in promotion["fields"]],
+                    expected_keys[media_type],
+                )
+
+        missing = app_tags.detail_promoted_facts(
+            MediaTypes.TV.value,
+            {"format": "TV", "runtime": None, "country": ""},
+        )
+        self.assertEqual([field["key"] for field in missing["fields"]], ["format"])
+        self.assertEqual(missing["suppressed_keys"], {"format"})
+        tv_facts = app_tags.detail_promoted_facts(
+            MediaTypes.TV.value,
+            {
+                "format": "TV",
+                "status": "Returning Series",
+                "country": "United States of America",
+                "languages": ["English", "French"],
+            },
+        )
+        self.assertEqual(tv_facts["fields"][0]["label"], "TV series status")
+        self.assertEqual(
+            tv_facts["fields"][-1]["value"],
+            {"languages": ["English", "French"], "country": "United States of America"},
+        )
+        movie_facts = app_tags.detail_promoted_facts(
+            MediaTypes.MOVIE.value,
+            {"runtime": "1h 42m", "total_runtime": "1h 42min"},
+        )
+        self.assertEqual(movie_facts["suppressed_keys"], {"runtime", "total_runtime"})
+        self.assertEqual(app_tags.country_code("United States of America"), "US")
+        self.assertEqual(app_tags.country_code("Canada"), "CA")
+
+
+class DetailScoreChipsTemplateTests(TestCase):
+    """Non-numeric provider score_count must not crash blocktranslate (#1147).
+
+    Season metadata is a plain dict assembled by different code paths per
+    provider/sync state, so score_count isn't guaranteed to be a real int
+    even when it isn't None (e.g. a freshly-migrated TVDB season). Without
+    the `|safe_count` filter this raises
+    `TemplateSyntaxError: 'count' argument to 'blocktranslate' tag must be a
+    number.` and 500s the season detail page.
+    """
+
+    def _render(self, score_count):
+        return render_to_string(
+            "app/components/detail_score_chips.html",
+            {
+                "media": {"media_id": "1", "source": "tvdb", "score_count": score_count},
+                "display_provider": Sources.TVDB.value,
+                "Sources": Sources,
+                "MediaTypes": MediaTypes,
+                "trakt_score": None,
+                "imdb_score": None,
+                "mal_score": None,
+                "user_medias": None,
+                "current_instance": None,
+                "public_view": False,
+                "media_type": MediaTypes.SEASON.value,
+                "provider_series_graph_data": None,
+                "trakt_series_graph_data": None,
+                "imdb_series_graph_data": None,
+                "csrf_token": "x",
+                "user": None,
+            },
+        )
+
+    def test_non_numeric_score_count_does_not_crash(self):
+        html = self._render("")
+        self.assertIn("votes", html)
+
+    def test_numeric_score_count_still_renders(self):
+        html = self._render(42)
+        self.assertIn("42", html)
+
+    def test_chip_row_fades_the_edge_it_can_scroll_towards(self):
+        html = self._render(42)
+        self.assertIn("'detail-score-card-row--fade-left': hasOverflow && !atStart", html)
+        self.assertIn("'detail-score-card-row--fade-right': hasOverflow && !atEnd", html)
+        # Layout can change after init (carousel arrives, Duo unfolds).
+        self.assertIn("new ResizeObserver(() => updateScroll()).observe($refs.scoreRow)", html)
+
+
+class DetailActivitySubtitleTemplateTests(SimpleTestCase):
+    """The phone subtitle breaks at the bullet on narrow widths instead of wrapping mid-date."""
+
+    def _render(self, **subtitle):
+        return render_to_string(
+            "app/components/detail_activity_subtitle.html",
+            {
+                "activity_subtitle": subtitle,
+                "media": {"media_id": "1", "source": "tmdb"},
+                "media_type": MediaTypes.MOVIE.value,
+                "MediaTypes": MediaTypes,
+                "user": None,
+            },
+        )
+
+    def test_duration_subtitle_stacks_when_its_box_is_narrow(self):
+        html = self._render(
+            duration_text="52h 42min watched",
+            primary_text="Progress: 35/44",
+            date_start=None,
+            date_end=None,
+        )
+        self.assertIn("@container", html)
+        self.assertIn("@max-[26rem]:flex-col", html)
+
+    def test_bullet_is_hidden_while_stacked(self):
+        html = self._render(
+            duration_text="1h watched",
+            date_start=date(2020, 10, 10),
+            date_end=date(2026, 9, 26),
+        )
+        self.assertIn("text-gray-600 @max-[26rem]:hidden", html)
+
+
+class EntrySourceLabelTests(TestCase):
+    """Test the entry_source_label display filter (issue #1258)."""
+
+    def test_built_in_lowercase_sources_are_capitalized(self):
+        self.assertEqual(app_tags.entry_source_label("plex"), "Plex")
+        self.assertEqual(app_tags.entry_source_label("jellyfin"), "Jellyfin")
+
+    def test_special_casing_and_underscores(self):
+        self.assertEqual(app_tags.entry_source_label("lastfm"), "Last.fm")
+        self.assertEqual(app_tags.entry_source_label("imdb"), "IMDb")
+        self.assertEqual(
+            app_tags.entry_source_label("jellyfin_playback_reporting"),
+            "Jellyfin playback reporting",
+        )
+
+    def test_user_typed_text_is_kept_as_typed(self):
+        self.assertEqual(app_tags.entry_source_label("Theatre"), "Theatre")
+        self.assertEqual(app_tags.entry_source_label("my BluRay"), "my BluRay")
+
+    def test_empty_values(self):
+        self.assertEqual(app_tags.entry_source_label(""), "")
+        self.assertEqual(app_tags.entry_source_label(None), "")
+
+
+class DetailActionRowTests(SimpleTestCase):
+    """Which icons the detail action row shows, and which fold into More on phones."""
+
+    def row(
+        self,
+        *,
+        source=Sources.TMDB.value,
+        media_type="movie",
+        seerr=False,
+        links=False,
+        podcast_show=None,
+    ):
+        user = SimpleNamespace(
+            seerr_url="https://seerr.test" if seerr else "",
+            seerr_api_key="key" if seerr else "",
+            seerr_user_id=1 if seerr else None,
+        )
+        context = {
+            "request": SimpleNamespace(user=user),
+            "detail_link_sections": [{"title": "Links"}] if links else [],
+            "podcast_show": podcast_show,
+        }
+        return app_tags.detail_action_row(context, {"source": source}, media_type)
+
+    def test_plain_page_keeps_every_icon_inline(self):
+        row = self.row()
+        self.assertEqual(row["overflow"], [])
+        self.assertFalse(row["link"])
+        self.assertFalse(row["seerr"])
+
+    def test_manual_items_have_no_sync_icon(self):
+        self.assertFalse(self.row(source=Sources.MANUAL.value)["sync"])
+        self.assertTrue(self.row()["sync"])
+
+    def test_seerr_needs_a_configured_server_and_a_tmdb_movie_or_show(self):
+        self.assertTrue(self.row(seerr=True)["seerr"])
+        self.assertTrue(self.row(seerr=True, media_type="tv")["seerr"])
+        self.assertFalse(self.row(seerr=False)["seerr"])
+        self.assertFalse(self.row(seerr=True, media_type="season")["seerr"])
+        self.assertFalse(self.row(seerr=True, source=Sources.MAL.value)["seerr"])
+
+    def test_podcast_shows_have_no_notes_icon(self):
+        self.assertFalse(self.row(podcast_show=object())["notes"])
+        self.assertTrue(self.row()["notes"])
+
+    def test_five_icons_do_not_overflow(self):
+        # tags, notes, lists, history, sync
+        self.assertEqual(self.row()["overflow"], [])
+        # tags, notes, lists, history (manual: no sync) + links
+        self.assertEqual(
+            self.row(source=Sources.MANUAL.value, links=True)["overflow"], []
+        )
+
+    def test_six_icons_move_the_last_two_into_more(self):
+        row = self.row(links=True)
+        self.assertEqual(row["overflow"], ["history", "sync"])
+
+    def test_seven_icons_move_the_last_three_into_more(self):
+        row = self.row(links=True, seerr=True)
+        self.assertEqual(row["overflow"], ["seerr", "history", "sync"])
+
+    def test_overflow_never_holds_the_first_four_icons(self):
+        for links in (False, True):
+            for seerr in (False, True):
+                for source in (Sources.TMDB.value, Sources.MANUAL.value):
+                    overflow = self.row(links=links, seerr=seerr, source=source)[
+                        "overflow"
+                    ]
+                    self.assertTrue(set(overflow) <= {"history", "seerr", "sync"})

@@ -1,6 +1,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import redis
 from django.test import TestCase
 
 from app.models import Item, MediaTypes, Sources
@@ -136,7 +137,12 @@ class GameLengthsServiceTests(TestCase):
                 "completionist_minutes": 540,
                 "all_styles_minutes": 480,
             },
-            "counts": {"main": 12, "main_plus": 8, "completionist": 4, "all_styles": 16},
+            "counts": {
+                "main": 12,
+                "main_plus": 8,
+                "completionist": 4,
+                "all_styles": 16,
+            },
             "single_player_table": [],
             "platform_table": [{"platform": "PC"}],
             "external_ids": {"hltb_game_id": 129742, "steam_app_id": 2592160},
@@ -156,13 +162,19 @@ class GameLengthsServiceTests(TestCase):
 
         self.assertEqual(payload["match"], "steam_verified")
         self.assertEqual(payload["hltb_id"], 129742)
-        self.assertEqual(payload["detail"]["url"], "https://howlongtobeat.com/game/129742")
+        self.assertEqual(
+            payload["detail"]["url"], "https://howlongtobeat.com/game/129742"
+        )
         self.assertEqual(mock_get.call_count, 1)
         self.assertEqual(mock_post.call_count, 1)
-        self.assertEqual(mock_post.call_args.kwargs["json"]["searchTerms"], ["Iron", "Meat"])
+        self.assertEqual(
+            mock_post.call_args.kwargs["json"]["searchTerms"], ["Iron", "Meat"]
+        )
 
     @patch("app.services.game_lengths.provider_services.session.get")
-    def test_fetch_hltb_detail_extracts_summary_platforms_and_external_ids(self, mock_get):
+    def test_fetch_hltb_detail_extracts_summary_platforms_and_external_ids(
+        self, mock_get
+    ):
         mock_get.return_value = _mock_response(text=_detail_html())
 
         payload = game_lengths.fetch_hltb_detail(160618)
@@ -172,10 +184,26 @@ class GameLengthsServiceTests(TestCase):
         self.assertEqual(payload["summary"]["main_plus_minutes"], 614)
         self.assertEqual(payload["summary"]["completionist_minutes"], 1191)
         self.assertEqual(payload["external_ids"]["steam_app_id"], 2592160)
-        self.assertEqual(payload["external_ids"]["ign_uuid"], "84fb8aca-cd19-4ff6-8919-c1b8ef5fa88a")
+        self.assertEqual(
+            payload["external_ids"]["ign_uuid"], "84fb8aca-cd19-4ff6-8919-c1b8ef5fa88a"
+        )
         self.assertEqual(payload["single_player_table"][0]["label"], "Main Story")
         self.assertEqual(payload["platform_table"][0]["platform"], "PC")
         self.assertEqual(payload["platform_table"][0]["fastest_minutes"], 240)
+
+    @patch("app.services.game_lengths.provider_services._fallback_session.get")
+    @patch("app.services.game_lengths.provider_services.session.get")
+    def test_fetch_hltb_detail_falls_back_when_redis_breaks_the_limiter(
+        self, mock_get, mock_fallback_get
+    ):
+        """A mid-run Redis outage must not crash the HLTB detail fetch (#1166)."""
+        mock_get.side_effect = redis.exceptions.ConnectionError("refused")
+        mock_fallback_get.return_value = _mock_response(text=_detail_html())
+
+        payload = game_lengths.fetch_hltb_detail(160618)
+
+        self.assertEqual(payload["game_id"], 160618)
+        mock_fallback_get.assert_called_once()
 
     @patch("app.services.game_lengths.fetch_hltb_detail")
     @patch("app.services.game_lengths.fetch_hltb_search")
@@ -204,7 +232,9 @@ class GameLengthsServiceTests(TestCase):
 
     @patch("app.services.game_lengths.fetch_hltb_detail")
     @patch("app.services.game_lengths.fetch_hltb_search")
-    def test_resolve_hltb_candidate_picks_dispatch_and_rejects_dispatcher(self, mock_search, mock_detail):
+    def test_resolve_hltb_candidate_picks_dispatch_and_rejects_dispatcher(
+        self, mock_search, mock_detail
+    ):
         mock_search.return_value = {
             "data": [
                 {
@@ -291,7 +321,9 @@ class GameLengthsServiceTests(TestCase):
 
     @patch("app.services.game_lengths.igdb.get_access_token", return_value="token")
     @patch("app.services.game_lengths.provider_services.api_request")
-    def test_fetch_igdb_time_to_beat_normalizes_response(self, mock_api_request, _mock_token):
+    def test_fetch_igdb_time_to_beat_normalizes_response(
+        self, mock_api_request, _mock_token
+    ):
         mock_api_request.return_value = [
             {
                 "game_id": 325609,

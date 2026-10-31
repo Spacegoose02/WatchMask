@@ -1,6 +1,8 @@
 import logging
 
-from app.models import MediaTypes, Sources
+from django.utils import timezone
+
+from app.models import Item, MediaTypes, Sources
 from events.models import Event
 
 from .anime import process_anime_bulk
@@ -9,6 +11,7 @@ from .other import process_other
 from .podcast import process_podcast
 from .selectors import get_items_to_process
 from .tv import process_tv
+from .video import process_video
 
 logger = logging.getLogger(__name__)
 
@@ -23,32 +26,60 @@ def fetch_releases(user=None, items_to_process=None):
     if not items_to_process:
         return "No items to process"
 
-    events_bulk = process_items(items_to_process)
+    events_bulk, checked_items = process_items(items_to_process)
     items_updated = save_events(events_bulk)
     cleanup_invalid_events(events_bulk)
+    record_calendar_checks(checked_items)
 
     return generate_final_message(items_to_process, items_updated)
 
 
 def process_items(items_to_process):
-    """Process items and categorize them."""
+    """Process items and categorize them.
+
+    Returns (events_bulk, checked_items), where checked_items are the items whose
+    processor reported success. Items whose provider call failed are left out so
+    they are not marked as checked and get retried on the next reload.
+    """
     events_bulk = []
     anime_to_process = []
+    checked_items = []
 
     for item in items_to_process:
         if item.media_type == MediaTypes.ANIME.value:
             anime_to_process.append(item)
-        elif item.media_type == MediaTypes.TV.value:
-            process_tv(item, events_bulk)
-        elif item.media_type == MediaTypes.COMIC.value:
-            process_comic(item, events_bulk)
-        elif item.media_type == MediaTypes.PODCAST.value:
-            process_podcast(item, events_bulk)
-        else:
-            process_other(item, events_bulk)
+            continue
 
-    process_anime_bulk(anime_to_process, events_bulk)
-    return events_bulk
+        if item.media_type == MediaTypes.TV.value:
+            checked = process_tv(item, events_bulk)
+        elif item.media_type == MediaTypes.COMIC.value:
+            checked = process_comic(item, events_bulk)
+        elif item.media_type == MediaTypes.PODCAST.value:
+            checked = process_podcast(item, events_bulk)
+        elif item.media_type == MediaTypes.VIDEO.value:
+            checked = process_video(item, events_bulk)
+        else:
+            checked = process_other(item, events_bulk)
+
+        if checked:
+            checked_items.append(item)
+
+    checked_items.extend(process_anime_bulk(anime_to_process, events_bulk))
+    return events_bulk, checked_items
+
+
+def record_calendar_checks(checked_items):
+    """Record when each successfully checked item was last looked at.
+
+    Written as one bulk UPDATE per call: on SQLite the single writer is the
+    contended resource, and calendar reloads are chunked, so each chunk stamps
+    only its own items and an interrupted reload keeps the progress it made.
+    """
+    item_ids = [item.id for item in checked_items if getattr(item, "id", None)]
+    if not item_ids:
+        return
+
+    Item.objects.filter(id__in=item_ids).update(calendar_checked_at=timezone.now())
 
 
 def save_events(events_bulk):
@@ -65,7 +96,7 @@ def save_events(events_bulk):
         if event.content_number is not None
     }
     existing_without_content = {
-        event.item_id: event
+        (event.item_id, event.release_type, event.region): event
         for event in existing_events
         if event.content_number is None
     }
@@ -84,8 +115,10 @@ def save_events(events_bulk):
                 to_update.append(existing_event)
             else:
                 to_create.append(event)
-        elif event.item_id in existing_without_content:
-            existing_event = existing_without_content[event.item_id]
+        elif (key := (event.item_id, event.release_type, event.region)) in (
+            existing_without_content
+        ):
+            existing_event = existing_without_content[key]
             existing_event.datetime = event.datetime
             to_update.append(existing_event)
         else:
@@ -156,6 +189,37 @@ def cleanup_invalid_events(events_bulk):
             )
             events_to_delete.append(event.id)
 
+    events_to_delete.extend(stale_release_type_event_ids(events_bulk))
+
     if events_to_delete:
         deleted_count = Event.objects.filter(id__in=events_to_delete).delete()[0]
         logger.info("Deleted %s invalid events for updated items", deleted_count)
+
+
+def stale_release_type_event_ids(events_bulk):
+    """Return ids of digital/physical events a refreshed movie no longer has.
+
+    That covers a date TMDB removed and a user who changed region or stopped
+    tracking. Movies the refresh skipped are left alone.
+    """
+    movie_item_ids = {
+        event.item_id
+        for event in events_bulk
+        if event.content_number is None
+        and not event.release_type
+        and event.item.media_type == MediaTypes.MOVIE.value
+    }
+    kept = {
+        (event.item_id, event.release_type, event.region)
+        for event in events_bulk
+        if event.release_type
+    }
+    return [
+        event_id
+        for event_id, item_id, release_type, region in Event.objects.filter(
+            item_id__in=movie_item_ids,
+        )
+        .exclude(release_type="")
+        .values_list("id", "item_id", "release_type", "region")
+        if (item_id, release_type, region) not in kept
+    ]

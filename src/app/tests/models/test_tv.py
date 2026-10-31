@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, tag
 
 from app.models import (
     TV,
@@ -137,6 +137,7 @@ class TVModel(TestCase):
             datetime(2023, 6, 5, 0, 0, tzinfo=UTC),
         )
 
+    @tag("network")
     def test_tv_save(self):
         """Test the custom save method of the TV model."""
         self.tv.status = Status.COMPLETED.value
@@ -146,6 +147,181 @@ class TVModel(TestCase):
             self.tv.seasons.filter(status=Status.COMPLETED.value).count(),
             10,
         )
+
+
+class TVSkipAheadProgressTests(TestCase):
+    """Regression for #527: show-level count vs. furthest-position semantics."""
+
+    def setUp(self):
+        """Create a show with one normally-watched season and one skip-ahead season."""
+        self.credentials = {"username": "skip-ahead-test", "password": "12345"}
+        self.user = get_user_model().objects.create_user(**self.credentials)
+
+        tv_item = Item.objects.create(
+            media_id="5555",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Skip Ahead Show",
+            image="http://example.com/show.jpg",
+        )
+        self.tv = TV.objects.create(
+            item=tv_item,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+
+        item_season1 = Item.objects.create(
+            media_id="5555",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+        )
+        self.season1 = Season.objects.create(
+            item=item_season1,
+            user=self.user,
+            related_tv=self.tv,
+            status=Status.IN_PROGRESS.value,
+        )
+        for ep_num in (1, 2):
+            item = Item.objects.create(
+                media_id="5555",
+                source=Sources.TMDB.value,
+                media_type=MediaTypes.EPISODE.value,
+                title="Skip Ahead Show",
+                image="http://example.com/image.jpg",
+                season_number=1,
+                episode_number=ep_num,
+            )
+            Episode.objects.create(
+                item=item,
+                related_season=self.season1,
+                end_date=datetime(2023, 6, ep_num, 0, 0, tzinfo=UTC),
+            )
+
+        item_season2 = Item.objects.create(
+            media_id="5555",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=2,
+        )
+        self.season2 = Season.objects.create(
+            item=item_season2,
+            user=self.user,
+            related_tv=self.tv,
+            status=Status.IN_PROGRESS.value,
+        )
+        item_ep9 = Item.objects.create(
+            media_id="5555",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=2,
+            episode_number=9,
+        )
+        Episode.objects.create(
+            item=item_ep9,
+            related_season=self.season2,
+            end_date=datetime(2023, 6, 9, 0, 0, tzinfo=UTC),
+        )
+
+        item_season3 = Item.objects.create(
+            media_id="5555",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=3,
+        )
+        self.dropped_season = Season.objects.create(
+            item=item_season3,
+            user=self.user,
+            related_tv=self.tv,
+            status=Status.DROPPED.value,
+        )
+        item_dropped_ep = Item.objects.create(
+            media_id="5555",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            title="Skip Ahead Show",
+            image="http://example.com/image.jpg",
+            season_number=3,
+            episode_number=1,
+        )
+        Episode.objects.create(
+            item=item_dropped_ep,
+            related_season=self.dropped_season,
+            end_date=datetime(2023, 7, 1, 0, 0, tzinfo=UTC),
+        )
+
+    def test_tv_completed_episode_count_excludes_dropped_seasons(self):
+        """Completed episode count should sum non-dropped seasons only."""
+        self.assertEqual(self.tv.progress, 11)  # 2 + 9, position-based (unchanged)
+        self.assertEqual(self.tv.completed_episode_count, 3)  # 2 + 1, count-based
+
+    def test_tv_plays_sort_value_uses_completed_count(self):
+        """Regression for #527: plays should reflect episodes watched, not position."""
+        self.assertEqual(self.tv._plays_sort_value(), 3)
+
+    def test_tv_progress_percentage_uses_completed_count(self):
+        """Regression for #527: percentage should reflect episodes watched, not position."""
+        self.tv.max_progress = 20
+        self.assertEqual(self.tv.progress_percentage, 15)  # 3 / 20 * 100
+
+    def test_tv_progress_percentage_none_without_max_progress(self):
+        """No max_progress attribute means percentage can't be computed."""
+        self.assertIsNone(self.tv.progress_percentage)
+
+
+class TVGroupedAnimeSkipAheadTests(TestCase):
+    """Regression for #527: grouped anime reuses the Season/TV models and fix."""
+
+    def setUp(self):
+        """Create a grouped-anime season with only a later episode watched."""
+        self.credentials = {"username": "anime-skip-test", "password": "12345"}
+        self.user = get_user_model().objects.create_user(**self.credentials)
+
+        item_season = Item.objects.create(
+            media_id="7777",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            library_media_type=MediaTypes.ANIME.value,
+            title="Grouped Anime Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+        )
+        self.season = Season.objects.create(
+            item=item_season,
+            user=self.user,
+            status=Status.IN_PROGRESS.value,
+        )
+        item_ep9 = Item.objects.create(
+            media_id="7777",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.EPISODE.value,
+            library_media_type=MediaTypes.ANIME.value,
+            title="Grouped Anime Show",
+            image="http://example.com/image.jpg",
+            season_number=1,
+            episode_number=9,
+        )
+        Episode.objects.create(
+            item=item_ep9,
+            related_season=self.season,
+            end_date=datetime(2023, 6, 9, 0, 0, tzinfo=UTC),
+        )
+
+    def test_grouped_anime_plays_and_percentage_use_completed_count(self):
+        """Grouped anime should get the same count-based fix as regular TV seasons."""
+        self.season.max_progress = 10
+
+        self.assertEqual(self.season.progress, 9)
+        self.assertEqual(self.season._plays_sort_value(), 1)
+        self.assertEqual(self.season.progress_percentage, 10)
 
 
 class TVStatusTests(TestCase):
@@ -275,8 +451,18 @@ class TVStatusTests(TestCase):
         )
 
     @patch("app.models.providers.services.get_media_metadata")
-    def test_in_progress_status_activates_next_season(self, _):
-        """Test setting status to IN_PROGRESS activates next available season."""
+    def test_in_progress_status_activates_next_season(self, mock_get_metadata):
+        """Test setting status to IN_PROGRESS activates an aired next season."""
+        mock_get_metadata.return_value = {
+            "related": {
+                "seasons": [
+                    {
+                        "season_number": 2,
+                        "first_air_date": datetime(2020, 1, 1, tzinfo=UTC),
+                    },
+                ],
+            },
+        }
         self.season1.status = Status.COMPLETED.value
         self.season1.save()
 
@@ -287,8 +473,28 @@ class TVStatusTests(TestCase):
         self.assertEqual(season2.status, Status.IN_PROGRESS.value)
 
     @patch("app.models.providers.services.get_media_metadata")
+    def test_in_progress_status_keeps_future_season_planning(self, mock_get_metadata):
+        """Test an unaired next season is not activated."""
+        future_air_date = datetime(2099, 1, 1, tzinfo=UTC)
+        mock_get_metadata.return_value = {
+            "related": {
+                "seasons": [
+                    {"season_number": 2, "first_air_date": future_air_date},
+                ],
+            },
+        }
+        self.season1.status = Status.COMPLETED.value
+        self.season1.save()
+
+        self.tv.status = Status.IN_PROGRESS.value
+        self.tv.save()
+
+        season2 = Season.objects.get(pk=self.season2.pk)
+        self.assertEqual(season2.status, Status.PLANNING.value)
+
+    @patch("app.models.providers.services.get_media_metadata")
     def test_in_progress_status_creates_new_season_if_needed(self, mock_get_metadata):
-        """Test setting status to IN_PROGRESS creates new season if needed."""
+        """Test setting status to IN_PROGRESS creates an aired new season."""
         self.season1.status = Status.COMPLETED.value
         self.season1.save()
         self.season2.status = Status.COMPLETED.value
@@ -299,7 +505,11 @@ class TVStatusTests(TestCase):
                 "seasons": [
                     {"season_number": 1, "image": "img1.jpg"},
                     {"season_number": 2, "image": "img2.jpg"},
-                    {"season_number": 3, "image": "img3.jpg"},
+                    {
+                        "season_number": 3,
+                        "image": "img3.jpg",
+                        "first_air_date": datetime(2020, 1, 1, tzinfo=UTC),
+                    },
                 ],
             },
         }
@@ -310,6 +520,35 @@ class TVStatusTests(TestCase):
 
         season3 = self.tv.seasons.get(item__season_number=3)
         self.assertEqual(season3.status, Status.IN_PROGRESS.value)
+
+    @patch("app.models.providers.services.get_media_metadata")
+    def test_in_progress_status_does_not_create_future_season(self, mock_get_metadata):
+        """Test an unaired season in provider metadata is not created."""
+        self.season1.status = Status.COMPLETED.value
+        self.season1.save()
+        self.season2.status = Status.COMPLETED.value
+        self.season2.save()
+
+        mock_get_metadata.return_value = {
+            "related": {
+                "seasons": [
+                    {"season_number": 1, "image": "img1.jpg"},
+                    {"season_number": 2, "image": "img2.jpg"},
+                    {
+                        "season_number": 3,
+                        "image": "img3.jpg",
+                        "first_air_date": datetime(2099, 1, 1, tzinfo=UTC),
+                    },
+                ],
+            },
+        }
+
+        self.tv.status = Status.IN_PROGRESS.value
+        self.tv.save()
+
+        self.assertFalse(
+            self.tv.seasons.filter(item__season_number=3).exists(),
+        )
 
     def test_in_progress_status_noop_if_already_has_in_progress_season(self):
         """Test IN_PROGRESS status change does nothing if season already in progress."""
@@ -353,15 +592,17 @@ class TVSpecialActivityTests(TestCase):
             image="http://example.com/season1.jpg",
             season_number=1,
         )
-        # Mark it completed directly: saving as completed would fetch the real
-        # season and create the episode items this setup builds by hand
+        # Create as PLANNING then flip via update() so the fixture does not
+        # trigger the completed-on-create fan-out (which fetches metadata).
         season_one = Season.objects.create(
             item=season_one_item,
             user=self.user,
             related_tv=self.tv,
-            status=Status.IN_PROGRESS.value,
+            status=Status.PLANNING.value,
         )
-        Season.objects.filter(pk=season_one.pk).update(status=Status.COMPLETED.value)
+        Season.objects.filter(pk=season_one.pk).update(
+            status=Status.COMPLETED.value,
+        )
         season_one.refresh_from_db()
         regular_episode = Episode(
             item=Item.objects.create(
@@ -389,9 +630,12 @@ class TVSpecialActivityTests(TestCase):
             item=special_item,
             user=self.user,
             related_tv=self.tv,
-            status=Status.IN_PROGRESS.value,
+            status=Status.PLANNING.value,
         )
-        Season.objects.filter(pk=specials.pk).update(status=Status.COMPLETED.value)
+        Season.objects.filter(pk=specials.pk).update(
+            status=Status.COMPLETED.value,
+        )
+        specials.refresh_from_db()
         special_episode = Episode(
             item=Item.objects.create(
                 media_id="114410",

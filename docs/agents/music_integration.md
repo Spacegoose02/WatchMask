@@ -122,6 +122,26 @@ class AlbumTracker(models.Model):
 
 Trackers are unique per user+artist/album (single tracker per target), default to `In Progress`, and mirror Media fields (status, score, start/end dates, notes).
 
+#### MusicReleasePreference
+Per-user display preference for a concrete MusicBrainz release/pressing. This is intentionally separate from `AlbumTracker`: it does not change the shared album identity or move play history to another tracklist.
+
+```python
+class MusicReleasePreference(models.Model):
+    user = models.ForeignKey(User, related_name="music_release_preferences")
+    album = models.ForeignKey(Album, related_name="music_release_preferences")
+    release_id = models.CharField(max_length=36)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+```
+
+Preferences are unique per user+album. The selected release overrides only the detail-page cover and release metadata; the canonical `Album`, `Track`, `Music`, collection, and history rows remain unchanged.
+
+On the album detail page and album tracking modal, a saved preference is hydrated from
+MusicBrainz only when the selected release still belongs to the album's release group.
+If the release is missing, no longer belongs to that group, or MusicBrainz is
+unavailable, the UI falls back to the canonical album metadata and cover without
+deleting the preference or changing any tracking rows.
+
 ### Enums
 
 ```python
@@ -184,7 +204,7 @@ def search_combined(query, page=1):
 def get_artist(artist_id):
     """Get detailed artist metadata."""
     # Fetches from /artist/{id} with inc=url-rels+genres+tags+ratings
-    # Gets Wikipedia bio and image via URL relations
+    # Gets bio/image from Last.fm (by MBID) first, Wikipedia as fallback
     # Returns: name, type, country, genres, tags, rating, bio, image
 
 def get_artist_discography(artist_id, skip_cover_art=False):
@@ -205,9 +225,16 @@ def get_release_for_group(release_group_id):
 
 def get_release(release_id, skip_cover_art=False):
     """Get detailed release metadata (album-level)."""
-    # Fetches /release/{id} with inc=recordings+artists
-    # Returns: title, artist, release_date, release_type, image, tracklist (optional)
+    # Fetches /release/{id} with recordings, labels, release-groups, and media
+    # Returns: title, artist, release metadata, cover, and tracklist (optional)
     # skip_cover_art avoids cover art calls when hydrating many releases
+
+def get_release_group_releases(release_group_id):
+    """Get all releases/pressings in a MusicBrainz release group."""
+    # Browses /release with release-group filtering and pagination
+    # Returns normalized release_id, date, country, status, format, packaging,
+    # labels, catalog numbers, barcode, track count, and cover URL.
+    # Results are cached and official releases sort before other statuses.
 ```
 
 #### Cover Art Functions
@@ -225,12 +252,28 @@ def _get_cover_art(release_id):
     # Handles redirects to archive.org
 ```
 
-#### Wikipedia Integration
+#### Last.fm Integration
+
+```python
+def get_lastfm_bio(mbid):
+    """Fetch an artist bio from Last.fm's artist.getInfo, keyed by MBID."""
+    # Requires settings.LASTFM_API_KEY (optional, user-supplied); returns
+    # None immediately if unset.
+    # Resolves the artist deterministically by MusicBrainz ID, so unlike
+    # guessing a Wikipedia title from the artist name, it can't land on an
+    # unrelated same-named entity (see issue #979, e.g. "Tool" the band vs.
+    # the Wikipedia disambiguation/tool-the-implement page).
+    # Strips Last.fm's "Read more on Last.fm" boilerplate and HTML markup.
+    # Caches hits for 7 days and misses for 1 day.
+```
+
+#### Wikipedia Integration (fallback)
 
 ```python
 def get_wikipedia_data(title):
     """Fetch Wikipedia bio and image."""
     # Uses Wikipedia REST API: /api/rest_v1/page/summary/{title}
+    # Treats a "type": "disambiguation" response as a miss (not a valid bio)
     # Caches hits for 7 days and misses for 1 day
     # Returns: extract (bio text), image (photo URL)
 
@@ -238,12 +281,25 @@ def get_wikipedia_extract(title):
     """Legacy wrapper returning only the extract string."""
 ```
 
-### Wikipedia Bio Strategy
+### Bio Resolution Strategy
 
-1. Check MusicBrainz `url-rels` for Wikipedia link (e.g., `Queen_(band)`)
-2. If found, use exact Wikipedia article title
-3. If not, try artist name directly (works for `Kenny G`)
-4. Fall back to `{name}_{disambiguation}` (e.g., `Queen_(band)`)
+`get_artist()` resolves an artist's bio in priority order, stopping at the
+first strategy that returns text:
+
+1. **Last.fm `artist.getInfo`, by MBID** — primary source when
+   `LASTFM_API_KEY` is configured; deterministic, no title guessing.
+2. Check MusicBrainz `url-rels` for a Wikipedia link (e.g., `Queen_(band)`)
+   and use the exact article title if found.
+3. If the MusicBrainz `type` is `"Group"`, try `{name}_(band)` — the
+   standard Wikipedia disambiguation suffix for musical groups.
+4. Try the artist name directly (works for unambiguous names like
+   `Kenny G`).
+5. Fall back to `{name}_({disambiguation})` using MusicBrainz's own
+   disambiguation string (e.g., `Queen_(band)`).
+
+Steps 2-5 are Wikipedia-only and only run when step 1 doesn't yield a bio
+(no Last.fm key configured, artist not found, or empty bio) — they're the
+fallback path for users who haven't set up Last.fm.
 
 ## Services (`src/app/services/music.py`)
 
@@ -383,6 +439,14 @@ def album_delete(request):
 @require_POST
 def song_save(request):
     """Add a listen for a track (like episode_save)."""
+
+@require_GET
+def list_music_releases(request, album_id):
+    """Return the HTMX release/pressing picker for an album."""
+
+@require_POST
+def set_music_release(request, album_id):
+    """Save a validated per-user release/pressing preference."""
 ```
 
 ### Creation Views
@@ -437,7 +501,13 @@ path("music/album/create/<str:release_mbid>/", views.create_album_from_search, n
 # Metadata sync
 path("music/artist/<int:artist_id>/sync/", views.sync_artist_discography_view, name="sync_artist_discography"),
 path("music/album/<int:album_id>/sync/", views.sync_album_metadata_view, name="sync_album_metadata"),
+
+# Release/pressing picker
+path("details/music/album/<int:album_id>/releases", views.list_music_releases, name="list_music_releases"),
+path("details/music/album/<int:album_id>/release", views.set_music_release, name="set_music_release"),
 ```
+
+A track detail page uses the same shared media details shell, nested under its album: `/details/music/artist/<artist_id>/<artist_slug>/album/<album_id>/<album_slug>/track/<track_id>/<track_slug>/`. `music/track/<track_id>/` redirects there. Genre chips show `Track.genres` when that list has entries, otherwise the album's genres.
 
 ## Templates
 
@@ -455,8 +525,19 @@ Layout matches TV show detail:
 Layout matches Season detail:
 - **Hero section**: Album cover, title, artist link, release type/year chips, stats
 - **Action button**: Album tracking modal
-- **Left column**: Your History, Actions, Details
-- **Right column**: Track list with "Track Song" buttons for each track
+  - **Left column**: Your History, Actions, and Details
+  - **Right column**: Track list with "Track Song" buttons for each track
+
+The release picker uses the shared Hardcover edition-picker interaction pattern in the
+album tracking modal's Metadata tab, but validates MusicBrainz release IDs against the
+album's release group and keeps release selection separate from tracking state.
+
+The picker is available to authenticated users even when an album has no
+`AlbumTracker`. It sends a safe `return_url` through the HTMX form and uses the
+following internal endpoints:
+
+- `GET details/music/album/<album_id>/releases`: browse and filter release-group pressings.
+- `POST details/music/album/<album_id>/release`: validate membership in the release group and save the per-user preference.
 
 ### Album Grid (`src/templates/app/components/album_grid.html`)
 
@@ -471,6 +552,12 @@ Reusable component for displaying album cards:
 - `artist_track_modal.html`: Same pattern as `fill_track.html` for TV
 - `album_track_modal.html`: Same pattern for albums
 - `fill_track_song.html`: Same pattern as `fill_track_episode.html` for tracks
+
+Track notes are edited from album track rows or the track detail page through
+`GET/POST music/track/<track_id>/notes/`. They use the current user's `Music.notes`
+and the shared Markdown editor. Notes saves do not create listen history rows;
+an unplayed track gets a Planning entry without a listen, and its first listen
+completes that entry while preserving its notes.
 
 ### Music List (`src/templates/app/media_list.html`)
 
@@ -511,6 +598,7 @@ Custom admin classes for music models:
 - `TrackAdmin`: Inline editing, filterable by album
 - `ArtistTrackerAdmin`: User/artist/status filters
 - `AlbumTrackerAdmin`: User/album/status filters
+- `MusicReleasePreferenceAdmin`: User/album/release ID filters
 
 ## Statistics
 
@@ -552,4 +640,4 @@ Custom admin classes for music models:
 3. **Changing album display**: Update `music_album_detail.html` and `album_grid.html`
 4. **Adding tracking features**: Mirror TV show/season patterns in views and templates
 5. **Performance issues**: Check if cover art is being fetched synchronously; use `skip_cover_art=True`
-6. **Missing Wikipedia data**: Check URL relations strategy in `get_artist()`
+6. **Missing/wrong bio data**: Check the bio resolution strategy (Last.fm by MBID, then Wikipedia fallbacks) in `get_artist()`

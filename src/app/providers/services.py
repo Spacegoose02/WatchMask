@@ -1,27 +1,41 @@
+import contextvars
+import hashlib
 import logging
 import os
 import re
 import sys
 import time
+from collections.abc import Mapping
+from contextlib import contextmanager
 from difflib import SequenceMatcher
+from http import HTTPStatus
+from pathlib import Path
 
 import requests
 from defusedxml import ElementTree
 from django.conf import settings
+from django.core.cache import cache
 from pyrate_limiter import RedisBucket
 from redis import ConnectionPool
+from redis.exceptions import RedisError
 from requests.adapters import HTTPAdapter
 from requests_ratelimiter import LimiterAdapter, LimiterSession
+from urllib3.util.retry import Retry
 
-from app import config, helpers
+from app import config, helpers, request_timing
+from app.helpers import seconds_to_hm
 from app.log_safety import exception_summary, mapping_keys
-from app.models import Item, MediaTypes, Sources
+from app.models import Item, MediaTypes, Sources, Video
 from app.providers import (
     bgg,
     comicvine,
+    gcd,
+    googlebooks,
+    gpodder,
     hardcover,
     igdb,
     mal,
+    mangabaka,
     mangaupdates,
     manual,
     musicbrainz,
@@ -41,6 +55,77 @@ TRANSIENT_HTTP_STATUS_CODES = frozenset(
     },
 )
 TRANSIENT_HTTP_MAX_RETRIES = 2
+RATE_LIMIT_MAX_RETRIES = 3
+# Retry-After is attacker-ish input from our perspective: providers occasionally
+# return minutes or hours, and each retry sleeps a Celery worker that runs at
+# concurrency 1, so the whole queue stalls for that long.
+RATE_LIMIT_MAX_WAIT_SECONDS = 60
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
+# Callers serving an interactive request (detail page, add-to-tracker modal)
+# already have a fast stored-metadata fallback for ProviderAPIError, so they
+# don't need the patient background-job retry budget above — sleeping up to
+# 3x60s in a gunicorn worker just makes the page look like it never loads,
+# and can exceed the worker timeout entirely (#1008).
+# Upper bound on how long a 429 may silence a provider. Retry-After is
+# attacker-ish input, and a bad value must not disable a provider for days.
+RATE_LIMIT_MAX_COOLDOWN_SECONDS = 60 * 60
+RATE_LIMIT_MAX_RETRIES_INTERACTIVE = 1
+RATE_LIMIT_MAX_WAIT_SECONDS_INTERACTIVE = 5
+# A user is waiting, so a flaky 5xx gets one quick retry rather than two sleeps.
+TRANSIENT_HTTP_MAX_RETRIES_INTERACTIVE = 1
+# After an interactive call times out, cannot connect, or gets a 5xx, later
+# interactive calls to that provider fail fast for this long instead of each
+# holding a web thread for REQUEST_TIMEOUT_INTERACTIVE (typing in search fires
+# a request per keystroke; a media list fires one per item).
+PROVIDER_DOWN_SECONDS = 30
+# A bare 500 can be one bad record, so only gateway-level failures trip it.
+PROVIDER_DOWN_STATUS_CODES = frozenset({502, 503, 504})
+# A provider that accepts the connection but never answers would hold a web
+# thread for the full REQUEST_TIMEOUT, longer than nginx waits for the page.
+# An interactive caller has a stored-metadata fallback, so it gives up sooner.
+REQUEST_TIMEOUT_INTERACTIVE = 10
+# Comic Vine's API can accept a connection without returning a response when
+# its edge service is unhealthy. Do not let that hold the single local worker
+# for the global 120-second provider timeout.
+COMICVINE_REQUEST_TIMEOUT = 20
+
+_interactive_request = contextvars.ContextVar("_interactive_request", default=False)
+
+
+def request_timeout(default=None):
+    """Return the provider read timeout for direct (non-api_request) callers.
+
+    Capped inside interactive_request_scope() like api_request() does, so an
+    aiohttp or requests call outside api_request cannot hold a web thread for
+    the 120 s background budget.
+    """
+    default = settings.REQUEST_TIMEOUT if default is None else default
+    if _interactive_request.get():
+        return min(default, REQUEST_TIMEOUT_INTERACTIVE)
+    return default
+
+
+@contextmanager
+def interactive_request_scope():
+    """Cap rate-limit retry waits for a synchronous, request-serving call.
+
+    Wrap a get_media_metadata()/api_request() call made while a user is
+    waiting on the HTTP response so a 429 fails fast into the caller's
+    existing fallback instead of blocking the request thread for minutes.
+    """
+    token = _interactive_request.set(True)
+    try:
+        yield
+    finally:
+        _interactive_request.reset(token)
+
+# ISBN-10 and ISBN-13 identifier lengths (digits only, after cleaning).
+ISBN_10_LENGTH = 10
+ISBN_13_LENGTH = 13
+
+# Minimum fuzzy title-similarity ratio to accept a Hardcover match as the
+# same book when disambiguating by ISBN fails.
+TITLE_SIMILARITY_THRESHOLD = 0.88
 
 
 def _audiobookshelf_book(media_id):
@@ -49,7 +134,7 @@ def _audiobookshelf_book(media_id):
     Audiobookshelf library item IDs are not Open Library IDs, so attempting to
     resolve them via Open Library causes 404s and can break details pages.
     """
-    from app.models import Item  # noqa: PLC0415
+    from app.models import Item
 
     item = Item.objects.filter(
         media_id=media_id,
@@ -92,6 +177,55 @@ def _audiobookshelf_book(media_id):
     }
 
 
+def _plex_book(media_id):
+    """Return local metadata for an audiobook imported from a Plex library.
+
+    Plex albums detected as audiobooks get a synthetic media_id derived from the
+    server + album rating key, so resolve them from the local Item rather than
+    an external book provider that has never heard of them.
+    """
+    from app.models import Item
+
+    item = Item.objects.filter(
+        media_id=media_id,
+        source=Sources.PLEX.value,
+        media_type=MediaTypes.BOOK.value,
+    ).first()
+
+    title = item.title if item else ""
+    image = item.image if item and item.image else settings.IMG_NONE
+    runtime_minutes = item.runtime_minutes if item else None
+    authors = item.authors if item else []
+    genres = item.genres if item else []
+    publishers = item.publishers if item else ""
+    publish_date = (
+        item.release_datetime.date().isoformat()
+        if item and item.release_datetime
+        else None
+    )
+    format_name = item.format if item and item.format else "audiobook"
+
+    return {
+        "media_id": str(media_id),
+        "source": Sources.PLEX.value,
+        "media_type": MediaTypes.BOOK.value,
+        "title": title,
+        "image": image,
+        "max_progress": runtime_minutes,
+        "synopsis": item.synopsis if item else "",
+        "genres": genres,
+        "related": {},
+        "details": {
+            "author": authors,
+            "isbn": [],
+            "publisher": publishers,
+            "publish_date": publish_date,
+            "format": format_name,
+            "runtime_minutes": runtime_minutes,
+        },
+    }
+
+
 def _storyteller_book(media_id):
     """Return local metadata for a Storyteller book item.
 
@@ -99,7 +233,7 @@ def _storyteller_book(media_id):
     synthetic media_id, so resolve them from the local Item instead of an
     external API (which would 404).
     """
-    from app.models import Item  # noqa: PLC0415
+    from app.models import Item
 
     item = Item.objects.filter(
         media_id=media_id,
@@ -145,10 +279,80 @@ def _storyteller_book(media_id):
 def get_redis_pool():
     """Return a Redis connection pool."""
     if settings.TESTING:
-        import fakeredis  # noqa: PLC0415
+        import fakeredis
 
         return fakeredis.FakeRedis().connection_pool
-    return ConnectionPool.from_url(settings.REDIS_URL)
+    # Bounded, unlike redis-py's 2**31 default: a stalled Redis would otherwise
+    # accumulate sockets for every blocked rate-limit check (#521).
+    return ConnectionPool.from_url(
+        settings.REDIS_URL,
+        max_connections=getattr(settings, "REDIS_LIMITER_MAX_CONNECTIONS", 8),
+    )
+
+
+def build_limiter_session():
+    """Return a rate-limited session, falling back to in-memory on Redis failure.
+
+    The shared token bucket lives in Redis so the container's processes can't
+    collectively exceed a provider's budget. That makes Redis a hard dependency
+    of *every* outbound API call, and it bypasses the Django cache entirely, so
+    IGNORE_EXCEPTIONS does nothing for it - a Redis fault surfaced as a failure
+    of whatever the user was doing, which is the tv_with_seasons path in #521.
+
+    An in-process bucket is a worse rate limiter (each process gets its own
+    budget, so the aggregate can overshoot) but a much better failure mode than
+    no outbound requests at all. The per-host adapters mounted below share this
+    same Redis-backed pattern via _build_host_limiter_adapter().
+    """
+    try:
+        return LimiterSession(
+            per_second=_GLOBAL_PER_SECOND,
+            bucket_class=RedisBucket,
+            bucket_kwargs={"redis_pool": get_redis_pool(), "bucket_name": bucket_key},
+        )
+    except Exception as error:
+        logger.warning(
+            "Redis rate-limit bucket unavailable (%s); falling back to a "
+            "per-process limiter. Provider budgets are shared across processes "
+            "again once Redis recovers and Watchmask restarts.",
+            error,
+        )
+        return LimiterSession(per_second=_GLOBAL_PER_SECOND)
+
+
+def _build_host_limiter_adapter(**limits):
+    """Return a per-host LimiterAdapter backed by a bucket shared across processes.
+
+    Mirrors build_limiter_session()'s RedisBucket fallback pattern, but for the
+    per-host adapters mounted below. Without this, each adapter defaults to an
+    in-memory bucket private to one process, so every gunicorn worker and
+    Celery process gets its own separate budget for the same host - the real
+    aggregate request rate becomes (process count) x the configured limit,
+    easily enough to trip a provider's actual server-side rate limit even
+    though the configured per-host limit looks conservative (#1025).
+
+    Unlike bucket_key, this bucket name is not partitioned by process role:
+    the limit represents an external provider's real ceiling, not an internal
+    fairness split, so web, interactive, and background processes must all
+    draw from the same counter for a given host.
+    """
+    try:
+        return LimiterAdapter(
+            bucket_class=RedisBucket,
+            bucket_kwargs={
+                "redis_pool": _host_limiter_redis_pool,
+                "bucket_name": _host_limiter_bucket_name,
+            },
+            **limits,
+        )
+    except Exception as error:
+        logger.warning(
+            "Redis rate-limit bucket unavailable (%s); falling back to a "
+            "per-process limiter for this host. Its provider budget is only "
+            "enforced per-process until Redis recovers and Watchmask restarts.",
+            error,
+        )
+        return LimiterAdapter(**limits)
 
 
 def get_process_role():
@@ -157,13 +361,24 @@ def get_process_role():
     Roles: "web" (gunicorn), "interactive" (the interactive Celery worker,
     which handles webhook scrobbles and user-triggered rebuilds), and
     "background" (the default Celery worker and beat). Set explicitly via
-    YAMTRACK_PROCESS_ROLE in supervisord; unlabeled celery processes fall
+    FLOPPY_PROCESS_ROLE in supervisord; unlabeled celery processes fall
     back to "background" so they can never starve interactive requests.
+
+    "combined" is the fourth role, used only on the "minimal" resource tier
+    where one Celery worker consumes every queue because three resident Django
+    imports don't fit (see config/runtime_profile.py). The cross-process
+    starvation the split exists to prevent can't occur there - a single worker
+    at concurrency 1 runs one task at a time either way - so ordering falls to
+    the broker's priority queue strategy instead of to separate buckets.
     """
-    role = os.environ.get("YAMTRACK_PROCESS_ROLE", "").strip().lower()
-    if role in {"web", "interactive", "background"}:
+    role = os.environ.get(
+        "FLOPPY_PROCESS_ROLE",
+        os.environ.get("YAMTRACK_PROCESS_ROLE", ""),
+    )
+    role = role.strip().lower()
+    if role in {"web", "interactive", "background", "combined"}:
         return role
-    argv0 = os.path.basename(sys.argv[0]).lower() if sys.argv and sys.argv[0] else ""
+    argv0 = Path(sys.argv[0]).name.lower() if sys.argv and sys.argv[0] else ""
     if "celery" in argv0:
         return "background"
     return "web"
@@ -171,60 +386,147 @@ def get_process_role():
 
 PROCESS_ROLE = get_process_role()
 
-redis_pool = get_redis_pool()
 bucket_key = f"{settings.REDIS_PREFIX}_api" if settings.REDIS_PREFIX else "api"
 
 # Background workers draw from their own, smaller bucket so bulk backfills and
 # imports can never exhaust the shared per-second budget that web requests and
-# the interactive worker rely on. Per-host adapters below are in-memory (one
-# per process), so provider-specific ceilings are unaffected by this split.
+# the interactive worker rely on. Per-host adapters below draw from one shared,
+# role-agnostic bucket instead, so provider-specific ceilings are unaffected by
+# this split.
 if PROCESS_ROLE == "background":
     bucket_key = f"{bucket_key}_background"
     _GLOBAL_PER_SECOND = 3
+elif PROCESS_ROLE == "combined":
+    # One worker serving every queue: there is no other worker to starve, so it
+    # gets a single bucket sized between the two split budgets.
+    bucket_key = f"{bucket_key}_combined"
+    _GLOBAL_PER_SECOND = 4
 else:
     _GLOBAL_PER_SECOND = 5
 
-session = LimiterSession(
-    per_second=_GLOBAL_PER_SECOND,
-    bucket_class=RedisBucket,
-    bucket_kwargs={"redis_pool": redis_pool, "bucket_name": bucket_key},
+session = build_limiter_session()
+
+# Built once and reused for every Redis-outage fallback (#1166) so the
+# fallback's own rate limit persists across calls instead of resetting on
+# each request - the same in-memory shape build_limiter_session() already
+# falls back to at construction time, just kept alive for request-time use.
+_fallback_session = LimiterSession(per_second=_GLOBAL_PER_SECOND)
+
+# Shared across every per-host adapter below: one Redis pool and one bucket
+# namespace, so nine hosts don't each open their own connection pool.
+try:
+    _host_limiter_redis_pool = get_redis_pool()
+except Exception as _host_pool_error:
+    logger.warning(
+        "Redis rate-limit pool unavailable (%s); per-host provider budgets "
+        "will fall back to a per-process limiter until Redis recovers and "
+        "Watchmask restarts.",
+        _host_pool_error,
+    )
+    _host_limiter_redis_pool = None
+_host_limiter_bucket_name = (
+    f"{settings.REDIS_PREFIX}_api_hosts" if settings.REDIS_PREFIX else "api_hosts"
 )
 
-session.mount("http://", HTTPAdapter(max_retries=3))
-session.mount("https://", HTTPAdapter(max_retries=3))
+# A read timeout is not retried: a provider that accepted the connection and
+# never answered would otherwise hold the thread for (retries + 1) x the
+# timeout, 480 s at REQUEST_TIMEOUT. Failing to connect is still retried.
+_GENERIC_RETRY = Retry(total=3, read=False)
+session.mount("http://", HTTPAdapter(max_retries=_GENERIC_RETRY))
+session.mount("https://", HTTPAdapter(max_retries=_GENERIC_RETRY))
 
 session.mount(
     "https://api.myanimelist.net/v2",
-    LimiterAdapter(per_minute=30),
+    _build_host_limiter_adapter(per_minute=30),
 )
 session.mount(
     "https://graphql.anilist.co",
-    LimiterAdapter(per_minute=85),
+    _build_host_limiter_adapter(per_minute=85),
+)
+session.mount(
+    "https://api.mangabaka.org/v1",
+    # MangaBaka allows 30 uncached searches a minute per IP.
+    _build_host_limiter_adapter(per_minute=30),
 )
 session.mount(
     "https://api.igdb.com/v4",
-    LimiterAdapter(per_second=3),
+    _build_host_limiter_adapter(per_second=3),
 )
 session.mount(
     "https://api4.thetvdb.com",
-    LimiterAdapter(per_second=2),
+    _build_host_limiter_adapter(per_second=2),
 )
 session.mount(
     "https://comicvine.gamespot.com/api",
-    LimiterAdapter(per_hour=190),
+    _build_host_limiter_adapter(per_hour=190),
+)
+session.mount(
+    "https://www.comics.org/api",
+    # GCD allows 2000 requests a day to a logged-in account.
+    _build_host_limiter_adapter(per_hour=80),
 )
 session.mount(
     "https://openlibrary.org",
-    LimiterAdapter(per_minute=20),
+    _build_host_limiter_adapter(per_minute=20),
 )
 session.mount(
     "https://api.hardcover.app/v1/graphql",
-    LimiterAdapter(per_minute=50),
+    _build_host_limiter_adapter(per_minute=50),
 )
 session.mount(
     "https://boardgamegeek.com/xmlapi2",
-    LimiterAdapter(per_second=2),
+    _build_host_limiter_adapter(per_second=2),
 )
+session.mount(
+    "https://xbl.io/api",
+    _build_host_limiter_adapter(per_hour=120),
+)
+session.mount(
+    "https://api.tvmaze.com",
+    _build_host_limiter_adapter(per_second=2),
+)
+
+
+@request_timing.timed_provider_call
+def resilient_request(method, url, **kwargs):
+    """Send a request through the shared rate-limited session.
+
+    Falls back to a per-process limited session if Redis breaks the shared
+    bucket mid-run, instead of raising RedisError. Construction-time Redis
+    failures already degrade this way (build_limiter_session()), but a
+    bucket built while Redis was up still does live Redis I/O on every
+    later call - without this, that surfaced as a 500 on every page and
+    import that made an outbound provider call (#1166). The fallback session
+    is built once and reused so its own limit persists across calls instead
+    of resetting on each request.
+
+    Used by api_request() below, and directly by callers that need a
+    provider response without api_request()'s retry/cooldown handling
+    (e.g. Trakt device-code polling, HowLongToBeat scraping).
+    """
+    request_func = {
+        "GET": session.get,
+        "POST": session.post,
+        "PUT": session.put,
+        "PATCH": session.patch,
+    }[method]
+    try:
+        return request_func(url=url, **kwargs)
+    except RedisError as error:
+        logger.warning(
+            "%s %s skipped the shared rate limiter: Redis is unavailable "
+            "(%s); falling back to a per-process limited request.",
+            method,
+            url,
+            error,
+        )
+        fallback_func = {
+            "GET": _fallback_session.get,
+            "POST": _fallback_session.post,
+            "PUT": _fallback_session.put,
+            "PATCH": _fallback_session.patch,
+        }[method]
+        return fallback_func(url=url, **kwargs)
 
 
 class ProviderAPIError(Exception):
@@ -246,7 +548,10 @@ class ProviderAPIError(Exception):
         content_type = None
         if response is not None:
             raw_headers = getattr(response, "headers", None)
-            headers = raw_headers if isinstance(raw_headers, dict) else {}
+            # requests uses CaseInsensitiveDict, which is a Mapping but NOT a
+            # dict subclass - an isinstance(..., dict) check here silently
+            # discarded the headers of every real response (#1025).
+            headers = raw_headers if isinstance(raw_headers, Mapping) else {}
             raw_content_type = headers.get("Content-Type")
             if isinstance(raw_content_type, str):
                 content_type = raw_content_type.split(";", 1)[0]
@@ -259,14 +564,16 @@ class ProviderAPIError(Exception):
                     except (TypeError, ValueError):
                         response_keys = []
 
-        log_method = logger.warning if self.status_code == 404 else logger.error
+        log_method = (
+            logger.warning if self.status_code == HTTPStatus.NOT_FOUND else logger.error
+        )
         if response is None:
             log_method(
                 "%s api request failed error=%s",
                 provider_label,
                 exception_summary(error),
             )
-            message = f"Could not reach {provider_label}"
+            message = f"Could not reach {provider_label} ({exception_summary(error)})"
         else:
             if response_keys:
                 log_method(
@@ -277,7 +584,9 @@ class ProviderAPIError(Exception):
                 )
             else:
                 response_text = getattr(response, "text", "")
-                body_length = len(response_text) if isinstance(response_text, str) else 0
+                body_length = (
+                    len(response_text) if isinstance(response_text, str) else 0
+                )
                 log_method(
                     "%s api error status=%s content_type=%s body_length=%s",
                     provider_label,
@@ -296,7 +605,22 @@ class ProviderAPIError(Exception):
         super().__init__(message)
 
 
-def raise_not_found_error(provider, media_id, media_type="item"):
+class ProviderNotConfiguredError(ProviderAPIError):
+    """Raised when a provider is used before its credentials are set up."""
+
+    def __init__(self, provider, message):
+        """Initialize without the HTTP-response parsing in the parent class."""
+        self.provider = provider
+        self.response = None
+        self.status_code = None
+        try:
+            self.provider_label = Sources(provider).label
+        except ValueError:
+            self.provider_label = provider.title()
+        Exception.__init__(self, message)
+
+
+def raise_not_found_error(provider, media_id, media_type="item", *, confirmed_absent=False):
     """
     Raise a 404 ProviderAPIError for when a media item is not found.
 
@@ -321,9 +645,119 @@ def raise_not_found_error(provider, media_id, media_type="item"):
     )()
     mock_error = requests.exceptions.HTTPError(response=mock_response)
 
-    raise ProviderAPIError(provider, mock_error, error_msg)
+    error = ProviderAPIError(provider, mock_error, error_msg)
+    error.confirmed_absent = confirmed_absent
+    raise error
 
 
+def _get_tmdb_proxy_url():
+    """Return the configured TMDB outbound proxy URL, if any.
+
+    The setting is stored per-user (Settings > Advanced UI), but applied
+    instance-wide: the first user with one configured wins. Cached briefly
+    since api_request is on the hot path for search and metadata backfill.
+    """
+    cached = cache.get("tmdb_proxy_url")
+    if cached is not None:
+        return cached or None
+
+    from integrations.imports.helpers import decrypt
+    from users.models import User
+
+    encrypted = (
+        User.objects.exclude(tmdb_proxy_url="")
+        .values_list("tmdb_proxy_url", flat=True)
+        .first()
+    )
+    proxy_url = decrypt(encrypted) if encrypted else ""
+    cache.set("tmdb_proxy_url", proxy_url, 60)
+    return proxy_url or None
+
+
+def _retry_after_seconds(response) -> int | None:
+    """Return the provider's requested wait, or None when it did not give one.
+
+    Retry-After may legitimately be an HTTP date rather than a number, and some
+    providers send neither; an unguarded int() would throw out of the exception
+    handler and lose the original error.
+    """
+    raw = response.headers.get("Retry-After") if response is not None else None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rate_limit_wait_seconds(response, max_wait=RATE_LIMIT_MAX_WAIT_SECONDS) -> int:
+    """Return how long to wait after a 429, clamped and never raising."""
+    seconds = _retry_after_seconds(response)
+    if seconds is None:
+        seconds = RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    # A small margin over what the provider asked for, so a clock skew of a
+    # second doesn't earn another 429 immediately.
+    return max(1, min(seconds + 3, max_wait))
+
+
+def _rate_limit_cooldown_key(provider, headers=None) -> str:
+    """Return the cooldown key for the credential this request authenticates as.
+
+    Providers meter per account, not per host: Hardcover's daily quota belongs
+    to whichever token signed the request. Keying on a digest of the
+    Authorization header keeps a member's personal token from being silenced by
+    the instance token's exhausted quota. Only the digest is stored.
+    """
+    authorization = (headers or {}).get("Authorization") or ""
+    if not authorization:
+        return f"provider_cooldown:{provider}"
+    digest = hashlib.sha256(authorization.encode("utf-8", "replace")).hexdigest()
+    return f"provider_cooldown:{provider}:{digest[:16]}"
+
+
+def _provider_down_key(provider) -> str:
+    """Return the short-lived circuit-breaker key for a provider."""
+    return f"provider_down:{provider}"
+
+
+def _rate_limit_headers(response) -> dict[str, str]:
+    """Return the provider's rate-limit headers for logging."""
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower().startswith(("ratelimit", "x-ratelimit", "retry-after"))
+    }
+
+
+def _raise_rate_limited(provider, error, retry_after, headers=None):
+    """Arm the provider cooldown and fail without retrying.
+
+    A Retry-After longer than the retry budget means the provider is telling us
+    the quota will not recover in time - Hardcover answers an exhausted daily
+    quota with hours (#1025). Retrying into that only spends more quota and
+    sleeps a worker, so record the cooldown and short-circuit every later call
+    until it elapses.
+    """
+    logger.warning(
+        "%s rate limited beyond the retry budget, cooling down %s seconds %s",
+        provider,
+        retry_after,
+        _rate_limit_headers(getattr(error, "response", None)),
+    )
+    cache.set(
+        _rate_limit_cooldown_key(provider, headers),
+        True,
+        min(retry_after, RATE_LIMIT_MAX_COOLDOWN_SECONDS),
+    )
+    raise ProviderAPIError(
+        provider,
+        error,
+        f"rate limit exceeded, retry in {retry_after} seconds",
+    )
+
+
+@request_timing.timed_provider_call
 def api_request(
     provider,
     method,
@@ -338,32 +772,61 @@ def api_request(
 
     Args:
         provider: Provider identifier for error messages
-        method: HTTP method ("GET" or "POST")
+        method: HTTP method ("GET", "POST", "PUT" or "PATCH")
         url: Request URL
         params: Query params for GET, JSON body for POST
-        data: Raw data for POST
+        data: Raw data for POST/PUT/PATCH (e.g. form-encoded body)
         headers: Request headers
         response_format: "json" (default) or "xml" for XML parsing
 
     Returns:
         Parsed JSON dict or ElementTree for XML
     """
+    if cache.get(_rate_limit_cooldown_key(provider, headers)):
+        logger.warning("%s request skipped: provider is in rate-limit cooldown", provider)
+        raise ProviderAPIError(
+            provider,
+            requests.exceptions.RequestException("rate-limit cooldown"),
+            "rate limit exceeded, still cooling down",
+        )
+
+    if _interactive_request.get() and cache.get(_provider_down_key(provider)):
+        raise ProviderAPIError(
+            provider,
+            requests.exceptions.RequestException("provider recently unavailable"),
+            "temporarily unavailable, skipping the request",
+        )
+
     try:
+        request_timeout = (
+            COMICVINE_REQUEST_TIMEOUT
+            if provider == Sources.COMICVINE.value
+            else settings.REQUEST_TIMEOUT
+        )
         request_kwargs = {
             "url": url,
             "headers": headers,
-            "timeout": settings.REQUEST_TIMEOUT,
+            "timeout": (
+                min(request_timeout, REQUEST_TIMEOUT_INTERACTIVE)
+                if _interactive_request.get()
+                else request_timeout
+            ),
         }
+
+        if provider == Sources.TMDB.value:
+            proxy_url = _get_tmdb_proxy_url()
+            if proxy_url:
+                request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
 
         if method == "GET":
             request_kwargs["params"] = params
-            request_func = session.get
         elif method == "POST":
             request_kwargs["data"] = data
             request_kwargs["json"] = params
-            request_func = session.post
+        elif method in {"PUT", "PATCH"}:
+            request_kwargs["data"] = data
 
-        response = request_func(**request_kwargs)
+        response = resilient_request(method, **request_kwargs)
         response.raise_for_status()
 
         if response_format == "xml":
@@ -375,25 +838,52 @@ def api_request(
         status_code = error_resp.status_code
 
         # handle rate limiting
+        interactive = _interactive_request.get()
+        max_retries = (
+            RATE_LIMIT_MAX_RETRIES_INTERACTIVE if interactive else RATE_LIMIT_MAX_RETRIES
+        )
         if status_code == requests.codes.too_many_requests:
-            seconds_to_wait = int(error_resp.headers.get("Retry-After", 5))
-            logger.warning("Rate limited, waiting %s seconds", seconds_to_wait)
-            time.sleep(seconds_to_wait + 3)
-            logger.info("Retrying request")
-            return api_request(
-                provider,
-                method,
-                url,
-                params=params,
-                data=data,
-                headers=headers,
-                response_format=response_format,
-                _retry_attempt=_retry_attempt,
+            max_wait = (
+                RATE_LIMIT_MAX_WAIT_SECONDS_INTERACTIVE
+                if interactive
+                else RATE_LIMIT_MAX_WAIT_SECONDS
             )
+            retry_after = _retry_after_seconds(error_resp)
+            if retry_after is not None and retry_after > max_wait:
+                _raise_rate_limited(provider, error, retry_after, headers)
 
+            if _retry_attempt < max_retries:
+                seconds_to_wait = _rate_limit_wait_seconds(error_resp, max_wait)
+                logger.warning(
+                    "%s rate limited, waiting %s seconds (attempt %s/%s)",
+                    provider,
+                    seconds_to_wait,
+                    _retry_attempt + 1,
+                    max_retries,
+                )
+                time.sleep(seconds_to_wait)
+                return api_request(
+                    provider,
+                    method,
+                    url,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                    response_format=response_format,
+                    # Previously passed through unchanged, so a provider that
+                    # kept returning 429 recursed and slept forever, holding a
+                    # worker (#521).
+                    _retry_attempt=_retry_attempt + 1,
+                )
+
+        max_transient = (
+            TRANSIENT_HTTP_MAX_RETRIES_INTERACTIVE
+            if interactive
+            else TRANSIENT_HTTP_MAX_RETRIES
+        )
         if (
             status_code in TRANSIENT_HTTP_STATUS_CODES
-            and _retry_attempt < TRANSIENT_HTTP_MAX_RETRIES
+            and _retry_attempt < max_transient
         ):
             seconds_to_wait = _retry_attempt + 1
             logger.warning(
@@ -405,7 +895,7 @@ def api_request(
                 status_code,
                 seconds_to_wait,
                 _retry_attempt + 1,
-                TRANSIENT_HTTP_MAX_RETRIES,
+                max_transient,
             )
             time.sleep(seconds_to_wait)
             return api_request(
@@ -419,8 +909,15 @@ def api_request(
                 _retry_attempt=_retry_attempt + 1,
             )
 
+        if interactive and status_code in PROVIDER_DOWN_STATUS_CODES:
+            cache.set(_provider_down_key(provider), True, PROVIDER_DOWN_SECONDS)
         raise error from None
     except requests.exceptions.RequestException as error:
+        if _interactive_request.get() and isinstance(
+            error,
+            requests.exceptions.Timeout | requests.exceptions.ConnectionError,
+        ):
+            cache.set(_provider_down_key(provider), True, PROVIDER_DOWN_SECONDS)
         raise ProviderAPIError(provider, error) from None
 
 
@@ -433,17 +930,281 @@ def _ensure_title_fields(metadata):
     return metadata
 
 
+def _stored_item_metadata(item):
+    """Build canonical metadata for an item already stored locally."""
+    return _ensure_title_fields(
+        {
+            "media_id": item.media_id,
+            "source": item.source,
+            "media_type": item.media_type,
+            "max_progress": None,
+            "title": item.title,
+            "image": item.image or settings.IMG_NONE,
+            "synopsis": item.synopsis,
+            "genres": item.genres or [],
+            "related": {},
+            "details": {},
+        },
+    )
+
+
+def _podcast_external_links(show, episode=None):
+    """Return the website links a podcast detail page can offer as chips.
+
+    Feeds carry a channel <link> and, on some hosts, a per-item <link>; both
+    are optional, so this returns only what the feed actually provided.
+    """
+    links = {}
+    episode_website_url = getattr(episode, "website_url", "") if episode else ""
+    if episode_website_url:
+        links["Episode website"] = episode_website_url
+    if show is not None and show.website_url:
+        links["Show website"] = show.website_url
+    return links
+
+
+def _podcast_show_metadata(show):
+    """Build generic media-detail metadata for a catalogued podcast show.
+
+    Podcast routes address a show by its podcast_uuid and an episode by its
+    episode_uuid, and only the episode form used to resolve -- so anything
+    reaching a show through get_media_metadata (the manual provider sync, the
+    media detail API) got "podcast episode not found" (issue #1014).
+    """
+    return _ensure_title_fields(
+        {
+            "media_id": show.podcast_uuid,
+            "source": show.source,
+            "media_type": MediaTypes.PODCAST.value,
+            "max_progress": None,
+            "title": show.title,
+            "image": show.image or settings.IMG_NONE,
+            "synopsis": show.description,
+            "genres": show.genres or [],
+            "related": {},
+            "details": {
+                "show_id": show.id,
+                "show_uuid": show.podcast_uuid,
+                "show_title": show.title,
+                "author": show.author,
+                "description": show.description,
+                "language": show.language,
+                "rss_feed_url": show.rss_feed_url,
+                "website_url": show.website_url,
+                "show_website_url": show.website_url,
+            },
+            "external_links": _podcast_external_links(show),
+        },
+    )
+
+
+def _podcast_episode_metadata(episode):
+    """Build generic media-detail metadata for a catalogued podcast episode."""
+    show = episode.show
+    return _ensure_title_fields(
+        {
+            "media_id": episode.episode_uuid,
+            "source": show.source,
+            "media_type": MediaTypes.PODCAST.value,
+            "max_progress": None,
+            "title": episode.title,
+            "image": show.image or settings.IMG_NONE,
+            "synopsis": show.description,
+            "genres": show.genres or [],
+            "related": {},
+            "details": {
+                "show_id": show.id,
+                "show_uuid": show.podcast_uuid,
+                "show_title": show.title,
+                "author": show.author,
+                "description": show.description,
+                "language": show.language,
+                "published": episode.published,
+                "duration": episode.duration,
+                "audio_url": episode.audio_url,
+                "episode_number": episode.episode_number,
+                "season_number": episode.season_number,
+                "episode_type": episode.episode_type,
+                "file_type": episode.file_type,
+                "website_url": episode.website_url,
+                "show_website_url": show.website_url,
+            },
+            "external_links": _podcast_external_links(show, episode),
+        },
+    )
+
+
+def _podcast_item_metadata(item, *, show=None, episode=None):
+    """Build podcast metadata from a tracked item when catalog links are stale."""
+    metadata = _stored_item_metadata(item)
+    details = metadata["details"]
+
+    if show is not None:
+        metadata["image"] = show.image or metadata["image"]
+        metadata["synopsis"] = show.description or metadata["synopsis"]
+        metadata["genres"] = show.genres or metadata["genres"]
+        details.update(
+            {
+                "show_id": show.id,
+                "show_uuid": show.podcast_uuid,
+                "show_title": show.title,
+                "author": show.author,
+                "description": show.description,
+                "language": show.language,
+                "show_website_url": show.website_url,
+            },
+        )
+
+    if episode is not None:
+        details.update(
+            {
+                "published": episode.published,
+                "duration": episode.duration,
+                "audio_url": episode.audio_url,
+                "episode_number": episode.episode_number,
+                "season_number": episode.season_number,
+                "episode_type": episode.episode_type,
+                "file_type": episode.file_type,
+                "website_url": episode.website_url,
+            },
+        )
+        if episode.title:
+            metadata["title"] = episode.title
+
+    metadata["external_links"] = _podcast_external_links(show, episode)
+    return _ensure_title_fields(metadata)
+
+
+def _resolve_podcast_metadata(media_id, source, user=None):
+    """Resolve a podcast episode or show from the local catalog or tracked cache.
+
+    Podcast routes carry an episode_uuid or a show's podcast_uuid in the same
+    media_id slot, so both have to resolve here; only the episode form used to,
+    which is why syncing a show 404'd (issue #1014).
+    """
+    from app.models import Podcast, PodcastEpisode, PodcastShow
+
+    tracked = None
+    if user is not None and getattr(user, "is_authenticated", False):
+        tracked = (
+            Podcast.objects.filter(
+                user=user,
+                item__media_id=media_id,
+                item__source=source,
+                item__media_type=MediaTypes.PODCAST.value,
+            )
+            .select_related("item", "show", "episode", "episode__show")
+            .first()
+        )
+
+    if tracked is not None:
+        episode = tracked.episode
+        show = tracked.show or (episode.show if episode is not None else None)
+        if episode is not None:
+            if episode.is_deleted or show is None or show.source != source:
+                raise_not_found_error(source, media_id, "podcast episode")
+            return _podcast_episode_metadata(episode)
+        return _podcast_item_metadata(tracked.item, show=show)
+
+    episode = (
+        PodcastEpisode.objects.filter(
+            episode_uuid=media_id,
+            show__source=source,
+            is_deleted=False,
+        )
+        .select_related("show")
+        .order_by("pk")
+        .first()
+    )
+    if episode is not None:
+        return _podcast_episode_metadata(episode)
+
+    show = PodcastShow.objects.filter(
+        podcast_uuid=media_id,
+        source=source,
+    ).first()
+    if show is not None:
+        return _podcast_show_metadata(show)
+
+    if source in {Sources.POCKETCASTS.value, Sources.GPODDER.value}:
+        from app.services.podcast_import import (
+            PodcastImportError,
+            resolve_show_for_media_id,
+        )
+
+        try:
+            show = resolve_show_for_media_id(media_id, source=source)
+        except PodcastImportError:
+            show = None
+        if show is not None:
+            return _podcast_show_metadata(show)
+
+    raise_not_found_error(source, media_id, "podcast episode")
+    return None  # unreachable: raise_not_found_error always raises
+
+
+def _resolve_video_metadata(media_id, source):
+    """Build video metadata from the stored item; no provider knows videos."""
+    item = Item.objects.filter(
+        media_id=media_id,
+        source=source,
+        media_type=MediaTypes.VIDEO.value,
+    ).first()
+    if item is None:
+        raise_not_found_error(source, media_id, "video")
+    metadata = _stored_item_metadata(item)
+    # Channel and length come from whoever reported the video; they describe
+    # the video, so any tracker row will do.
+    video = Video.objects.filter(item=item).order_by("-id").first()
+    details = {}
+    if video and video.channel:
+        details["channel"] = video.channel
+    if video and video.length_seconds:
+        details["runtime"] = seconds_to_hm(video.length_seconds)
+    if item.release_datetime:
+        details["publish_date"] = item.release_datetime
+    metadata["details"] = details
+    return metadata
+
+
 def get_media_metadata(
     media_type,
     media_id,
     source,
     season_numbers=None,
     episode_number=None,
+    language=None,
+    edition_id=None,
+    user=None,
+    episode_order=None,
 ):
     """Return the metadata for the selected media."""
+    if media_type in {"tv", "anime", "tv_with_seasons", "season", "episode"}:
+        from app.services.order_resolution import active_order, order_from_media_id
+
+        order = episode_order or order_from_media_id(media_id, source)
+        if order is None and user is not None:
+            order = active_order(user, media_id, source)
+        if order is not None:
+            from app.services.episode_ordering import metadata_for_order
+
+            return _ensure_title_fields(metadata_for_order(
+                media_type, order, season_numbers=season_numbers,
+                episode_number=episode_number,
+            ))
     if media_type == MediaTypes.MUSIC.value and source == Sources.MANUAL.value:
+        item = Item.objects.filter(
+            media_id=media_id,
+            source=source,
+            media_type=media_type,
+        ).first()
+        if item is not None:
+            return _stored_item_metadata(item)
         return _ensure_title_fields(
             {
+                "media_id": media_id,
+                "source": source,
+                "media_type": media_type,
                 "max_progress": None,
                 "title": "",
                 "image": "",
@@ -456,20 +1217,27 @@ def get_media_metadata(
         if media_type == MediaTypes.SEASON.value:
             return _ensure_title_fields(manual.season(media_id, season_numbers[0]))
         if media_type == MediaTypes.EPISODE.value:
-            return _ensure_title_fields(manual.episode(media_id, season_numbers[0], episode_number))
+            return _ensure_title_fields(
+                manual.episode(media_id, season_numbers[0], episode_number)
+            )
         if media_type == "tv_with_seasons":
             media_type = MediaTypes.TV.value
         return _ensure_title_fields(manual.metadata(media_id, media_type))
 
     def tmdb_season_metadata():
         """Return TMDB season metadata or raise a not-found error."""
-        seasons = tmdb.tv_with_seasons(media_id, season_numbers)
-        season_key = f"season/{season_numbers[0]}"
+        missing_seasons = set()
+        seasons = tmdb.tv_with_seasons(
+            media_id, season_numbers, language, missing_seasons=missing_seasons
+        )
+        requested_season = tmdb._normalize_season_numbers(season_numbers)[0]
+        season_key = f"season/{requested_season}"
         if season_key not in seasons:
             raise_not_found_error(
                 Sources.TMDB.value,
                 media_id,
                 media_type=f"season {season_numbers[0]}",
+                confirmed_absent=requested_season in missing_seasons,
             )
         season_data = seasons[season_key]
         if not season_data.get("cast"):
@@ -485,7 +1253,7 @@ def get_media_metadata(
 
     def tvdb_series_metadata(routed_media_type=MediaTypes.TV.value):
         """Return TVDB series metadata for TV or grouped anime routes."""
-        return tvdb.tv(media_id, routed_media_type=routed_media_type)
+        return tvdb.tv(media_id, routed_media_type=routed_media_type, language=language)
 
     def tvdb_series_with_seasons(routed_media_type=MediaTypes.TV.value):
         """Return TVDB season bundle for TV or grouped anime routes."""
@@ -493,6 +1261,7 @@ def get_media_metadata(
             media_id,
             season_numbers,
             routed_media_type=routed_media_type,
+            language=language,
         )
 
     def tvdb_season_metadata(routed_media_type=MediaTypes.TV.value):
@@ -511,7 +1280,8 @@ def get_media_metadata(
         MediaTypes.ANIME.value: lambda: (
             mal.anime(media_id)
             if source == Sources.MAL.value
-            else tmdb.tv(media_id) | {
+            else tmdb.tv(media_id, language)
+            | {
                 "media_type": MediaTypes.ANIME.value,
                 "identity_media_type": MediaTypes.TV.value,
                 "library_media_type": MediaTypes.ANIME.value,
@@ -522,15 +1292,17 @@ def get_media_metadata(
         MediaTypes.MANGA.value: lambda: (
             mangaupdates.manga(media_id)
             if source == Sources.MANGAUPDATES.value
+            else mangabaka.manga(media_id)
+            if source == Sources.MANGABAKA.value
             else mal.manga(media_id)
         ),
         MediaTypes.TV.value: lambda: (
-            tmdb.tv(media_id)
+            tmdb.tv(media_id, language)
             if source == Sources.TMDB.value
             else tvdb_series_metadata(MediaTypes.TV.value)
         ),
         "tv_with_seasons": lambda: (
-            tmdb.tv_with_seasons(media_id, season_numbers)
+            tmdb.tv_with_seasons(media_id, season_numbers, language)
             if source == Sources.TMDB.value
             else tvdb_series_with_seasons(MediaTypes.TV.value)
         ),
@@ -544,67 +1316,56 @@ def get_media_metadata(
                 media_id,
                 season_numbers[0],
                 episode_number,
+                language,
             )
             if source == Sources.TMDB.value
             else tvdb.episode(
                 media_id,
                 season_numbers[0],
                 episode_number,
+                language=language,
             )
         ),
-        MediaTypes.MOVIE.value: lambda: tmdb.movie(media_id),
+        MediaTypes.MOVIE.value: lambda: tmdb.movie(media_id, language),
         MediaTypes.GAME.value: lambda: igdb.game(media_id),
         MediaTypes.BOOK.value: lambda: (
-            hardcover.book(media_id)
+            hardcover.book(media_id, edition_id=edition_id, user=user)
             if source == Sources.HARDCOVER.value
+            else googlebooks.book(media_id, user=user)
+            if source == Sources.GOOGLEBOOKS.value
             else _audiobookshelf_book(media_id)
             if source == Sources.AUDIOBOOKSHELF.value
             else _storyteller_book(media_id)
             if source == Sources.STORYTELLER.value
+            else _plex_book(media_id)
+            if source == Sources.PLEX.value
             else openlibrary.book(media_id)
         ),
-        MediaTypes.COMIC.value: lambda: comicvine.comic(media_id),
-        MediaTypes.COMIC_ISSUE.value: lambda: comicvine.comic_issue(media_id),
+        MediaTypes.COMIC.value: lambda: (
+            gcd.comic(media_id, user=user)
+            if source == Sources.GCD.value
+            else comicvine.comic(media_id, user=user)
+        ),
+        MediaTypes.COMIC_ISSUE.value: lambda: (
+            gcd.comic_issue(media_id, user=user)
+            if source == Sources.GCD.value
+            else comicvine.comic_issue(media_id, user=user)
+        ),
         MediaTypes.BOARDGAME.value: lambda: bgg.boardgame(media_id),
         MediaTypes.MUSIC.value: lambda: musicbrainz.recording(media_id),
-        MediaTypes.PODCAST.value: lambda s=source: {
-            "max_progress": None,
-            "title": "",
-            "image": "",
-            "related": {},
-            "details": {},
-            # Podcasts use runtime_minutes from Item, not external metadata.
-            "source": s,  # Add source to fix KeyError in template tag
-        },
+        MediaTypes.PODCAST.value: lambda: _resolve_podcast_metadata(
+            media_id,
+            source,
+            user=user,
+        ),
+        MediaTypes.VIDEO.value: lambda: _resolve_video_metadata(media_id, source),
     }
     if media_type == MediaTypes.MUSIC.value:
-        if not media_id or len(str(media_id)) < 30:
-            return _ensure_title_fields(
-                {
-                    "max_progress": None,
-                    "title": "",
-                    "image": "",
-                    "related": {},
-                    "details": {},
-                },
-            )
-        try:
-            return _ensure_title_fields(metadata_retrievers[media_type]())
-        except Exception as exc:  # pragma: no cover - defensive guard for bad IDs
-            logger.debug(
-                "Music metadata lookup failed source=%s error=%s",
-                source,
-                exception_summary(exc),
-            )
-            return _ensure_title_fields(
-                {
-                    "max_progress": None,
-                    "title": "",
-                    "image": "",
-                    "related": {},
-                    "details": {},
-                },
-            )
+        # A MusicBrainz MBID is a UUID. Anything else (a title slug, say) can
+        # only earn a 400 from the API, so treat it as not found without asking.
+        if not media_id or not _UUID_RE.match(str(media_id)):
+            raise_not_found_error(source, media_id, "music recording")
+        return _ensure_title_fields(metadata_retrievers[media_type]())
 
     return _ensure_title_fields(metadata_retrievers[media_type]())
 
@@ -634,19 +1395,33 @@ def _resolve_search_source(media_type, source=None):
     """Return the effective search provider for a media type."""
     resolved = _normalize_source_value(source)
     if resolved:
-        if resolved == Sources.TVDB.value and not tvdb.enabled():
+        if (
+            resolved == Sources.TVDB.value
+            and not tvdb.enabled()
+        ) or (
+            resolved == Sources.GOOGLEBOOKS.value
+            and not googlebooks.enabled()
+        ):
             resolved = None
         else:
             return resolved
 
     default_source = config.get_default_source_name(media_type)
     default_value = _normalize_source_value(default_source)
-    if default_value != Sources.TVDB.value or tvdb.enabled():
+    if default_value not in {Sources.TVDB.value, Sources.GOOGLEBOOKS.value} or (
+        default_value == Sources.TVDB.value
+        and tvdb.enabled()
+    ) or (
+        default_value == Sources.GOOGLEBOOKS.value
+        and googlebooks.enabled()
+    ):
         return default_value
 
     for candidate in config.get_sources(media_type) or []:
         candidate_value = _normalize_source_value(candidate)
         if candidate_value == Sources.TVDB.value and not tvdb.enabled():
+            continue
+        if candidate_value == Sources.GOOGLEBOOKS.value and not googlebooks.enabled():
             continue
         if candidate_value:
             return candidate_value
@@ -670,14 +1445,14 @@ def _metadata_to_search_result(metadata):
 def _normalize_isbn_candidate(value):
     """Return a normalized ISBN-10/13 when the input passes checksum validation."""
     cleaned = _ISBN_CLEAN_RE.sub("", str(value or "")).upper()
-    if len(cleaned) == 10 and re.fullmatch(r"\d{9}[\dX]", cleaned):
+    if len(cleaned) == ISBN_10_LENGTH and re.fullmatch(r"\d{9}[\dX]", cleaned):
         total = 0
         for index, char in enumerate(cleaned):
             digit = 10 if char == "X" else int(char)
             total += (10 - index) * digit
         return cleaned if total % 11 == 0 else None
 
-    if len(cleaned) == 13 and cleaned.isdigit():
+    if len(cleaned) == ISBN_13_LENGTH and cleaned.isdigit():
         checksum = 0
         for index, char in enumerate(cleaned[:12]):
             checksum += int(char) * (1 if index % 2 == 0 else 3)
@@ -748,9 +1523,44 @@ def _extract_isbns(metadata):
     return normalized
 
 
-def _resolve_hardcover_isbn_search(query, page):
+# "Death Note, Vol. 1: Boredom" -> "Death Note", "Spider-Man #5" -> "Spider-Man".
+_VOLUME_SUFFIX_RE = re.compile(
+    r"[\s,:(\-]*(?:\b(?:vol(?:ume)?|book|omnibus|part)\b\.?\s*#?|#)\s*\d+.*$",
+    re.IGNORECASE,
+)
+# These types have no ISBN lookup of their own: a scanned book barcode is
+# turned into the series title and searched like typed text.
+_SERIES_BARCODE_TYPES = frozenset(
+    {
+        MediaTypes.MANGA.value,
+        MediaTypes.COMIC.value,
+        MediaTypes.COMIC_ISSUE.value,
+    },
+)
+
+
+def _isbn_series_title(isbn):
+    """Return the series title a volume's ISBN belongs to, or an empty string."""
+    lookups = [lambda: openlibrary.search(isbn, 1)]
+    if googlebooks.enabled():
+        lookups.append(lambda: googlebooks.search(f"isbn:{isbn}", 1))
+
+    title = ""
+    for lookup in lookups:
+        try:
+            results = lookup().get("results", [])
+        except Exception as error:  # best-effort provider lookup
+            logger.debug("ISBN title lookup failed: %s", exception_summary(error))
+            continue
+        title = str(results[0].get("title") or "") if results else ""
+        if title:
+            break
+    return _VOLUME_SUFFIX_RE.sub("", title).strip(" ,:-")
+
+
+def _resolve_hardcover_isbn_search(query, page, user=None):
     """Resolve ISBN queries against Hardcover using Open Library metadata."""
-    from app import helpers  # noqa: PLC0415
+    from app import helpers
 
     isbn = _normalize_isbn_candidate(query)
     if not isbn:
@@ -758,7 +1568,7 @@ def _resolve_hardcover_isbn_search(query, page):
 
     try:
         ol_results = openlibrary.search(isbn, 1).get("results", [])
-    except Exception:  # noqa: BLE001
+    except Exception:  # best-effort provider lookup
         return None
 
     best_fallback_response = None
@@ -771,7 +1581,7 @@ def _resolve_hardcover_isbn_search(query, page):
         if media_id:
             try:
                 ol_metadata = openlibrary.book(str(media_id))
-            except Exception:  # noqa: BLE001
+            except Exception:  # best-effort provider lookup
                 ol_metadata = None
             else:
                 title = str(ol_metadata.get("title") or title).strip()
@@ -794,8 +1604,8 @@ def _resolve_hardcover_isbn_search(query, page):
             seen_queries.add(normalized_query)
 
             try:
-                hardcover_results = hardcover.search(normalized_query, page)
-            except Exception:  # noqa: BLE001
+                hardcover_results = hardcover.search(normalized_query, page, user=user)
+            except Exception:  # noqa: S112  # best-effort provider lookup
                 continue
 
             if not best_fallback_response and hardcover_results.get("results"):
@@ -807,8 +1617,8 @@ def _resolve_hardcover_isbn_search(query, page):
                     continue
 
                 try:
-                    hardcover_metadata = hardcover.book(media_id)
-                except Exception:  # noqa: BLE001
+                    hardcover_metadata = hardcover.book(media_id, user=user)
+                except Exception:  # noqa: S112  # best-effort provider lookup
                     continue
 
                 hardcover_isbns = _extract_isbns(hardcover_metadata)
@@ -822,7 +1632,7 @@ def _resolve_hardcover_isbn_search(query, page):
 
                 hardcover_title = hardcover_metadata.get("title") or result.get("title")
                 title_score = _title_similarity(title, hardcover_title)
-                if title_score < 0.88:
+                if title_score < TITLE_SIMILARITY_THRESHOLD:
                     continue
 
                 candidate_authors = {
@@ -846,7 +1656,7 @@ def _resolve_hardcover_isbn_search(query, page):
     return best_fallback_response
 
 
-def _lookup_by_numeric_id(media_type, query, source):  # noqa: PLR0911
+def _lookup_by_numeric_id(media_type, query, source, user=None):
     """Return full metadata for a media item identified by a numeric provider ID."""
     n = int(query)
     tv_types = (MediaTypes.TV.value, MediaTypes.SEASON.value, MediaTypes.EPISODE.value)
@@ -867,26 +1677,32 @@ def _lookup_by_numeric_id(media_type, query, source):  # noqa: PLR0911
     if media_type == MediaTypes.MANGA.value:
         if source == Sources.MANGAUPDATES.value:
             return mangaupdates.manga(query)
+        if source == Sources.MANGABAKA.value:
+            # Direct ID lookups follow the same filters as search results.
+            metadata = mangabaka.manga(n)
+            return metadata if mangabaka.is_searchable(metadata) else None
         return mal.manga(n)
     if media_type == MediaTypes.GAME.value:
         return igdb.game(n)
     if media_type == MediaTypes.BOOK.value and source == Sources.HARDCOVER.value:
-        return hardcover.book(n)
+        return hardcover.book(n, user=user)
     if media_type == MediaTypes.COMIC.value:
-        return comicvine.comic(query)
+        if source == Sources.GCD.value:
+            return gcd.comic(query, user=user)
+        return comicvine.comic(query, user=user)
     if media_type == MediaTypes.BOARDGAME.value:
         return bgg.boardgame(query)
     return None
 
 
-def search_by_id(media_type, query, source=None):
+def search_by_id(media_type, query, source=None, user=None):
     """Try to look up a single media item directly by its provider ID.
 
     Returns a search-format response dict (1 result) when the query matches
     an ID pattern and the provider lookup succeeds, or ``None`` otherwise
     (triggering the normal text-search fallback).
     """
-    from app import helpers  # noqa: PLC0415
+    from app import helpers
 
     query = query.strip()
     source = _resolve_search_source(media_type, source)
@@ -903,12 +1719,12 @@ def search_by_id(media_type, query, source=None):
                 )
             ):
                 return None
-            metadata = _lookup_by_numeric_id(media_type, query, source)
+            metadata = _lookup_by_numeric_id(media_type, query, source, user=user)
         elif _OL_ID_RE.match(query) and media_type == MediaTypes.BOOK.value:
             metadata = openlibrary.book(query)
         elif _UUID_RE.match(query) and media_type == MediaTypes.MUSIC.value:
             metadata = musicbrainz.recording(query)
-    except Exception:  # noqa: BLE001
+    except Exception:  # best-effort provider lookup
         return None
 
     if not metadata or not metadata.get("title"):
@@ -918,21 +1734,45 @@ def search_by_id(media_type, query, source=None):
     return helpers.format_search_response(1, 1, 1, [result])
 
 
-def search(media_type, query, page, source=None):
+def search(
+    media_type,
+    query,
+    page,
+    source=None,
+    limit=None,
+    offset=None,
+    user=None,
+    language=None,
+):
     """Search for media based on the query and return the results."""
+    if source == Sources.MANUAL.value:
+        return manual.search(
+            media_type,
+            query,
+            page=page,
+            limit=limit,
+            offset=offset,
+            user=user,
+        )
+
     source = _resolve_search_source(media_type, source)
 
-    # Attempt direct ID lookup on page 1 only
-    if page == 1:
-        id_result = search_by_id(media_type, query, source)
-        if id_result is not None:
-            return id_result
+    if media_type in _SERIES_BARCODE_TYPES:
+        isbn = _normalize_isbn_candidate(query)
+        query = (isbn and _isbn_series_title(isbn)) or query
 
-        if (
-            media_type == MediaTypes.BOOK.value
-            and source != Sources.OPENLIBRARY.value
-        ):
-            isbn_result = _resolve_hardcover_isbn_search(query, page)
+    # Attempt direct ID lookup on page 1 only. The result is merged with the
+    # normal text-search results below rather than returned immediately, so a
+    # numeric title (e.g. "1883") isn't hidden behind an unrelated provider ID
+    # lookup (e.g. TMDB tv/1883 is "Dog the Bounty Hunter", not the show
+    # "1883"). The ID match still comes first so pasting a known ID keeps
+    # jumping straight to that item.
+    id_result = None
+    if page == 1:
+        id_result = search_by_id(media_type, query, source, user=user)
+
+        if media_type == MediaTypes.BOOK.value and source == Sources.HARDCOVER.value:
+            isbn_result = _resolve_hardcover_isbn_search(query, page, user=user)
             if isbn_result is not None:
                 return isbn_result
 
@@ -940,55 +1780,108 @@ def search(media_type, query, page, source=None):
         MediaTypes.MANGA.value: lambda: (
             mangaupdates.search(query, page)
             if source == Sources.MANGAUPDATES.value
+            else mangabaka.search(query, page)
+            if source == Sources.MANGABAKA.value
             else mal.search(media_type, query, page)
         ),
         MediaTypes.ANIME.value: lambda: (
             mal.search(media_type, query, page)
             if source == Sources.MAL.value
             else _annotate_grouped_anime_results(
-                tmdb.search(MediaTypes.TV.value, query, page),
+                tmdb.search(MediaTypes.TV.value, query, page, language),
                 source=Sources.TMDB.value,
             )
             if source == Sources.TMDB.value
-            else tvdb.search(media_type, query, page)
+            else tvdb.search(media_type, query, page, language)
         ),
         MediaTypes.TV.value: lambda: (
-            tmdb.search(media_type, query, page)
+            tmdb.search(media_type, query, page, language)
             if source == Sources.TMDB.value
-            else tvdb.search(media_type, query, page)
+            else tvdb.search(media_type, query, page, language)
         ),
-        MediaTypes.MOVIE.value: lambda: tmdb.search(media_type, query, page),
+        MediaTypes.MOVIE.value: lambda: tmdb.search(media_type, query, page, language),
         MediaTypes.SEASON.value: lambda: (
-            tmdb.search(MediaTypes.TV.value, query, page)
+            tmdb.search(MediaTypes.TV.value, query, page, language)
             if source == Sources.TMDB.value
-            else tvdb.search(MediaTypes.TV.value, query, page)
+            else tvdb.search(MediaTypes.TV.value, query, page, language)
         ),
         MediaTypes.EPISODE.value: lambda: (
-            tmdb.search(MediaTypes.TV.value, query, page)
+            tmdb.search(MediaTypes.TV.value, query, page, language)
             if source == Sources.TMDB.value
-            else tvdb.search(MediaTypes.TV.value, query, page)
+            else tvdb.search(MediaTypes.TV.value, query, page, language)
         ),
-        MediaTypes.GAME.value: lambda: igdb.search(query, page),
+        MediaTypes.GAME.value: lambda: igdb.search(query, page, user=user),
         MediaTypes.BOOK.value: lambda: (
             openlibrary.search(query, page)
             if source == Sources.OPENLIBRARY.value
-            else hardcover.search(query, page)
+            else googlebooks.search(query, page, language=language, user=user)
+            if source == Sources.GOOGLEBOOKS.value
+            else hardcover.search(query, page, user=user)
         ),
-        MediaTypes.COMIC.value: lambda: comicvine.search(query, page),
-        MediaTypes.COMIC_ISSUE.value: lambda: comicvine.search_issues(query, page),
+        MediaTypes.COMIC.value: lambda: (
+            gcd.search(query, page, user=user)
+            if source == Sources.GCD.value
+            else comicvine.search(query, page, user=user)
+        ),
+        MediaTypes.COMIC_ISSUE.value: lambda: (
+            gcd.search_issues(query, page, user=user)
+            if source == Sources.GCD.value
+            else comicvine.search_issues(query, page, user=user)
+        ),
         MediaTypes.BOARDGAME.value: lambda: bgg.search(query, page),
         MediaTypes.MUSIC.value: lambda: musicbrainz.search_combined(query, page),
         MediaTypes.PODCAST.value: lambda: (
             pocketcasts.search(query, page)
             if source == Sources.POCKETCASTS.value
+            else gpodder.search(query, page)
+            if source == Sources.GPODDER.value
             else None
         ),
+        # Videos arrive from clients, so there is no provider to search.
+        MediaTypes.VIDEO.value: lambda: None,
     }
     response = search_handlers[media_type]()
 
     if response is None:
-        # Return empty results for non-pocketcasts podcast sources.
-        return helpers.format_search_response(page, settings.PER_PAGE, 0, [])
+        # Return empty results for non-pocketcasts podcast sources and videos.
+        response = helpers.format_search_response(page, settings.PER_PAGE, 0, [])
+
+    if id_result is not None:
+        response = _merge_id_result(response, id_result, page=page)
+
+    return response
+
+
+def _merge_id_result(response, id_result, *, page):
+    """Prepend a direct ID-lookup match to a text-search response.
+
+    Skips the merge if the item is already present in the text-search
+    results (same media_id and source), and only ever runs for page 1 since
+    ``id_result`` is only computed there.
+    """
+    if page != 1:
+        return response
+
+    id_items = id_result.get("results") or []
+    if not id_items:
+        return response
+
+    existing = {
+        (item.get("media_id"), item.get("source"))
+        for item in response.get("results", [])
+    }
+    new_items = [
+        item
+        for item in id_items
+        if (item.get("media_id"), item.get("source")) not in existing
+    ]
+    if not new_items:
+        return response
+
+    response = dict(response)
+    response["results"] = [*new_items, *response.get("results", [])]
+    response["total_results"] = response.get("total_results", 0) + len(new_items)
+    response["total_pages"] = response["total_results"] // settings.PER_PAGE + 1
     return response
 
 

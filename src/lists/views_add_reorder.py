@@ -16,12 +16,14 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.utils.translation import gettext
 from django.views.decorators.http import require_GET, require_POST
 
 from app import helpers
 from app.discover import tab_cache as discover_tab_cache
 from app.models import Item, MediaTypes
 from app.providers import services
+from integrations.imports.helpers import find_item_across_buckets
 from lists.models import (
     CustomList,
     CustomListItem,
@@ -32,9 +34,17 @@ from lists.views_helpers import (
     _extract_list_search_results,
     _list_item_title_fields_from_metadata,
     _maybe_backfill_episode_title,
+    list_has_item_identity,
+    list_metadata_language,
 )
 
 logger = logging.getLogger(__name__)
+
+# Minimum characters required before a search query is sent to providers.
+MIN_SEARCH_QUERY_LENGTH = 2
+
+# Reordering (first/back/next/last) is only meaningful with at least 2 items.
+MIN_ITEMS_FOR_REORDER = 2
 
 
 @require_GET
@@ -52,7 +62,9 @@ def add_list_item_page(request, list_id):
     if custom_list.is_smart:
         messages.info(
             request,
-            "Smart lists update from their rules. Edit the rules to change items.",
+            gettext(
+                "Smart lists update from their rules. Edit the rules to change items."
+            ),
         )
         return redirect("list_detail", custom_list.public_reference)
 
@@ -113,7 +125,12 @@ def add_list_item_search(request, list_id):
         episode_number = request.GET.get("episode_number")
 
         try:
-            media_metadata = services.get_media_metadata(media_type, media_id, source)
+            media_metadata = services.get_media_metadata(
+                media_type,
+                media_id,
+                source,
+                language=list_metadata_language(request.user),
+            )
         except Exception as exc:
             logger.exception(
                 "Quick add preview failed: list_id=%s media_type=%s media_id=%s",
@@ -176,7 +193,7 @@ def add_list_item_search(request, list_id):
     except (TypeError, ValueError):
         page = 1
 
-    if not query or len(query) < 2:
+    if not query or len(query) < MIN_SEARCH_QUERY_LENGTH:
         return render(
             request,
             "lists/components/add_item_search_results.html",
@@ -188,7 +205,14 @@ def add_list_item_search(request, list_id):
     source = config.get_default_source_name(media_type).value
 
     try:
-        data = services.search(media_type, query, page, source)
+        data = services.search(
+            media_type,
+            query,
+            page,
+            source,
+            user=request.user,
+            language=list_metadata_language(request.user),
+        )
     except Exception as exc:
         logger.exception(
             "Quick add search failed: list_id=%s media_type=%s query=%s",
@@ -245,13 +269,17 @@ def add_list_item_submit(request, list_id):
     )
 
     if not custom_list.user_can_edit(request.user):
-        messages.error(request, "You do not have permission to edit this list.")
+        messages.error(
+            request, gettext("You do not have permission to edit this list.")
+        )
         return helpers.redirect_back(request)
 
     if custom_list.is_smart:
         messages.error(
             request,
-            "Smart lists update from their rules and do not support manual additions.",
+            gettext(
+                "Smart lists update from their rules and do not support manual additions."
+            ),
         )
         return redirect("list_detail", custom_list.public_reference)
 
@@ -271,22 +299,28 @@ def add_list_item_submit(request, list_id):
     season_number = int(season_number) if season_number else None
     episode_number = int(episode_number) if episode_number else None
 
-    try:
-        item = Item.objects.get(
-            media_id=media_id,
-            source=source,
-            media_type=media_type,
-            season_number=season_number,
-            episode_number=episode_number,
+    item = find_item_across_buckets(
+        user=request.user,
+        media_id=media_id,
+        source=source,
+        media_type=media_type,
+        season_number=season_number,
+        episode_number=episode_number,
+    )
+    if item is not None:
+        _maybe_backfill_episode_title(
+            item,
+            force=True,
+            language=list_metadata_language(request.user),
         )
-        _maybe_backfill_episode_title(item, force=True)
-    except Item.DoesNotExist:
+    else:
         metadata = services.get_media_metadata(
             media_type,
             media_id,
             source,
             [season_number] if season_number else None,
             episode_number,
+            language=list_metadata_language(request.user),
         )
         release_datetime = helpers.extract_release_datetime(metadata)
         item = Item.objects.create(
@@ -305,8 +339,11 @@ def add_list_item_submit(request, list_id):
         fallback_media_type=item.media_type,
     )
 
-    if custom_list.items.filter(id=item.id).exists():
-        messages.info(request, f'"{item.title}" is already in this list.')
+    if list_has_item_identity(custom_list, item):
+        messages.info(
+            request,
+            gettext('"%(value_1)s" is already in this list.') % {"value_1": item.title},
+        )
         return _redirect_after_submit(redirect("list_add_item", list_id=list_id))
 
     CustomListItem.objects.create(
@@ -321,31 +358,28 @@ def add_list_item_submit(request, list_id):
         activity_type=ListActivityType.ITEM_ADDED,
         item=item,
     )
-    messages.success(request, f'"{item.title}" has been added to the list.')
+    messages.success(
+        request,
+        gettext('"%(value_1)s" has been added to the list.') % {"value_1": item.title},
+    )
 
     return _redirect_after_submit(redirect("list_detail", custom_list.public_reference))
 
 
-@login_required
-@require_POST
-def reorder_list_item(request, list_id):
-    """Reorder a list item in custom sort mode."""
-    custom_list = get_object_or_404(CustomList, id=list_id)
-    if not custom_list.user_can_edit(request.user):
-        return HttpResponse(status=403)
-
-    item_id = request.POST.get("item_id")
-    action = (request.POST.get("action") or "").strip().lower()
+# FORK: reorder cores shared with the REST API. Return values are HTTP
+# status codes so the thin web/API wrappers stay behavior-identical.
+def apply_reorder_action(custom_list, item_id, action):
+    """Move one item first/back/next/last; returns an HTTP status code."""
     if not item_id or action not in {"first", "back", "next", "last"}:
-        return HttpResponse(status=400)
+        return 400
 
     list_items = list(
         CustomListItem.objects.filter(custom_list=custom_list)
         .select_related("item")
         .order_by("date_added", "id"),
     )
-    if len(list_items) < 2:
-        return HttpResponse(status=204)
+    if len(list_items) < MIN_ITEMS_FOR_REORDER:
+        return 204
 
     current_index = next(
         (
@@ -356,7 +390,7 @@ def reorder_list_item(request, list_id):
         None,
     )
     if current_index is None:
-        return HttpResponse(status=404)
+        return 404
 
     if action == "first":
         new_index = 0
@@ -368,7 +402,7 @@ def reorder_list_item(request, list_id):
         new_index = len(list_items) - 1
 
     if new_index == current_index:
-        return HttpResponse(status=204)
+        return 204
 
     moved_item = list_items.pop(current_index)
     list_items.insert(new_index, moved_item)
@@ -378,7 +412,63 @@ def reorder_list_item(request, list_id):
         custom_list_item.date_added = base_time + datetime.timedelta(seconds=index)
     CustomListItem.objects.bulk_update(list_items, ["date_added"])
 
-    return HttpResponse(status=204)
+    return 204
+
+
+def apply_full_order(custom_list, item_ids):
+    """Reorder items by an ordered ID list; returns an HTTP status code.
+
+    ``item_ids`` are ``Item`` ids and may name every item in the list or only
+    a subset: the submitted items take the slots they already occupy, in the
+    submitted order, and the others stay where they are. A duplicate, or an id
+    that is not in this list, rejects the whole request with 400 and changes
+    nothing.
+    """
+    if not item_ids:
+        return 400
+
+    all_items = list(
+        CustomListItem.objects.filter(custom_list=custom_list).order_by(
+            "date_added", "id"
+        ),
+    )
+    submitted = [str(i) for i in item_ids]
+    item_map = {str(li.item_id): li for li in all_items}
+    submitted_set = set(submitted)
+    if len(submitted_set) != len(submitted) or not submitted_set <= set(item_map):
+        return 400
+
+    # Positions in the full list currently occupied by the submitted subset
+    original_positions = sorted(
+        i for i, li in enumerate(all_items) if str(li.item_id) in submitted_set
+    )
+
+    # Place submitted items in their new DnD order at those same positions
+    for pos, item_id in zip(original_positions, submitted, strict=True):
+        all_items[pos] = item_map[item_id]
+
+    base_time = timezone.now().replace(microsecond=0)
+    for index, li in enumerate(all_items):
+        li.date_added = base_time + datetime.timedelta(seconds=index)
+    CustomListItem.objects.bulk_update(all_items, ["date_added"])
+
+    return 204
+
+
+@login_required
+@require_POST
+def reorder_list_item(request, list_id):
+    """Reorder a list item in custom sort mode."""
+    custom_list = get_object_or_404(CustomList, id=list_id)
+    if not custom_list.user_can_edit(request.user):
+        return HttpResponse(status=403)
+
+    status = apply_reorder_action(
+        custom_list,
+        request.POST.get("item_id"),
+        (request.POST.get("action") or "").strip().lower(),
+    )
+    return HttpResponse(status=status)
 
 
 @login_required
@@ -389,31 +479,5 @@ def reorder_list_items_all(request, list_id):
     if not custom_list.user_can_edit(request.user):
         return HttpResponse(status=403)
 
-    item_ids = request.POST.getlist("item_ids[]")
-    if not item_ids:
-        return HttpResponse(status=400)
-
-    all_items = list(
-        CustomListItem.objects.filter(custom_list=custom_list).order_by("date_added", "id"),
-    )
-    submitted_set = {str(i) for i in item_ids}
-    item_map = {str(li.item_id): li for li in all_items}
-
-    # Positions in the full list currently occupied by the submitted subset
-    original_positions = sorted(
-        i for i, li in enumerate(all_items) if str(li.item_id) in submitted_set
-    )
-    if not original_positions:
-        return HttpResponse(status=400)
-
-    # Place submitted items in their new DnD order at those same positions
-    for pos, item_id in zip(original_positions, item_ids):
-        if str(item_id) in item_map:
-            all_items[pos] = item_map[str(item_id)]
-
-    base_time = timezone.now().replace(microsecond=0)
-    for index, li in enumerate(all_items):
-        li.date_added = base_time + datetime.timedelta(seconds=index)
-    CustomListItem.objects.bulk_update(all_items, ["date_added"])
-
-    return HttpResponse(status=204)
+    status = apply_full_order(custom_list, request.POST.getlist("item_ids[]"))
+    return HttpResponse(status=status)

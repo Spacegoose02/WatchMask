@@ -12,6 +12,7 @@ from csv import DictReader
 from django.utils.dateparse import parse_datetime
 
 from app.models import CollectionEntry, MediaTypes, Sources
+from integrations import import_progress
 from integrations.imports.helpers import MediaImportError, retry_on_lock
 from integrations.imports.trakt import TraktMetadataResolverMixin
 
@@ -89,11 +90,15 @@ def apply_season_and_show_rollup(
     tv_metadata,
     season_metadata,
     collected_at=None,
+    show_collected_at=None,
 ):
     """Create season/show CollectionEntry rows once every episode is owned.
 
     Mirrors how ``TraktImporter._update_completion_status`` rolls episode watch
     events up into season/show watch status, but for ownership.
+
+    ``collected_at`` dates the season entry and ``show_collected_at`` the show
+    entry (falling back to ``collected_at``), so historical dates survive.
     """
     max_progress = season_metadata.get("max_progress")
     if not max_progress:
@@ -134,7 +139,12 @@ def apply_season_and_show_rollup(
         ).values_list("item__season_number", flat=True),
     )
     if collected_season_numbers >= season_numbers:
-        upsert_collection_entry(user, tv_item, mode=mode, collected_at=collected_at)
+        upsert_collection_entry(
+            user,
+            tv_item,
+            mode=mode,
+            collected_at=show_collected_at or collected_at,
+        )
 
 
 class TraktCollectionCsvImporter(TraktMetadataResolverMixin):
@@ -162,10 +172,12 @@ class TraktCollectionCsvImporter(TraktMetadataResolverMixin):
             msg = "Invalid file format. Please upload a CSV file."
             raise MediaImportError(msg) from e
 
-        reader = DictReader(decoded_file)
+        rows = list(DictReader(decoded_file))
+        total = len(rows)
         imported_counts = {"movie": 0, "episode": 0}
 
-        for row in reader:
+        for i, row in enumerate(rows, start=1):
+            import_progress.report(i, total, "Trakt collection CSV")
             row_type = (row.get("type") or "").strip().lower()
             try:
                 if row_type == "movie":
@@ -268,8 +280,7 @@ class TraktCollectionCsvImporter(TraktMetadataResolverMixin):
             return False
 
         episode_exists = any(
-            ep["episode_number"] == episode_number
-            for ep in season_metadata["episodes"]
+            ep["episode_number"] == episode_number for ep in season_metadata["episodes"]
         )
         if not episode_exists:
             self.warnings.append(

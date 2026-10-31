@@ -12,18 +12,30 @@ PERCENT_COMPLETE_THRESHOLD = 80
 
 
 class KodiEvent(StrEnum):
+    """Kodi event."""
+
     PLAYBACK_START = "start"
     PLAYBACK_STOP = "stop"
     PLAYBACK_END = "end"
 
 
+KODI_EVENT_MAP = {
+    KodiEvent.PLAYBACK_START: "media.play",
+    KodiEvent.PLAYBACK_STOP: "media.stop",
+    KodiEvent.PLAYBACK_END: "media.scrobble",
+}
+
+
 class KodiWebhookProcessor(BaseWebhookProcessor):
     """Processor for Kodi webhook events via the HTTP Scrobbler add-on."""
 
+    SOURCE_LABEL = "kodi"
+
     def process_payload(self, payload, user):
+        """Return the process payload."""
         event_type = payload.get("event")
         if not self._is_supported_event(event_type):
-            logger.debug("Ignoring Kodi webhook event type: %s", event_type)
+            logger.info("Ignoring Kodi webhook event type: %s", event_type)
             return
 
         ids = self._extract_external_ids(payload)
@@ -32,6 +44,35 @@ class KodiWebhookProcessor(BaseWebhookProcessor):
         if not any(ids.values()):
             logger.warning("Ignoring Kodi webhook: no external ID found in payload.")
             return
+
+        progress = payload.get("progress") or {}
+        position_seconds = progress.get("time")
+        duration_seconds = payload.get("duration")
+        if not self._should_record(
+            KODI_EVENT_MAP[event_type],
+            played=self._is_played(payload),
+            position_seconds=(
+                position_seconds if isinstance(position_seconds, int | float) else None
+            ),
+            duration_seconds=(
+                duration_seconds
+                if isinstance(duration_seconds, int | float)
+                else None
+            ),
+        ):
+            return
+
+        if (
+            event_type == KodiEvent.PLAYBACK_STOP
+            and payload.get("mediaType", "").lower() == "episode"
+            and not self._is_played(payload)
+        ):
+            logger.info(
+                "Kodi stop event below watched threshold for episode: "
+                "percent=%s time=%s",
+                progress.get("percent"),
+                progress.get("time"),
+            )
 
         self._process_media(payload, user, ids)
 
@@ -47,7 +88,7 @@ class KodiWebhookProcessor(BaseWebhookProcessor):
             return True
         if payload.get("event") == KodiEvent.PLAYBACK_STOP:
             percent = payload.get("progress", {}).get("percent", 0)
-            if percent and percent > PERCENT_COMPLETE_THRESHOLD:
+            if percent and percent >= PERCENT_COMPLETE_THRESHOLD:
                 return True
         return False
 
@@ -75,9 +116,11 @@ class KodiWebhookProcessor(BaseWebhookProcessor):
         return payload.get("tvShowTitle")
 
     def _extract_external_ids(self, payload):
-        provider_ids = payload.get("uniqueIds", {})
+        episode_ids = payload.get("uniqueIds", {})
+        series_ids = payload.get("tvShowUniqueIds", {})
         return {
-            "tmdb_id": provider_ids.get("tmdb"),
-            "imdb_id": provider_ids.get("imdb"),
-            "tvdb_id": provider_ids.get("tvdb"),
+            "tmdb_id": episode_ids.get("tmdb") or series_ids.get("tmdb"),
+            "imdb_id": episode_ids.get("imdb") or series_ids.get("imdb"),
+            "tvdb_id": episode_ids.get("tvdb") or series_ids.get("tvdb"),
+            "tvmaze_id": episode_ids.get("tvmaze") or series_ids.get("tvmaze"),
         }

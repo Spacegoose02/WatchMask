@@ -1,14 +1,17 @@
 {% load app_tags %}
+{% comment %}Kometa's parser only recognizes TVDB-shaped episode anchors.{% endcomment %}
+{% if media.item.kometa_episode_url %}<a href="{{ media.item.kometa_episode_url }}" class="hidden" aria-hidden="true" tabindex="-1"></a>{% endif %}
 <div class="flex justify-between items-center">
-  <a href="{{ media.item|media_url }}"
+  <a href="{% if public_list_reference %}{{ media.item|media_url }}?public_view=1&amp;public_list={{ public_list_reference|urlencode }}{% else %}{{ media.item|media_url }}{% endif %}"
      hx-boost="true"
-     class="hover:text-indigo-400 transition-colors line-clamp-1">{{ media.item }}</a>
+     {% if enable_bulk_select %}@click="if (selectMode) { $event.preventDefault(); toggleItemSelected({{ media.item.id }}) }"{% endif %}
+     class="hover:text-[var(--color-link)] transition-colors line-clamp-1">{{ media.item }}</a>
 
   {% if media.repeats > 1 %}
     {% if media.item.media_type != MediaTypes.GAME.value and media.item.media_type != MediaTypes.BOARDGAME.value or user.game_logging_style != 'sessions' %}
       <div class="flex items-center">
         {% include "app/icons/repeat.svg" with classes="w-4 h-4 text-slate-200 mr-1" %}
-        <span class="text-sm text-white">{{ media.repeats }}</span>
+        <span class="text-sm text-[var(--color-text)]">{{ media.repeats }}</span>
       </div>
     {% endif %}
   {% endif %}

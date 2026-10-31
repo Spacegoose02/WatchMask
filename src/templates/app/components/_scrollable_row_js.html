@@ -54,8 +54,8 @@
     });
   }
 
-  if (!window.__yamtrackHomeRowRefreshBound) {
-    window.__yamtrackHomeRowRefreshBound = true;
+  if (!window.__floppyHomeRowRefreshBound) {
+    window.__floppyHomeRowRefreshBound = true;
     document.body.addEventListener('refreshHomeRow', function(event) {
       const rowId = event.detail && event.detail.rowId;
       if (!rowId) return;
@@ -66,7 +66,7 @@
 
   function triggerHomeRowLoadMore(row) {
     const { loaded, total } = getHomeRowCounts(row);
-    if (row.dataset.loading === 'true' || loaded >= total) {
+    if (row.dataset.loading === 'true' || row.dataset.homeRowExhausted === 'true' || loaded >= total) {
       return;
     }
     row.dataset.stickToEnd = 'true';
@@ -87,7 +87,7 @@
 
   function maybeAutofillHomeRow(row) {
     const { loaded, total } = getHomeRowCounts(row);
-    if (row.dataset.loading === 'true' || loaded >= total) {
+    if (row.dataset.loading === 'true' || row.dataset.homeRowExhausted === 'true' || loaded >= total) {
       return;
     }
     if (row.scrollWidth <= row.clientWidth + 1) {
@@ -97,7 +97,7 @@
   }
 
   function ensureHomeRowObserver(row) {
-    if (!('IntersectionObserver' in window) || homeRowObservers.has(row)) {
+    if (!('IntersectionObserver' in window) || homeRowObservers.has(row) || row.dataset.homeRowExhausted === 'true') {
       return;
     }
 
@@ -190,6 +190,13 @@
     });
   }
 
+  function syncEmptyHomeGroups() {
+    document.querySelectorAll('[data-home-deferred-group]').forEach(group => {
+      const hasContent = group.querySelector('[data-home-row-slot], [data-home-row-wrapper], [data-home-row-failed]');
+      group.toggleAttribute('hidden', !hasContent);
+    });
+  }
+
   function formatPlaybackClock(totalSeconds) {
     const clamped = Math.max(0, Math.floor(totalSeconds || 0));
     const hours = Math.floor(clamped / 3600);
@@ -237,9 +244,9 @@
   function initActivePlaybackTicker() {
     // Timer id lives on window so a re-executed copy of this script can
     // still clear the interval started by a previous page.
-    if (window.__yamtrackActivePlaybackTimer) {
-      clearInterval(window.__yamtrackActivePlaybackTimer);
-      window.__yamtrackActivePlaybackTimer = null;
+    if (window.__floppyActivePlaybackTimer) {
+      clearInterval(window.__floppyActivePlaybackTimer);
+      window.__floppyActivePlaybackTimer = null;
     }
 
     const tick = () => {
@@ -248,13 +255,25 @@
     };
 
     tick();
-    window.__yamtrackActivePlaybackTimer = setInterval(tick, 1000);
+    window.__floppyActivePlaybackTimer = setInterval(tick, 1000);
   }
 
   function initHomePageEnhancements() {
     loadVisibleReleaseYears();
     initHomeRowInfiniteScroll();
     initActivePlaybackTicker();
+    scheduleActivePlaybackPoll();
+  }
+
+  function scheduleActivePlaybackPoll(delay = 10000) {
+    const container = document.getElementById('active-playback-container');
+    if (!container || container._playbackPending || container._playbackPollTimer) return;
+    container._playbackPollTimer = setTimeout(() => {
+      container._playbackPollTimer = null;
+      if (container.isConnected && !container._playbackPending) {
+        htmx.trigger(container, 'playback-poll');
+      }
+    }, delay);
   }
 
   if (document.readyState === 'loading') {
@@ -265,19 +284,63 @@
 
   // Bind once: these handlers resolve functions and state through global
   // names, so the latest executed copy of this script is always used.
-  if (!window.__yamtrackHomeRowEventsBound) {
-  window.__yamtrackHomeRowEventsBound = true;
+  if (!window.__floppyHomeRowEventsBound) {
+  window.__floppyHomeRowEventsBound = true;
+
+  function retryDeferredHomeRow(event) {
+    const slot = event.detail.elt;
+    if (!slot || !slot.matches('[data-home-row-slot]')) return;
+    const retries = Number.parseInt(slot.dataset.retries || '0', 10);
+    if (retries >= 2) {
+      slot.classList.remove('animate-pulse');
+      slot.removeAttribute('aria-busy');
+      slot.textContent = slot.dataset.homeRowErrorLabel || 'Unable to load this row.';
+      // Stop counting a failed row as pending so the artwork poller can settle.
+      slot.removeAttribute('data-home-row-slot');
+      slot.setAttribute('data-home-row-failed', '');
+      return;
+    }
+    slot.dataset.retries = String(retries + 1);
+    setTimeout(() => htmx.trigger(slot, 'load'), 2000 * (retries + 1));
+  }
+  document.body.addEventListener('htmx:responseError', retryDeferredHomeRow);
+  document.body.addEventListener('htmx:sendError', retryDeferredHomeRow);
 
   document.body.addEventListener('htmx:beforeRequest', function(event) {
     const row = event.detail.elt;
+    if (row && row.id === 'active-playback-container') {
+      clearTimeout(row._playbackPollTimer);
+      row._playbackPollTimer = null;
+      row._playbackPending = true;
+      row._playbackStarted = performance.now();
+    }
     if (row && row.matches('[data-home-row="true"]')) {
       row.dataset.loading = 'true';
+      row.dataset.pendingOffset = row.dataset.loadedCount || '0';
     }
   });
 
   document.body.addEventListener('htmx:afterRequest', function(event) {
     const row = event.detail.elt;
+    if (row && row.id === 'active-playback-container') {
+      row._playbackPending = false;
+      const slow = performance.now() - row._playbackStarted >= 10000;
+      const failed = !event.detail.successful;
+      row._playbackBackoff = slow || failed
+        ? Math.min(30000, (row._playbackBackoff || 10000) * 2)
+        : 10000;
+      scheduleActivePlaybackPoll(row._playbackBackoff);
+    }
     if (row && row.matches('[data-home-row="true"]')) {
+      const xhr = event.detail.xhr;
+      const freshTotal = xhr && xhr.getResponseHeader('X-Home-Row-Total');
+      if (freshTotal !== null && freshTotal !== undefined) {
+        row.dataset.totalCount = freshTotal;
+      }
+      const freshSeed = xhr && xhr.getResponseHeader('X-Home-Row-Seed');
+      if (freshSeed !== null && freshSeed !== undefined) {
+        row.dataset.seed = freshSeed;
+      }
       row.dataset.loading = 'false';
     }
   });
@@ -289,10 +352,13 @@
   });
 
   document.body.addEventListener('htmx:afterSwap', function(event) {
+    syncEmptyHomeGroups();
     const row = event.detail.target;
     if (row && row.matches('[data-home-row="true"]')) {
-      if (row.dataset.fullReload === 'true') {
+      const isFullReload = row.dataset.fullReload === 'true';
+      if (isFullReload) {
         delete row.dataset.fullReload;
+        delete row.dataset.homeRowExhausted;
         const obs = homeRowObservers.get(row);
         if (obs) { obs.disconnect(); homeRowObservers.delete(row); }
         row.dataset.homeRowBound = 'false';
@@ -301,9 +367,20 @@
           delete row._prevScrollLeft;
         }
       }
+      const pendingOffset = Number.parseInt(row.dataset.pendingOffset || '0', 10);
       syncHomeRowSentinel(row);
       syncHomeRowLoadedCount(row);
       row.dataset.stickToEnd = 'false';
+      const newLoadedCount = Number.parseInt(row.dataset.loadedCount || '0', 10);
+      if (!isFullReload && row.dataset.pendingOffset !== undefined && newLoadedCount <= pendingOffset) {
+        // The response appended no new cards even though the client still
+        // believed more items existed — stop retrying this row for good,
+        // regardless of what total says, to avoid looping on the same offset.
+        row.dataset.homeRowExhausted = 'true';
+        const obs = homeRowObservers.get(row);
+        if (obs) { obs.disconnect(); homeRowObservers.delete(row); }
+      }
+      delete row.dataset.pendingOffset;
       requestAnimationFrame(() => {
         ensureHomeRowObserver(row);
         maybeAutofillHomeRow(row);
@@ -312,6 +389,7 @@
       });
     }
     setTimeout(() => {
+      syncEmptyHomeGroups();
       loadVisibleReleaseYears();
       initHomeRowInfiniteScroll();
       initActivePlaybackTicker();

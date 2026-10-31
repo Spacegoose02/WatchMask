@@ -7,6 +7,7 @@ from django.core.cache import cache
 from django.test import TestCase
 
 from app.models import TV, Item, MediaTypes, Season, Sources, Status
+from app.templatetags.app_tags import user_event_time
 from events.calendar.helpers import date_parser
 from events.calendar.tv import (
     get_episode_datetime,
@@ -15,6 +16,7 @@ from events.calendar.tv import (
     get_tvmaze_response,
     process_season_episodes,
     process_tv,
+    process_tv_seasons,
 )
 from events.models import Event
 from events.tests.calendar.utils import CalendarFixturesMixin
@@ -45,6 +47,13 @@ class CalendarTVTests(CalendarFixturesMixin, TestCase):
         }
 
         mock_tv_with_seasons.return_value = {
+            "related": {
+                "seasons": [
+                    {"season_number": 1, "episode_count": 3},
+                    {"season_number": 2, "episode_count": 2},
+                    {"season_number": 3, "episode_count": 1},
+                ],
+            },
             "season/1": {
                 "image": "http://example.com/season1.jpg",
                 "season_number": 1,
@@ -89,6 +98,55 @@ class CalendarTVTests(CalendarFixturesMixin, TestCase):
 
         expected_date = datetime.datetime.fromisoformat("2008-01-20T22:00:00+00:00")
         self.assertEqual(events_bulk[0].datetime, expected_date)
+
+    @patch("events.calendar.tv.get_tvmaze_episode_map")
+    @patch("events.calendar.tv.tmdb.tv_with_seasons")
+    def test_process_tv_seasons_reuses_season_item_from_shows_bucket(
+        self,
+        mock_tv_with_seasons,
+        mock_get_tvmaze_episode_map,
+    ):
+        """A season item already tracked in the show's grouped-anime bucket is reused."""
+        Item.objects.filter(pk=self.tv_item.pk).update(
+            library_media_type=MediaTypes.ANIME.value,
+        )
+        self.tv_item.refresh_from_db()
+        mock_get_tvmaze_episode_map.return_value = {}
+
+        tracked_season = Item.objects.create(
+            media_id="1396",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            library_media_type=MediaTypes.ANIME.value,
+            season_number=2,
+            title="Breaking Bad Season 2",
+            image="http://example.com/season2.jpg",
+        )
+
+        mock_tv_with_seasons.return_value = {
+            "season/2": {
+                "image": "http://example.com/season2.jpg",
+                "season_number": 2,
+                "episodes": [
+                    {"episode_number": 1, "air_date": "2009-01-20"},
+                ],
+                "tvdb_id": "81189",
+            },
+        }
+
+        events_bulk = []
+        processed_season_items = process_tv_seasons(self.tv_item, [2], events_bulk)
+
+        self.assertEqual(len(processed_season_items), 1)
+        self.assertEqual(processed_season_items[0].pk, tracked_season.pk)
+        self.assertEqual(
+            Item.objects.filter(
+                media_id="1396",
+                media_type=MediaTypes.SEASON.value,
+                season_number=2,
+            ).count(),
+            1,
+        )
 
     @patch("events.calendar.tv.get_tvmaze_episode_map")
     @patch("events.calendar.tv.tmdb.tv_with_seasons")
@@ -218,8 +276,19 @@ class CalendarTVTests(CalendarFixturesMixin, TestCase):
                         {
                             "season": 1,
                             "number": 2,
-                            "airstamp": "2008-01-27T22:00:00+00:00",
-                            "airtime": "22:00",
+                            "airdate": "2008-01-27",
+                            "airstamp": "2008-01-27T12:00:00+00:00",
+                            "airtime": "",
+                        },
+                        {
+                            "season": 1,
+                            "number": 3,
+                            "airstamp": "2008-02-03T00:00:00+00:00",
+                            "airtime": "00:00",
+                        },
+                        {
+                            "season": 2,
+                            "number": 1,
                         },
                     ],
                 },
@@ -228,14 +297,55 @@ class CalendarTVTests(CalendarFixturesMixin, TestCase):
 
         result = get_tvmaze_episode_map("81189")
 
-        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result), 4)
         self.assertIn("1_1", result)
         self.assertIn("1_2", result)
-        self.assertEqual(result["1_1"], "2008-01-20T22:00:00+00:00")
-        self.assertEqual(result["1_2"], "2008-01-27T22:00:00+00:00")
+        self.assertIn("1_3", result)
+        self.assertIn("2_1", result)
+        self.assertEqual(
+            result["1_1"],
+            {
+                "airdate": "2008-01-20",
+                "airstamp": "2008-01-20T22:00:00+00:00",
+            },
+        )
+        self.assertEqual(result["1_2"], {"airdate": "2008-01-27"})
+        self.assertEqual(
+            result["1_3"],
+            {
+                "airdate": "2008-02-03",
+                "airstamp": "2008-02-03T00:00:00+00:00",
+            },
+        )
+        self.assertEqual(result["2_1"], {})
 
-        cached_result = cache.get("tvmaze_map_81189")
+        cached_result = cache.get("tvmaze_map_v4_81189")
         self.assertEqual(cached_result, result)
+
+        date_only_datetime = get_episode_datetime(
+            {"air_date": "2008-01-27"},
+            season_number=1,
+            episode_number=2,
+            tvmaze_map=result,
+        )
+        self.assertEqual(date_only_datetime, date_parser("2008-01-27"))
+        self.assertEqual(
+            user_event_time(
+                Event(item=self.season_item, datetime=date_only_datetime),
+                self.user,
+            ),
+            "",
+        )
+
+        self.assertEqual(
+            get_episode_datetime(
+                {"air_date": "2008-02-03"},
+                season_number=1,
+                episode_number=3,
+                tvmaze_map=result,
+            ),
+            datetime.datetime.fromisoformat("2008-02-03T00:00:00+00:00"),
+        )
 
         mock_api_request.reset_mock()
         get_tvmaze_episode_map("81189")
@@ -262,6 +372,84 @@ class CalendarTVTests(CalendarFixturesMixin, TestCase):
         )
 
         self.assertEqual(result, date_parser("2025-01-31"))
+
+    def test_get_episode_datetime_prefers_tvmaze_air_date_without_time(self):
+        """TVMaze's date should win when it has no precise time."""
+        result = get_episode_datetime(
+            {"air_date": "2026-07-23"},
+            season_number=3,
+            episode_number=4,
+            tvmaze_map={"3_4": {"airdate": "2026-07-24"}},
+        )
+
+        self.assertEqual(result, date_parser("2026-07-24"))
+
+    def test_get_episode_datetime_falls_back_for_mismatched_tvmaze_air_date(self):
+        """A mismatched date-only TVMaze entry should not overwrite TMDB."""
+        result = get_episode_datetime(
+            {"air_date": "2026-07-23"},
+            season_number=3,
+            episode_number=4,
+            tvmaze_map={"3_4": {"airdate": "2026-08-23"}},
+        )
+
+        self.assertEqual(result, date_parser("2026-07-23"))
+
+    @patch("events.calendar.tv.get_tvmaze_episode_map")
+    def test_process_season_episodes_translates_lupin_style_season_position(
+        self,
+        mock_get_tvmaze_episode_map,
+    ):
+        """TMDB split seasons should resolve the matching ordered TVMaze episode."""
+        season_item = Item.objects.create(
+            media_id=self.tv_item.media_id,
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.SEASON.value,
+            title=self.tv_item.title,
+            image=self.tv_item.image,
+            season_number=3,
+        )
+        mock_get_tvmaze_episode_map.return_value = {
+            **{
+                f"{season_number}_{episode_number}": {}
+                for season_number, episode_count in ((1, 5), (2, 5))
+                for episode_number in range(1, episode_count + 1)
+            },
+            **{
+                f"3_{episode_number}": (
+                    {"airdate": "2026-10-22"} if episode_number == 1 else {}
+                )
+                for episode_number in range(1, 8)
+            },
+            "4_1": {"airdate": "2026-10-23"},
+        }
+        tv_metadata = {
+            "related": {
+                "seasons": [
+                    {"season_number": 1, "episode_count": 10},
+                    {"season_number": 2, "episode_count": 7},
+                    {"season_number": 3, "episode_count": 8},
+                ],
+            },
+        }
+        events_bulk = []
+
+        process_season_episodes(
+            season_item,
+            {
+                "season_number": 3,
+                "tvdb_id": "81189",
+                "episodes": [
+                    {"episode_number": 1, "air_date": "2026-10-23"},
+                ],
+            },
+            events_bulk,
+            tv_metadata=tv_metadata,
+        )
+
+        self.assertEqual(len(events_bulk), 1)
+        self.assertEqual(events_bulk[0].datetime, date_parser("2026-10-23"))
+        mock_get_tvmaze_episode_map.assert_called_once_with("81189")
 
     def test_get_episode_datetime_returns_placeholder_for_invalid_date(self):
         """Invalid or missing episode dates should produce a placeholder datetime."""
@@ -321,6 +509,95 @@ class CalendarTVTests(CalendarFixturesMixin, TestCase):
         process_tv(self.tv_item, events_bulk)
 
         self.assertEqual(events_bulk, [])
+
+    @patch("events.calendar.tv.process_tv_seasons")
+    @patch("events.calendar.tv.get_seasons_to_process", return_value=[1])
+    def test_process_tv_reads_current_provider_data(self, _seasons, _process):
+        """A check drops the cached payloads so it cannot miss a new or dated season."""
+        from app.providers import tmdb
+
+        show_key = tmdb._tv_cache_key(self.tv_item.media_id)
+        season_key = tmdb._season_cache_key(self.tv_item.media_id, 1)
+        other_key = tmdb._tv_cache_key("not-this-show")
+        for key in (show_key, season_key, other_key):
+            cache.set(key, {"cached": True})
+
+        self.assertTrue(process_tv(self.tv_item, []))
+
+        self.assertIsNone(cache.get(show_key))
+        self.assertIsNone(cache.get(season_key))
+        self.assertIsNotNone(cache.get(other_key))
+
+    @patch("events.calendar.tv.process_tv_seasons")
+    @patch("events.calendar.tv.get_seasons_to_process", return_value=[1])
+    def test_process_tv_keeps_cache_when_given_fresh_metadata(self, _seasons, _process):
+        """The metadata backfill hands in a payload it just fetched; leave the cache."""
+        from app.providers import tmdb
+
+        show_key = tmdb._tv_cache_key(self.tv_item.media_id)
+        cache.set(show_key, {"cached": True})
+
+        process_tv(self.tv_item, [], tv_metadata={"related": {"seasons": []}})
+
+        self.assertIsNotNone(cache.get(show_key))
+
+    def test_season_eviction_keeps_the_show_payload_just_fetched(self):
+        """TVDB's season keys include the series payload; a season-only eviction spares it."""
+        from types import SimpleNamespace
+
+        from app.metadata_utils import provider_metadata_cache_keys
+        from events.calendar.tv import _evict_cached_metadata
+
+        tvdb_item = SimpleNamespace(source=Sources.TVDB.value, media_id="81189")
+        show_keys = provider_metadata_cache_keys(
+            tvdb_item.source,
+            MediaTypes.TV.value,
+            tvdb_item.media_id,
+        )
+        season_keys = [
+            key
+            for key in provider_metadata_cache_keys(
+                tvdb_item.source,
+                MediaTypes.SEASON.value,
+                tvdb_item.media_id,
+                season_number=1,
+            )
+            if key not in show_keys
+        ]
+        self.assertTrue(season_keys)
+        for key in show_keys + season_keys:
+            cache.set(key, {"cached": True})
+
+        _evict_cached_metadata(tvdb_item, [1], show=False)
+
+        for key in show_keys:
+            self.assertIsNotNone(cache.get(key))
+        for key in season_keys:
+            self.assertIsNone(cache.get(key))
+
+    def test_process_season_episodes_logs_how_many_episodes_have_no_date(self):
+        """The log shows whether the provider dated the season, for bug reports."""
+        events_bulk = []
+        with (
+            patch("events.calendar.tv.get_tvmaze_episode_map", return_value={}),
+            self.assertLogs("events.calendar.tv", level="INFO") as logs,
+        ):
+            process_season_episodes(
+                self.season_item,
+                {
+                    "season_number": 1,
+                    "episodes": [
+                        {"episode_number": 1, "air_date": "2026-10-16"},
+                        {"episode_number": 2, "air_date": None},
+                    ],
+                },
+                events_bulk,
+            )
+
+        self.assertTrue(
+            any("2 episodes from the provider, 1 without an air date" in line for line in logs.output),
+            logs.output,
+        )
 
     def test_process_season_episodes_handles_missing_tvdb_and_episodes(self):
         """A season without TVDB data or episodes should not add events."""
@@ -403,6 +680,32 @@ class CalendarTVTests(CalendarFixturesMixin, TestCase):
         self.assertEqual(
             get_seasons_to_process(self.tv_item, tv_metadata=tv_metadata),
             [],
+        )
+
+    def test_get_seasons_to_process_can_force_past_seasons(self):
+        """Repair callers can explicitly refresh a season with past events."""
+        Event.objects.create(
+            item=self.season_item,
+            content_number=1,
+            datetime=date_parser("2008-01-20"),
+        )
+        tv_metadata = {
+            "related": {
+                "seasons": [
+                    {"season_number": 1},
+                    {"season_number": 2},
+                ],
+            },
+            "next_episode_season": 2,
+        }
+
+        self.assertEqual(
+            get_seasons_to_process(
+                self.tv_item,
+                tv_metadata=tv_metadata,
+                force_seasons=[1],
+            ),
+            [1],
         )
 
     @patch("events.calendar.tv.get_tvmaze_episode_map")

@@ -1,4 +1,4 @@
-"""statistics.py — Core statistics orchestration for Cursor.
+"""statistics.py — Core statistics orchestration for Floppy.
 
 The heavy lifting has been extracted into focused submodules:
   - stats_utils.py    shared pure utilities (parse_runtime_to_minutes, etc.)
@@ -10,6 +10,7 @@ The heavy lifting has been extracted into focused submodules:
 Re-exports at the bottom of this file keep all callers that use
 `from app import statistics as stats` fully transparent.
 """
+
 import logging
 
 from django.apps import apps
@@ -44,23 +45,30 @@ def get_user_media(user, start_date, end_date):
 
     # Cache the base episodes query
     base_episodes = None
+    _all_time = start_date is None and end_date is None
     if TV in media_models or Season in media_models:
-        if start_date is None and end_date is None:
+        if _all_time:
             # No date filtering for "All Time"
-            base_episodes = Episode.objects.filter(
+            base_episodes = Episode.all_objects.filter(
                 related_season__user=user,
             )
         else:
-            base_episodes = Episode.objects.filter(
+            base_episodes = Episode.all_objects.filter(
                 related_season__user=user,
                 end_date__range=(start_date, end_date),
             )
 
+    _status_filter = [
+        Status.IN_PROGRESS.value,
+        Status.COMPLETED.value,
+        Status.DROPPED.value,
+        Status.PAUSED.value,
+    ]
+
     _tv_ids = None  # saved for grouped-anime pass after the main loop
     _genre_anime_tv_ids = set()
-    _split_tv_anime = (
-        not getattr(user, "anime_enabled", True)
-        and getattr(user, "stats_split_tv_anime", False)
+    _split_tv_anime = not getattr(user, "anime_enabled", True) and getattr(
+        user, "stats_split_tv_anime", False
     )
 
     for model in media_models:
@@ -72,11 +80,17 @@ def get_user_media(user, start_date, end_date):
                 "related_season__related_tv",
                 flat=True,
             ).distinct()
+            # "All Time" includes every show regardless of episode history
+            # (e.g. a season completed via rating-only import with no
+            # per-episode rows); date-ranged views still rely on episode
+            # activity since TV/Season have no date fields of their own.
+            base_tv_qs = (
+                TV.objects.filter(user=user, status__in=_status_filter)
+                if _all_time
+                else TV.objects.filter(id__in=_tv_ids, status__in=_status_filter)
+            )
             # Exclude grouped anime (library_media_type="anime") — they belong in the anime bucket
-            queryset = TV.objects.filter(
-                id__in=_tv_ids,
-                status__in=[Status.IN_PROGRESS.value, Status.COMPLETED.value, Status.DROPPED.value, Status.PAUSED.value],
-            ).exclude(
+            queryset = base_tv_qs.exclude(
                 item__library_media_type=MediaTypes.ANIME.value,
             )
             if _split_tv_anime:
@@ -96,10 +110,17 @@ def get_user_media(user, start_date, end_date):
                 Prefetch(
                     "seasons",
                     queryset=Season.objects.filter(
-                        status__in=[Status.IN_PROGRESS.value, Status.COMPLETED.value, Status.DROPPED.value, Status.PAUSED.value],
-                    ).select_related(
+                        status__in=[
+                            Status.IN_PROGRESS.value,
+                            Status.COMPLETED.value,
+                            Status.DROPPED.value,
+                            Status.PAUSED.value,
+                        ],
+                    )
+                    .select_related(
                         "item",
-                    ).prefetch_related(
+                    )
+                    .prefetch_related(
                         Prefetch(
                             "episodes",
                             queryset=base_episodes.filter(
@@ -114,9 +135,15 @@ def get_user_media(user, start_date, end_date):
                 "related_season",
                 flat=True,
             ).distinct()
-            queryset = Season.objects.filter(
-                id__in=season_ids,
-                status__in=[Status.IN_PROGRESS.value, Status.COMPLETED.value, Status.DROPPED.value, Status.PAUSED.value],
+            base_season_qs = (
+                Season.objects.filter(user=user, status__in=_status_filter)
+                if _all_time
+                else Season.objects.filter(id__in=season_ids, status__in=_status_filter)
+            )
+            # Grouped anime seasons belong to the anime bucket, which is
+            # counted separately below; without this they are counted twice.
+            queryset = base_season_qs.exclude(
+                related_tv__item__library_media_type=MediaTypes.ANIME.value,
             ).prefetch_related(
                 Prefetch("episodes", queryset=base_episodes),
             )
@@ -125,12 +152,22 @@ def get_user_media(user, start_date, end_date):
             # No date filtering for "All Time"
             queryset = model.objects.filter(
                 user=user,
-                status__in=[Status.IN_PROGRESS.value, Status.COMPLETED.value, Status.DROPPED.value, Status.PAUSED.value],
+                status__in=[
+                    Status.IN_PROGRESS.value,
+                    Status.COMPLETED.value,
+                    Status.DROPPED.value,
+                    Status.PAUSED.value,
+                ],
             )
         else:
             queryset = model.objects.filter(
                 user=user,
-                status__in=[Status.IN_PROGRESS.value, Status.COMPLETED.value, Status.DROPPED.value, Status.PAUSED.value],
+                status__in=[
+                    Status.IN_PROGRESS.value,
+                    Status.COMPLETED.value,
+                    Status.DROPPED.value,
+                    Status.PAUSED.value,
+                ],
             ).filter(
                 # Case 1: Media has both start_date and end_date
                 # Include if ranges overlap
@@ -168,9 +205,21 @@ def get_user_media(user, start_date, end_date):
 
     # Pull grouped anime (TV-structured, library_media_type="anime") into the anime bucket
     if _tv_ids is not None and base_episodes is not None:
+        # Mirror the TV bucket's own base: "All Time" counts every show, even
+        # one with no episode rows (a rating-only import). Keying this pass off
+        # `_tv_ids` alone dropped those shows from TV *and* anime.
+        _grouped_anime_episodes = (
+            base_episodes
+            if _all_time
+            else base_episodes.filter(related_season__related_tv__in=_tv_ids)
+        )
         _grouped_anime_qs = (
-            TV.objects.filter(
-                id__in=_tv_ids,
+            (
+                TV.objects.filter(user=user)
+                if _all_time
+                else TV.objects.filter(id__in=_tv_ids)
+            )
+            .filter(
                 item__library_media_type=MediaTypes.ANIME.value,
                 status__in=[
                     Status.IN_PROGRESS.value,
@@ -195,9 +244,7 @@ def get_user_media(user, start_date, end_date):
                     .prefetch_related(
                         Prefetch(
                             "episodes",
-                            queryset=base_episodes.filter(
-                                related_season__related_tv__in=_tv_ids,
-                            ),
+                            queryset=_grouped_anime_episodes,
                         ),
                     ),
                 ),
@@ -208,8 +255,12 @@ def get_user_media(user, start_date, end_date):
             anime_key = MediaTypes.ANIME.value
             if anime_key in user_media:
                 # Combine with flat anime (MAL) queryset already in the bucket
-                user_media[anime_key] = _CombinedMediaBucket(user_media[anime_key], _grouped_anime_qs)
-                media_count[anime_key] = media_count.get(anime_key, 0) + _grouped_anime_count
+                user_media[anime_key] = _CombinedMediaBucket(
+                    user_media[anime_key], _grouped_anime_qs
+                )
+                media_count[anime_key] = (
+                    media_count.get(anime_key, 0) + _grouped_anime_count
+                )
             else:
                 user_media[anime_key] = _grouped_anime_qs
                 media_count[anime_key] = _grouped_anime_count
@@ -255,8 +306,12 @@ def get_user_media(user, start_date, end_date):
         if _genre_anime_count > 0:
             anime_key = MediaTypes.ANIME.value
             if anime_key in user_media:
-                user_media[anime_key] = _CombinedMediaBucket(user_media[anime_key], _genre_anime_qs)
-                media_count[anime_key] = media_count.get(anime_key, 0) + _genre_anime_count
+                user_media[anime_key] = _CombinedMediaBucket(
+                    user_media[anime_key], _genre_anime_qs
+                )
+                media_count[anime_key] = (
+                    media_count.get(anime_key, 0) + _genre_anime_count
+                )
             else:
                 user_media[anime_key] = _genre_anime_qs
                 media_count[anime_key] = _genre_anime_count
@@ -293,7 +348,11 @@ def get_media_type_distribution(media_count, minutes_per_type=None):
 
         ordered_types = list(MEDIA_TYPE_HOURS_ORDER)
         ordered_types.extend(
-            [media_type for media_type in minutes_per_type if media_type not in ordered_types],
+            [
+                media_type
+                for media_type in minutes_per_type
+                if media_type not in ordered_types
+            ],
         )
 
         for media_type in ordered_types:
@@ -397,6 +456,7 @@ def get_status_color(status):
     except KeyError:
         return "rgba(201, 203, 207)"
 
+
 # ---------------------------------------------------------------------------
 # Re-exports from extracted submodules — keeps all callers using
 # `from app import statistics as stats` fully transparent.
@@ -463,6 +523,7 @@ from app.stats_reading import (  # noqa: E402,F401
     _format_reading_unit,
     _normalize_item_author_names,
     _reading_entry_in_range,
+    _reading_entry_range_filter,
     get_reading_consumption_stats,
 )
 from app.stats_score import (  # noqa: E402,F401

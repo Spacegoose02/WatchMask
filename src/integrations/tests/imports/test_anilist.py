@@ -4,11 +4,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, tag
 
 from app.models import (
     Anime,
+    DeletedMedia,
     Manga,
+    MediaTypes,
+    Sources,
     Status,
 )
 from integrations.imports import (
@@ -59,6 +62,26 @@ class ImportAniList(TestCase):
         )
 
     @patch("requests.Session.post")
+    def test_import_does_not_bring_back_a_deleted_anime(self, mock_request):
+        """An anime the user deleted by hand stays deleted across syncs (#1133)."""
+        with Path(mock_path / "import_anilist.json").open() as file:
+            anilist_response = json.load(file)
+        mock_request.return_value.json.return_value = anilist_response
+        DeletedMedia.objects.create(
+            user=self.user,
+            media_type=MediaTypes.ANIME.value,
+            source=Sources.MAL.value,
+            media_id="227",
+        )
+
+        anilist.importer(None, self.user, "new", "bloodthirstiness")
+
+        self.assertEqual(Anime.objects.filter(user=self.user).count(), 3)
+        self.assertFalse(
+            Anime.objects.filter(user=self.user, item__title="FLCL").exists(),
+        )
+
+    @patch("requests.Session.post")
     def test_import_anilist_private(self, mock_request):
         """Basic test importing anime and manga from AniList."""
         with Path(mock_path / "import_anilist.json").open() as file:
@@ -91,8 +114,15 @@ class ImportAniList(TestCase):
             datetime(2025, 6, 4, 10, 11, 17, tzinfo=UTC),
         )
 
+    @tag("network")
     def test_user_not_found(self):
-        """Test that an error is raised if the user is not found."""
+        """Test that an error is raised if the user is not found.
+
+        Unlike its neighbours this one does not patch the session, so it asks
+        AniList about a made-up user for real. AniList answers a bare 403 when
+        it feels like it, which surfaces as the wrong exception type and fails
+        the run for reasons that have nothing to do with the change under test.
+        """
         self.assertRaises(
             helpers.MediaImportError,
             anilist.importer,

@@ -5,10 +5,14 @@ from django.contrib import admin
 from django.contrib.admin.sites import AlreadyRegistered
 
 from app.models import (
+    DeletedMedia,
     Episode,
     Item,
     ItemProviderLink,
     MetadataProviderPreference,
+    MoviePlay,
+    PlaybackProgress,
+    VideoPlay,
 )
 
 
@@ -34,7 +38,23 @@ class EpisodeAdmin(admin.ModelAdmin):
     """Custom admin for Episode model with search and filter options."""
 
     search_fields = ["item__title", "related_season__item__title"]
-    list_display = ["__str__", "end_date"]
+    list_display = ["__str__", "end_date", "external_id"]
+
+
+@admin.register(MoviePlay)
+class MoviePlayAdmin(admin.ModelAdmin):
+    """Custom admin for MoviePlay model with search and filter options."""
+
+    search_fields = ["movie__item__title"]
+    list_display = ["__str__", "end_date", "external_id"]
+
+
+@admin.register(VideoPlay)
+class VideoPlayAdmin(admin.ModelAdmin):
+    """Custom admin for a video play."""
+
+    search_fields = ["video__item__title", "external_id"]
+    list_display = ["__str__", "end_date", "external_id"]
 
 
 class MediaAdmin(admin.ModelAdmin):
@@ -67,7 +87,13 @@ class TrackAdmin(admin.ModelAdmin):
     """Custom admin for Track model."""
 
     search_fields = ["title", "musicbrainz_recording_id", "album__title"]
-    list_display = ["title", "album", "track_number", "disc_number", "duration_formatted"]
+    list_display = [
+        "title",
+        "album",
+        "track_number",
+        "disc_number",
+        "duration_formatted",
+    ]
     list_filter = ["album"]
 
 
@@ -77,6 +103,9 @@ app_models = apps.get_app_config("app").get_models()
 SpecialModels = [
     "Item",
     "Episode",
+    "MoviePlay",
+    "VideoPlay",
+    "VideoGameTag",
     "BasicMedia",
     "Artist",
     "Album",
@@ -92,15 +121,38 @@ SpecialModels = [
     "ItemPersonCredit",
     "ItemStudioCredit",
     "MetadataBackfillState",
+    "BackfillReconcileState",
     "ItemProviderLink",
     "MetadataProviderPreference",
+    "HardcoverEditionPreference",
+    "MusicReleasePreference",
     "CollectionEntry",
+    "CollectionEntrySource",
+    "CollectionField",
+    "CollectionFieldGroup",
+    "CollectionFieldSource",
     "Tag",
     "ItemTag",
     "DiscoverFeedback",
     "DiscoverApiCache",
     "DiscoverTasteProfile",
     "DiscoverRowCache",
+    "DeletedMedia",
+    "PlaybackProgress",
+    "ApplicationSettings",
+    "InstanceProviderCredential",
+    "UserProviderCredential",
+    "ProgressChange",
+    "WatchState",
+    "WatchStateChange",
+    "WatchStateSequence",
+    "EpisodeOrder",
+    "EpisodeOrderChange",
+    "StatisticsDirtyDay",
+    "StatisticsSnapshot",
+    "StatisticsSyncState",
+    "GameArtwork",
+    "RewatchCancellation",
 ]
 for model in app_models:
     if (
@@ -117,7 +169,9 @@ from app.models import (  # noqa: E402
     AlbumTracker,
     Artist,
     ArtistTracker,
+    BackfillReconcileState,
     MetadataBackfillState,
+    MusicReleasePreference,
     Track,
 )
 
@@ -147,6 +201,18 @@ admin.site.register(ArtistTracker, ArtistTrackerAdmin)
 admin.site.register(AlbumTracker, AlbumTrackerAdmin)
 
 
+class MusicReleasePreferenceAdmin(admin.ModelAdmin):
+    """Admin for per-user MusicBrainz release choices."""
+
+    list_display = ["user", "album", "release_id", "updated_at"]
+    list_filter = ["updated_at"]
+    search_fields = ["user__username", "album__title", "release_id"]
+    raw_id_fields = ["user", "album"]
+
+
+admin.site.register(MusicReleasePreference, MusicReleasePreferenceAdmin)
+
+
 class MetadataBackfillStateAdmin(admin.ModelAdmin):
     """Admin for metadata backfill tracking."""
 
@@ -155,16 +221,36 @@ class MetadataBackfillStateAdmin(admin.ModelAdmin):
         "field",
         "fail_count",
         "give_up",
+        "terminal",
         "next_retry_at",
         "last_attempt_at",
         "last_success_at",
     ]
-    list_filter = ["field", "give_up"]
+    list_filter = ["field", "give_up", "terminal"]
     search_fields = ["item__title", "item__media_id", "last_error"]
     raw_id_fields = ["item"]
 
 
 admin.site.register(MetadataBackfillState, MetadataBackfillStateAdmin)
+
+
+class BackfillReconcileStateAdmin(admin.ModelAdmin):
+    """Admin for whole-library reconcile sweep progress."""
+
+    list_display = [
+        "key",
+        "strategy_version",
+        "completed_at",
+        "last_run_at",
+        "next_run_after",
+        "consecutive_no_op_runs",
+        "last_cursor_item_id",
+    ]
+    list_filter = ["key"]
+    search_fields = ["key"]
+
+
+admin.site.register(BackfillReconcileState, BackfillReconcileStateAdmin)
 
 
 class ItemProviderLinkAdmin(admin.ModelAdmin):
@@ -227,9 +313,19 @@ admin.site.register(PodcastEpisode, PodcastEpisodeAdmin)
 class CollectionEntryAdmin(admin.ModelAdmin):
     """Admin for CollectionEntry model."""
 
-    list_display = ["user", "item", "collected_at", "media_type", "resolution", "audio_codec", "bitrate"]
+    list_display = [
+        "user",
+        "item",
+        "collected_at",
+        "media_type",
+        "resolution",
+        "audio_codec",
+        "bitrate",
+        "purchase_price",
+        "purchase_location",
+    ]
     list_filter = ["media_type", "resolution", "hdr", "is_3d", "collected_at"]
-    search_fields = ["user__username", "item__title"]
+    search_fields = ["user__username", "item__title", "purchase_location"]
     readonly_fields = ["collected_at", "updated_at"]
     raw_id_fields = ["user", "item"]
 
@@ -238,6 +334,30 @@ class CollectionEntryAdmin(admin.ModelAdmin):
 from app.models import CollectionEntry  # noqa: E402
 
 admin.site.register(CollectionEntry, CollectionEntryAdmin)
+
+
+class CollectionFieldGroupAdmin(admin.ModelAdmin):
+    """Admin for CollectionFieldGroup model."""
+
+    search_fields = ["name", "user__username"]
+    list_display = ["name", "user", "position"]
+    list_filter = ["user"]
+    raw_id_fields = ["user"]
+
+
+class CollectionFieldAdmin(admin.ModelAdmin):
+    """Admin for CollectionField model."""
+
+    search_fields = ["label", "group__name"]
+    list_display = ["label", "group", "field_type", "position"]
+    list_filter = ["field_type"]
+    raw_id_fields = ["group"]
+
+
+from app.models import CollectionField, CollectionFieldGroup  # noqa: E402
+
+admin.site.register(CollectionFieldGroup, CollectionFieldGroupAdmin)
+admin.site.register(CollectionField, CollectionFieldAdmin)
 
 
 class TagAdmin(admin.ModelAdmin):
@@ -305,7 +425,109 @@ from app.models import (  # noqa: E402
     DiscoverTasteProfile,
 )
 
+
+class DeletedMediaAdmin(admin.ModelAdmin):
+    """Admin for DeletedMedia tombstones."""
+
+    list_display = ["user", "media_type", "source", "media_id", "deleted_at"]
+    list_filter = ["media_type", "source", "deleted_at"]
+    search_fields = ["user__username", "media_id"]
+    raw_id_fields = ["user"]
+
+
+class PlaybackProgressAdmin(admin.ModelAdmin):
+    """Admin for durable resume positions."""
+
+    list_display = ["user", "item", "position_seconds", "completed", "updated_at"]
+    list_filter = ["completed", "updated_at"]
+    search_fields = ["user__username", "item__title"]
+    raw_id_fields = ["user", "item"]
+
+
+admin.site.register(DeletedMedia, DeletedMediaAdmin)
+admin.site.register(PlaybackProgress, PlaybackProgressAdmin)
 admin.site.register(DiscoverFeedback, DiscoverFeedbackAdmin)
 admin.site.register(DiscoverApiCache, DiscoverApiCacheAdmin)
 admin.site.register(DiscoverTasteProfile, DiscoverTasteProfileAdmin)
 admin.site.register(DiscoverRowCache, DiscoverRowCacheAdmin)
+
+
+class ProviderCredentialAdmin(admin.ModelAdmin):
+    """Admin for stored provider credentials.
+
+    The encrypted value is deliberately not listed or searchable.
+    """
+
+    list_display = ["provider", "field", "updated_at"]
+    list_filter = ["provider"]
+    search_fields = ["provider", "field"]
+
+
+class UserProviderCredentialAdmin(ProviderCredentialAdmin):
+    """Admin for personal provider credentials."""
+
+    list_display = ["user", "provider", "field", "updated_at"]
+    search_fields = ["user__username", "provider", "field"]
+    raw_id_fields = ["user"]
+
+
+from app.models import (  # noqa: E402
+    InstanceProviderCredential,
+    UserProviderCredential,
+)
+
+admin.site.register(InstanceProviderCredential, ProviderCredentialAdmin)
+admin.site.register(UserProviderCredential, UserProviderCredentialAdmin)
+
+
+class SyncProjectionAdmin(admin.ModelAdmin):
+    """Inspect protocol state without bypassing its transactional writers."""
+
+    def has_add_permission(self, request):
+        """Require the application writer for new protocol records."""
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        """Keep event identities, generations and allocator positions immutable here."""
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        """Use compaction or the explicit reset command instead."""
+        return False
+
+
+class WatchStateAdmin(SyncProjectionAdmin):
+    """Admin for canonical watched state."""
+
+    list_display = ["user", "item", "watched", "play_count", "revision", "conflicted"]
+    list_filter = ["watched", "conflicted", "origin_kind"]
+    search_fields = ["user__username", "item__title"]
+    raw_id_fields = ["user", "item"]
+
+
+class WatchStateChangeAdmin(SyncProjectionAdmin):
+    """Admin for the ordered watched-state change log."""
+
+    list_display = ["user", "sequence", "item", "kind", "watched", "origin_kind"]
+    list_filter = ["kind", "origin_kind"]
+    search_fields = ["user__username", "item__title", "origin_key"]
+    raw_id_fields = ["user", "item"]
+
+
+class WatchStateSequenceAdmin(SyncProjectionAdmin):
+    """Admin for the per-user change sequence allocator."""
+
+    list_display = ["user", "last_sequence"]
+    search_fields = ["user__username"]
+    raw_id_fields = ["user"]
+
+
+from app.models import (  # noqa: E402
+    WatchState,
+    WatchStateChange,
+    WatchStateSequence,
+)
+
+admin.site.register(WatchState, WatchStateAdmin)
+admin.site.register(WatchStateChange, WatchStateChangeAdmin)
+admin.site.register(WatchStateSequence, WatchStateSequenceAdmin)

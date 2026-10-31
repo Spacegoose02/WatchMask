@@ -1,19 +1,21 @@
+
+{% load i18n %}
 {% load app_tags %}
 {% if media.aggregated_progress is not None %}
   <div class="font-medium">{{ media.formatted_aggregated_progress }}</div>
-  {% if media.max_progress %}/ {{ media.max_progress }}{% endif %}
+  {% if media.max_progress and not media.progress_is_percentage %}/ {{ media.formatted_max_progress }}{% endif %}
   {% if media.repeats > 1 %}
     {% if media.item.media_type != MediaTypes.GAME.value and media.item.media_type != MediaTypes.BOARDGAME.value or user.game_logging_style != 'sessions' %}
-      <div class="text-xs text-indigo-400 mt-1">
-        <span>Total ({{ media.repeats }} repeats)</span>
+      <div class="text-xs text-[var(--color-link)] mt-1">
+        <span>{% blocktranslate trimmed with value_1=media.repeats %}Total ({{ value_1 }} repeats){% endblocktranslate %}</span>
       </div>
     {% endif %}
   {% endif %}
 {% else %}
   {% if media.progress is not None %}
     {{ media.formatted_progress|default:media.progress }}
-    {% if media.max_progress %}/ {{ media.max_progress }}{% endif %}
+    {% if media.max_progress and not media.progress_is_percentage %}/ {{ media.formatted_max_progress }}{% endif %}
   {% else %}
-    <span class="text-gray-500">-</span>
+    <span class="text-[var(--color-text-muted)]">-</span>
   {% endif %}
 {% endif %}

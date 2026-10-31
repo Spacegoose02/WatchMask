@@ -5,12 +5,14 @@ from public APIs that don't require auth: RSS feeds, Podcast Index, and iTunes.
 """
 
 import logging
-import xml.etree.ElementTree as ET
 
 import requests
+from defusedxml import ElementTree as ET  # noqa: N817  # long-standing alias
 from django.core.cache import cache
 
 from app.log_safety import exception_summary, safe_url
+from integrations.podcast_rss import MAX_FEED_BYTES
+from integrations.safe_fetch import safe_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ def fetch_podcast_artwork(
     cache_key = f"podcast_artwork_{podcast_uuid}"
     cached = cache.get(cache_key)
     if cached is not None:
-        return cached if cached else None
+        return cached or None
 
     image_url = None
 
@@ -90,10 +92,7 @@ def fetch_podcast_artwork_and_rss(
     """
     try:
         # Build search query
-        if author:
-            query = f"{show_title} {author}"
-        else:
-            query = show_title
+        query = f"{show_title} {author}" if author else show_title
 
         # iTunes API expects URL-encoded query
         params = {
@@ -129,15 +128,27 @@ def fetch_podcast_artwork_and_rss(
                 artwork_url = result.get("artworkUrl600") or result.get("artworkUrl100")
                 feed_url = result.get("feedUrl")
                 if artwork_url or feed_url:
-                    logger.debug("Found iTunes match for %s: artwork=%s, feed=%s", show_title, bool(artwork_url), bool(feed_url))
+                    logger.debug(
+                        "Found iTunes match for %s: artwork=%s, feed=%s",
+                        show_title,
+                        bool(artwork_url),
+                        bool(feed_url),
+                    )
                     return artwork_url, feed_url
 
         # If no exact match, use first result
         if results:
-            artwork_url = results[0].get("artworkUrl600") or results[0].get("artworkUrl100")
+            artwork_url = results[0].get("artworkUrl600") or results[0].get(
+                "artworkUrl100"
+            )
             feed_url = results[0].get("feedUrl")
             if artwork_url or feed_url:
-                logger.debug("Using first iTunes result for %s: artwork=%s, feed=%s", show_title, bool(artwork_url), bool(feed_url))
+                logger.debug(
+                    "Using first iTunes result for %s: artwork=%s, feed=%s",
+                    show_title,
+                    bool(artwork_url),
+                    bool(feed_url),
+                )
                 return artwork_url, feed_url
 
     except Exception as e:
@@ -156,12 +167,19 @@ def _fetch_from_rss_feed(rss_feed_url: str) -> str | None:
         Image URL or None
     """
     try:
-        response = requests.get(rss_feed_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        response, body = safe_fetch(
+            rss_feed_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/rss+xml, application/atom+xml, application/xml",
+            },
+            max_bytes=MAX_FEED_BYTES,
+        )
         response.raise_for_status()
 
         # Parse XML - handle both RSS and Atom feeds
         try:
-            root = ET.fromstring(response.content)
+            root = ET.fromstring(body)
         except ET.ParseError as e:
             logger.debug("Failed to parse RSS feed XML: %s", e)
             return None
@@ -240,10 +258,7 @@ def _fetch_from_itunes(show_title: str, author: str | None = None) -> str | None
     """
     try:
         # Build search query
-        if author:
-            query = f"{show_title} {author}"
-        else:
-            query = show_title
+        query = f"{show_title} {author}" if author else show_title
 
         # iTunes API expects URL-encoded query
         params = {
@@ -279,11 +294,20 @@ def _fetch_from_itunes(show_title: str, author: str | None = None) -> str | None
             ):
                 artwork_url = result.get("artworkUrl600") or result.get("artworkUrl100")
                 if artwork_url:
+                    # Replace with higher resolution if available
+                    # artworkUrl600 is 600x600, but we can get 1400x1400 by replacing dimensions
+                    if "artworkUrl600" in result:
+                        # Try to get larger version
+                        artwork_url.replace("600x600", "1400x1400")
+                        # Verify it exists (or just use 600x600 which is usually fine)
+                        return artwork_url
                     return artwork_url
 
         # If no exact match, use first result's artwork
         if results:
-            artwork_url = results[0].get("artworkUrl600") or results[0].get("artworkUrl100")
+            artwork_url = results[0].get("artworkUrl600") or results[0].get(
+                "artworkUrl100"
+            )
             if artwork_url:
                 return artwork_url
 

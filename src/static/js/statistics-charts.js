@@ -1,20 +1,115 @@
 (function () {
+// Keep a floating chart popup inside the viewport. A popup centered on a bar near
+// the screen edge otherwise hangs off the page and makes it scroll sideways.
+function placeChartTooltip(tooltipEl, context) {
+  const margin = 8;
+  const rect = context.chart.canvas.getBoundingClientRect();
+  const viewportWidth = document.documentElement.clientWidth;
+  // Fixed width first, so measuring does not depend on where the popup sits.
+  tooltipEl.style.width = "max-content";
+  tooltipEl.style.maxWidth = viewportWidth - margin * 2 + "px";
+  const half = tooltipEl.offsetWidth / 2;
+  const centerX = Math.min(
+    Math.max(rect.left + context.tooltip.caretX, margin + half),
+    viewportWidth - margin - half
+  );
+  tooltipEl.style.opacity = 1;
+  tooltipEl.style.position = "absolute";
+  tooltipEl.style.left = centerX + window.scrollX + "px";
+  tooltipEl.style.top = rect.top + window.scrollY + context.tooltip.caretY + "px";
+  tooltipEl.style.transform = "translate(-50%, -100%)";
+  tooltipEl.style.pointerEvents = "none";
+}
+
 function initStatisticsCharts() {
   if (typeof Chart === "undefined") {
     return;
   }
   Chart.register(ChartDataLabels);
+  // Labels are also backend data keys: translate only at the display boundary.
+  function chartDisplayLabel(value) {
+    const labels = {
+      "TV Show": gettext("TV Show"),
+      "TV Shows": gettext("TV Shows"),
+      "TV Season": gettext("TV Season"),
+      "Movie": gettext("Movie"),
+      "Movies": gettext("Movies"),
+      "Anime": gettext("Anime"),
+      "Music": gettext("Music"),
+      "Podcast": gettext("Podcast"),
+      "Podcasts": gettext("Podcasts"),
+      "Book": gettext("Book"),
+      "Books": gettext("Books"),
+      "Comic": gettext("Comic"),
+      "Comics": gettext("Comics"),
+      "Comic Issue": gettext("Comic Issue"),
+      "Board Game": gettext("Board Game"),
+      "Board Games": gettext("Board Games"),
+      "Game": gettext("Game"),
+      "Games": gettext("Games"),
+      "Manga": gettext("Manga"),
+      "Completed": gettext("Completed"),
+      "In progress": gettext("In progress"),
+      "Planning": gettext("Planning"),
+      "Paused": gettext("Paused"),
+      "Dropped": gettext("Dropped"),
+      "Repeating": gettext("Repeating"),
+      "Other": gettext("Other"),
+      "Unknown": gettext("Unknown"),
+      "Items": gettext("Items"),
+      "Plays": gettext("Plays"),
+      "Episodes": gettext("Episodes"),
+      "Chapters": gettext("Chapters"),
+      "Pages": gettext("Pages"),
+      "Hours": gettext("Hours"),
+      "Minutes": gettext("Minutes"),
+      "Movie Plays": gettext("Movie Plays"),
+      "Episode Plays": gettext("Episode Plays"),
+      "Anime Plays": gettext("Anime Plays"),
+      "Music Plays": gettext("Music Plays"),
+      "Podcast Plays": gettext("Podcast Plays"),
+      "Pages Read": gettext("Pages Read"),
+      "Chapters Read": gettext("Chapters Read"),
+    };
+    return labels[value] || value;
+  }
+  // Colors come from JSON embedded in the page; only let plain CSS color
+  // values through before they are written into inline styles.
+  function chartSafeColor(value) {
+    const text = String(value == null ? "" : value).trim();
+    if (/^(#[0-9a-fA-F]{3,8}|(rgb|rgba|hsl|hsla)\([0-9.,%\s/-]+\)|[a-zA-Z]+)$/.test(text)) {
+      return text;
+    }
+    return "transparent";
+  }
+
+  function chartEscapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, function (ch) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
+    });
+  }
+
+
+  // Resolved once per chart-init pass so custom HTML tooltips (built via
+  // inline styles, not Tailwind classes) follow the current light/dark theme.
+  function chartThemeColor(varName, fallback) {
+    var value = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+    return value || fallback;
+  }
+  var CHART_TOOLTIP_BG = chartThemeColor("--color-panel", "#1f2937");
+  var CHART_TOOLTIP_BORDER = chartThemeColor("--color-surface-border", "rgba(255,255,255,0.1)");
+  var CHART_TOOLTIP_TEXT = chartThemeColor("--color-text", "#f3f4f6");
 
   // Destroy charts from a previous visit (their canvases were detached by a
   // boosted body swap) before creating new instances.
-  (window.__yamtrackStatsCharts || []).forEach(function (chart) {
+  (window.__floppyStatsCharts || []).forEach(function (chart) {
     try {
       chart.destroy();
     } catch (error) {
       console.debug("[stats] failed to destroy stale chart", error);
     }
   });
-  window.__yamtrackStatsCharts = [];
+  window.__floppyStatsCharts = [];
 
   // Custom external tooltip for bar charts
   function customBarTooltip(context) {
@@ -51,29 +146,29 @@ function initStatisticsCharts() {
             chart.options.plugins.scoreScaleMax) ||
           10;
         if (score === scoreMax) {
-          formattedTitle = `Score: ${scoreMax}`;
+          formattedTitle = interpolate(gettext("Score: %(score)s"), { score: scoreMax }, true);
         } else {
-          formattedTitle = `Score: ${score}.0-${score}.9`;
+          formattedTitle = interpolate(gettext("Score: %(lower)s\u2013%(upper)s"), { lower: score.toLocaleString(document.documentElement.lang || undefined, { minimumFractionDigits: 1 }), upper: (score + 0.9).toLocaleString(document.documentElement.lang || undefined, { minimumFractionDigits: 1 }) }, true);
         }
       }
 
       function fmt(v) {
         const n = Number(v) || 0;
-        return n.toFixed(1);
+        return n.toLocaleString(document.documentElement.lang || undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
       }
 
-      let html = '<div style="font-weight:600;margin-bottom:6px;color:#fff">' + formattedTitle + "</div>";
+      let html = '<div style="font-weight:600;margin-bottom:6px;color:' + CHART_TOOLTIP_TEXT + '">' + chartEscapeHtml(formattedTitle) + "</div>";
       chart.data.datasets.forEach((dataset) => {
         const raw = Number(dataset.data[dataIndex]) || 0;
         if (raw > 0) {
           const bgColor = dataset.backgroundColor;
-          const label = dataset.label || "";
+          const label = chartDisplayLabel(dataset.label || "");
           html +=
             '<div style="display:flex;align-items:center;gap:6px;margin-top:4px">' +
             '<span style="width:10px;height:10px;border-radius:2px;background:' +
             bgColor +
             ';flex-shrink:0"></span>' +
-            "<span>" + label + ": " + fmt(raw) + "</span>" +
+            "<span>" + chartEscapeHtml(label) + ": " + fmt(raw) + "</span>" +
             "</div>";
         }
       });
@@ -81,18 +176,7 @@ function initStatisticsCharts() {
       tooltipEl.innerHTML = html;
     }
 
-    // Position and style the tooltip
-    const position = context.chart.canvas.getBoundingClientRect();
-
-    // Set tooltip styles
-    tooltipEl.style.opacity = 1;
-    tooltipEl.style.position = "absolute";
-    tooltipEl.style.left =
-      position.left + window.scrollX + tooltipModel.caretX + "px";
-    tooltipEl.style.top =
-      position.top + window.scrollY + tooltipModel.caretY + "px";
-    tooltipEl.style.transform = "translate(-50%, -100%)";
-    tooltipEl.style.pointerEvents = "none";
+    placeChartTooltip(tooltipEl, context);
   }
 
   // Common configuration for bar charts
@@ -148,10 +232,11 @@ function initStatisticsCharts() {
   // Helper function to process stacked bar data
   function processBarData(chartData) {
     return {
-      labels: chartData.labels,
+      labels: chartData.labels.map(chartDisplayLabel),
       datasets: chartData.datasets
         .map((dataset) => ({
-          label: dataset.label,
+          label: chartDisplayLabel(dataset.label),
+          source_label: dataset.label,
           media_type: dataset.media_type,
           data: dataset.data,
           backgroundColor: dataset.background_color,
@@ -172,7 +257,7 @@ function initStatisticsCharts() {
         data: data,
         options: options,
       });
-      window.__yamtrackStatsCharts.push(chart);
+      window.__floppyStatsCharts.push(chart);
       return chart;
     }
     return null;
@@ -249,22 +334,21 @@ function initStatisticsCharts() {
     // Add score-specific configurations
     scoreChartOptions.scales.x.title = {
       display: true,
-      text: "Score",
+      text: gettext("Score"),
       color: "#D1D5DB",
       padding: { top: 10, bottom: 0 },
     };
 
     scoreChartOptions.scales.y.title = {
       display: true,
-      text: "Number of Items",
+      text: gettext("Number of Items"),
       color: "#D1D5DB",
       padding: { top: 0, left: 10 },
     };
 
     scoreChartOptions.plugins.title = {
       display: true,
-      text: `Average Score: ${scoreData.average_score} / ${scoreScaleMax} (${scoreData.total_scored
-        } ${scoreData.total_scored === 1 ? "item" : "items"})`,
+      text: interpolate(ngettext("Average Score: %(score)s / %(max)s (%(count)s item)", "Average Score: %(score)s / %(max)s (%(count)s items)", scoreData.total_scored), { score: scoreData.average_score, max: scoreScaleMax, count: scoreData.total_scored }, true),
       color: "#D1D5DB",
       padding: { bottom: 10 },
       font: { size: 14 },
@@ -408,7 +492,7 @@ function initStatisticsCharts() {
             } else if (d.getFullYear() !== nowYear) {
               opts.year = 'numeric';
             }
-            return d.toLocaleDateString(navigator.language || 'en-US', opts);
+            return d.toLocaleDateString(document.documentElement.lang || undefined, opts);
           }
 
           if (bucket === 'week') {
@@ -421,7 +505,7 @@ function initStatisticsCharts() {
               opts.year = 'numeric';
             }
             // Show a short date for the week (no "Week of" prefix)
-            return d.toLocaleDateString(navigator.language || 'en-US', opts);
+            return d.toLocaleDateString(document.documentElement.lang || undefined, opts);
           }
 
           if (bucket === 'month') {
@@ -430,10 +514,10 @@ function initStatisticsCharts() {
             const date = new Date(Number(yy), Number(mm) - 1, 1);
             // If the selected range is within the current year, show full month name only
             if (startYear && endYear && startYear === endYear && startYear === nowYear) {
-              return date.toLocaleDateString(navigator.language || 'en-US', { month: 'long' });
+              return date.toLocaleDateString(document.documentElement.lang || undefined, { month: 'long' });
             }
             // Otherwise show abbreviated month + year
-            return date.toLocaleDateString(navigator.language || 'en-US', { month: 'short', year: 'numeric' });
+            return date.toLocaleDateString(document.documentElement.lang || undefined, { month: 'short', year: 'numeric' });
           }
 
           if (bucket === 'year') {
@@ -502,7 +586,7 @@ function initStatisticsCharts() {
         }
         dailyOptions.scales.y.title = {
           display: true,
-          text: "Hours",
+          text: gettext("Hours"),
           color: "#D1D5DB",
           padding: { top: 0, left: 10 },
         };
@@ -631,14 +715,14 @@ function initStatisticsCharts() {
         const bandLabel = tooltipModel.title[0] || "";
         const bandGames = topGamesByBand[bandLabel] || [];
 
-        let html = '<div style="font-weight:600;margin-bottom:6px;color:#fff">Avg/day: ' + bandLabel + "</div>";
+        let html = '<div style="font-weight:600;margin-bottom:6px;color:' + CHART_TOOLTIP_TEXT + '">' + chartEscapeHtml(interpolate(gettext("Avg/day: %(band)s"), { band: bandLabel }, true)) + "</div>";
         bandGames.forEach(function (game, idx) {
           html +=
             '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:4px">' +
             '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px">' +
             (idx + 1) +
             ". " +
-            (game.title || "Unknown") +
+            chartEscapeHtml(game.title || gettext("Unknown")) +
             "</span>" +
             '<span style="font-weight:600;white-space:nowrap">' +
             (game.formatted_daily_average || "") +
@@ -649,15 +733,7 @@ function initStatisticsCharts() {
         tooltipEl.innerHTML = html;
       }
 
-      const position = context.chart.canvas.getBoundingClientRect();
-      tooltipEl.style.opacity = 1;
-      tooltipEl.style.position = "absolute";
-      tooltipEl.style.left =
-        position.left + window.scrollX + tooltipModel.caretX + "px";
-      tooltipEl.style.top =
-        position.top + window.scrollY + tooltipModel.caretY + "px";
-      tooltipEl.style.transform = "translate(-50%, -100%)";
-      tooltipEl.style.pointerEvents = "none";
+      placeChartTooltip(tooltipEl, context);
     }
 
     const chartOptions = JSON.parse(JSON.stringify(barChartConfig));
@@ -693,11 +769,21 @@ function initStatisticsCharts() {
     "podcast_plays_by_year"
   );
 
-  function getCurrentMediaType() {
+  // Video charts
+  initializeSingleSeriesBarChart(
+    "videoPlaysByYearChart",
+    "video_plays_by_year"
+  );
+
+  // The selected media types from the URL, in dropdown order. Empty = "All media".
+  function getCurrentMediaTypes() {
     try {
-      return new URL(window.location.href).searchParams.get("media-type") || "all";
+      return StatsMediaMerge.parseMediaTypeParam(
+        new URL(window.location.href).searchParams.get("media-type"),
+        Object.keys(MEDIA_SLUG_TO_LABEL),
+      );
     } catch (_) {
-      return "all";
+      return [];
     }
   }
 
@@ -706,9 +792,72 @@ function initStatisticsCharts() {
   // media_type_distribution payloads (e.g. "tv" -> "TV Show").
   const MEDIA_SLUG_TO_LABEL = {
     tv: "TV Show", movie: "Movie", anime: "Anime", music: "Music",
-    podcast: "Podcast", book: "Book", comic: "Comic",
+    podcast: "Podcast", video: "Video", book: "Book", comic: "Comic",
     boardgame: "Board Game", game: "Game", manga: "Manga",
   };
+
+  // ─── Activity History heatmap ──────────────────────────────────────────────
+  // The server renders every day for all media types; cells with activity carry
+  // their per-type counts so the heatmap can follow the media-type filter.
+  const HEATMAP_LEVEL_CLASSES = ["bg-[var(--color-surface-muted)]", "bg-indigo-700", "bg-indigo-600", "bg-indigo-500", "bg-indigo-400"];
+
+  // Same thresholds as stats_activity.get_level.
+  function heatmapLevel(count) {
+    if (count <= 0) return 0;
+    if (count <= 3) return 1;
+    if (count <= 6) return 2;
+    if (count <= 9) return 3;
+    return 4;
+  }
+
+  function updateActivityHeatmap() {
+    const heatmap = document.getElementById("activityHistory");
+    const cells = heatmap ? heatmap.querySelectorAll("[data-heatmap-counts]") : [];
+    if (!cells.length) return;
+    const types = getCurrentMediaTypes();
+    cells.forEach(function (cell) {
+      let count = 0;
+      cell.dataset.heatmapCounts.split(",").forEach(function (pair) {
+        const [type, n] = pair.split(":");
+        if (types.length === 0 || types.includes(type)) count += Number(n) || 0;
+      });
+      cell.classList.remove(...HEATMAP_LEVEL_CLASSES);
+      cell.classList.add(HEATMAP_LEVEL_CLASSES[heatmapLevel(count)]);
+    });
+  }
+
+  // Cells carry no per-cell date or title (all-time history is thousands of
+  // weeks); the tooltip is built on hover from the cell's position in the grid.
+  // The server rendered the translated tooltip for 0, 1 and 2 (the locale's
+  // plural rule decides which wording each uses); swap in the real count first
+  // (the template has no other digits), then the date.
+  const heatmapGrid = document.querySelector("#activityHistory [data-heatmap-grid]");
+  if (heatmapGrid) {
+    const start = new Date(heatmapGrid.dataset.heatmapStart + "T00:00:00Z");
+    heatmapGrid.addEventListener("mouseover", function (event) {
+      const cell = event.target;
+      if (!(cell instanceof HTMLElement) || !cell.classList.contains("hm")) return;
+      const column = cell.parentElement;
+      const offset = Array.prototype.indexOf.call(heatmapGrid.children, column) * 7 + Array.prototype.indexOf.call(column.children, cell);
+      const date = new Date(start.getTime() + offset * 86400000).toISOString().slice(0, 10);
+      if (cell.classList.contains("hm-f")) {
+        cell.title = date;
+        return;
+      }
+      const types = getCurrentMediaTypes();
+      let count = 0;
+      (cell.dataset.heatmapCounts || "").split(",").forEach(function (pair) {
+        const [type, n] = pair.split(":");
+        if (type && (types.length === 0 || types.includes(type))) count += Number(n) || 0;
+      });
+      const marker = count > 2 ? "2" : String(count);
+      const heatmap = document.getElementById("activityHistory");
+      cell.title = heatmap.getAttribute("data-title-" + marker).replace(marker, String(count)).replace("__DATE__", date);
+    });
+  }
+
+  updateActivityHeatmap();
+  window.addEventListener("stats-media-type-changed", updateActivityHeatmap);
 
   // ─── Activity Rhythm SVG dot matrix ────────────────────────────────────────
   const weekdayHourEl = document.getElementById("weekday_hour_chart_data");
@@ -716,7 +865,8 @@ function initStatisticsCharts() {
   if (weekdayHourEl && rhythmContainer) {
     const rhythmData = JSON.parse(weekdayHourEl.textContent || "{}");
 
-    const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const DAY_LABELS = Array.from({ length: 7 }, (_, day) =>
+      new Date(2024, 0, day + 1).toLocaleDateString(document.documentElement.lang || undefined, { weekday: "short" }));
     const cellSize = 12;
     const cellGap = 4;
     const dotArea = cellSize + cellGap;
@@ -741,12 +891,11 @@ function initStatisticsCharts() {
       return `rgba(99,102,241,${opacity.toFixed(2)})`;
     }
 
-    function drawRhythmChart(mediaType) {
-      const key = mediaType && mediaType !== "all" ? mediaType : "all";
-      const matrix = rhythmData[key] || (key !== "all" ? rhythmData["all"] : null);
+    function drawRhythmChart(mediaTypes) {
+      const matrix = StatsMediaMerge.sumMatrices(rhythmData, mediaTypes);
       if (!matrix) {
         rhythmContainer.innerHTML =
-          '<p class="text-sm text-gray-500 text-center py-6">No activity data for this range.</p>';
+          '<p class="text-sm text-[var(--color-text-muted)] text-center py-6">' + chartEscapeHtml(gettext("No activity data for this range.")) + '</p>';
         return;
       }
 
@@ -788,7 +937,7 @@ function initStatisticsCharts() {
           const radius = tierRadius(tier);
           const fill = tierFill(tier);
           const title = count > 0
-            ? `<title>${DAY_LABELS[r]} ${c}:00 — ${count} session${count !== 1 ? "s" : ""}</title>`
+            ? `<title>${chartEscapeHtml(interpolate(ngettext("%(day)s %(hour)s:00 \u2014 %(count)s session", "%(day)s %(hour)s:00 \u2014 %(count)s sessions", count), { day: DAY_LABELS[r], hour: c, count }, true))}</title>`
             : "";
           cells += `<circle cx="${cx}" cy="${cy}" r="${radius.toFixed(1)}" fill="${fill}">${title}</circle>`;
         }
@@ -797,7 +946,7 @@ function initStatisticsCharts() {
       let hourLabels = "";
       for (const h of [0, 6, 12, 18]) {
         const cx = labelW + h * dotArea + cellSize / 2;
-        const lbl = h === 0 ? "12a" : h === 12 ? "12p" : h < 12 ? `${h}a` : `${h - 12}p`;
+        const lbl = new Date(2024, 0, 1, h).toLocaleTimeString(document.documentElement.lang || undefined, { hour: "numeric" });
         hourLabels +=
           `<text x="${cx}" y="${labelH - 2}" text-anchor="middle" ` +
           `font-size="9" fill="#6b7280">${lbl}</text>`;
@@ -807,7 +956,7 @@ function initStatisticsCharts() {
       const legendEl = document.getElementById("activityRhythmLegend");
       if (legendEl) {
         legendEl.innerHTML =
-          '<span style="font-size:9px;color:#6b7280">Low</span>';
+          '<span style="font-size:9px;color:#6b7280">' + chartEscapeHtml(gettext("Low")) + '</span>';
         for (let t = 1; t <= TIERS; t++) {
           const r = tierRadius(t);
           const size = (r * 2).toFixed(1) + "px";
@@ -819,7 +968,7 @@ function initStatisticsCharts() {
         }
         legendEl.insertAdjacentHTML(
           "beforeend",
-          '<span style="font-size:9px;color:#6b7280">High</span>'
+          '<span style="font-size:9px;color:#6b7280">' + chartEscapeHtml(gettext("High")) + '</span>'
         );
       }
 
@@ -829,9 +978,9 @@ function initStatisticsCharts() {
         hourLabels + cells + `</svg>`;
     }
 
-    drawRhythmChart(getCurrentMediaType());
+    drawRhythmChart(getCurrentMediaTypes());
     window.addEventListener("stats-media-type-changed", function () {
-      drawRhythmChart(getCurrentMediaType());
+      drawRhythmChart(getCurrentMediaTypes());
     });
   }
 
@@ -881,8 +1030,8 @@ function initStatisticsCharts() {
           tooltipEl.id = "combinedPlaysTooltip";
           tooltipEl.style.cssText =
             "position:absolute;z-index:100;pointer-events:none;opacity:0;transition:opacity 0.2s ease;" +
-            "background:#1f2937;border:1px solid rgba(255,255,255,0.1);border-radius:6px;" +
-            "padding:10px 12px;font-size:13px;color:#f3f4f6;min-width:160px;" +
+            "background:" + CHART_TOOLTIP_BG + ";border:1px solid " + CHART_TOOLTIP_BORDER + ";border-radius:6px;" +
+            "padding:10px 12px;font-size:13px;color:" + CHART_TOOLTIP_TEXT + ";min-width:160px;" +
             "box-shadow:0 4px 12px rgba(0,0,0,0.4);";
           document.body.appendChild(tooltipEl);
         }
@@ -897,7 +1046,7 @@ function initStatisticsCharts() {
           const dataIndex = tooltipModel.dataPoints[0].dataIndex;
           const title = tooltipModel.title[0] || "";
           const byKey = (combinedPlaysData && combinedPlaysData[spec.key]) || {};
-          const currentMediaType = getCurrentMediaType();
+          const currentMediaType = getCurrentMediaTypes();
           const relevantTypes =
             currentMediaType === "all" ? COMBINED_PLAYS_MEDIA_TYPES : [currentMediaType];
 
@@ -908,7 +1057,7 @@ function initStatisticsCharts() {
               const value = ds ? Number(ds.data[dataIndex]) || 0 : 0;
               const color = ds ? ds.background_color : "#9ca3af";
               return {
-                label: COMBINED_PLAYS_TYPE_LABELS[type] || type,
+                label: chartDisplayLabel(COMBINED_PLAYS_TYPE_LABELS[type] || type),
                 value: value,
                 color: color,
               };
@@ -921,37 +1070,31 @@ function initStatisticsCharts() {
             });
 
           function fmtHoursValue(hrs) {
-            return (Number(hrs) || 0).toFixed(1) + "h";
+            return interpolate(gettext("%(count)sh"), { count: (Number(hrs) || 0).toLocaleString(document.documentElement.lang || undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) }, true);
           }
 
-          let html = '<div style="font-weight:600;margin-bottom:6px;color:#fff">' + title + "</div>";
+          let html = '<div style="font-weight:600;margin-bottom:6px;color:' + CHART_TOOLTIP_TEXT + '">' + title + "</div>";
           rows.forEach(function (row) {
             html +=
               '<div style="display:flex;align-items:center;gap:6px;margin-top:4px">' +
               '<span style="width:10px;height:10px;border-radius:2px;background:' +
               row.color +
               ';flex-shrink:0"></span>' +
-              "<span>" + row.label + ": " + fmtHoursValue(row.value) + "</span>" +
+              "<span>" + chartEscapeHtml(row.label) + ": " + fmtHoursValue(row.value) + "</span>" +
               "</div>";
           });
 
           tooltipEl.innerHTML = html;
         }
 
-        const position = context.chart.canvas.getBoundingClientRect();
-        tooltipEl.style.opacity = 1;
-        tooltipEl.style.left =
-          position.left + window.scrollX + tooltipModel.caretX + "px";
-        tooltipEl.style.top =
-          position.top + window.scrollY + tooltipModel.caretY + "px";
-        tooltipEl.style.transform = "translate(-50%, -100%)";
+        placeChartTooltip(tooltipEl, context);
       };
     }
 
-    function drawCombinedChart(spec, mediaType) {
+    function drawCombinedChart(spec, mediaTypes) {
       const container = document.getElementById(spec.containerId);
       const byKey = (combinedPlaysData && combinedPlaysData[spec.key]) || {};
-      const chartData = byKey[mediaType] || byKey.all;
+      const chartData = StatsMediaMerge.mergeSeriesChart(byKey, mediaTypes);
 
       if (!chartData || !chartData.labels || chartData.labels.length === 0) {
         if (combinedChartInstances[spec.key]) {
@@ -960,7 +1103,7 @@ function initStatisticsCharts() {
         }
         if (container) {
           container.innerHTML =
-            '<p class="text-sm text-gray-500 text-center py-8 w-full">No data for this filter.</p>';
+            '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No data for this filter.")) + '</p>';
         }
         return;
       }
@@ -993,21 +1136,21 @@ function initStatisticsCharts() {
           document.getElementById(spec.canvasId).getContext("2d"),
           { type: "bar", data: processed, options: chartOptions }
         );
-        window.__yamtrackStatsCharts.push(chart);
+        window.__floppyStatsCharts.push(chart);
         combinedChartInstances[spec.key] = chart;
       }
     }
 
-    function drawAllCombinedCharts(mediaType) {
+    function drawAllCombinedCharts(mediaTypes) {
       COMBINED_CHART_SPECS.forEach(function (spec) {
-        drawCombinedChart(spec, mediaType);
+        drawCombinedChart(spec, mediaTypes);
       });
     }
 
     if (combinedPlaysData && typeof combinedPlaysData === "object") {
-      drawAllCombinedCharts(getCurrentMediaType());
+      drawAllCombinedCharts(getCurrentMediaTypes());
       window.addEventListener("stats-media-type-changed", function () {
-        drawAllCombinedCharts(getCurrentMediaType());
+        drawAllCombinedCharts(getCurrentMediaTypes());
       });
     }
   }
@@ -1016,6 +1159,7 @@ function initStatisticsCharts() {
   const timeWorldsCanvas = document.getElementById("timeWorldsChart");
   const timeWorldsLegendEl = document.getElementById("timeWorldsLegend");
   const timeWorldsCenterEl = document.getElementById("timeWorldsCenter");
+  const timeWorldsInfoEl = document.getElementById("timeWorldsInfo");
   const distEl = document.getElementById("media_type_distribution");
 
   if (timeWorldsCanvas && distEl) {
@@ -1033,11 +1177,11 @@ function initStatisticsCharts() {
     function fmtHours(hrs, maxParts) {
       if (maxParts === undefined) maxParts = 2;
       let minutes = Math.round(hrs * 60);
-      if (minutes <= 0) return "0h 0min";
+      if (minutes <= 0) return interpolate(gettext("%(hours)sh %(minutes)smin"), { hours: 0, minutes: 0 }, true);
       if (durationFormat === "long_units") {
-        if (minutes < 60) return minutes + "min";
+        if (minutes < 60) return interpolate(gettext("%(count)smin"), { count: minutes }, true);
         if (minutes < 1440) {
-          return Math.floor(minutes / 60) + "h " + (minutes % 60) + "min";
+          return interpolate(gettext("%(hours)sh %(minutes)smin"), { hours: Math.floor(minutes / 60), minutes: minutes % 60 }, true);
         }
         const MONTH = 43800;
         const DAY = 1440;
@@ -1049,13 +1193,13 @@ function initStatisticsCharts() {
         const h = Math.floor(rem / HOUR);
         const m = rem % HOUR;
         const parts = [];
-        if (mo) parts.push(mo + "mo");
-        if (d) parts.push(d + "d");
-        if (h) parts.push(h + "h");
-        if (m || !parts.length) parts.push(m + "min");
+        if (mo) parts.push(interpolate(gettext("%(count)smo"), { count: mo }, true));
+        if (d) parts.push(interpolate(gettext("%(count)sd"), { count: d }, true));
+        if (h) parts.push(interpolate(gettext("%(count)sh"), { count: h }, true));
+        if (m || !parts.length) parts.push(interpolate(gettext("%(count)smin"), { count: m }, true));
         return parts.slice(0, maxParts).join(" ");
       }
-      return Math.floor(minutes / 60) + "h " + (minutes % 60) + "min";
+      return interpolate(gettext("%(hours)sh %(minutes)smin"), { hours: Math.floor(minutes / 60), minutes: minutes % 60 }, true);
     }
 
     // Palette for genre slices (cycles if there are more genres than colors).
@@ -1069,8 +1213,23 @@ function initStatisticsCharts() {
     function loadGenreData(slug) {
       try {
         const el = document.getElementById(slug + "_top_genres");
-        return el ? JSON.parse(el.textContent || "[]") : [];
+        // An empty list is emitted as the string "[]" (template default), so check the type.
+        const genres = el ? JSON.parse(el.textContent || "[]") : [];
+        return Array.isArray(genres) ? genres : [];
       } catch (_) { return []; }
+    }
+
+    // Actual (non-overlapping) total hours for a media type, mirroring the
+    // fallback used by date-range.js's currentTypeSummary getter. Genre
+    // buckets attribute full hours to every genre a title has, so they can't
+    // be summed for a "total" — this reads the real total instead.
+    function loadTypeTotalHours(slug) {
+      try {
+        const el = document.getElementById("summary_stats_by_type");
+        const all = el ? JSON.parse(el.textContent || "{}") : {};
+        const s = all[slug] || all.all || {};
+        return (s.total_minutes || 0) / 60;
+      } catch (_) { return 0; }
     }
     const GENRE_TYPES = { tv: 1, movie: 1, anime: 1, music: 1, game: 1 };
 
@@ -1088,8 +1247,8 @@ function initStatisticsCharts() {
         el.id = "timeWorldsTooltip";
         el.style.cssText =
           "position:fixed;z-index:9999;pointer-events:none;opacity:0;transition:opacity 0.1s;" +
-          "background:#1f2937;border:1px solid rgba(255,255,255,0.1);border-radius:6px;" +
-          "padding:8px 10px;font-size:12px;color:#f3f4f6;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
+          "background:" + CHART_TOOLTIP_BG + ";border:1px solid " + CHART_TOOLTIP_BORDER + ";border-radius:6px;" +
+          "padding:8px 10px;font-size:12px;color:" + CHART_TOOLTIP_TEXT + ";white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
         document.body.appendChild(el);
       }
       return el;
@@ -1106,16 +1265,16 @@ function initStatisticsCharts() {
 
       if (tooltip.dataPoints && tooltip.dataPoints.length) {
         const dp = tooltip.dataPoints[0];
-        const label = dp.label || "";
+        const label = chartDisplayLabel(dp.label || "");
         const hrs = dp.raw;
         const total = getTotalHours();
         const pct = total > 0 ? Math.round((hrs / total) * 100) : 0;
         const color = dp.dataset.backgroundColor[dp.dataIndex];
 
         tooltipEl.innerHTML =
-          '<div style="font-weight:600;margin-bottom:4px;color:#fff">' + label + "</div>" +
+          '<div style="font-weight:600;margin-bottom:4px;color:' + CHART_TOOLTIP_TEXT + '">' + chartEscapeHtml(label) + "</div>" +
           '<div style="display:flex;align-items:center;gap:6px">' +
-            '<span style="width:10px;height:10px;border-radius:2px;background:' + color + ';flex-shrink:0"></span>' +
+            '<span style="width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + ';flex-shrink:0"></span>' +
             '<span>' + fmtHours(hrs, Infinity) + " (" + pct + "%)</span>" +
           "</div>";
       }
@@ -1126,7 +1285,7 @@ function initStatisticsCharts() {
 
       // Flip left if near right edge of viewport.
       const tipW = tooltipEl.offsetWidth || 160;
-      const left = x + 12 + tipW > window.innerWidth ? x - tipW - 12 : x + 12;
+      const left = Math.max(8, x + 12 + tipW > window.innerWidth ? x - tipW - 12 : x + 12);
 
       tooltipEl.style.left = left + "px";
       tooltipEl.style.top = (y - 16) + "px";
@@ -1158,7 +1317,7 @@ function initStatisticsCharts() {
             elements: { arc: { borderWidth: 1, borderColor: "rgba(0,0,0,0.15)" } },
           },
         });
-        window.__yamtrackStatsCharts.push(donutChartInstance);
+        window.__floppyStatsCharts.push(donutChartInstance);
       }
     }
 
@@ -1168,7 +1327,7 @@ function initStatisticsCharts() {
       const sortedIndices = labels.map(function (_, i) { return i; })
         .sort(function (a, b) { return data[b] - data[a]; });
       sortedIndices.forEach(function (i) {
-        const label = labels[i];
+        const label = chartDisplayLabel(labels[i]);
         const hrs = data[i];
         const color = colors[i];
         const pct = totalHours > 0 ? Math.round((hrs / totalHours) * 100) : 0;
@@ -1176,11 +1335,11 @@ function initStatisticsCharts() {
         row.style.cssText = "display:flex;align-items:center;gap:14px;font-size:11px;line-height:1.3;";
         row.innerHTML =
           '<div style="flex-shrink:0;display:flex;align-items:center;gap:6px;width:74px">' +
-            '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + color + '"></span>' +
-            '<span style="flex:1;color:#d1d5db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + label + "</span>" +
+            '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + '"></span>' +
+            '<span style="flex:1;color:#d1d5db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + chartEscapeHtml(label) + "</span>" +
           '</div>' +
           '<div style="flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,0.07);overflow:hidden;min-width:40px">' +
-            '<div style="height:100%;border-radius:3px;background:' + color + ';width:' + pct + '%"></div>' +
+            '<div style="height:100%;border-radius:3px;background:' + chartSafeColor(color) + ';width:' + pct + '%"></div>' +
           '</div>' +
           '<span style="flex-shrink:0;width:34px;text-align:center;color:#d1d5db;font-weight:600">' + pct + "%</span>" +
           '<span style="flex-shrink:0;min-width:80px;text-align:center;color:#6b7280;font-variant-numeric:tabular-nums;white-space:nowrap">' + fmtHours(hrs) + "</span>";
@@ -1188,10 +1347,12 @@ function initStatisticsCharts() {
       });
     }
 
-    function drawTimeWorldsChart(mediaType) {
+    function drawTimeWorldsChart(mediaTypes) {
       const container = document.getElementById("timeWorldsContainer");
-      const isFiltered = mediaType && mediaType !== "all";
-      const hasGenres = isFiltered && GENRE_TYPES[mediaType];
+      const isFiltered = mediaTypes.length > 0;
+      // Genres are per type and overlap between types, so they only show for one type.
+      const mediaType = mediaTypes.length === 1 ? mediaTypes[0] : null;
+      const hasGenres = mediaType && GENRE_TYPES[mediaType];
       const genres = hasGenres ? loadGenreData(mediaType) : [];
 
       if (isFiltered && hasGenres && genres.length > 0) {
@@ -1199,16 +1360,17 @@ function initStatisticsCharts() {
         const labels = genres.map(function (g) { return g.name; });
         const data = genres.map(function (g) { return +(g.minutes / 60).toFixed(2); });
         const colors = genres.map(function (_, i) { return GENRE_PALETTE[i % GENRE_PALETTE.length]; });
-        const totalHours = data.reduce(function (a, b) { return a + b; }, 0);
+        const totalHours = loadTypeTotalHours(mediaType);
 
-        if (timeWorldsTitleEl) timeWorldsTitleEl.textContent = "Top Genres";
-        if (timeWorldsSubtitleEl) timeWorldsSubtitleEl.textContent = "Where your " + mediaType + " hours go.";
+        if (timeWorldsTitleEl) timeWorldsTitleEl.textContent = gettext("Top Genres");
+        if (timeWorldsSubtitleEl) timeWorldsSubtitleEl.textContent = interpolate(gettext("Where your %(type)s hours go."), { type: chartDisplayLabel(MEDIA_SLUG_TO_LABEL[mediaType] || mediaType) }, true);
+        if (timeWorldsInfoEl) timeWorldsInfoEl.classList.remove("hidden");
 
         if (timeWorldsCenterEl) {
           timeWorldsCenterEl.innerHTML =
-            '<span style="font-size:1rem;font-weight:700;color:#fff;line-height:1.2;text-align:center">' +
+            '<span style="font-size:1rem;font-weight:700;color:' + CHART_TOOLTIP_TEXT + ';line-height:1.2;text-align:center">' +
             fmtHours(totalHours) + "</span>" +
-            '<span style="font-size:0.65rem;color:#9ca3af;line-height:1.2">total</span>';
+            '<span style="font-size:0.65rem;color:#9ca3af;line-height:1.2">' + chartEscapeHtml(gettext("total")) + '</span>';
         }
 
         renderDonut(labels, data, colors, function () { return totalHours; });
@@ -1217,8 +1379,9 @@ function initStatisticsCharts() {
       }
 
       // ── Type distribution mode (all, or filtered type with no genre data) ─
-      if (timeWorldsTitleEl) timeWorldsTitleEl.textContent = "Hours by Media Type";
-      if (timeWorldsSubtitleEl) timeWorldsSubtitleEl.textContent = "Where your hours go.";
+      if (timeWorldsTitleEl) timeWorldsTitleEl.textContent = gettext("Hours by Media Type");
+      if (timeWorldsSubtitleEl) timeWorldsSubtitleEl.textContent = gettext("Where your hours go.");
+      if (timeWorldsInfoEl) timeWorldsInfoEl.classList.add("hidden");
 
       // Build the filtered view of the distribution data.
       let labels, data, colors;
@@ -1228,24 +1391,24 @@ function initStatisticsCharts() {
         data = ds.data || [];
         colors = ds.backgroundColor || [];
       } else {
-        // Single-type filter for a type with no genre breakdown.
-        const targetLabel = MEDIA_SLUG_TO_LABEL[mediaType];
-        const idx = targetLabel ? (fullDistData.labels || []).indexOf(targetLabel) : -1;
-        if (idx >= 0) {
-          const ds = fullDistData.datasets[0];
-          labels = [fullDistData.labels[idx]];
-          data = [ds.data[idx]];
-          colors = [ds.backgroundColor[idx]];
-        } else {
-          labels = []; data = []; colors = [];
-        }
+        // Keep only the selected types' slices (also used for one type with no genre breakdown).
+        const ds = fullDistData.datasets[0];
+        labels = []; data = []; colors = [];
+        mediaTypes.forEach(function (type) {
+          const idx = MEDIA_SLUG_TO_LABEL[type] ? fullDistData.labels.indexOf(MEDIA_SLUG_TO_LABEL[type]) : -1;
+          if (idx >= 0) {
+            labels.push(fullDistData.labels[idx]);
+            data.push(ds.data[idx]);
+            colors.push(ds.backgroundColor[idx]);
+          }
+        });
       }
 
       if (!labels.length) {
         if (donutChartInstance) { donutChartInstance.destroy(); donutChartInstance = null; }
         if (container) {
           container.innerHTML =
-            '<p class="text-sm text-gray-500 text-center py-8 w-full">No time data available for this filter.</p>';
+            '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No time data available for this filter.")) + '</p>';
         }
         return;
       }
@@ -1254,9 +1417,9 @@ function initStatisticsCharts() {
 
       if (timeWorldsCenterEl) {
         timeWorldsCenterEl.innerHTML =
-          '<span style="font-size:1rem;font-weight:700;color:#fff;line-height:1.2;text-align:center">' +
+          '<span style="font-size:1rem;font-weight:700;color:' + CHART_TOOLTIP_TEXT + ';line-height:1.2;text-align:center">' +
           fmtHours(totalHours) + "</span>" +
-          '<span style="font-size:0.65rem;color:#9ca3af;line-height:1.2">total</span>';
+          '<span style="font-size:0.65rem;color:#9ca3af;line-height:1.2">' + chartEscapeHtml(gettext("total")) + '</span>';
       }
 
       renderDonut(labels, data, colors, function () { return totalHours; });
@@ -1264,15 +1427,15 @@ function initStatisticsCharts() {
     }
 
     if (fullDistData.labels && fullDistData.labels.length > 0) {
-      drawTimeWorldsChart(getCurrentMediaType());
+      drawTimeWorldsChart(getCurrentMediaTypes());
       window.addEventListener("stats-media-type-changed", function () {
-        drawTimeWorldsChart(getCurrentMediaType());
+        drawTimeWorldsChart(getCurrentMediaTypes());
       });
     } else {
       const container = document.getElementById("timeWorldsContainer");
       if (container) {
         container.innerHTML =
-          '<p class="text-sm text-gray-500 text-center py-8 w-full">No time data available for this range.</p>';
+          '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No time data available for this range.")) + '</p>';
       }
     }
   }
@@ -1290,8 +1453,8 @@ function initStatisticsCharts() {
         el.id = "statusCompositionTooltip";
         el.style.cssText =
           "position:fixed;z-index:9999;pointer-events:none;opacity:0;transition:opacity 0.1s;" +
-          "background:#1f2937;border:1px solid rgba(255,255,255,0.1);border-radius:6px;" +
-          "padding:8px 10px;font-size:12px;color:#f3f4f6;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
+          "background:" + CHART_TOOLTIP_BG + ";border:1px solid " + CHART_TOOLTIP_BORDER + ";border-radius:6px;" +
+          "padding:8px 10px;font-size:12px;color:" + CHART_TOOLTIP_TEXT + ";white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
         document.body.appendChild(el);
       }
       return el;
@@ -1306,23 +1469,23 @@ function initStatisticsCharts() {
       }
       if (tooltip.dataPoints && tooltip.dataPoints.length) {
         const dp = tooltip.dataPoints[0];
-        const label = dp.label || "";
+        const label = chartDisplayLabel(dp.label || "");
         const count = dp.raw;
         const total = getTotal();
         const pct = total > 0 ? Math.round((count / total) * 100) : 0;
         const color = dp.dataset.backgroundColor[dp.dataIndex];
         tooltipEl.innerHTML =
-          '<div style="font-weight:600;margin-bottom:4px;color:#fff">' + label + "</div>" +
+          '<div style="font-weight:600;margin-bottom:4px;color:' + CHART_TOOLTIP_TEXT + '">' + chartEscapeHtml(label) + "</div>" +
           '<div style="display:flex;align-items:center;gap:6px">' +
-            '<span style="width:10px;height:10px;border-radius:2px;background:' + color + ';flex-shrink:0"></span>' +
-            "<span>" + count.toLocaleString() + " (" + pct + "%)</span>" +
+            '<span style="width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + ';flex-shrink:0"></span>' +
+            "<span>" + count.toLocaleString(document.documentElement.lang || undefined) + " (" + pct + "%)</span>" +
           "</div>";
       }
       const rect = canvas.getBoundingClientRect();
       const x = rect.left + tooltip.caretX;
       const y = rect.top + tooltip.caretY;
       const tipW = tooltipEl.offsetWidth || 160;
-      const left = x + 12 + tipW > window.innerWidth ? x - tipW - 12 : x + 12;
+      const left = Math.max(8, x + 12 + tipW > window.innerWidth ? x - tipW - 12 : x + 12);
       tooltipEl.style.left = left + "px";
       tooltipEl.style.top = (y - 16) + "px";
       tooltipEl.style.opacity = "1";
@@ -1336,9 +1499,9 @@ function initStatisticsCharts() {
 
       if (centerEl) {
         centerEl.innerHTML =
-          '<span style="font-size:1.1rem;font-weight:700;color:#fff;line-height:1.2">' +
-          total.toLocaleString() + "</span>" +
-          '<span style="font-size:0.65rem;color:#9ca3af;line-height:1.2">total items</span>';
+          '<span style="font-size:1.1rem;font-weight:700;color:' + CHART_TOOLTIP_TEXT + ';line-height:1.2">' +
+          total.toLocaleString(document.documentElement.lang || undefined) + "</span>" +
+          '<span style="font-size:0.65rem;color:#9ca3af;line-height:1.2">' + chartEscapeHtml(gettext("total items")) + '</span>';
       }
 
       if (statusCompositionChartInstance) {
@@ -1363,7 +1526,7 @@ function initStatisticsCharts() {
             elements: { arc: { borderWidth: 1, borderColor: "rgba(0,0,0,0.15)" } },
           },
         });
-        window.__yamtrackStatsCharts.push(statusCompositionChartInstance);
+        window.__floppyStatsCharts.push(statusCompositionChartInstance);
       }
 
       if (legendEl) {
@@ -1371,31 +1534,31 @@ function initStatisticsCharts() {
         const sortedIndices = labels.map(function (_, i) { return i; })
           .sort(function (a, b) { return data[b] - data[a]; });
         sortedIndices.forEach(function (i) {
-          const label = labels[i];
+          const label = chartDisplayLabel(labels[i]);
           const count = data[i];
           const color = colors[i];
           const pct = total > 0 ? Math.round((count / total) * 100) : 0;
           const row = document.createElement("div");
-          row.style.cssText = "display:flex;align-items:center;gap:10px;font-size:11px;";
+          row.style.cssText = "display:flex;align-items:center;gap:10px;font-size:11px;min-width:250px;";
           row.innerHTML =
             '<div style="flex-shrink:0;display:flex;align-items:center;gap:6px;min-width:0;width:84px">' +
-              '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + color + '"></span>' +
-              '<span style="min-width:0;color:#d1d5db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + label + "</span>" +
+              '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + '"></span>' +
+              '<span style="min-width:0;color:#d1d5db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + chartEscapeHtml(label) + "</span>" +
             "</div>" +
             '<div style="flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,0.07);overflow:hidden;min-width:40px">' +
-              '<div style="height:100%;border-radius:3px;background:' + color + ';width:' + pct + '%"></div>' +
+              '<div style="height:100%;border-radius:3px;background:' + chartSafeColor(color) + ';width:' + pct + '%"></div>' +
             "</div>" +
-            '<span style="flex-shrink:0;width:34px;text-align:center;color:#fff;font-weight:700">' + pct + "%</span>" +
-            '<span style="flex-shrink:0;min-width:60px;text-align:center;color:#6b7280;font-variant-numeric:tabular-nums">' + count.toLocaleString() + "</span>";
+            '<span style="flex-shrink:0;width:34px;text-align:center;color:' + CHART_TOOLTIP_TEXT + ';font-weight:700">' + pct + "%</span>" +
+            '<span style="flex-shrink:0;min-width:60px;text-align:center;color:#6b7280;font-variant-numeric:tabular-nums">' + count.toLocaleString(document.documentElement.lang || undefined) + "</span>";
           legendEl.appendChild(row);
         });
       }
     }
 
-    function drawStatusComposition(mediaType) {
+    function drawStatusComposition(mediaTypes) {
       const container = document.getElementById("statusCompositionContainer");
       const subtitleEl = document.getElementById("statusCompositionSubtitle");
-      const isFiltered = mediaType && mediaType !== "all";
+      const isFiltered = mediaTypes.length > 0;
       const statusLabels = (statusCompositionData.datasets || []).map(function (ds) { return ds.label; });
       const statusColors = (statusCompositionData.datasets || []).map(function (ds) { return ds.background_color; });
 
@@ -1414,31 +1577,32 @@ function initStatisticsCharts() {
           }
         });
       } else {
-        targetLabel = MEDIA_SLUG_TO_LABEL[mediaType];
-        const idx = targetLabel ? (statusCompositionData.labels || []).indexOf(targetLabel) : -1;
-        if (idx >= 0) {
-          (statusCompositionData.datasets || []).forEach(function (ds, i) {
-            const value = Number((ds.data || [])[idx]) || 0;
-            if (value > 0) {
-              labels.push(statusLabels[i]);
-              data.push(value);
-              colors.push(statusColors[i]);
-            }
-          });
-        }
+        // Sum each status over the selected types' columns.
+        if (mediaTypes.length === 1) targetLabel = MEDIA_SLUG_TO_LABEL[mediaTypes[0]];
+        const idxs = mediaTypes
+          .map(function (type) { return (statusCompositionData.labels || []).indexOf(MEDIA_SLUG_TO_LABEL[type]); })
+          .filter(function (idx) { return idx >= 0; });
+        (statusCompositionData.datasets || []).forEach(function (ds, i) {
+          const value = idxs.reduce(function (sum, idx) { return sum + (Number((ds.data || [])[idx]) || 0); }, 0);
+          if (value > 0) {
+            labels.push(statusLabels[i]);
+            data.push(value);
+            colors.push(statusColors[i]);
+          }
+        });
       }
 
       if (subtitleEl) {
         subtitleEl.textContent = isFiltered && targetLabel
-          ? targetLabel + " status breakdown."
-          : "What portion of your library is in each state.";
+          ? interpolate(gettext("%(type)s status breakdown."), { type: chartDisplayLabel(targetLabel) }, true)
+          : gettext("What portion of your library is in each state.");
       }
 
       if (!labels.length) {
         if (statusCompositionChartInstance) { statusCompositionChartInstance.destroy(); statusCompositionChartInstance = null; }
         if (container) {
           container.innerHTML =
-            '<p class="text-sm text-gray-500 text-center py-8 w-full">No status data available for this filter.</p>';
+            '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No status data available for this filter.")) + '</p>';
         }
         return;
       }
@@ -1449,7 +1613,7 @@ function initStatisticsCharts() {
             '<div id="statusCompositionCenter" class="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-center"></div>' +
             '<canvas id="statusCompositionChart" style="position:relative;z-index:1"></canvas>' +
           "</div>" +
-          '<div id="statusCompositionLegend" class="flex-1 min-w-0 space-y-1.5"></div>';
+          '<div id="statusCompositionLegend" class="flex-1 min-w-0 overflow-x-auto overflow-y-hidden scrollbar-hidden space-y-1.5"></div>';
         statusCompositionChartInstance = null;
       }
 
@@ -1462,15 +1626,15 @@ function initStatisticsCharts() {
     }
 
     if (statusCompositionData.labels && statusCompositionData.labels.length > 0) {
-      drawStatusComposition(getCurrentMediaType());
+      drawStatusComposition(getCurrentMediaTypes());
       window.addEventListener("stats-media-type-changed", function () {
-        drawStatusComposition(getCurrentMediaType());
+        drawStatusComposition(getCurrentMediaTypes());
       });
     } else {
       const container = document.getElementById("statusCompositionContainer");
       if (container) {
         container.innerHTML =
-          '<p class="text-sm text-gray-500 text-center py-8 w-full">No status data available for this range.</p>';
+          '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No status data available for this range.")) + '</p>';
       }
     }
   }
@@ -1481,8 +1645,8 @@ function initStatisticsCharts() {
     const ratingDistributionData = JSON.parse(ratingDistributionDataEl.textContent || "{}");
     let ratingDistributionChartInstance = null;
 
-    function buildRatingDistribution(mediaType) {
-      const isFiltered = mediaType && mediaType !== "all";
+    function buildRatingDistribution(mediaTypes) {
+      const isFiltered = mediaTypes.length > 0;
       const labels = ratingDistributionData.labels || [];
       const datasets = ratingDistributionData.datasets || [];
       const data = labels.map(function () { return 0; });
@@ -1500,30 +1664,34 @@ function initStatisticsCharts() {
       if (!isFiltered) {
         datasets.forEach(addDataset);
       } else {
-        targetLabel = MEDIA_SLUG_TO_LABEL[mediaType];
-        const match = datasets.find(function (ds) { return ds.label === targetLabel; });
-        if (match) addDataset(match);
+        if (mediaTypes.length === 1) targetLabel = MEDIA_SLUG_TO_LABEL[mediaTypes[0]];
+        const wanted = mediaTypes.map(function (type) { return MEDIA_SLUG_TO_LABEL[type]; });
+        datasets.filter(function (ds) { return wanted.indexOf(ds.label) >= 0; }).forEach(addDataset);
       }
 
       return { labels: labels, data: data, totalScored: totalScored, targetLabel: targetLabel };
     }
 
-    function drawRatingDistribution(mediaType) {
+    function drawRatingDistribution(mediaTypes) {
       const container = document.getElementById("ratingDistributionContainer");
       const subtitleEl = document.getElementById("ratingDistributionSubtitle");
-      const built = buildRatingDistribution(mediaType);
+      const built = buildRatingDistribution(mediaTypes);
 
       if (subtitleEl) {
-        const itemsPhrase = built.totalScored.toLocaleString() + " rated" +
-          (built.targetLabel ? " " + built.targetLabel : "") + " item" + (built.totalScored === 1 ? "" : "s");
-        subtitleEl.textContent = "How your " + itemsPhrase + " are distributed.";
+        const summary = built.targetLabel
+          ? ngettext("How your %(count)s rated item (%(type)s) is distributed.", "How your %(count)s rated items (%(type)s) are distributed.", built.totalScored)
+          : ngettext("How your %(count)s rated item is distributed.", "How your %(count)s rated items are distributed.", built.totalScored);
+        subtitleEl.textContent = interpolate(summary, {
+          count: built.totalScored.toLocaleString(document.documentElement.lang || undefined),
+          type: chartDisplayLabel(built.targetLabel || ""),
+        }, true);
       }
 
       if (!built.totalScored) {
         if (ratingDistributionChartInstance) { ratingDistributionChartInstance.destroy(); ratingDistributionChartInstance = null; }
         if (container) {
           container.innerHTML =
-            '<p class="text-sm text-gray-500 text-center py-8 w-full">No ratings yet for this filter.</p>';
+            '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No ratings yet for this filter.")) + '</p>';
         }
         return;
       }
@@ -1560,7 +1728,7 @@ function initStatisticsCharts() {
         formatter: function (value) {
           if (!value) return "";
           const pct = built.totalScored > 0 ? ((value / built.totalScored) * 100).toFixed(1) : "0.0";
-          return value.toLocaleString() + "\n(" + pct + "%)";
+          return value.toLocaleString(document.documentElement.lang || undefined) + "\n(" + pct + "%)";
         },
       };
       chartOptions.plugins.tooltip = {
@@ -1574,8 +1742,8 @@ function initStatisticsCharts() {
             tooltipEl.id = "ratingDistributionTooltip";
             tooltipEl.style.cssText =
               "position:absolute;z-index:100;pointer-events:none;opacity:0;transition:opacity 0.2s ease;" +
-              "background:#1f2937;border:1px solid rgba(255,255,255,0.1);border-radius:6px;" +
-              "padding:8px 10px;font-size:12px;color:#f3f4f6;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
+              "background:" + CHART_TOOLTIP_BG + ";border:1px solid " + CHART_TOOLTIP_BORDER + ";border-radius:6px;" +
+              "padding:8px 10px;font-size:12px;color:" + CHART_TOOLTIP_TEXT + ";box-shadow:0 4px 12px rgba(0,0,0,0.4);";
             document.body.appendChild(tooltipEl);
           }
           const tooltipModel = context.tooltip;
@@ -1587,21 +1755,17 @@ function initStatisticsCharts() {
             const dataIndex = tooltipModel.dataPoints[0].dataIndex;
             const value = built.data[dataIndex] || 0;
             tooltipEl.innerHTML =
-              '<div style="font-weight:600;color:#fff">Rating ' + built.labels[dataIndex] + "</div>" +
-              '<div style="margin-top:4px">' + value.toLocaleString() + (value === 1 ? " item" : " items") + "</div>";
+              '<div style="font-weight:600;color:' + CHART_TOOLTIP_TEXT + '">' + chartEscapeHtml(interpolate(gettext("Rating %(rating)s"), { rating: built.labels[dataIndex] }, true)) + "</div>" +
+              '<div style="margin-top:4px">' + chartEscapeHtml(interpolate(ngettext("%(count)s item", "%(count)s items", value), { count: value.toLocaleString(document.documentElement.lang || undefined) }, true)) + "</div>";
           }
-          const position = context.chart.canvas.getBoundingClientRect();
-          tooltipEl.style.opacity = 1;
-          tooltipEl.style.left = position.left + window.scrollX + tooltipModel.caretX + "px";
-          tooltipEl.style.top = position.top + window.scrollY + tooltipModel.caretY + "px";
-          tooltipEl.style.transform = "translate(-50%, -100%)";
+          placeChartTooltip(tooltipEl, context);
         },
       };
 
       const chartData = {
         labels: built.labels,
         datasets: [{
-          label: "Items",
+          label: gettext("Items"),
           data: built.data,
           backgroundColor: "#6366f1",
           borderColor: "rgba(255, 255, 255, 0.1)",
@@ -1620,20 +1784,20 @@ function initStatisticsCharts() {
           data: chartData,
           options: chartOptions,
         });
-        window.__yamtrackStatsCharts.push(ratingDistributionChartInstance);
+        window.__floppyStatsCharts.push(ratingDistributionChartInstance);
       }
     }
 
     if (ratingDistributionData.labels && ratingDistributionData.labels.length > 0) {
-      drawRatingDistribution(getCurrentMediaType());
+      drawRatingDistribution(getCurrentMediaTypes());
       window.addEventListener("stats-media-type-changed", function () {
-        drawRatingDistribution(getCurrentMediaType());
+        drawRatingDistribution(getCurrentMediaTypes());
       });
     } else {
       const container = document.getElementById("ratingDistributionContainer");
       if (container) {
         container.innerHTML =
-          '<p class="text-sm text-gray-500 text-center py-8 w-full">No ratings yet.</p>';
+          '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No ratings yet.")) + '</p>';
       }
     }
   }
@@ -1656,18 +1820,19 @@ function initStatisticsCharts() {
       });
     }
 
-    function drawStatusBreakdown(mediaType) {
+    function drawStatusBreakdown(mediaTypes) {
       const container = document.getElementById("statusBreakdownContainer");
-      const isFiltered = mediaType && mediaType !== "all";
-      const targetLabel = isFiltered ? MEDIA_SLUG_TO_LABEL[mediaType] : null;
+      const isFiltered = mediaTypes.length > 0;
+      const targetLabel = mediaTypes.length === 1 ? MEDIA_SLUG_TO_LABEL[mediaTypes[0]] : null;
+      const selectedLabels = mediaTypes.map(function (type) { return MEDIA_SLUG_TO_LABEL[type]; });
       const subtitleText = targetLabel
-        ? targetLabel + " status counts."
-        : "Breakdown by type across all status states.";
+        ? interpolate(gettext("%(type)s status counts."), { type: chartDisplayLabel(targetLabel) }, true)
+        : gettext("Breakdown by type across all status states.");
 
       const typeLabels = statusBreakdownData.labels || [];
       let rowIndices = [];
       typeLabels.forEach(function (label, i) {
-        if (!isFiltered || label === targetLabel) rowIndices.push(i);
+        if (!isFiltered || selectedLabels.indexOf(label) >= 0) rowIndices.push(i);
       });
 
       // Only show status columns that actually have items, mirroring the
@@ -1680,7 +1845,7 @@ function initStatisticsCharts() {
         if (container) {
           container.innerHTML =
             '<p class="text-xs text-gray-400 mb-3">' + escapeHtml(subtitleText) + "</p>" +
-            '<p class="text-sm text-gray-500 text-center py-8 w-full">No status data available for this filter.</p>';
+            '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No status data available for this filter.")) + '</p>';
         }
         return;
       }
@@ -1700,11 +1865,11 @@ function initStatisticsCharts() {
       html +=
         '<p class="text-xs text-gray-400 flex-1 min-w-0" style="min-width:110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" ' +
         'id="statusBreakdownSubtitle" title="' + escapeHtml(subtitleText) + '">' + escapeHtml(subtitleText) + "</p>";
-      html += '<div class="shrink-0 text-right text-xs font-medium text-gray-400" style="width:56px">Total</div>';
+      html += '<div class="shrink-0 text-right text-xs font-medium text-gray-400" style="width:56px">' + chartEscapeHtml(gettext("Total")) + '</div>';
       statusColumns.forEach(function (ds) {
         html +=
-          '<div class="shrink-0 text-right text-xs font-medium" style="width:' + colWidth(ds) + 'px;color:' + ds.background_color + '">' +
-          escapeHtml(ds.label) + "</div>";
+          '<div class="shrink-0 text-right text-xs font-medium" style="width:' + colWidth(ds) + 'px;color:' + chartSafeColor(ds.background_color) + '">' +
+          escapeHtml(chartDisplayLabel(ds.label)) + "</div>";
       });
       html += "</div>";
 
@@ -1720,12 +1885,12 @@ function initStatisticsCharts() {
           '<div class="flex items-center gap-2 flex-1 min-w-0" style="min-width:110px">' +
           '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" ' +
           'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ' +
-          'class="w-4 h-4 shrink-0" style="color:' + (visuals.color || "#9ca3af") + '">' + (visuals.icon || "") + "</svg>" +
-          '<span class="text-sm text-gray-300 truncate">' + escapeHtml(typeLabel) + "</span>" +
+          'class="w-4 h-4 shrink-0" style="color:' + chartSafeColor(visuals.color || "#9ca3af") + '">' + (visuals.icon || "") + "</svg>" +
+          '<span class="text-sm text-gray-300 truncate">' + escapeHtml(chartDisplayLabel(typeLabel)) + "</span>" +
           "</div>";
         html +=
           '<div class="shrink-0 text-sm font-semibold text-white text-right" style="width:56px">' +
-          total.toLocaleString() + "</div>";
+          total.toLocaleString(document.documentElement.lang || undefined) + "</div>";
 
         statusColumns.forEach(function (ds) {
           const value = Number((ds.data || [])[idx]) || 0;
@@ -1734,14 +1899,14 @@ function initStatisticsCharts() {
             html +=
               '<div class="shrink-0 flex items-center gap-2" style="width:' + colWidth(ds) + 'px">' +
               '<div class="rounded-full overflow-hidden shrink-0" style="width:34px;height:4px;background:rgba(255,255,255,0.1)">' +
-              '<div style="height:100%;width:' + pct + '%;background:' + ds.background_color + '"></div>' +
+              '<div style="height:100%;width:' + pct + '%;background:' + chartSafeColor(ds.background_color) + '"></div>' +
               "</div>" +
-              '<span class="text-sm text-right flex-1" style="color:' + ds.background_color + '">' + value.toLocaleString() + "</span>" +
+              '<span class="text-sm text-right flex-1" style="color:' + chartSafeColor(ds.background_color) + '">' + value.toLocaleString(document.documentElement.lang || undefined) + "</span>" +
               "</div>";
           } else {
             html +=
-              '<div class="shrink-0 text-sm text-right" style="width:' + colWidth(ds) + 'px;color:' + ds.background_color + '">' +
-              value.toLocaleString() + "</div>";
+              '<div class="shrink-0 text-sm text-right" style="width:' + colWidth(ds) + 'px;color:' + chartSafeColor(ds.background_color) + '">' +
+              value.toLocaleString(document.documentElement.lang || undefined) + "</div>";
           }
         });
 
@@ -1754,15 +1919,15 @@ function initStatisticsCharts() {
     }
 
     if (statusBreakdownData.labels && statusBreakdownData.labels.length > 0) {
-      drawStatusBreakdown(getCurrentMediaType());
+      drawStatusBreakdown(getCurrentMediaTypes());
       window.addEventListener("stats-media-type-changed", function () {
-        drawStatusBreakdown(getCurrentMediaType());
+        drawStatusBreakdown(getCurrentMediaTypes());
       });
     } else {
       const container = document.getElementById("statusBreakdownContainer");
       if (container) {
         container.innerHTML =
-          '<p class="text-sm text-gray-500 text-center py-8 w-full">No status data available for this range.</p>';
+          '<p class="text-sm text-[var(--color-text-muted)] text-center py-8 w-full">' + chartEscapeHtml(gettext("No status data available for this range.")) + '</p>';
       }
     }
   }
@@ -1799,9 +1964,9 @@ function initStatisticsCharts() {
 
       if (centerEl) {
         centerEl.innerHTML =
-          '<span style="font-size:1rem;font-weight:700;color:#fff;line-height:1.2">' +
+          '<span style="font-size:1rem;font-weight:700;color:' + CHART_TOOLTIP_TEXT + ';line-height:1.2">' +
           clamped.toFixed(1).replace(/\.0$/, "") + "%</span>" +
-          '<span style="font-size:0.6rem;color:#9ca3af;line-height:1.2">of titles</span>';
+          '<span style="font-size:0.6rem;color:#9ca3af;line-height:1.2">' + chartEscapeHtml(gettext("of titles")) + '</span>';
       }
 
       if (featuredPersonRingChart && featuredPersonRingCanvas !== canvas) {
@@ -1833,7 +1998,7 @@ function initStatisticsCharts() {
         },
       });
       featuredPersonRingCanvas = canvas;
-      window.__yamtrackStatsCharts.push(featuredPersonRingChart);
+      window.__floppyStatsCharts.push(featuredPersonRingChart);
     };
 
     if (document.getElementById("featuredPersonRingChart")) {
@@ -1847,15 +2012,15 @@ function initStatisticsCharts() {
   matchScoreCopyHeight();
   // Re-bind through a window-level reference so the resize listener is only
   // attached once but always uses the current page's sizing function.
-  window.__yamtrackStatsFit = matchScoreCopyHeight;
-  if (!window.__yamtrackStatsResizeBound) {
-    window.__yamtrackStatsResizeBound = true;
+  window.__floppyStatsFit = matchScoreCopyHeight;
+  if (!window.__floppyStatsResizeBound) {
+    window.__floppyStatsResizeBound = true;
     window.addEventListener("resize", function () {
       // Debounce-ish
       clearTimeout(window._scoreCopyResizeTimer);
       window._scoreCopyResizeTimer = setTimeout(function () {
-        if (window.__yamtrackStatsFit) {
-          window.__yamtrackStatsFit();
+        if (window.__floppyStatsFit) {
+          window.__floppyStatsFit();
         }
       }, 120);
     });

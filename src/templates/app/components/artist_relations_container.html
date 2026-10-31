@@ -1,0 +1,33 @@
+
+{% load i18n %}
+<div id="artist-relations-container"
+     {% if poll_for_relation_images %}
+       hx-get="{% url 'prefetch_artist_relation_images' artist.id %}?attempt={{ next_attempt|default:1 }}"
+       {% if next_attempt %}
+         hx-trigger="every 5s [document.visibilityState === 'visible']"
+       {% else %}
+         hx-trigger="load delay:500ms, every 5s [document.visibilityState === 'visible']"
+       {% endif %}
+       hx-target="#artist-relations-container"
+       hx-swap="outerHTML"
+     {% endif %}>
+  {% if band_members %}
+    <section class="mb-8">
+      <h2 class="text-xl font-bold mb-4">{% translate "Members" %}</h2>
+      {% include "app/components/artist_relation_grid.html" with relations=band_members user=user only %}
+    </section>
+  {% endif %}
+
+  {% if member_of_bands %}
+    <section class="mb-8">
+      <h2 class="text-xl font-bold mb-4">{% translate "Also In" %}</h2>
+      {% include "app/components/artist_relation_grid.html" with relations=member_of_bands user=user only %}
+    </section>
+  {% endif %}
+
+  {% if poll_for_relation_images %}
+    <div class="mt-4 text-xs text-[var(--color-text-muted)]">
+      {% translate "Refreshing photos" %}{% if missing_relation_image_count %} {% blocktranslate trimmed with value_1=missing_relation_image_count %}({{ value_1 }} remaining){% endblocktranslate %}{% endif %}...
+    </div>
+  {% endif %}
+</div>

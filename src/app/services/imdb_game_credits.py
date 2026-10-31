@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import ast
 import logging
+from datetime import timedelta
 
-from django.db.models import Q
+from django.db.models import F, Q
+from django.utils import timezone
 
 from app import credits as credit_helpers
 from app.models import (
     CREDITS_BACKFILL_VERSION,
+    PERSON_PROFILE_BACKFILL_VERSION,
     Item,
     MediaTypes,
     MetadataBackfillField,
@@ -28,7 +31,9 @@ from app.models import (
 from app.providers import services as provider_services
 from app.tasks_backfill_state import (
     _apply_backfill_state_filters,
+    _backfill_delay_seconds,
     _record_backfill_failure,
+    _record_backfill_pending,
     _record_backfill_success,
 )
 
@@ -36,6 +41,16 @@ logger = logging.getLogger(__name__)
 
 _YEAR_TOLERANCE = 1
 _IMAGE_BACKFILL_PROGRESS_EVERY = 25
+# The task that drives these runs nightly, and the shared backoff caps at one
+# day - so without a longer floor every miss is due again on the very next run
+# and nothing is actually deferred. One eligible candidate re-downloads and
+# re-parses the whole title.basics dataset, so the floor has to clear the beat
+# interval by a wide margin. A newly tracked game has no state and is still
+# picked up immediately.
+_IMDB_MATCH_RETRY_SECONDS = 7 * 24 * 60 * 60
+# IGDB gains companies for an existing game rarely; the same nightly-cadence
+# reasoning applies.
+_STUDIO_RETRY_SECONDS = 7 * 24 * 60 * 60
 
 # IMDB principals "category" -> our CreditRoleType/department.
 _CAST_CATEGORIES = {"actor", "actress", "self"}
@@ -48,7 +63,7 @@ _CREW_CATEGORIES = {
 
 
 def _title_key(title: str) -> str:
-    return Item._title_comparison_key(title)  # noqa: SLF001
+    return Item._title_comparison_key(title)
 
 
 def resolve_game_imdb_ids() -> int:
@@ -56,14 +71,23 @@ def resolve_game_imdb_ids() -> int:
 
     Returns the number of Items updated with a provider_external_ids["imdb_id"].
     """
-    from app.providers import imdb_datasets  # noqa: PLC0415
+    from app.providers import imdb_datasets
 
+    candidates_qs = Item.objects.filter(
+        source=Sources.IGDB.value,
+        media_type=MediaTypes.GAME.value,
+    ).exclude(
+        provider_external_ids__has_key="imdb_id",
+    )
+    # Matching is exact title + year, so a game that did not match today will
+    # not match again until IMDB publishes something new. Backfill state keeps
+    # those out of the candidate set, which matters because a single candidate
+    # is enough to pull and parse the whole multi-hundred-MB title.basics
+    # dataset into this worker.
     candidates = list(
-        Item.objects.filter(
-            source=Sources.IGDB.value,
-            media_type=MediaTypes.GAME.value,
-        ).exclude(
-            provider_external_ids__has_key="imdb_id",
+        _apply_backfill_state_filters(
+            candidates_qs,
+            MetadataBackfillField.IMDB_MATCH.value,
         ),
     )
     if not candidates:
@@ -72,31 +96,46 @@ def resolve_game_imdb_ids() -> int:
     try:
         title_index = imdb_datasets.download_videogame_title_index()
     except Exception:
-        logger.warning("imdb_game_credits: failed to download title index", exc_info=True)
+        logger.warning(
+            "imdb_game_credits: failed to download title index", exc_info=True
+        )
         return 0
 
+    # Only index the title keys we are actually going to look up. IMDB lists
+    # hundreds of thousands of video games and a library has at most a few
+    # thousand, so indexing everything kept a second whole-dataset object graph
+    # alive in this worker for no benefit.
+    wanted_keys = {key for key in (_title_key(item.title) for item in candidates) if key}
     by_title_key: dict[str, list[tuple[str, int | None]]] = {}
     for tconst, (title, year) in title_index.items():
-        by_title_key.setdefault(_title_key(title), []).append((tconst, year))
+        key = _title_key(title)
+        if key in wanted_keys:
+            by_title_key.setdefault(key, []).append((tconst, year))
+    del title_index
 
     updated = []
     for item in candidates:
         key = _title_key(item.title)
-        if not key:
-            continue
-        entries = by_title_key.get(key)
-        if not entries:
-            continue
-
-        item_year = item.release_datetime.year if item.release_datetime else None
-        matches = [
-            tconst
-            for tconst, year in entries
-            if item_year is None
-            or year is None
-            or abs(year - item_year) <= _YEAR_TOLERANCE
-        ]
+        entries = by_title_key.get(key) if key else None
+        matches = []
+        if entries:
+            item_year = item.release_datetime.year if item.release_datetime else None
+            matches = [
+                tconst
+                for tconst, year in entries
+                if item_year is None
+                or year is None
+                or abs(year - item_year) <= _YEAR_TOLERANCE
+            ]
         if len(matches) != 1:
+            # No unambiguous match in today's dataset. A future dataset can
+            # still add one, so back off instead of giving up.
+            _record_backfill_pending(
+                item,
+                MetadataBackfillField.IMDB_MATCH.value,
+                "no unambiguous imdb videogame match",
+                min_delay_seconds=_IMDB_MATCH_RETRY_SECONDS,
+            )
             continue
 
         item.provider_external_ids = {
@@ -144,7 +183,9 @@ def sync_game_credits_from_imdb(
         imdb_id = (item.provider_external_ids or {}).get("imdb_id")
         principals = principals_by_tconst.get(imdb_id)
         if not principals:
-            _record_backfill_failure(item, MetadataBackfillField.CREDITS.value, "no imdb principals")
+            _record_backfill_failure(
+                item, MetadataBackfillField.CREDITS.value, "no imdb principals"
+            )
             continue
 
         cast_rows = []
@@ -175,12 +216,14 @@ def sync_game_credits_from_imdb(
                 )
 
         if not cast_rows and not crew_rows:
-            _record_backfill_failure(item, MetadataBackfillField.CREDITS.value, "no usable principals")
+            _record_backfill_failure(
+                item, MetadataBackfillField.CREDITS.value, "no usable principals"
+            )
             continue
 
         # Suppress per-row credit signals — a bulk sync across many games would
         # otherwise schedule a Discover rebuild per ItemPersonCredit row.
-        from app.signals import suppress_media_change_side_effects  # noqa: PLC0415
+        from app.signals import suppress_media_change_side_effects
 
         with suppress_media_change_side_effects():
             credit_helpers.sync_item_credits_from_metadata(
@@ -201,6 +244,48 @@ def sync_game_credits_from_imdb(
     return synced
 
 
+def people_needing_profile_backfill():
+    """Return IMDB people whose TMDB profile lookup is genuinely outstanding.
+
+    "Missing an image or a gender" is not the same as "worth asking TMDB
+    again". Most IMDB game credits are voice actors with no TMDB entry at all,
+    so a completed lookup that found nothing is the expected steady state, and
+    re-running it changes nothing. A person is a candidate only when:
+
+    * no lookup has completed at the current strategy version, or
+    * the name - the entire lookup key - changed since that lookup, or
+    * the last attempt failed transiently and its retry is now due.
+
+    Bumping ``PERSON_PROFILE_BACKFILL_VERSION`` re-opens everyone.
+    """
+    now = timezone.now()
+    missing = Person.objects.filter(source=Sources.IMDB.value).filter(
+        Q(image="") | Q(gender=PersonGender.UNKNOWN.value),
+    )
+    stale = Q(profile_backfill_version__lt=PERSON_PROFILE_BACKFILL_VERSION) | ~Q(
+        profile_backfill_name=F("name"),
+    )
+    retry_pending = Q(profile_backfill_next_retry_at__isnull=False)
+    retry_due = Q(profile_backfill_next_retry_at__lte=now)
+    return missing.filter((stale & ~retry_pending) | retry_due)
+
+
+def _record_profile_backfill_complete(person: Person) -> None:
+    """Mark a finished lookup, whether or not TMDB had anything to give."""
+    person.profile_backfill_version = PERSON_PROFILE_BACKFILL_VERSION
+    person.profile_backfill_name = person.name
+    person.profile_backfill_next_retry_at = None
+    person.profile_backfill_fail_count = 0
+
+
+def _record_profile_backfill_transient_failure(person: Person) -> None:
+    """Keep a provider-side failure retryable on an exponential schedule."""
+    person.profile_backfill_fail_count = min(person.profile_backfill_fail_count + 1, 9999)
+    person.profile_backfill_next_retry_at = timezone.now() + timedelta(
+        seconds=_backfill_delay_seconds(person.profile_backfill_fail_count),
+    )
+
+
 def backfill_missing_person_profiles() -> int:
     """Best-effort headshot + gender lookup via TMDB for IMDB-sourced people.
 
@@ -212,14 +297,13 @@ def backfill_missing_person_profiles() -> int:
     sort someone into the actor vs actress leaderboard) in a single API call.
     Runs once per Person, not per credit, so it naturally dedupes across however
     many games a person is credited on.
-    """
-    from app.providers import tmdb  # noqa: PLC0415
 
-    people = list(
-        Person.objects.filter(source=Sources.IMDB.value).filter(
-            Q(image="") | Q(gender=PersonGender.UNKNOWN.value),
-        ),
-    )
+    Each person is searched once per strategy version. See
+    ``people_needing_profile_backfill`` for what re-opens a lookup.
+    """
+    from app.providers import tmdb
+
+    people = list(people_needing_profile_backfill())
     if not people:
         return 0
 
@@ -242,8 +326,11 @@ def backfill_missing_person_profiles() -> int:
                 person.source_person_id,
                 exc,
             )
-            profile = None
+            # Transient: the provider never answered, so nothing is known yet.
+            _record_profile_backfill_transient_failure(person)
+            continue
 
+        _record_profile_backfill_complete(person)
         if profile:
             matched += 1
             changed = False
@@ -259,10 +346,7 @@ def backfill_missing_person_profiles() -> int:
             if changed:
                 updated.append(person)
 
-        if (
-            index == len(people)
-            or index % _IMAGE_BACKFILL_PROGRESS_EVERY == 0
-        ):
+        if index == len(people) or index % _IMAGE_BACKFILL_PROGRESS_EVERY == 0:
             logger.info(
                 (
                     "imdb_game_credits: TMDB profile backfill progress %d/%d "
@@ -275,8 +359,21 @@ def backfill_missing_person_profiles() -> int:
                 failures,
             )
 
-    if updated:
-        Person.objects.bulk_update(updated, ["image", "gender"])
+    # Every attempted person gets its state written, not only the ones whose
+    # profile improved: recording "asked, nothing there" is precisely what
+    # stops the next run from asking again.
+    Person.objects.bulk_update(
+        people,
+        [
+            "image",
+            "gender",
+            "profile_backfill_version",
+            "profile_backfill_name",
+            "profile_backfill_next_retry_at",
+            "profile_backfill_fail_count",
+        ],
+        batch_size=500,
+    )
     logger.info(
         (
             "imdb_game_credits: completed TMDB person profile backfill "
@@ -293,16 +390,19 @@ def backfill_missing_person_profiles() -> int:
 
 def backfill_missing_game_studios() -> int:
     """Best-effort IGDB studio/company backfill for IMDB-resolved games."""
-    from app.providers import services  # noqa: PLC0415
-    from app.signals import suppress_media_change_side_effects  # noqa: PLC0415
+    from app.providers import services
+    from app.signals import suppress_media_change_side_effects
 
+    items_qs = Item.objects.filter(
+        source=Sources.IGDB.value,
+        media_type=MediaTypes.GAME.value,
+        provider_external_ids__has_key="imdb_id",
+        studio_credits__isnull=True,
+    ).distinct()
+    # A game IGDB has no companies for stays studio-less forever, so without
+    # backfill state it was re-fetched from IGDB on every single run.
     items = list(
-        Item.objects.filter(
-            source=Sources.IGDB.value,
-            media_type=MediaTypes.GAME.value,
-            provider_external_ids__has_key="imdb_id",
-            studio_credits__isnull=True,
-        ).distinct(),
+        _apply_backfill_state_filters(items_qs, MetadataBackfillField.STUDIOS.value),
     )
     if not items:
         return 0
@@ -329,7 +429,8 @@ def backfill_missing_game_studios() -> int:
                 item.media_id,
                 exc,
             )
-            metadata = None
+            _record_backfill_failure(item, MetadataBackfillField.STUDIOS.value, str(exc))
+            continue
 
         studios_full = []
         if isinstance(metadata, dict):
@@ -341,7 +442,17 @@ def backfill_missing_game_studios() -> int:
                     item,
                     {"studios_full": studios_full},
                 )
+            _record_backfill_success(item, MetadataBackfillField.STUDIOS.value)
             updated += 1
+        else:
+            # IGDB answered, it just has no companies for this game yet. That
+            # can change upstream, so back off rather than give up.
+            _record_backfill_pending(
+                item,
+                MetadataBackfillField.STUDIOS.value,
+                "no igdb studios",
+                min_delay_seconds=_STUDIO_RETRY_SECONDS,
+            )
 
         if index == len(items) or index % _IMAGE_BACKFILL_PROGRESS_EVERY == 0:
             logger.info(
@@ -365,7 +476,9 @@ def backfill_missing_game_studios() -> int:
 
 
 def _apply_credit_backfill_filters(queryset):
-    filtered = _apply_backfill_state_filters(queryset, MetadataBackfillField.CREDITS.value)
+    filtered = _apply_backfill_state_filters(
+        queryset, MetadataBackfillField.CREDITS.value
+    )
     current_ids = credit_helpers.current_credits_backfill_item_ids(
         filtered.values_list("id", flat=True),
     )
@@ -375,7 +488,11 @@ def _apply_credit_backfill_filters(queryset):
 
 
 def count_people_missing_profiles() -> int:
-    """Return the number of IMDB-sourced people still missing image or gender."""
-    return Person.objects.filter(source=Sources.IMDB.value).filter(
-        Q(image="") | Q(gender=PersonGender.UNKNOWN.value),
-    ).count()
+    """Return how many IMDB people still have an outstanding profile lookup.
+
+    This gates the startup sweep, so it counts work that would actually be
+    done - not everyone who merely lacks an image. Counting the latter kept the
+    whole dataset refresh scheduled on every boot forever, because the people
+    TMDB has never heard of can never stop lacking an image.
+    """
+    return people_needing_profile_backfill().count()

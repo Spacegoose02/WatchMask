@@ -11,13 +11,19 @@ META = {"max_progress": 13, "episodes": []}
 
 
 class AnimeCompletionAutoMigrateTests(TestCase):
-    """Completing a flat MAL anime should migrate it to episode tracking."""
+    """Completing a flat MAL anime migrates it when conversion is enabled."""
 
     def setUp(self):
-        self.user = get_user_model().objects.create_user(username="a", password="x")
+        self.user = get_user_model().objects.create_user(
+            username="a",
+            password="x",
+            group_scrobbled_anime=True,
+        )
         self.item = Item.objects.create(
-            media_id="10087", source=Sources.MAL.value,
-            media_type=MediaTypes.ANIME.value, title="Fate/Zero",
+            media_id="10087",
+            source=Sources.MAL.value,
+            media_type=MediaTypes.ANIME.value,
+            title="Fate/Zero",
         )
 
     def _make(self, status=Status.PLANNING.value):
@@ -30,19 +36,28 @@ class AnimeCompletionAutoMigrateTests(TestCase):
             patch("app.providers.services.get_media_metadata", return_value=META),
         )
         stack.enter_context(
-            patch("app.services.metadata_resolution.provider_is_enabled", return_value=True),
+            patch(
+                "app.services.metadata_resolution.provider_is_enabled",
+                return_value=True,
+            ),
         )
         stack.enter_context(
-            patch("app.services.metadata_resolution.metadata_default_source",
-                  return_value=Sources.TVDB.value),
+            patch(
+                "app.services.metadata_resolution.metadata_default_source",
+                return_value=Sources.TVDB.value,
+            ),
         )
         stack.enter_context(
-            patch("integrations.anime_mapping.resolve_provider_series_id",
-                  return_value=series_id),
+            patch(
+                "integrations.anime_mapping.resolve_provider_series_id",
+                return_value=series_id,
+            ),
         )
         return stack.enter_context(
-            patch("app.services.anime_migration.migrate_flat_anime_to_grouped",
-                  side_effect=migrate_side_effect),
+            patch(
+                "app.services.anime_migration.migrate_flat_anime_to_grouped",
+                side_effect=migrate_side_effect,
+            ),
         )
 
     def test_completing_flat_mal_anime_triggers_migration(self):
@@ -56,6 +71,20 @@ class AnimeCompletionAutoMigrateTests(TestCase):
         self.assertEqual(args[0], self.user)
         self.assertEqual(args[1], self.item)
         self.assertEqual(args[2], Sources.TVDB.value)
+
+    def test_no_migration_without_conversion_opt_in(self):
+        """Completing a MAL entry must not silently switch its provider."""
+        self.user.group_scrobbled_anime = False
+        self.user.save(update_fields=["group_scrobbled_anime"])
+        anime = self._make()
+        with ExitStack() as stack:
+            migrate = self._env(stack)
+            anime.status = Status.COMPLETED.value
+            anime.save()
+        migrate.assert_not_called()
+        anime.refresh_from_db()
+        self.assertEqual(anime.status, Status.COMPLETED.value)
+        self.assertIsNone(anime.migrated_to_item_id)
 
     def test_no_migration_without_provider_mapping(self):
         anime = self._make()
@@ -76,7 +105,9 @@ class AnimeCompletionAutoMigrateTests(TestCase):
     def test_migration_error_is_non_fatal(self):
         anime = self._make()
         with ExitStack() as stack:
-            self._env(stack, migrate_side_effect=AnimeMigrationError("no mapping season"))
+            self._env(
+                stack, migrate_side_effect=AnimeMigrationError("no mapping season")
+            )
             anime.status = Status.COMPLETED.value
             anime.save()  # must not raise
         anime.refresh_from_db()
@@ -86,13 +117,15 @@ class AnimeCompletionAutoMigrateTests(TestCase):
         # Drive the real migration (only the provider/network calls are stubbed)
         # to prove completion produces actual Episode watch records.
         from app.models import Episode
-        from app.services.tracking_hydration import HydratedItemResult
 
         anime = self._make()
 
         tv_item = Item.objects.create(
-            media_id="275798", source=Sources.TVDB.value,
-            media_type=MediaTypes.TV.value, title="Fate/Zero",
+            media_id="275798",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            library_media_type=MediaTypes.ANIME.value,
+            title="Fate/Zero",
         )
         season_meta = {
             "title": "Fate/Zero Season 1",
@@ -108,32 +141,37 @@ class AnimeCompletionAutoMigrateTests(TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(
-                patch("app.providers.services.get_media_metadata",
-                      side_effect=meta_side_effect),
+                patch(
+                    "app.providers.services.get_media_metadata",
+                    side_effect=meta_side_effect,
+                ),
             )
             stack.enter_context(
-                patch("app.services.metadata_resolution.provider_is_enabled", return_value=True),
+                patch(
+                    "app.services.metadata_resolution.provider_is_enabled",
+                    return_value=True,
+                ),
             )
             stack.enter_context(
-                patch("app.services.metadata_resolution.metadata_default_source",
-                      return_value=Sources.TVDB.value),
+                patch(
+                    "app.services.metadata_resolution.metadata_default_source",
+                    return_value=Sources.TVDB.value,
+                ),
             )
             stack.enter_context(
-                patch("integrations.anime_mapping.resolve_provider_series_id",
-                      return_value="275798"),
+                patch(
+                    "integrations.anime_mapping.resolve_provider_series_id",
+                    return_value="275798",
+                ),
             )
             stack.enter_context(
-                patch("integrations.anime_mapping.find_entries_for_mal_id",
-                      return_value=[{"tvdb_id": "275798", "tvdb_season": 1, "tvdb_epoffset": 0}]),
+                patch(
+                    "integrations.anime_mapping.find_entries_for_mal_id",
+                    return_value=[
+                        {"tvdb_id": "275798", "tvdb_season": 1, "tvdb_epoffset": 0}
+                    ],
+                ),
             )
-            stack.enter_context(
-                patch("app.services.anime_migration.ensure_item_metadata",
-                      return_value=HydratedItemResult(item=tv_item, metadata={"title": "Fate/Zero"}, created=False)),
-            )
-            stack.enter_context(
-                patch("app.services.anime_migration.upsert_provider_links"),
-            )
-
             anime.status = Status.COMPLETED.value
             anime.save()
 
@@ -141,7 +179,8 @@ class AnimeCompletionAutoMigrateTests(TestCase):
         self.assertEqual(
             Episode.objects.filter(
                 related_season__related_tv__user=self.user,
-                item__media_id="275798", item__source=Sources.TVDB.value,
+                item__media_id="275798",
+                item__source=Sources.TVDB.value,
             ).count(),
             13,
         )
@@ -151,8 +190,10 @@ class AnimeCompletionAutoMigrateTests(TestCase):
 
     def test_already_migrated_not_remigrated(self):
         other = Item.objects.create(
-            media_id="275798", source=Sources.TVDB.value,
-            media_type=MediaTypes.TV.value, title="Fate/Zero",
+            media_id="275798",
+            source=Sources.TVDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Fate/Zero",
         )
         anime = self._make()
         anime.migrated_to_item = other

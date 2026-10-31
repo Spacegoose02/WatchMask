@@ -15,12 +15,15 @@ from django.http import Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.utils.translation import gettext
 from django.views.decorators.http import require_GET, require_POST
 
 from app import helpers
 from app.discover import tab_cache as discover_tab_cache
+from app.media_list_filters import media_list_entries_for_items
 from app.models import Item, MediaTypes
 from app.providers import services
+from integrations.imports.helpers import find_item_across_buckets
 from lists.models import (
     CustomList,
     CustomListItem,
@@ -32,9 +35,14 @@ from lists.views_helpers import (
     _extract_list_search_results,
     _list_item_title_fields_from_metadata,
     _maybe_backfill_episode_title,
+    list_has_item_identity,
+    list_metadata_language,
 )
 
 logger = logging.getLogger(__name__)
+
+# Minimum characters required before a search query is sent to providers.
+MIN_SEARCH_QUERY_LENGTH = 2
 
 
 @login_not_required
@@ -102,7 +110,12 @@ def recommend_search(request, list_id):
         episode_number = request.GET.get("episode_number")
 
         try:
-            media_metadata = services.get_media_metadata(media_type, media_id, source)
+            media_metadata = services.get_media_metadata(
+                media_type,
+                media_id,
+                source,
+                language=list_metadata_language(request.user, custom_list.owner),
+            )
         except Exception as exc:
             logger.exception(
                 "Recommendation preview failed: list_id=%s media_type=%s media_id=%s",
@@ -173,7 +186,7 @@ def recommend_search(request, list_id):
     except (TypeError, ValueError):
         page = 1
 
-    if not query or len(query) < 2:
+    if not query or len(query) < MIN_SEARCH_QUERY_LENGTH:
         return render(
             request,
             "lists/components/recommend_search_results.html",
@@ -186,7 +199,14 @@ def recommend_search(request, list_id):
     source = config.get_default_source_name(media_type).value
 
     try:
-        data = services.search(media_type, query, page, source)
+        data = services.search(
+            media_type,
+            query,
+            page,
+            source,
+            user=request.user if request.user.is_authenticated else None,
+            language=list_metadata_language(request.user, custom_list.owner),
+        )
     except Exception as exc:
         logger.exception(
             "Recommendation search failed: list_id=%s media_type=%s query=%s",
@@ -244,6 +264,50 @@ def recommend_search(request, list_id):
     return render(request, "lists/components/recommend_search_results.html", context)
 
 
+# FORK: item resolution shared with the REST API.
+def get_or_create_recommendation_item(
+    media_id,
+    media_type,
+    source,
+    season_number=None,
+    episode_number=None,
+    user=None,
+    language=None,
+):
+    """Return the Item for a recommendation, creating it from metadata if new."""
+    item = find_item_across_buckets(
+        user=user,
+        media_id=media_id,
+        source=source,
+        media_type=media_type,
+        season_number=season_number,
+        episode_number=episode_number,
+    )
+    if item is not None:
+        _maybe_backfill_episode_title(item, force=True, language=language)
+    else:
+        metadata = services.get_media_metadata(
+            media_type,
+            media_id,
+            source,
+            [season_number] if season_number else None,
+            episode_number,
+            language=language,
+        )
+        release_datetime = helpers.extract_release_datetime(metadata)
+        item = Item.objects.create(
+            media_id=media_id,
+            source=source,
+            media_type=media_type,
+            season_number=season_number,
+            episode_number=episode_number,
+            image=metadata["image"],
+            release_datetime=release_datetime,
+            **_list_item_title_fields_from_metadata(media_type, metadata),
+        )
+    return item
+
+
 @login_not_required
 @require_POST
 def submit_recommendation(request, list_id):
@@ -251,7 +315,9 @@ def submit_recommendation(request, list_id):
     custom_list = get_object_or_404(CustomList, id=list_id)
 
     if not custom_list.can_recommend():
-        messages.error(request, "Recommendations are not enabled for this list.")
+        messages.error(
+            request, gettext("Recommendations are not enabled for this list.")
+        )
         return redirect("list_detail", custom_list.public_reference)
 
     next_url = request.POST.get("next")
@@ -273,34 +339,15 @@ def submit_recommendation(request, list_id):
     episode_number = int(episode_number) if episode_number else None
 
     # Get or create the item
-    try:
-        item = Item.objects.get(
-            media_id=media_id,
-            source=source,
-            media_type=media_type,
-            season_number=season_number,
-            episode_number=episode_number,
-        )
-        _maybe_backfill_episode_title(item, force=True)
-    except Item.DoesNotExist:
-        metadata = services.get_media_metadata(
-            media_type,
-            media_id,
-            source,
-            [season_number] if season_number else None,
-            episode_number,
-        )
-        release_datetime = helpers.extract_release_datetime(metadata)
-        item = Item.objects.create(
-            media_id=media_id,
-            source=source,
-            media_type=media_type,
-            season_number=season_number,
-            episode_number=episode_number,
-            image=metadata["image"],
-            release_datetime=release_datetime,
-            **_list_item_title_fields_from_metadata(media_type, metadata),
-        )
+    item = get_or_create_recommendation_item(
+        media_id,
+        media_type,
+        source,
+        season_number,
+        episode_number,
+        user=request.user if request.user.is_authenticated else None,
+        language=list_metadata_language(request.user, custom_list.owner),
+    )
 
     discover_tab_cache.mark_active_from_request(
         request,
@@ -308,13 +355,20 @@ def submit_recommendation(request, list_id):
     )
 
     # Check if item is already in the list
-    if custom_list.items.filter(id=item.id).exists():
-        messages.info(request, f'"{item.title}" is already in this list.')
+    if list_has_item_identity(custom_list, item):
+        messages.info(
+            request,
+            gettext('"%(value_1)s" is already in this list.') % {"value_1": item.title},
+        )
         return _redirect_after_submit(redirect("recommend_item", list_id=list_id))
 
     # Check if already recommended
     if ListRecommendation.objects.filter(custom_list=custom_list, item=item).exists():
-        messages.info(request, f'"{item.title}" has already been recommended.')
+        messages.info(
+            request,
+            gettext('"%(value_1)s" has already been recommended.')
+            % {"value_1": item.title},
+        )
         return _redirect_after_submit(redirect("recommend_item", list_id=list_id))
 
     # Create the recommendation
@@ -336,7 +390,8 @@ def submit_recommendation(request, list_id):
     logger.info("Recommendation created: %s for %s", item.title, custom_list.name)
     messages.success(
         request,
-        f'Your recommendation for "{item.title}" has been submitted!',
+        gettext('Your recommendation for "%(value_1)s" has been submitted!')
+        % {"value_1": item.title},
     )
 
     return _redirect_after_submit(redirect("list_detail", custom_list.public_reference))
@@ -354,10 +409,22 @@ def list_recommendations(request, list_id):
         msg = "You do not have permission to view recommendations for this list"
         raise Http404(msg)
 
-    recommendations = custom_list.recommendations.select_related(
-        "item",
-        "recommended_by",
-    ).order_by("-date_recommended")
+    recommendations = list(
+        custom_list.recommendations.select_related(
+            "item",
+            "recommended_by",
+        ).order_by("-date_recommended"),
+    )
+    # Show the viewer's own rating and status on items they already track.
+    media_by_item_id = {
+        entry.item.pk: entry.media
+        for entry in media_list_entries_for_items(
+            request.user,
+            list({rec.item_id: rec.item for rec in recommendations}.values()),
+        )
+    }
+    for rec in recommendations:
+        rec.media = media_by_item_id.get(rec.item_id)
 
     context = {
         "custom_list": custom_list,
@@ -398,7 +465,9 @@ def approve_recommendation(request, list_id, recommendation_id):
     custom_list = get_object_or_404(CustomList, id=list_id)
 
     if not custom_list.user_can_edit(request.user):
-        messages.error(request, "You do not have permission to manage recommendations.")
+        messages.error(
+            request, gettext("You do not have permission to manage recommendations.")
+        )
         return helpers.redirect_back(request)
 
     recommendation = get_object_or_404(
@@ -425,7 +494,8 @@ def approve_recommendation(request, list_id, recommendation_id):
         )
         messages.success(
             request,
-            f'"{recommendation.item.title}" has been added to the list.',
+            gettext('"%(value_1)s" has been added to the list.')
+            % {"value_1": recommendation.item.title},
         )
         ListActivity.objects.create(
             custom_list=custom_list,
@@ -437,7 +507,8 @@ def approve_recommendation(request, list_id, recommendation_id):
     else:
         messages.info(
             request,
-            f'"{recommendation.item.title}" is already in the list.',
+            gettext('"%(value_1)s" is already in the list.')
+            % {"value_1": recommendation.item.title},
         )
 
     recommendation.delete()
@@ -451,7 +522,9 @@ def deny_recommendation(request, list_id, recommendation_id):
     custom_list = get_object_or_404(CustomList, id=list_id)
 
     if not custom_list.user_can_edit(request.user):
-        messages.error(request, "You do not have permission to manage recommendations.")
+        messages.error(
+            request, gettext("You do not have permission to manage recommendations.")
+        )
         return helpers.redirect_back(request)
 
     recommendation = get_object_or_404(
@@ -478,6 +551,10 @@ def deny_recommendation(request, list_id, recommendation_id):
     )
 
     logger.info("Recommendation denied: %s for %s", item_title, custom_list.name)
-    messages.success(request, f'Recommendation for "{item_title}" has been removed.')
+    messages.success(
+        request,
+        gettext('Recommendation for "%(value_1)s" has been removed.')
+        % {"value_1": item_title},
+    )
 
     return helpers.redirect_back(request)

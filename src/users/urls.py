@@ -1,8 +1,47 @@
 from django.urls import path
 
-from users import views
+from users import metadata_views, onboarding_views, server_port_views, views
 
 urlpatterns = [
+    path("setup/", onboarding_views.onboarding_media_types, name="onboarding_media_types"),
+    path("setup/metadata/", onboarding_views.onboarding_metadata, name="onboarding_metadata"),
+    path(
+        "setup/services/<int:index>/",
+        onboarding_views.onboarding_services,
+        name="onboarding_services",
+    ),
+    path(
+        "setup/services/summary/",
+        onboarding_views.onboarding_services_summary,
+        name="onboarding_services_summary",
+    ),
+    path(
+        "setup/connect/",
+        onboarding_views.onboarding_service_setup,
+        name="onboarding_service_setup",
+    ),
+    path(
+        "setup/connect/<slug:slug>/skip/",
+        onboarding_views.onboarding_skip_service,
+        name="onboarding_skip_service",
+    ),
+    path(
+        "setup/import-status/",
+        onboarding_views.onboarding_import_status,
+        name="onboarding_import_status",
+    ),
+    path(
+        "setup/integrations/",
+        onboarding_views.onboarding_integration_setup,
+        name="onboarding_integration_setup",
+    ),
+    path(
+        "setup/integrations/<slug:slug>/skip/",
+        onboarding_views.onboarding_skip_integration,
+        name="onboarding_skip_integration",
+    ),
+    path("setup/resume/", onboarding_views.onboarding_resume, name="onboarding_resume"),
+    path("setup/restart/", onboarding_views.onboarding_restart, name="onboarding_restart"),
     path("accounts/password/recover/", views.password_recover, name="password_recover"),
     path("settings/account", views.account, name="account"),
     path("settings/notifications", views.notifications, name="notifications"),
@@ -19,6 +58,10 @@ urlpatterns = [
     ),
     path("test_notification", views.test_notification, name="test_notification"),
     path("settings/ui", views.ui_preferences, name="ui_preferences"),
+    path("settings/appearance", views.appearance, name="appearance"),
+    path("settings/cards", views.cards, name="cards"),
+    path("settings/cards/preview", views.cards_preview, name="cards_preview"),
+    path("settings/cards/<str:media_type>", views.cards, name="cards_type"),
     path("settings/sidebar", views.sidebar, name="sidebar"),
     path("settings/home-screen", views.home_screen, name="home_screen"),
     path(
@@ -27,19 +70,81 @@ urlpatterns = [
         name="home_screen_list_search",
     ),
     path(
+        "settings/home-screen/filter-fields",
+        views.home_screen_filter_fields,
+        name="home_screen_filter_fields",
+    ),
+    path(
         "settings/home-screen/rows/<int:row_id>/toggle-direction",
         views.toggle_home_screen_row_direction,
         name="toggle_home_screen_row_direction",
     ),
+    path("saved-views/create", views.saved_view_create, name="saved_view_create"),
+    path(
+        "saved-views/<int:view_id>/delete",
+        views.saved_view_delete,
+        name="saved_view_delete",
+    ),
+    path("saved-views/reorder", views.saved_view_reorder, name="saved_view_reorder"),
     path(
         "settings/toggle-obfuscate-episodes",
         views.toggle_obfuscate_episodes,
         name="toggle_obfuscate_episodes",
     ),
     path("settings/preferences", views.preferences, name="preferences"),
+    path(
+        "settings/preferences/convert-anime-library",
+        views.convert_anime_library,
+        name="convert_anime_library",
+    ),
+    path(
+        "settings/metadata/convert-tv-library",
+        views.convert_tv_library,
+        name="convert_tv_library",
+    ),
+    path(
+        "settings/metadata/repair-duplicate-anime",
+        views.repair_duplicate_anime_libraries,
+        name="repair_duplicate_anime_libraries",
+    ),
     path("settings/integrations", views.integrations, name="integrations"),
+    path(
+        "settings/integrations/stremio-catalog-status",
+        views.stremio_catalog_status,
+        name="stremio_catalog_status",
+    ),
+    path("settings/rss", views.rss_settings, name="rss_settings"),
+    path(
+        "settings/metadata",
+        metadata_views.metadata_settings,
+        name="metadata_settings",
+    ),
+    path(
+        "settings/metadata/<str:slug>/save",
+        metadata_views.save_provider_credential,
+        name="save_provider_credential",
+    ),
+    path(
+        "settings/metadata/<str:slug>/clear",
+        metadata_views.clear_provider_credential,
+        name="clear_provider_credential",
+    ),
+    path(
+        "settings/metadata/<str:slug>/personal",
+        metadata_views.save_personal_credential,
+        name="save_personal_credential",
+    ),
+    path(
+        "settings/metadata/provider-default/<str:media_type>",
+        metadata_views.set_media_type_provider,
+        name="set_media_type_provider",
+    ),
     path("settings/import", views.import_data, name="import_data"),
-    path("settings/import/save-settings", views.save_import_settings, name="save_import_settings"),
+    path(
+        "settings/import/save-settings",
+        views.save_import_settings,
+        name="save_import_settings",
+    ),
     path(
         "settings/import/activity",
         views.import_data_activity,
@@ -56,12 +161,55 @@ urlpatterns = [
         name="import_data_plex_sections",
     ),
     path("settings/export", views.export_data, name="export_data"),
+    path("settings/export/mal", views.mal_export, name="mal_export"),
     path("settings/advanced", views.advanced, name="advanced"),
+    path(
+        "settings/advanced/image-cache",
+        views.update_image_cache,
+        name="update_image_cache",
+    ),
+    path(
+        "settings/advanced/image-cache/clear",
+        views.clear_image_cache,
+        name="clear_image_cache",
+    ),
+    path("settings/advanced/logs", views.export_logs, name="export_logs"),
+    path(
+        "settings/advanced/server-port",
+        server_port_views.update_server_port,
+        name="update_server_port",
+    ),
     path("settings/about", views.about, name="about"),
+    path("settings/about/whats-new", views.whats_new, name="whats_new"),
     path(
         "delete_import_schedule",
         views.delete_import_schedule,
         name="delete_import_schedule",
+    ),
+    path(
+        "rollback_import_run/<int:run_id>",
+        views.rollback_import_run,
+        name="rollback_import_run",
+    ),
+    path(
+        "cancel_import_run/<int:run_id>",
+        views.cancel_import_run,
+        name="cancel_import_run",
+    ),
+    path(
+        "cancel_pending_import/<str:task_id>",
+        views.cancel_pending_import,
+        name="cancel_pending_import",
+    ),
+    path(
+        "bulk_delete_by_import_source/<str:media_type>/<str:source>",
+        views.bulk_delete_by_import_source,
+        name="bulk_delete_by_import_source",
+    ),
+    path(
+        "bulk_delete_by_media_type",
+        views.bulk_delete_by_media_type,
+        name="bulk_delete_by_media_type",
     ),
     path(
         "create_export_schedule",
@@ -74,7 +222,44 @@ urlpatterns = [
         name="delete_export_schedule",
     ),
     path("regenerate_token", views.regenerate_token, name="regenerate_token"),
+    path(
+        "settings/integrations/catalog-grants/create",
+        views.create_catalog_grant,
+        name="create_catalog_grant",
+    ),
+    path(
+        "settings/integrations/catalog-grants/<int:grant_id>/revoke",
+        views.revoke_catalog_grant,
+        name="revoke_catalog_grant",
+    ),
+    path(
+        "settings/integrations/tokens/create",
+        views.create_integration_token,
+        name="create_integration_token",
+    ),
+    path(
+        "settings/integrations/tokens/<int:token_id>/revoke",
+        views.revoke_integration_token,
+        name="revoke_integration_token",
+    ),
     path("clear_search_cache", views.clear_search_cache, name="clear_search_cache"),
+    path(
+        "clear_history_cache",
+        views.clear_history_cache,
+        name="clear_history_cache",
+    ),
+    path(
+        "clear_statistics_cache",
+        views.clear_statistics_cache,
+        name="clear_statistics_cache",
+    ),
+    path(
+        "clear_discover_cache",
+        views.clear_discover_cache,
+        name="clear_discover_cache",
+    ),
+    path("clear_all_caches", views.clear_all_caches, name="clear_all_caches"),
+    path("update_tmdb_proxy", views.update_tmdb_proxy, name="update_tmdb_proxy"),
     path(
         "update_plex_usernames",
         views.update_plex_usernames,
@@ -85,6 +270,37 @@ urlpatterns = [
         views.update_plex_webhook_libraries,
         name="update_plex_webhook_libraries",
     ),
+    path(
+        "update_plex_webhook_share",
+        views.update_plex_webhook_share,
+        name="update_plex_webhook_share",
+    ),
+    path(
+        "toggle_plex_webhook_share",
+        views.toggle_plex_webhook_share,
+        name="toggle_plex_webhook_share",
+    ),
+    path(
+        "delete_plex_webhook_share",
+        views.delete_plex_webhook_share,
+        name="delete_plex_webhook_share",
+    ),
+    path(
+        "update_plex_mark_watched",
+        views.update_plex_mark_watched,
+        name="update_plex_mark_watched",
+    ),
+    path(
+        "update_jellyfin_webhook_events",
+        views.update_jellyfin_webhook_events,
+        name="update_jellyfin_webhook_events",
+    ),
+    path(
+        "update_group_scrobbled_anime",
+        views.update_group_scrobbled_anime,
+        name="update_group_scrobbled_anime",
+    ),
+    # kept: URL path/name unchanged, matches views.py route (see plan)
     path(
         "settings/integrations/jellyseerr/",
         views.update_jellyseerr_settings,

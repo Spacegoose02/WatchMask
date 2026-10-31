@@ -17,17 +17,14 @@ def refresh_imdb_game_credits_from_datasets():
     normalized title + release year (see app.services.imdb_game_credits), so
     coverage is intentionally limited to unambiguous matches.
     """
-    from app.providers import imdb_datasets  # noqa: PLC0415
-    from app.services import imdb_game_credits  # noqa: PLC0415
+    from app.providers import imdb_datasets
+    from app.services import imdb_game_credits
 
     resolved = imdb_game_credits.resolve_game_imdb_ids()
     synced = 0
     error = None
 
-    tconsts = {
-        item.provider_external_ids["imdb_id"]
-        for item in _resolved_game_items()
-    }
+    tconsts = {item.provider_external_ids["imdb_id"] for item in _resolved_game_items()}
     if tconsts:
         try:
             principals = imdb_datasets.download_principals(tconsts)
@@ -54,19 +51,51 @@ def refresh_imdb_game_credits_from_datasets():
     return result
 
 
+@shared_task(name="Sync IMDB ratings from datasets")
+def sync_imdb_ratings_from_datasets():
+    """Sync IMDB's public aggregate ratings for movies, shows, and episodes."""
+    from app.services import imdb_ratings
+
+    movies_and_shows_updated = imdb_ratings.sync_movie_and_show_ratings()
+    episodes_updated = imdb_ratings.sync_episode_ratings()
+    seasons_updated = imdb_ratings.sync_season_ratings()
+
+    return {
+        "movies_and_shows_updated": movies_and_shows_updated,
+        "episodes_updated": episodes_updated,
+        "seasons_updated": seasons_updated,
+    }
+
+
 @shared_task(name="Backfill IMDB game person profiles")
 def backfill_imdb_game_person_profiles():
     """Backfill TMDB profile data for IMDB-sourced game people."""
-    from app.services import imdb_game_credits  # noqa: PLC0415
+    from app.services import imdb_game_credits
 
     profiles_backfilled = imdb_game_credits.backfill_missing_person_profiles()
     return {"profiles_backfilled": profiles_backfilled}
 
 
+@shared_task(name="Schedule IMDB game person profile backfill if needed")
+def schedule_imdb_game_person_profile_backfill_if_needed():
+    """Queue the credits refresh only if profiles are actually missing.
+
+    Runs the DB count check in a Celery worker rather than in
+    ``AppConfig.ready()``, which executes in the Gunicorn master process
+    before workers fork (see ``preload_app`` in ``config/gunicorn.py``).
+    """
+    from app.services import imdb_game_credits
+
+    if imdb_game_credits.count_people_missing_profiles() <= 0:
+        return
+
+    refresh_imdb_game_credits_from_datasets.apply_async()
+
+
 def _resolved_game_items():
-    from app.models import Item, MediaTypes, Sources  # noqa: PLC0415
+    from app.models import Item, MediaTypes, Sources
     from app.services.imdb_game_credits import (
-        _apply_credit_backfill_filters,  # noqa: PLC0415
+        _apply_credit_backfill_filters,
     )
 
     items_qs = Item.objects.filter(

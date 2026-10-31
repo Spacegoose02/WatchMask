@@ -192,18 +192,29 @@
   - Clears stale locks to avoid "refreshing" stuck states.
   - If stats cache is stale and no lock exists, it schedules a refresh during polling.
 - `src/static/js/cache-updater.js`:
-  - Poll interval 2.5s, timeout 120s.
+  - Polls every 2.5s while the cache refresh is healthy, with a 180s active-online timeout and a 10s timeout for each cache-status request.
+  - Stops immediately on non-retryable HTTP failures, including 400/401/403/404. This prevents a permanent response from becoming a repeated request loop.
+  - Retries 408/425/429/5xx responses and network/request timeouts with exponential backoff from 2.5s up to 30s. `Retry-After` is respected within the remaining 180s refresh window.
+  - Pauses requests while the browser reports that it is offline, resumes on the `online` event, and does not count offline time against the refresh timeout.
+  - Aborts an in-flight request when the updater stops or the page exits, so boosted navigation cannot leave an orphaned request behind.
   - Uses `built_at` + `wasRefreshing` to avoid reload loops.
-  - For statistics, waits until the active range is done and no other ranges are refreshing.
+  - For statistics, reloads when the active range is ready; other range refreshes can continue in the background.
+  - Self-check: `node src/static/js/cache-updater.selfcheck.mjs` covers terminal 404, transient backoff, `Retry-After`, offline pause, request abort/timeout, and the healthy polling cadence.
+- Transport boundary:
+  - Cache-status refresh remains ordinary HTTP polling. It is intermittent, needs normal HTTP failure semantics, and does not have a measured continuous server-push workload that justifies a persistent WebSocket or WebTransport session.
+  - Revisit push transport only when profiling shows a real persistent-update workload and a measurable benefit over bounded HTTP polling.
 - Templates:
   - `src/templates/app/history.html`: polling is skipped for filtered views (bypass cache).
   - `src/templates/app/statistics.html`: polling only for predefined ranges.
-  - `src/templates/app/discover.html`: shows a top-level background-refresh banner, polls Discover cache status on load/tab switch, and refreshes only `#discover-rows` when a rebuild completes.
+  - `src/templates/app/discover.html`: shows a top-level background-refresh banner, polls Discover cache status on load/tab switch, and refreshes only `#discover-rows` when the rebuild completes.
 
 ## Known failure modes (symptoms -> suspects)
 - Page 1 works, pages 2+ blank: page miss schedules refresh, but task warms newest days instead of requested `day_keys`.
 - Repeated `warmed=30` with continued page misses: day key mismatch or refresh task not honoring `day_keys`.
 - UI stuck on "refreshing": stale lock not cleared (clock skew or lock payload missing `started_at`).
+- Cache-status returns 404/401/403 repeatedly: client polling should stop after the first non-retryable response; run the cache-updater self-check and verify the route/auth state instead of increasing retries.
+- Cache-status request hangs or returns 5xx/429: the client should use bounded backoff and stop at the overall active-online timeout rather than sending fixed-interval failures.
+- Browser goes offline during a refresh: status polling pauses and resumes after reconnect; static assets can remain available from the service worker cache, but dynamic tracked-data routes are not made offline-safe by browser HTML caching.
 - "Warmed" logs but view still misses: key mismatch (logging_style default vs explicit, YYYYMMDD vs YYYY-MM-DD, or version mismatch).
 - Inline rebuild spikes on filtered views: expected; filtered paths bypass cache and build inline.
 - Book/comic/manga details show plain author text (not links): provider item cache payload is stale and lacks `authors_full`, so `authors_linked` cannot be built from IDs.
@@ -212,6 +223,11 @@
 - Cold miss vs broken:
   - Expected: first request logs miss + scheduled refresh, second request after task logs hit>0 and renders entries.
   - Broken: refresh completes but page still shows hit=0/miss=30 for the same days.
+- Cache-status browser failure:
+  - `404`, `401`, or `403`: expect one failed cache-status request, then no further requests from that updater.
+  - `408`, `425`, `429`, or `5xx`: expect the retry delay to increase instead of remaining at 2.5s; a valid `Retry-After` can extend the delay within the overall refresh window.
+  - Offline: expect no cache-status requests until the browser reports `online` again.
+  - Hung request: expect the request to abort at 10s and enter transient-failure backoff.
 - Log checks for history:
   - Good: `history_day_cache_cold_miss ... scheduled=True`, then `history_cache_refresh_done ... warmed=30`, then `history_day_cache_get_many ... hit>0`.
   - Bad: `history_cache_refresh_done ... warmed=30`, but subsequent `history_day_cache_get_many ... hit=0 miss=30`.
@@ -269,7 +285,8 @@
 
 ## Service worker caching (frontend)
 - `src/static/js/serviceworker.js` caches a small list of static assets and additional static GETs.
-- Does not cache HTML navigation or `/api/*` requests (keeps cache-status real-time).
+- Does not cache HTML navigation or `/api/*` requests (keeps cache-status real-time and avoids serving authenticated dynamic HTML from a cross-session browser cache).
+- Offline support from this worker is limited to static assets. Full offline tracked-data use needs app-owned local state plus queued, idempotent replay/reconciliation; it must not be implemented by caching authenticated route responses indiscriminately.
 - Versioned via `CACHE_NAME` and clears older caches on activate.
 
 ## Provider/API caches (Redis-backed)
@@ -290,10 +307,15 @@ Default TTL is `CACHE_TIMEOUT` unless specified.
 - ComicVine (`src/app/providers/comicvine.py`):
   - `search_COMICVINE_{media_type}_{query}_{page}`, `COMICVINE_comic_{media_id}`,
     `COMICVINE_issue_{media_id}`, `COMICVINE_similar_{publisher_id}_{current_id}`.
+- GCD (`src/app/providers/gcd.py`):
+  - `search_gcd_{media_type}_{query}_{page}`, `gcd_comic_{media_id}`,
+    `gcd_comicissue_{media_id}`, `gcd_series_{media_id}_issues`, `gcd_publisher_{publisher_id}`.
 - OpenLibrary (`src/app/providers/openlibrary.py`):
   - `search_OPENLIBRARY_{media_type}_{query}_{page}`, `OPENLIBRARY_book_{media_id}`.
 - MangaUpdates (`src/app/providers/mangaupdates.py`):
-  - `search_MANGAUPDATES_{media_type}_{query}_{page}`, `MANGAUPDATES_manga_{media_id}`.
+  - `search_MANGAUPDATES_{media_type}_nsfw_{MU_NSFW}_{query}_{page}` (the flag selects the result set, so both states cache separately), `MANGAUPDATES_manga_{media_id}`.
+- MangaBaka (`src/app/providers/mangabaka.py`):
+  - `search_MANGABAKA_manga_nsfw_{MANGABAKA_NSFW}_{query}_{page}` (the flag selects the result set, so both states cache separately), `MANGABAKA_manga_{media_id}`.
 - BGG (`src/app/providers/bgg.py`):
   - `bgg_search_ids_{query}` (24h).
   - `bgg_search_page_{query}_p{page}` (24h).
@@ -342,3 +364,41 @@ Default TTL is `CACHE_TIMEOUT` unless specified.
 ## Redis memory notes
 - Approx key count per user per logging_style: `~#days` day payloads + 1 index + locks. For long histories (10k+ days), key volume can be large even with 6h TTLs.
 - Redis eviction policy matters in a 768 MB footprint (allkeys-lru vs volatile-lru changes whether hot caches survive long enough for paging).
+
+### Bounded since #521
+Redis previously had no ceiling at all: no `maxmemory` in any shipped compose file, so it
+defaulted to `maxmemory 0` / `noeviction` and grew until the host OOMed.
+
+- `app/redis_tuning.py` applies `maxmemory` (~15% of detected host memory, clamped to
+  96 MiB–512 MiB) and `maxmemory-policy volatile-lru` at startup, but **only when the
+  operator has not set `maxmemory` themselves**. Override or disable with
+  `FLOPPY_REDIS_MAXMEMORY` (`0` = never touch Redis). `manage.py tune_redis --dry-run`
+  shows what it would do.
+- The policy is `volatile-lru`, not `allkeys-lru`, because this Redis is also the Celery
+  broker: Kombu's queue keys carry no TTL, so `volatile-lru` cannot evict them.
+  **Consequence: any `cache.set(..., timeout=None)` writes a key eviction can never
+  reclaim.** Prefer an explicit TTL for anything large.
+- The largest values are `tmdb_tv_*` and `tmdb_season_*`. Seasons now expire at
+  `SEASON_CACHE_TIMEOUT` (12h) rather than the 24h default, and `search_*` at
+  `SEARCH_CACHE_TIMEOUT` (1h) since those keys are unbounded in count (arbitrary query
+  strings) and the cheapest to refetch.
+- Backfill work queues are Redis **sets** (`app/backfill_queue.py`), not pickled lists.
+  The old read-modify-write of a whole ID list per batch was O(N²) bytes per reconcile
+  sweep and, with `--appendonly yes`, O(N²) disk writes too.
+
+## Cache failures are not errors
+`CACHES["default"]["OPTIONS"]["IGNORE_EXCEPTIONS"]` is on, so a Redis fault reads as a
+cache miss instead of propagating. That is right for the ~460 read-through call sites and
+wrong for the ~20 that use `cache.add` as a lock, because `None` is falsy and reads as
+"someone else holds it". Those go through `app/cache_safety.py`, which exposes the three
+states and requires the caller to say which failure direction is safe:
+
+- `ON_ERROR_SKIP` — best-effort maintenance. Skipping a cache warm during an outage costs
+  nothing; adding load to a struggling host costs plenty.
+- `ON_ERROR_PROCEED` — work the user is waiting on (imports, webhook scrobbles). Silently
+  refusing is data loss; these paths have their own downstream duplicate protection.
+
+`DJANGO_REDIS_LOG_IGNORED_EXCEPTIONS` keeps the swallowed failures visible in the logs.
+Redis is deliberately **not** in the `/health/` liveness subset any more — the app serves
+from Postgres through an outage, so reporting unhealthy would get a working container
+restarted.

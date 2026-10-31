@@ -1,13 +1,13 @@
 import logging
+import re
 
 import requests
-from bs4 import BeautifulSoup
 from django.conf import settings
 from django.core.cache import cache
 
 from app import helpers
 from app.models import MediaTypes, Sources
-from app.providers import services
+from app.providers import credentials, services
 
 logger = logging.getLogger(__name__)
 base_url = "https://comicvine.gamespot.com/api"
@@ -35,7 +35,7 @@ def handle_error(error):
     raise services.ProviderAPIError(Sources.COMICVINE.value, error)
 
 
-def search(query, page):
+def search(query, page, user=None):
     """Search for comics on Comic Vine."""
     cache_key = (
         f"search_{Sources.COMICVINE.value}_{MediaTypes.COMIC.value}_{query}_{page}"
@@ -44,7 +44,7 @@ def search(query, page):
 
     if data is None:
         params = {
-            "api_key": settings.COMICVINE_API,
+            "api_key": credentials.get("comicvine", "api_key", user=user),
             "format": "json",
             "query": query,
             "resources": "volume",
@@ -89,14 +89,14 @@ def search(query, page):
     return data
 
 
-def comic(media_id):
+def comic(media_id, user=None):
     """Return the metadata for the selected comic volume from Comic Vine."""
     cache_key = f"{Sources.COMICVINE.value}_{MediaTypes.COMIC.value}_{media_id}"
     data = cache.get(cache_key)
 
     if data is None:
         params = {
-            "api_key": settings.COMICVINE_API,
+            "api_key": credentials.get("comicvine", "api_key", user=user),
             "format": "json",
             "field_list": (
                 "publisher,site_detail_url,name,last_issue,image,description,"
@@ -128,7 +128,18 @@ def comic(media_id):
         publisher_id = response.get("publisher", {}).get("id")
         publisher_comics = []
         if publisher_id:
-            publisher_comics = get_publisher_comics(publisher_id, media_id)
+            try:
+                publisher_comics = get_publisher_comics(publisher_id, media_id)
+            except services.ProviderAPIError:
+                logger.warning(
+                    "Failed to fetch publisher comics for volume %s", media_id
+                )
+
+        try:
+            issues = get_volume_issues(media_id)
+        except services.ProviderAPIError:
+            logger.warning("Failed to fetch issues for volume %s", media_id)
+            issues = []
 
         data = {
             "media_id": media_id,
@@ -160,7 +171,7 @@ def comic(media_id):
             },
             # used for events fetching
             "last_issue_id": response["last_issue"]["id"],
-            "issues": get_volume_issues(media_id),
+            "issues": issues,
         }
 
         cache.set(cache_key, data)
@@ -177,6 +188,11 @@ def get_image(response):
 
 def get_synopsis(response):
     """Return the synopsis."""
+    # Imported here, not at module scope: beautifulsoup4 is only needed to
+    # flatten an HTML description, so importing it at module scope would
+    # keep it resident in every process that touches this provider.
+    from bs4 import BeautifulSoup
+
     if not response.get("description"):
         return "No synopsis available"
 
@@ -296,19 +312,23 @@ def get_people_full(response):
     return people_full
 
 
-def get_volume_issues(volume_id, limit=100):
-    """Get the list of issues for a comic volume, sorted by issue number."""
+def get_volume_issues(volume_id, limit=100, user=None, offset=0):
+    """Get one page of a comic volume's issues, sorted by issue number."""
     cache_key = f"{Sources.COMICVINE.value}_volume_{volume_id}_issues"
+    if offset:
+        cache_key = f"{cache_key}_offset_{offset}"
     data = cache.get(cache_key)
+    cache_hit = data is not None
 
     if data is None:
         params = {
-            "api_key": settings.COMICVINE_API,
+            "api_key": credentials.get("comicvine", "api_key", user=user),
             "format": "json",
             "field_list": "id,name,image,issue_number,cover_date,site_detail_url",
             "filter": f"volume:{volume_id}",
             "sort": "issue_number:asc",
             "limit": limit,
+            "offset": offset,
         }
 
         try:
@@ -337,19 +357,31 @@ def get_volume_issues(volume_id, limit=100):
             for item in response.get("results", [])
         ]
 
+    data = sorted(data, key=_volume_issue_sort_key)
+
+    if not cache_hit:
         cache.set(cache_key, data)
 
     return data
 
 
-def get_publisher_comics(publisher_id, current_id, limit=15):
+def _volume_issue_sort_key(issue):
+    """Sort volume issues by their leading numeric issue number."""
+    issue_number = str(issue.get("issue_number") or "").lstrip()
+    match = re.match(r"\d+", issue_number)
+    if match:
+        return (0, int(match.group()))
+    return (1, 0)
+
+
+def get_publisher_comics(publisher_id, current_id, limit=15, user=None):
     """Get comics from the same publisher."""
     cache_key = f"{Sources.COMICVINE.value}_publisher_{publisher_id}_{current_id}"
     data = cache.get(cache_key)
 
     if data is None:
         params = {
-            "api_key": settings.COMICVINE_API,
+            "api_key": credentials.get("comicvine", "api_key", user=user),
             "format": "json",
             "field_list": "id,name,image,start_year,publisher",
             "filter": f"publisher:{publisher_id}",
@@ -386,16 +418,14 @@ def get_publisher_comics(publisher_id, current_id, limit=15):
     return data
 
 
-def search_issues(query, page):
+def search_issues(query, page, user=None):
     """Search for individual comic issues on Comic Vine."""
-    cache_key = (
-        f"search_{Sources.COMICVINE.value}_{MediaTypes.COMIC_ISSUE.value}_{query}_{page}"
-    )
+    cache_key = f"search_{Sources.COMICVINE.value}_{MediaTypes.COMIC_ISSUE.value}_{query}_{page}"
     data = cache.get(cache_key)
 
     if data is None:
         params = {
-            "api_key": settings.COMICVINE_API,
+            "api_key": credentials.get("comicvine", "api_key", user=user),
             "format": "json",
             "query": query,
             "resources": "issue",
@@ -450,14 +480,14 @@ def search_issues(query, page):
     return data
 
 
-def comic_issue(media_id):
+def comic_issue(media_id, user=None):
     """Return the full metadata for an individual comic issue from Comic Vine."""
     cache_key = f"{Sources.COMICVINE.value}_{MediaTypes.COMIC_ISSUE.value}_{media_id}"
     data = cache.get(cache_key)
 
     if data is None:
         params = {
-            "api_key": settings.COMICVINE_API,
+            "api_key": credentials.get("comicvine", "api_key", user=user),
             "format": "json",
             "field_list": (
                 "id,name,image,issue_number,volume,cover_date,store_date,"
@@ -530,24 +560,20 @@ def comic_issue(media_id):
 
 def _get_issue_people(response):
     """Return writer names from issue person_credits."""
-    credits = response.get("person_credits") or []
+    credit_entries = response.get("person_credits") or []
     return [
         person["name"]
-        for person in credits[:5]
+        for person in credit_entries[:5]
         if isinstance(person, dict) and _is_writer_role(person.get("role") or "")
-    ] or [
-        person["name"]
-        for person in credits[:5]
-        if isinstance(person, dict)
-    ]
+    ] or [person["name"] for person in credit_entries[:5] if isinstance(person, dict)]
 
 
 def _get_issue_people_full(response):
     """Return normalized writer payloads from issue person_credits."""
-    credits = response.get("person_credits") or []
+    credit_entries = response.get("person_credits") or []
     people_full = []
     seen = set()
-    for index, person in enumerate(credits):
+    for index, person in enumerate(credit_entries):
         if not isinstance(person, dict):
             continue
         role = person.get("role") or ""
@@ -570,14 +596,14 @@ def _get_issue_people_full(response):
     return people_full
 
 
-def issue(media_id):
+def issue(media_id, user=None):
     """Return cover and store dates for a comic issue (used by volume detail page)."""
     cache_key = f"{Sources.COMICVINE.value}_issue_{media_id}"
     data = cache.get(cache_key)
 
     if data is None:
         params = {
-            "api_key": settings.COMICVINE_API,
+            "api_key": credentials.get("comicvine", "api_key", user=user),
             "format": "json",
             "field_list": ("cover_date,store_date"),
         }
@@ -605,19 +631,23 @@ def issue(media_id):
     return data
 
 
-def person_profile(person_id):
+def person_profile(person_id, user=None):
     """Return metadata for a Comic Vine person profile."""
+    # Imported here, not at module scope: beautifulsoup4 is only needed to
+    # flatten an HTML description, so importing it at module scope would
+    # keep it resident in every process that touches this provider.
+    from bs4 import BeautifulSoup
+
     cache_key = f"{Sources.COMICVINE.value}_person_{person_id}"
     data = cache.get(cache_key)
     if data is not None:
         return data
 
     params = {
-        "api_key": settings.COMICVINE_API,
+        "api_key": credentials.get("comicvine", "api_key", user=user),
         "format": "json",
         "field_list": (
-            "id,name,image,deck,description,birth,death,hometown,"
-            "site_detail_url"
+            "id,name,image,deck,description,birth,death,hometown,site_detail_url"
         ),
     }
     try:
