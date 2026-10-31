@@ -4,6 +4,39 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
+## v26.10.31
+
+### New
+
+- **BingeBandit Play and Resume**: connected users' BingeBandit libraries are
+  indexed on connect and every 6 hours. Detail pages show a Play button that
+  opens the title in BingeBandit, and media cards show a badge when a title is
+  in the library.
+- **Continue Watching**: `playback.stop` webhooks save where a movie or episode
+  stopped part way. Home lists these under Continue Watching, and the detail
+  page button becomes Resume, opening BingeBandit's player at that position.
+
+### Performance
+
+- The Postgres connection pool now matches the gunicorn thread count, so
+  requests no longer queue for a free connection, and workers no longer inherit
+  the master's pool.
+- The IMDB dataset refresh runs at most once a day, 10 minutes after startup,
+  instead of on every restart.
+- Celery workers and beat run at lower CPU priority so web requests win when
+  the server is busy.
+- HTMX polling pauses while the tab is hidden, and the service worker skips
+  non-static requests.
+- The live BingeBandit status check times out after 5 seconds.
+- The nginx access log records request and upstream timings.
+
+### Upgrade notes
+
+- Runs one new database migration
+  (`integrations.0018_bingebandit_library_resume`) on start.
+- To see Play buttons and badges for an existing BingeBandit connection, wait
+  for the first library index (on connect, then every 6 hours).
+
 ## v26.10.29
 
 ### New
