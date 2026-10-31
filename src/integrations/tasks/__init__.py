@@ -3,6 +3,10 @@ import logging
 from celery import shared_task
 from django.contrib.auth import get_user_model
 
+from integrations.tasks._bingebandit import (
+    sync_all_bingebandit_libraries,
+    sync_bingebandit_library,
+)
 from integrations.tasks._cinemask import (
     sync_all_cinemask_requests,
     sync_cinemask_requests,
