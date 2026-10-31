@@ -49,6 +49,7 @@ SMART_FILTER_KEYS = (
     "format",
     "author",
     "provider",
+    "library",
     "tag",
     "tag_mode",
     "list",
@@ -92,6 +93,7 @@ SMART_FILTER_DEFAULTS = {
     "format": "",
     "author": "",
     "provider": "",
+    "library": "",
     "tag": [],
     "tag_mode": "or",
     "list": [],
@@ -537,6 +539,7 @@ def normalize_rule_payload(payload, owner):
         "format": str(_payload_get(payload, "format", "") or "").strip(),
         "author": str(_payload_get(payload, "author", "") or "").strip(),
         "provider": str(_payload_get(payload, "provider", "") or "").strip(),
+        "library": str(_payload_get(payload, "library", "") or "").strip(),
         "tag": deduped_tags,
         "tag_mode": tag_mode,
         "list": list_ids,
@@ -780,7 +783,12 @@ def _collection_only_item_ids(
 def _library_query(owner, normalized_rules: dict, target_media_types: list[str]):
     from app.library_query.adapters import from_smart_rules
 
-    return from_smart_rules(owner, normalized_rules, tuple(target_media_types))
+    query = from_smart_rules(owner, normalized_rules, tuple(target_media_types))
+    if normalized_rules.get("library"):
+        # A BingeBandit library list shows everything on the server in that
+        # library, watched or not, the way the media list's chip does.
+        query = dataclasses.replace(query, include_collection_only=True)
+    return query
 
 
 def collect_matching_item_ids(

@@ -654,6 +654,18 @@
         </button>
 
         <button type="button"
+                @click="openModal('lootden')"
+                x-show="sourceSupports(['games'])"
+                x-transition.opacity.duration.150ms
+                class="bg-[var(--color-surface-strong)] hover:bg-[var(--color-surface-border)] transition-colors rounded-lg p-4 text-left cursor-pointer flex flex-col gap-2">
+          <div class="flex items-center justify-between">
+            {% source_display "lootden" %}
+            {% if lootden_account %}<span class="flex items-center justify-center w-5 h-5 rounded-full bg-emerald-500/10 text-[var(--color-success-text)] border border-emerald-500/30" title="{% translate "Connected" %}">{% include "app/icons/checkmark.svg" with classes="w-3 h-3" %}</span>{% endif %}
+          </div>
+          <p class="text-xs text-[var(--color-text-muted)] line-clamp-2">Sync your LootDen games and play time every hour.</p>
+        </button>
+
+        <button type="button"
                 @click="openModal('xbox')"
                 x-show="sourceSupports(['games'])"
                 x-transition.opacity.duration.150ms
@@ -974,6 +986,73 @@
           </div>
         </div>
 
+        {# LootDen #}
+        <div x-show="activeModal === 'lootden'"
+             x-cloak
+             @keydown.escape.window="closeModal()"
+             x-transition.opacity.duration.150ms
+             class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+             @mousedown.self="closeModal()">
+          <div class="modal-max-height overflow-y-auto w-full"
+               style="width: min(96vw, 32rem);">
+            <button type="button"
+                    @click="closeModal()"
+                    class="block w-fit ml-auto mb-2 text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer p-1 rounded-md hover:bg-[var(--color-surface-hover)] bg-[var(--color-surface)]">
+              {% include "app/icons/x.svg" with classes="w-4 h-4" %}
+            </button>
+            <div class="bg-[var(--color-surface-strong)] p-4 rounded-lg space-y-3">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center">{% source_display "lootden" %}</div>
+                {% if lootden_account %}
+                  <form method="post" action="{% url 'lootden_disconnect' %}">
+                    {% csrf_token %}
+                    <button type="submit"
+                            class="px-2 py-1 text-xs rounded bg-slate-500/10 text-slate-200 border border-slate-400/30 hover:bg-slate-500/20 transition-colors cursor-pointer">
+                      Disconnect
+                    </button>
+                  </form>
+                {% else %}
+                  <span class="px-2 py-1 text-xs rounded bg-gray-500/20 text-[var(--color-text-secondary)] border border-gray-600/50">Disconnected</span>
+                {% endif %}
+              </div>
+              {% if lootden_account %}
+                <p class="text-sm text-[var(--color-text-muted)]">
+                  Connected as {{ lootden_account.username|default:"your account" }}.
+                  Games you install or play on LootDen are added to Games, and their play time is kept up to date every hour.
+                  {% if lootden_account.last_synced_at %}Last synced {{ lootden_account.last_synced_at|timesince }} ago.{% endif %}
+                </p>
+                {% if lootden_account.last_error %}
+                  <div class="text-xs text-amber-200 bg-amber-500/10 border border-amber-400/30 rounded p-2">{{ lootden_account.last_error }}</div>
+                {% endif %}
+                <form method="post" action="{% url 'lootden_sync_now' %}">
+                  {% csrf_token %}
+                  <button type="submit"
+                          class="w-full px-4 py-2 text-sm rounded-md transition-colors cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700">
+                    Sync now
+                  </button>
+                </form>
+              {% else %}
+                <p class="text-sm text-[var(--color-text-muted)]">
+                  Track your LootDen games and play time. Each person (kid profiles too) connects with their own token from Profile → Devices and tokens in LootDen.
+                </p>
+                <form method="post" action="{% url 'lootden_connect' %}" class="space-y-3">
+                  {% csrf_token %}
+                  <input type="url" name="base_url" required
+                         class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                         placeholder="Server URL, e.g. http://192.168.1.10:8080">
+                  <input type="password" name="api_token" required
+                         class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                         placeholder="Personal API token">
+                  <button type="submit"
+                          class="w-full px-4 py-2 text-sm rounded-md transition-colors cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700">
+                    Connect LootDen
+                  </button>
+                </form>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
         {# BingeBandit #}
         <div x-show="activeModal === 'bingebandit'"
              x-cloak
@@ -1077,6 +1156,27 @@
                   Import
                 </button>
               </div>
+            </form>
+
+            <form method="post" action="{% url 'bingebandit_settings' %}" class="space-y-2 pt-3 border-t border-gray-600">
+              {% csrf_token %}
+              <label class="flex items-center gap-2 text-sm text-[var(--color-text-secondary)]">
+                <input type="checkbox" name="sync_collection" {% if bingebandit_account.sync_collection %}checked{% endif %}
+                       class="rounded border-gray-600 bg-[var(--color-surface)] text-indigo-600">
+                Mark everything on the server as collected
+              </label>
+              <label class="flex items-center gap-2 text-sm text-[var(--color-text-secondary)]">
+                <input type="checkbox" name="push_watched" {% if bingebandit_account.push_watched %}checked{% endif %}
+                       class="rounded border-gray-600 bg-[var(--color-surface)] text-indigo-600">
+                Mark titles watched on BingeBandit when I complete them here
+              </label>
+              <input type="password" name="webhook_secret" autocomplete="off"
+                     class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                     placeholder="{% if bingebandit_account.webhook_secret %}Webhook secret is set (type a new one to change, or a space to clear){% else %}Webhook secret (optional, from the webhook in BingeBandit){% endif %}">
+              <button type="submit"
+                      class="w-full px-4 py-2 text-sm rounded-md transition-colors cursor-pointer bg-[var(--color-surface)] text-[var(--color-text)] border border-gray-600 hover:bg-[var(--color-surface-hover)]">
+                Save BingeBandit settings
+              </button>
             </form>
           {% else %}
             <p class="text-sm text-[var(--color-text-muted)]">Import watch history from your BingeBandit server.</p>

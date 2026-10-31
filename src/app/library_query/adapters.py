@@ -171,6 +171,7 @@ def filter_values_from_rules(
         format=str(rules.get("format") or ""),
         author=str(rules.get("author") or ""),
         provider=str(rules.get("provider") or ""),
+        library=str(rules.get("library") or ""),
         tags=_values(rules.get("tag")),
         tag_mode=str(rules.get("tag_mode") or "or"),
         collection_attributes=collection_attributes,

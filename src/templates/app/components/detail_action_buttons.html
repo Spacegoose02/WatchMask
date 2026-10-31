@@ -238,6 +238,13 @@
               </div>
             {% endif %}
 
+            {% if media_type == MediaTypes.GAME.value and media.source == Sources.IGDB.value and request.user.lootden_account %}
+              <div class="flex-1 md:flex-none"
+                   hx-get="{% url 'lootden_play_button' %}?igdb_id={{ media.media_id|urlencode }}"
+                   hx-trigger="load"
+                   hx-swap="outerHTML"></div>
+            {% endif %}
+
             {% if media.source == Sources.TMDB.value %}
               {% if media_type == MediaTypes.MOVIE.value or media_type == MediaTypes.TV.value %}{% if request.user.bingebandit_account %}
                 <div class="flex-1 md:flex-none"

@@ -217,3 +217,8 @@
     </div>
   </div>
 </div>
+{% if library_options %}
+  <div x-show="editMode" x-cloak class="mt-3">
+    {% include "app/components/library_chips.html" with filter_hx_endpoint=list_filter_endpoint filter_hx_target="#items-view" filter_form_id="smart-filter-form" filter_on_change="onRuleChange(0);" %}
+  </div>
+{% endif %}

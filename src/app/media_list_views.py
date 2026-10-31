@@ -30,7 +30,6 @@ from app.columns import (
     sanitize_column_prefs,
 )
 from app.library_query import FilterValues, LibraryQuery, LibraryQueryExecutor
-from integrations import bingebandit
 from app.library_query.adapters import (
     from_media_list_filters,
     last_watched_sort_key,
@@ -63,6 +62,7 @@ from app.services import metadata_resolution
 from app.stats_music import _country_name_from_code
 from app.templatetags import app_tags
 from app.tv_sort import _sort_tv_media_by_time_left
+from integrations import bingebandit
 from lists import smart_rules
 from users.models import (
     MediaSortChoices,

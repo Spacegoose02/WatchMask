@@ -513,7 +513,7 @@ class MediaManager(models.Manager.from_queryset(ImportScopedQuerySet)):
 
         library = str(filters.get("library") or "").strip()
         if library:
-            from integrations import bingebandit  # noqa: PLC0415
+            from integrations import bingebandit
 
             queryset = queryset.filter(
                 item__source=Sources.TMDB.value,

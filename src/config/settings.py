@@ -1658,6 +1658,7 @@ else:
         "app.tasks_game_groups",
         "integrations.tasks._bingebandit",
         "integrations.tasks._change_log",
+        "integrations.tasks._lootden",
         "integrations.tasks._cinemask",
         "integrations.tasks._jellyfin_pull",
         "integrations.tasks._koito",
@@ -1803,6 +1804,7 @@ CELERY_RESULT_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_ROUTES = {
     "Sync Cinemask requests*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     "Sync BingeBandit librar*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
+    "Sync LootDen games*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     "app.tasks.populate_*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     "app.tasks.reconcile_*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     "Cleanup task results": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
@@ -2203,6 +2205,10 @@ CELERY_BEAT_SCHEDULE = {
     "sync_bingebandit_libraries": {
         "task": "Sync BingeBandit libraries for all users",
         "schedule": 60 * 60 * 6,  # every 6 hours
+    },
+    "sync_lootden_games": {
+        "task": "Sync LootDen games for all users",
+        "schedule": 60 * 60,  # every hour
     },
     "refresh_discover_profiles": {
         "task": "Refresh Discover Profiles",

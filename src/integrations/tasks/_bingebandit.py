@@ -39,3 +39,21 @@ def sync_all_bingebandit_libraries():
                 exc,
             )
     return {"synced": synced, "errors": errors}
+
+
+@shared_task(name="Push watched to BingeBandit")
+def push_bingebandit_watched(user_id, media_type, tmdb_id):
+    """Mark a title completed in Watchmask as watched on BingeBandit."""
+    from django.contrib.auth import get_user_model
+
+    from integrations import bingebandit
+
+    user = get_user_model().objects.filter(id=user_id).first()
+    if not user:
+        return "No user"
+    try:
+        pushed = bingebandit.push_watched(user, media_type, tmdb_id)
+    except bingebandit.BingeBanditError as exc:
+        logger.warning("Could not mark %s %s watched on BingeBandit: %s", media_type, tmdb_id, exc)
+        return "Failed"
+    return "Pushed" if pushed else "Not on the server"

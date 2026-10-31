@@ -1226,6 +1226,7 @@ class CollectionSourceState(models.Model):
         ("sonarr", "Sonarr"),
         ("mylar", "Mylar3"),
         ("kapowarr", "Kapowarr"),
+        ("bingebandit", "BingeBandit"),
     ]
 
     user = models.ForeignKey(
@@ -2916,6 +2917,19 @@ class BingeBanditAccount(models.Model):
         default="",
         help_text="Comma-separated BingeBandit usernames whose webhook events are tracked",
     )
+    webhook_secret = models.TextField(
+        blank=True,
+        default="",
+        help_text="Encrypted secret BingeBandit signs webhooks with; empty skips the check",
+    )
+    sync_collection = models.BooleanField(
+        default=True,
+        help_text="Mark the movies and shows on the server as collected",
+    )
+    push_watched = models.BooleanField(
+        default=False,
+        help_text="Mark titles watched on BingeBandit when they are completed here",
+    )
     library_synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -3044,3 +3058,77 @@ class BingeBanditResumePoint(models.Model):
         if hours:
             return f"{hours}:{minutes:02d}:{seconds:02d}"
         return f"{minutes}:{seconds:02d}"
+
+
+class LootDenAccount(models.Model):
+    """Store a user's LootDen server and personal API token."""
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="lootden_account",
+    )
+    base_url = models.URLField(help_text="LootDen server URL")
+    api_token = models.TextField(help_text="Encrypted LootDen personal API token")
+    username = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="LootDen username the token belongs to",
+    )
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model options."""
+
+        verbose_name = "LootDen account"
+        verbose_name_plural = "LootDen accounts"
+
+    def __str__(self):
+        """Readable representation."""
+        return f"LootDenAccount({self.username})"
+
+    def game_url(self, game_id):
+        """Link to a game's page in the LootDen web app."""
+        return f"{self.base_url}/games/{game_id}"
+
+
+class LootDenGame(models.Model):
+    """A game the user installed or played on LootDen, and its Watchmask item."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="lootden_games",
+    )
+    game_id = models.CharField(max_length=255)
+    title = models.CharField(max_length=500, blank=True, default="")
+    item = models.ForeignKey(
+        "app.Item",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    playtime_seconds = models.PositiveIntegerField(default=0)
+    first_seen_at = models.DateTimeField(null=True, blank=True)
+    last_played_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        """Model options."""
+
+        verbose_name = "LootDen game"
+        verbose_name_plural = "LootDen games"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "game_id"],
+                name="integrations_lootdengame_unique_user_game",
+            ),
+        ]
+
+    def __str__(self):
+        """Readable representation."""
+        return f"LootDenGame({self.title})"

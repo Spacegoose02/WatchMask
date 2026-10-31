@@ -550,7 +550,7 @@ def _text(key: str):
 
 def _library_sql(values: FilterValues, ctx: TypeContext) -> Q:
     """Titles in one of the user's BingeBandit libraries (matched by TMDB id)."""
-    from integrations import bingebandit  # noqa: PLC0415
+    from integrations import bingebandit
 
     media_type = (
         MediaTypes.TV.value if ctx.media_type == MediaTypes.SEASON.value else ctx.media_type

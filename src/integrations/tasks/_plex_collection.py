@@ -1035,7 +1035,7 @@ def update_collection_metadata_from_plex(library, user_id):
             compatibility with already-scheduled PeriodicTask rows)
         user_id: User ID
     """
-    from app.signals import suppress_media_change_side_effects  # noqa: PLC0415
+    from app.signals import suppress_media_change_side_effects
 
     lock_key = PLEX_COLLECTION_LOCK_KEY.format(user_id=user_id)
     if not cache.add(lock_key, True, timeout=PLEX_COLLECTION_LOCK_SECONDS):
@@ -1052,12 +1052,12 @@ def update_collection_metadata_from_plex(library, user_id):
 
 def _replay_collection_side_effects(user_id):
     """Run the cache and smart-list work the suppressed per-row signals skipped."""
-    from app.cache_utils import (  # noqa: PLC0415
+    from app.cache_utils import (
         clear_home_row_cache_for_user,
         clear_media_list_cache_for_user,
     )
-    from lists.models import CustomList  # noqa: PLC0415
-    from lists.tasks import schedule_smart_list_sync  # noqa: PLC0415
+    from lists.models import CustomList
+    from lists.tasks import schedule_smart_list_sync
 
     clear_media_list_cache_for_user(user_id)
     clear_home_row_cache_for_user(user_id)
