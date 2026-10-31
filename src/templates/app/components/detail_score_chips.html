@@ -111,7 +111,7 @@
               <div x-init="htmx.process($el)">
               <div id="trakt-series-graph-{{ display_provider }}-{{ media.media_id }}"
                    hx-get="{% url 'trakt_series_graph_fragment' source=display_provider media_id=media.media_id %}"
-                   hx-trigger="load delay:300ms, every 5s"
+                   hx-trigger="load delay:300ms, every 5s [document.visibilityState === 'visible']"
                    hx-target="this"
                    hx-swap="outerHTML">
               <div class="flex items-center gap-2 py-5 px-1 text-xs text-[var(--color-text-muted)]">

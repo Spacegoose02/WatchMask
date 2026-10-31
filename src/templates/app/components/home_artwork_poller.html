@@ -16,9 +16,9 @@
 {% if poll_row_ids or active %}
   <div id="home-artwork-poller" {% if oob %}hx-swap-oob="outerHTML"{% endif %} hx-get="{% url 'home_rows_artwork_refresh' %}" hx-vals='js:{ids: Array.from(document.querySelectorAll("[data-home-row-poll-id]")).map(el => el.dataset.homeRowPollId).join(","), pending: document.querySelectorAll("[data-home-row-slot]").length}'
     {% if initial or retry_soon %}
-      hx-trigger="load delay:1s, every 30s"
+      hx-trigger="load delay:1s, every 30s [document.visibilityState === 'visible']"
     {% else %}
-      hx-trigger="every 30s"
+      hx-trigger="every 30s [document.visibilityState === 'visible']"
     {% endif %}
     hx-sync="this:abort" hx-swap="outerHTML"></div>
 {% else %}

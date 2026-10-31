@@ -4,9 +4,9 @@
      {% if poll_for_covers %}
        hx-get="{% url 'prefetch_artist_covers' artist.id %}?attempt={{ next_attempt|default:1 }}"
        {% if next_attempt %}
-         hx-trigger="every 5s"
+         hx-trigger="every 5s [document.visibilityState === 'visible']"
        {% else %}
-         hx-trigger="load delay:500ms, every 5s"
+         hx-trigger="load delay:500ms, every 5s [document.visibilityState === 'visible']"
        {% endif %}
        hx-target="#discography-container"
        hx-swap="outerHTML"
