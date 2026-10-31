@@ -44,7 +44,7 @@ def staging_failure_message(error: OSError) -> str:
         return f"{summary} The disk is full. Free some space and try again."
     if error.errno in {errno.EACCES, errno.EPERM}:
         return (
-            f"{summary} Floppy does not have permission to write to {folder}. "
+            f"{summary} Watchmask does not have permission to write to {folder}. "
             "Give that folder to the PUID and PGID the container runs as."
         )
     if error.errno == errno.EROFS:

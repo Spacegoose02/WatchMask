@@ -754,9 +754,9 @@ def test_notification(request):
 
         # Send test notification
         result = apobj.notify(
-            title="Floppy Test Notification",
+            title="Watchmask Test Notification",
             body=(
-                "<p>This is a test notification from Floppy.</p>"
+                "<p>This is a test notification from Watchmask.</p>"
                 "<p>If you're seeing this, "
                 "your notifications are working correctly!</p>"
             ),
@@ -2480,7 +2480,7 @@ def advanced(request):
     image_stats = image_cache.cache_stats()
     log_files = _log_files(Path(settings.LOG_FILE).name)
     bug_report_body = (
-        f"**Floppy version:** {settings.VERSION}\n\n"
+        f"**Watchmask version:** {settings.VERSION}\n\n"
         "**Describe the issue:**\n\n\n"
         "**Steps to reproduce:**\n\n\n"
         "**Logs:** attach the file downloaded from Settings > Advanced > "

@@ -5,7 +5,7 @@
 {% load app_tags %}
 
 {% block title %}
-  {% blocktranslate with value1=error_page_title|default:"Forbidden" %}{{ value1 }} - Floppy{% endblocktranslate %}
+  {% blocktranslate with value1=error_page_title|default:"Forbidden" %}{{ value1 }} - Watchmask{% endblocktranslate %}
 {% endblock title %}
 
 {% block extra_head %}
@@ -44,7 +44,7 @@
         <div class="bg-[var(--color-surface)] p-4 rounded-lg mb-4 text-left">
           <h3 class="font-medium mb-2 text-[var(--color-text-secondary)]">{% translate "Using a Reverse Proxy?" %}</h3>
           <p class="text-sm text-[var(--color-text-muted)]">
-            {% translate "If you're accessing Floppy through a reverse proxy, you need to set the" %} <code class="bg-[var(--color-surface-strong)] px-1 py-0.5 rounded">URLS</code> {% translate "environment variable to your application URL." %}
+            {% translate "If you're accessing Watchmask through a reverse proxy, you need to set the" %} <code class="bg-[var(--color-surface-strong)] px-1 py-0.5 rounded">URLS</code> {% translate "environment variable to your application URL." %}
           </p>
 
           <p class="text-sm text-[var(--color-text-muted)] mt-2">

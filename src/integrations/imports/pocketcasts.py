@@ -3251,7 +3251,7 @@ class PocketCastsImporter:
                 itunes_api_base,
                 params=params,
                 headers={
-                    "User-Agent": "Floppy/1.0 (https://github.com/dannyvfilms/Floppy)"
+                    "User-Agent": "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
                 },
                 timeout=10,
             )

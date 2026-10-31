@@ -43,7 +43,7 @@ def request_headers(user=None):
     password = credentials.get("gcd", "password", user=user)
     token = base64.b64encode(f"{username}:{password}".encode()).decode()
     return {
-        "User-Agent": "Floppy (self-hosted media tracker)",
+        "User-Agent": "Watchmask (self-hosted media tracker)",
         "Accept": "application/json",
         "Authorization": f"Basic {token}",
     }

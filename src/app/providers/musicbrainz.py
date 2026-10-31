@@ -29,7 +29,7 @@ RELEASE_GROUP_RELEASES_CACHE_VERSION = 1
 _last_request_time = 0
 
 # User-Agent required by MusicBrainz API
-USER_AGENT = "Floppy/1.0 (https://github.com/dannyvfilms/Floppy)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 _GENRE_ACRONYMS = frozenset({"ebm", "edm", "idm", "ndw", "nsbm", "nwobhm", "usbm"})
 _GENRE_PARENT_SUFFIXES = {
     "rock": "Rock",

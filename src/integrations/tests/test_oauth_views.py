@@ -125,7 +125,7 @@ class OAuthStateViewTests(TestCase):
         request_kwargs = provider_request.call_args.kwargs
         self.assertEqual(request_kwargs["url"], "https://api.simkl.com/oauth2/token")
         self.assertEqual(request_kwargs["headers"]["simkl-api-key"], "test-simkl-id")
-        self.assertTrue(request_kwargs["headers"]["User-Agent"].startswith("Floppy/"))
+        self.assertTrue(request_kwargs["headers"]["User-Agent"].startswith("Watchmask/"))
         self.assertEqual(request_kwargs["data"]["client_secret"], "test-simkl-secret")
         self.assertEqual(request_kwargs["data"]["code_verifier"], code_verifier)
 

@@ -14,7 +14,7 @@
 {% block content %}
 
   <p class="text-[var(--color-text-muted)] mb-6">
-    {% blocktranslate with value1=account.get_provider.name %}You signed in with {{ value1 }}. Choose a username to finish creating your Floppy account.{% endblocktranslate %}
+    {% blocktranslate with value1=account.get_provider.name %}You signed in with {{ value1 }}. Choose a username to finish creating your Watchmask account.{% endblocktranslate %}
   </p>
 
   {% url 'socialaccount_signup' as action_url %}

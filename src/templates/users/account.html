@@ -5,7 +5,7 @@
 {% load static %}
 
 {% block title %}
-  {% translate "Account - Floppy" %}
+  {% translate "Account - Watchmask" %}
 {% endblock title %}
 
 {% block settings_content %}
@@ -69,12 +69,12 @@
       {% if user.is_superuser %}
         <p class="flex items-start gap-2 text-sm text-[var(--color-text-muted)] leading-relaxed">
           {% include "app/icons/info.svg" with classes="w-4 h-4 text-[var(--color-link)] shrink-0 mt-0.5" %}
-          <span>{% blocktranslate %}You are a <strong>Superuser</strong>. You have full administrative access to this Floppy instance.{% endblocktranslate %}</span>
+          <span>{% blocktranslate %}You are a <strong>Superuser</strong>. You have full administrative access to this Watchmask instance.{% endblocktranslate %}</span>
         </p>
       {% else %}
         <p class="flex items-start gap-2 text-sm text-[var(--color-text-muted)] leading-relaxed">
           {% include "app/icons/info.svg" with classes="w-4 h-4 text-[var(--color-link)] shrink-0 mt-0.5" %}
-          <span>{% translate "You are a regular user. Superuser access grants full administrative control over this Floppy instance." %}</span>
+          <span>{% translate "You are a regular user. Superuser access grants full administrative control over this Watchmask instance." %}</span>
         </p>
 
         <div class="rounded-lg border border-[var(--color-surface-border)] bg-[var(--color-surface-strong)] p-4">
@@ -83,11 +83,11 @@
             <h3 class="font-medium text-[var(--color-warning-text)]">{% translate "Upgrading to Superuser" %}</h3>
           </div>
           <p class="text-sm text-[var(--color-text-secondary)] mb-2">
-            {% translate "Floppy never grants superuser access automatically. If you have access to the host or container running this instance, you can promote this account by running:" %}
+            {% translate "Watchmask never grants superuser access automatically. If you have access to the host or container running this instance, you can promote this account by running:" %}
           </p>
           <code class="block bg-[var(--color-surface)] rounded-md p-3 text-sm overflow-x-auto">docker exec floppy python manage.py promote_superuser {{ user.username }}</code>
           <p class="text-sm text-[var(--color-text-secondary)] mt-2">
-            {% translate "This must be run from a terminal with access to the Floppy container — it cannot be done from this web UI." %}
+            {% translate "This must be run from a terminal with access to the Watchmask container — it cannot be done from this web UI." %}
           </p>
         </div>
       {% endif %}
@@ -206,7 +206,7 @@
       <div class="text-sm text-[var(--color-text-secondary)]">
         <p class="mb-3 flex items-start gap-2 text-sm text-[var(--color-text-muted)] leading-relaxed">
           {% include "app/icons/info.svg" with classes="w-4 h-4 text-[var(--color-link)] shrink-0 mt-0.5" %}
-          <span>{% translate "Floppy cannot send password reset emails or text messages. Authenticator codes, recovery codes, or an admin password reset in the container terminal are the only recovery options." %}</span>
+          <span>{% translate "Watchmask cannot send password reset emails or text messages. Authenticator codes, recovery codes, or an admin password reset in the container terminal are the only recovery options." %}</span>
         </p>
 
         {% if show_authenticator_setup %}

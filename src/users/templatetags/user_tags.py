@@ -150,7 +150,7 @@ SOURCES_CONFIG = {
     # Source key stays "yamtrack": it is persisted on import records and the
     # CSV format is shared with upstream Yamtrack.
     "yamtrack": {
-        "name": "Floppy",
+        "name": "Watchmask",
         "logo": static("favicon/apple-touch-icon.png"),
     },
     # Display-only entry: same "yamtrack" import backend/CSV format as above,

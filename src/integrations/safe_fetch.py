@@ -345,7 +345,7 @@ def _read_bounded(response, deadline=None, max_bytes=MAX_BYTES):
     """Read at most max_bytes of decoded content, refusing anything larger."""
     declared = response.headers.get("Content-Length")
     if declared and declared.isdigit() and int(declared) > max_bytes:
-        msg = "This response is larger than Floppy will fetch."
+        msg = "This response is larger than Watchmask will fetch."
         raise UnsafeUrlError(REASON_RESPONSE_TOO_LARGE, msg)
 
     body = bytearray()
@@ -358,7 +358,7 @@ def _read_bounded(response, deadline=None, max_bytes=MAX_BYTES):
         # memory. Requests may perform many socket reads before yielding a
         # chunk, so this check cannot impose a hard wall-clock deadline.
         if len(body) > max_bytes:
-            msg = "This response is larger than Floppy will fetch."
+            msg = "This response is larger than Watchmask will fetch."
             raise UnsafeUrlError(REASON_RESPONSE_TOO_LARGE, msg)
         if deadline is not None and time.monotonic() >= deadline:
             raise _deadline_error()
@@ -390,7 +390,7 @@ def safe_fetch(
     Raises UnsafeUrlError for anything the boundary refuses, and
     requests.RequestException for a transport failure.
     """
-    outbound = {"Accept": "application/json", "User-Agent": "Floppy"}
+    outbound = {"Accept": "application/json", "User-Agent": "Watchmask"}
     for name in REQUEST_HEADER_ALLOWLIST:
         if headers and name in headers:
             outbound[name] = headers[name]
@@ -530,7 +530,7 @@ def validate_self_hosted_url(url):
         except ValueError:
             continue
         if _self_hosted_address_is_forbidden(address):
-            msg = "This server address is not one Floppy will contact."
+            msg = "This server address is not one Watchmask will contact."
             raise SelfHostedUrlError(REASON_FORBIDDEN_ADDRESS, msg)
 
 

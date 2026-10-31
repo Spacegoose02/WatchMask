@@ -90,7 +90,7 @@ def parse_descriptor(document):
         raise InvalidDescriptorError(REASON_NOT_OBJECT, msg)
 
     if document.get("kind") != DESCRIPTOR_KIND:
-        msg = "This is not a Floppy collection descriptor."
+        msg = "This is not a Watchmask collection descriptor."
         raise InvalidDescriptorError(REASON_WRONG_KIND, msg)
 
     version = document.get("version")
@@ -101,7 +101,7 @@ def parse_descriptor(document):
         # Refused rather than half-applied: importing a newer descriptor by
         # ignoring what we do not understand produces a collection that looks
         # complete and is not.
-        msg = "This descriptor was written by a newer version of Floppy."
+        msg = "This descriptor was written by a newer version of Watchmask."
         raise InvalidDescriptorError(REASON_UNSUPPORTED_VERSION, msg)
 
     name = document.get("name")
@@ -114,7 +114,7 @@ def parse_descriptor(document):
         msg = "'items' must be a list."
         raise InvalidDescriptorError(REASON_BAD_FIELD, msg)
     if len(raw_items) > MAX_ITEMS:
-        msg = "This descriptor holds more items than Floppy will import."
+        msg = "This descriptor holds more items than Watchmask will import."
         raise InvalidDescriptorError(REASON_TOO_MANY_ITEMS, msg)
 
     items = []

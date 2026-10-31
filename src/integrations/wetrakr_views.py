@@ -211,7 +211,7 @@ def wetrakr_poll(request):
         _finish_connection(request.user, account, payload)
         messages.success(
             request,
-            "WeTrakr connected. Choose what Floppy sends to it.",
+            "WeTrakr connected. Choose what Watchmask sends to it.",
         )
         return JsonResponse({"state": "approved"})
     if state == "failed":

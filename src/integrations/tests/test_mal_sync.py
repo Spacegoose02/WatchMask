@@ -1345,7 +1345,7 @@ class PreviewFullSync(TestCase):
 
         self.assertEqual(preview[0]["changes"], [
             {
-                "target": "floppy", "target_label": "Floppy",
+                "target": "floppy", "target_label": "Watchmask",
                 "field": "Status", "from": Status.IN_PROGRESS.value,
                 "to": Status.PLANNING.value,
             }
@@ -1391,7 +1391,7 @@ class PreviewFullSync(TestCase):
 
         self.assertEqual(preview[0]["changes"], [
             {
-                "target": "floppy", "target_label": "Floppy",
+                "target": "floppy", "target_label": "Watchmask",
                 "field": "Status", "from": Status.IN_PROGRESS.value,
                 "to": Status.PAUSED.value,
             }
@@ -1437,7 +1437,7 @@ class PreviewFullSync(TestCase):
 
         self.assertEqual(preview[0]["changes"], [
             {
-                "target": "floppy", "target_label": "Floppy",
+                "target": "floppy", "target_label": "Watchmask",
                 "field": "Status", "from": Status.IN_PROGRESS.value,
                 "to": Status.DROPPED.value,
             }
@@ -1483,12 +1483,12 @@ class PreviewFullSync(TestCase):
 
         self.assertEqual(preview[0]["changes"], [
             {
-                "target": "floppy", "target_label": "Floppy",
+                "target": "floppy", "target_label": "Watchmask",
                 "field": "Status", "from": Status.DROPPED.value,
                 "to": Status.IN_PROGRESS.value,
             },
             {
-                "target": "floppy", "target_label": "Floppy",
+                "target": "floppy", "target_label": "Watchmask",
                 "field": "Episodes watched", "from": 0, "to": 3,
             },
             {
@@ -1537,7 +1537,7 @@ class PreviewFullSync(TestCase):
 
         self.assertEqual(preview[0]["changes"], [
             {
-                "target": "floppy", "target_label": "Floppy",
+                "target": "floppy", "target_label": "Watchmask",
                 "field": "Score", "from": None, "to": 8,
             }
         ])

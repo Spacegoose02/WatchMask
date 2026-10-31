@@ -326,7 +326,7 @@ REST_FRAMEWORK = {
 }
 
 SPECTACULAR_SETTINGS = {
-    "TITLE": "Floppy",
+    "TITLE": "Watchmask",
     "DESCRIPTION": "A self-hosted media tracker.",
     "VERSION": "1.0.0",
     "CONTACT": {
@@ -1429,7 +1429,7 @@ SCREENSCRAPER_DEV_PASSWORD = config(
     "SCREENSCRAPER_DEV_PASSWORD",
     default=secret("SCREENSCRAPER_DEV_PASSWORD_FILE", ""),
 )
-SCREENSCRAPER_SOFTNAME = config("SCREENSCRAPER_SOFTNAME", default="Floppy")
+SCREENSCRAPER_SOFTNAME = config("SCREENSCRAPER_SOFTNAME", default="Watchmask")
 SCREENSCRAPER_SSID = config(
     "SCREENSCRAPER_SSID",
     default=secret("SCREENSCRAPER_SSID_FILE", ""),
@@ -1499,9 +1499,9 @@ PLEX_CLIENT_IDENTIFIER = config(
     "PLEX_CLIENT_IDENTIFIER",
     default=DEFAULT_PLEX_CLIENT_IDENTIFIER,
 )
-PLEX_PRODUCT = config("PLEX_PRODUCT", default="Floppy")
-PLEX_DEVICE = config("PLEX_DEVICE", default="Floppy Importer")
-PLEX_PLATFORM = config("PLEX_PLATFORM", default="Floppy")
+PLEX_PRODUCT = config("PLEX_PRODUCT", default="Watchmask")
+PLEX_DEVICE = config("PLEX_DEVICE", default="Watchmask Importer")
+PLEX_PLATFORM = config("PLEX_PLATFORM", default="Watchmask")
 PLEX_PLATFORM_VERSION = config("PLEX_PLATFORM_VERSION", default=VERSION)
 PLEX_SSL_VERIFY = config("PLEX_SSL_VERIFY", default=False, cast=bool)
 PLEX_SECTIONS_TTL_HOURS = config("PLEX_SECTIONS_TTL_HOURS", default=24, cast=int)
@@ -1790,6 +1790,8 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_RESULT_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_ROUTES = {
+    "Sync Cinemask requests*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
+    "Sync BingeBandit librar*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     "app.tasks.populate_*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     "app.tasks.reconcile_*": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     "Cleanup task results": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
@@ -2186,12 +2188,10 @@ CELERY_BEAT_SCHEDULE = {
     "sync_cinemask_requests": {
         "task": "Sync Cinemask requests for all users",
         "schedule": 60 * 30,  # every 30 minutes
-        "options": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     },
     "sync_bingebandit_libraries": {
         "task": "Sync BingeBandit libraries for all users",
         "schedule": 60 * 60 * 6,  # every 6 hours
-        "options": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     },
     "refresh_discover_profiles": {
         "task": "Refresh Discover Profiles",

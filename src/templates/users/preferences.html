@@ -5,7 +5,7 @@
 {% load app_tags %}
 
 {% block title %}
-  {% translate "Preferences - Floppy" %}
+  {% translate "Preferences - Watchmask" %}
 {% endblock title %}
 
 {% block settings_content %}
@@ -86,7 +86,7 @@
         <div class="p-3 bg-[var(--color-surface-strong)] rounded-md mb-4">
           <div class="flex flex-col items-start gap-1 mb-2">
             <label class="text-[var(--color-text-secondary)] text-sm font-medium">{% translate "Logo" %}</label>
-            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Floppy logo style." %}</span>
+            <span class="text-[var(--color-text-muted)] text-xs">{% translate "Watchmask logo style." %}</span>
           </div>
           <div class="relative"
                x-data="{ open: false, selectedValue: '{{ user.logo_style|default:'colorful' }}', selectedLabel: '' }"
@@ -698,7 +698,7 @@
           <div class="preferences-section-icon">{% include "app/icons/pulse.svg" with classes="w-5 h-5" %}</div>
           <div>
             <h3>{% translate "Tracking & Interaction" %}</h3>
-            <p>{% translate "Control how Floppy tracks and interacts with your activity." %}</p>
+            <p>{% translate "Control how Watchmask tracks and interacts with your activity." %}</p>
           </div>
         </div>
         <div class="preferences-grid preferences-tracking-grid">

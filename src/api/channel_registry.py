@@ -89,8 +89,29 @@ INBOUND_CHANNELS: tuple[InboundChannel, ...] = (
         address="webhook/seerr/global/",
         provider="seerr",
         summary=(
-            "Overseerr or Jellyseerr global webhook. Floppy resolves the owning "
+            "Overseerr or Jellyseerr global webhook. Watchmask resolves the owning "
             "user from the payload instead of a token in the path."
+        ),
+        dispatches_to="celery",
+    ),
+    InboundChannel(
+        key="bingebanditWebhook",
+        address="webhook/bingebandit/{token}",
+        provider="bingebandit",
+        summary=(
+            "BingeBandit JSON webhook: playback.start and playback.finished "
+            "track progress, player.* events drive Now Playing, and "
+            "playback.stop saves a resume point."
+        ),
+        dispatches_to="celery",
+    ),
+    InboundChannel(
+        key="cinemaskWebhook",
+        address="webhook/cinemask/{token}",
+        provider="cinemask",
+        summary=(
+            "Cinemask request.created and request.available events, which "
+            "refresh request status and add requests as Planning."
         ),
         dispatches_to="celery",
     ),
@@ -107,7 +128,7 @@ INBOUND_CHANNELS: tuple[InboundChannel, ...] = (
         provider="stremio",
         summary=(
             "Stremio subtitles request used as a playback-start signal. Stremio "
-            "re-requests on seek and quality change, so Floppy throttles to one "
+            "re-requests on seek and quality change, so Watchmask throttles to one "
             "scrobble per item per window."
         ),
         dispatches_to="celery",
@@ -247,11 +268,11 @@ def render_asyncapi() -> str:
     document = {
         "asyncapi": ASYNCAPI_VERSION,
         "info": {
-            "title": "Floppy asynchronous channels",
+            "title": "Watchmask asynchronous channels",
             "version": CONTRACT_VERSION,
             "description": (
                 "Verified inbound message channels and Celery queue ownership for "
-                "a Floppy instance. Scope is deliberately narrow: polling "
+                "a Watchmask instance. Scope is deliberately narrow: polling "
                 "importers, Apprise notification destinations, and shared base "
                 "classes are not channels and are excluded."
             ),

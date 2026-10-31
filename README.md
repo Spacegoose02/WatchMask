@@ -1,22 +1,20 @@
 <p align="center">
-  <img alt="Floppy — everything in one place" src="docs/brand/floppy-wallpaper.png" width="880" />
+  <img alt="Watchmask" src="src/static/img/floppy-logo@2x.png" width="317" />
 </p>
 
 <p align="center">
   <b>Your own private Trakt, Letterboxd, and Goodreads — in one app, on your own hardware.</b><br>
-  Track movies, TV, anime, books, comics, manga, games, board games, music, and podcasts in one place.
+  Track movies, TV, anime, books, comics, manga and games in one place, with BingeBandit built in.
 </p>
 
 <p align="center">
-  <a href="https://yamtrack.dannyvfilms.com">Live demo</a> ·
   <a href="#install">Install</a> ·
-  <a href="https://github.com/dannyvfilms/Floppy/wiki">Docs</a> ·
-  <a href="https://discord.gg/uFgha7Kb6n">Discord</a> ·
-  <a href="https://github.com/dannyvfilms/Floppy/releases">Releases</a> ·
-  <a href="https://github.com/sponsors/dannyvfilms?metadata_source=readme">Sponsor</a>
+  <a href="https://github.com/dannyvfilms/Floppy/wiki">Docs (Floppy wiki)</a> ·
+  <a href="https://github.com/Spacegoose02/Yamtrack/releases">Releases</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
-Floppy is a self-hosted media tracker and diary for everything you watch, read,
+Watchmask is a self-hosted media tracker and diary for everything you watch, read,
 play, and listen to. Log
 what you finish, see what to pick up next, and get a yearly recap of how you spent
 your time. Connect Plex, Jellyfin, Emby, Pocket Casts, or Last.fm and your history
@@ -27,7 +25,7 @@ home and open it from any browser, on desktop or phone. Your data never leaves
 your machine unless you connect a service that needs it.
 
 <p align="center">
-  <img alt="A movie's detail page in Floppy, with backdrop, ratings, and check-in button" src="docs/screenshots/readme/details.jpg" width="880" />
+  <img alt="A movie's detail page in Watchmask, with backdrop, ratings, and check-in button" src="docs/screenshots/readme/details.jpg" width="880" />
 </p>
 
 ## A look around
@@ -59,7 +57,7 @@ your machine unless you connect a service that needs it.
       <b>Calendar</b> — upcoming episodes and releases for everything you track.
     </td>
     <td valign="top">
-      <img alt="Floppy on a phone: home, a movie, and statistics" src="docs/screenshots/readme/mobile.jpg" /><br>
+      <img alt="Watchmask on a phone: home, a movie, and statistics" src="docs/screenshots/readme/mobile.jpg" /><br>
       <b>On your phone</b> — built for mobile, and installable as an app.
     </td>
   </tr>
@@ -102,45 +100,16 @@ you add is visible to everyone else trying it.
 
 ## Install
 
-Floppy runs on a computer or server you leave on. You open it from any browser
-on your network. One guided installer covers the common setups. Paste the
-same line on Windows, macOS, or Linux; it selects the right installer.
+Watchmask runs in Docker. Use the [Docker Compose example](docs/deployment.md#docker-compose-recommended)
+with the `ghcr.io/spacegoose02/watchmask` image; `SECRET` is the only setting you must fill in.
+[Docker Run](docs/deployment.md#docker-run) and the [deployment reference](docs/deployment.md)
+cover PostgreSQL, reverse proxies, environment variables and upgrades.
 
-| Your system | What the installer does |
-| --- | --- |
-| Windows 10 and 11 | Uses Docker Desktop and offers to install it for you |
-| macOS | Uses Docker Desktop, or a native Homebrew install |
-| Ubuntu and Debian | Installs Docker for you, or runs natively with systemd |
-| Other Linux | Needs Docker already installed |
-
-The installer asks a few plain questions and asks before it installs anything.
-It never asks for a password or API key. It finishes with Floppy open in your
-browser.
-
-Open **PowerShell** on Windows or **Terminal** on macOS/Linux. Paste this entire
-line and press Enter:
-
-```text
-echo "\" | Out-Null; irm 'https://raw.githubusercontent.com/dannyvfilms/Floppy/latest/scripts/install.ps1' -ErrorAction Stop | iex; #" >/dev/null; bash -c 'p=$(mktemp) || exit; cleanup() { rm -f "$p"; }; trap cleanup EXIT; curl -fsSL https://raw.githubusercontent.com/dannyvfilms/Floppy/latest/scripts/install.sh -o "$p" && bash "$p"'
-```
-
-### Phones and tablets
-
-Once Floppy is running, open it in your phone's browser and add it to your
-home screen. [Step-by-step guide](https://github.com/dannyvfilms/Floppy/wiki/2.-User-Guide#installing-floppy-on-your-phone).
-
-### If you know what you're doing
-
-- [Docker Compose](docs/deployment.md#docker-compose-recommended) works for
-  Unraid, Synology and Portainer too. `SECRET` is the only setting you must fill in.
-- [Docker Run](docs/deployment.md#docker-run) if you don't use Compose.
-- [Deployment reference](docs/deployment.md) covers PostgreSQL, reverse proxies,
-  environment variables, upgrades and troubleshooting.
-- [What the installer does](docs/install.md), step by step.
+Once it is running, open it in your phone's browser and add it to your home screen.
 
 ## Privacy and trust
 
-Your library, ratings, and activity stay in the database you run. Floppy has no
+Your library, ratings, and activity stay in the database you run. Watchmask has no
 analytics and no central update check. It does contact metadata providers (such
 as TMDB) to look up titles and artwork, and connected services receive what their
 features need. Run it for yourself or people you trust, and turn off sign-ups
@@ -148,54 +117,27 @@ after creating your account. Details:
 [security notes](docs/security-hardening.md) ·
 [reporting a vulnerability](SECURITY.md).
 
-## Coming from Yamtrack?
+## Watchmask, Watchmask and Yamtrack
 
-Floppy started as a fork of [Yamtrack](https://github.com/FuzzyGrim/Yamtrack).
-Yamtrack CSV exports import directly under **Settings → Import**, and existing
-containers of this project keep working after the rename — just move to the
-`ghcr.io/dannyvfilms/floppy` image. [Migration notes](https://github.com/dannyvfilms/Floppy/wiki#coming-from-yamtrack).
+Watchmask is built on [Floppy](https://github.com/dannyvfilms/Floppy), which
+started as a fork of [Yamtrack](https://github.com/FuzzyGrim/Yamtrack). It
+follows Watchmask closely and adds a native [BingeBandit](https://github.com/Spacegoose02/BingeBandit)
+integration (webhook tracking, history import, Play/Resume and Continue
+Watching) and Cinemask requests. Existing Watchmask and Yamtrack data keep
+working; Yamtrack CSV exports import under **Settings → Import**.
 
-## Building on Floppy
+## Building on Watchmask
 
-Floppy has a REST API at `/api/v1` and an [MCP server](mcp_server/) for AI
+Watchmask has a REST API at `/api/v1` and an [MCP server](mcp_server/) for AI
 assistants. Start with the
 [API and MCP guide](https://github.com/dannyvfilms/Floppy/wiki/7.-API-and-MCP-Server);
 your running instance serves its own API index at `/api/docs/`. Download tools
 can read lists and report owned media ([FlexGet guide](docs/integrations/flexget.md)).
 
-## Community and support
+## Support
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <ul>
-        <li><b>Questions and ideas:</b> <a href="https://discord.gg/uFgha7Kb6n">Discord</a> is the place to share setups and help each other out.</li>
-        <li><b>Bugs and feature requests:</b> <a href="https://github.com/dannyvfilms/Floppy/issues">open an issue</a>.</li>
-        <li><b>Contributing:</b> code, docs, and polish are welcome — see the <a href="CONTRIBUTING.md">contributing guide</a>.</li>
-        <li><b>Sponsoring:</b> <a href="https://github.com/sponsors/dannyvfilms">support Floppy on GitHub Sponsors</a>.</li>
-        <li><b>Starring</b> the repository helps more people find it.</li>
-        <li><i>The card refreshes daily from GitHub Sponsors public data.</i></li>
-      </ul>
-    </td>
-    <td width="50%" align="center" valign="middle">
-      <a href="https://github.com/sponsors/dannyvfilms">
-        <img src="docs/brand/sponsors-goal.svg" alt="Live GitHub Sponsors goal progress for Floppy" width="100%" />
-      </a>
-    </td>
-  </tr>
-</table>
-
-<hr>
-
-<p align="center">
-  Thank you to everyone who has contributed to Floppy and to Yamtrack before it.<br><br>
-</p>
-
-<p align="center">
-  <a href="https://github.com/dannyvfilms/Floppy/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=dannyvfilms/Floppy&amp;columns=16" alt="Contributors" width="60%" />
-  </a>
-</p>
+Report Watchmask bugs on [this repository's issues](https://github.com/Spacegoose02/Yamtrack/issues).
+Thank you to everyone who has contributed to Watchmask, and to Yamtrack before it.
 
 ## Configuration and deployment
 
@@ -214,7 +156,7 @@ Links into the old sections of this page land here:
 - [Environment variables](docs/deployment.md#environment-variables) ·
   [Running on a small host](docs/deployment.md#running-on-a-small-host) ·
   [Reverse proxy setup](docs/deployment.md#reverse-proxy-setup)
-- [Floppy can't reach Redis](docs/deployment.md#floppy-cant-reach-redis) ·
+- [Watchmask can't reach Redis](docs/deployment.md#floppy-cant-reach-redis) ·
   [Startup diagnostics](docs/deployment.md#startup-diagnostics) ·
   [I updated and my login is gone](docs/deployment.md#troubleshooting-i-updated-and-my-login-is-gone)
 - [Upgrading container images](docs/deployment.md#upgrading-container-images) ·
@@ -228,13 +170,13 @@ AGPL-3.0.
 
 ## Origins and AI use
 
-Floppy began as a fork of [FuzzyGrim/Yamtrack](https://github.com/FuzzyGrim/Yamtrack)
+Watchmask began as a fork of [FuzzyGrim/Yamtrack](https://github.com/FuzzyGrim/Yamtrack)
 and still shares its foundation and data model; this repository keeps the fork
 link. It has since grown into its own project. Thanks to FuzzyGrim and Yamtrack's
 contributors for the groundwork.
 
-Floppy uses AI coding agents for implementation, tests, and documentation under
-maintainer direction. This describes Floppy's development, not all inherited
+Watchmask uses AI coding agents for implementation, tests, and documentation under
+maintainer direction. This describes Watchmask's development, not all inherited
 Yamtrack history. PRs should disclose the model/workflow used and record human
 review only when it actually occurred. Agent reviews and passing checks are
 not independent security certification.

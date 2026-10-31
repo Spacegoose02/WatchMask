@@ -60,7 +60,7 @@ def _request_token(data, auth_v1=False):
     """Exchange a code or refresh token at SIMKL's token endpoint."""
     headers = {
         "simkl-api-key": credentials.get("simkl", "client_id"),
-        "User-Agent": f"Floppy/{settings.VERSION}",
+        "User-Agent": f"Watchmask/{settings.VERSION}",
     }
     data = {
         "client_id": credentials.get("simkl", "client_id"),
@@ -95,7 +95,7 @@ def _request_token(data, auth_v1=False):
             msg = (
                 "SIMKL rejected the Client ID and Client secret. Check them in "
                 "Settings > Metadata, and that the SIMKL app's redirect URI "
-                "matches this Floppy address."
+                "matches this Watchmask address."
             )
             raise MediaImportError(msg) from error
         raise
@@ -106,7 +106,7 @@ def _api_headers(token):
     return {
         "Authorization": f"Bearer {token}",
         "simkl-api-key": credentials.get("simkl", "client_id"),
-        "User-Agent": f"Floppy/{settings.VERSION}",
+        "User-Agent": f"Watchmask/{settings.VERSION}",
     }
 
 

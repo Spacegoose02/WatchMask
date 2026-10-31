@@ -5,7 +5,7 @@
 {% load app_tags %}
 
 {% block title %}
-  {% translate "Sync to Trackers - Floppy" %}
+  {% translate "Sync to Trackers - Watchmask" %}
 {% endblock title %}
 
 {% block settings_content %}
@@ -695,14 +695,14 @@
                    name="pull_higher_progress"
                    {% if mal_account.pull_higher_progress_enabled %}checked{% endif %}
                    class="mr-2 rounded bg-[var(--color-surface)] border-gray-600 text-indigo-600 focus:outline-none focus:ring-indigo-500 focus:ring-offset-0">
-            {% translate "Adopt MyAnimeList's progress when it's higher than Floppy's" %}
+            {% translate "Adopt MyAnimeList's progress when it's higher than Watchmask's" %}
           </label>
           <label class="flex items-center text-sm text-[var(--color-text-secondary)]">
             <input type="checkbox"
                    name="pull_ratings"
                    {% if mal_account.pull_ratings_enabled %}checked{% endif %}
                    class="mr-2 rounded bg-[var(--color-surface)] border-gray-600 text-indigo-600 focus:outline-none focus:ring-indigo-500 focus:ring-offset-0">
-            {% translate "Adopt a MyAnimeList rating when Floppy doesn't have one" %}
+            {% translate "Adopt a MyAnimeList rating when Watchmask doesn't have one" %}
           </label>
           <button type="submit"
                   class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
@@ -949,7 +949,7 @@
               {% translate "Select all" %}
             </label>
           </div>
-          <template x-for="group in [{ target: 'floppy', label: gettext('Pull into Floppy') }, { target: 'mal', label: gettext('Push to MyAnimeList') }]"
+          <template x-for="group in [{ target: 'floppy', label: gettext('Pull into Watchmask') }, { target: 'mal', label: gettext('Push to MyAnimeList') }]"
                     :key="group.target">
             <section x-show="previewEntries(group.target).length" class="space-y-2">
               <h3 class="text-sm font-semibold text-[var(--color-text)]"
@@ -992,7 +992,7 @@
                            x-model="malSyncPull[entry.key]"
                            :disabled="!malSyncSelected[entry.key]"
                            class="mr-2 rounded bg-[var(--color-surface)] border-gray-600 text-indigo-600 focus:outline-none focus:ring-indigo-500 focus:ring-offset-0 disabled:opacity-50">
-                    {% translate "Pull from MyAnimeList into Floppy instead" %}
+                    {% translate "Pull from MyAnimeList into Watchmask instead" %}
                   </label>
                 </div>
               </template>

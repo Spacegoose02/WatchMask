@@ -1,9 +1,9 @@
 {
   "asyncapi": "3.0.0",
   "info": {
-    "title": "Floppy asynchronous channels",
+    "title": "Watchmask asynchronous channels",
     "version": "1.0.0",
-    "description": "Verified inbound message channels and Celery queue ownership for a Floppy instance. Scope is deliberately narrow: polling importers, Apprise notification destinations, and shared base classes are not channels and are excluded.",
+    "description": "Verified inbound message channels and Celery queue ownership for a Watchmask instance. Scope is deliberately narrow: polling importers, Apprise notification destinations, and shared base classes are not channels and are excluded.",
     "contact": {
       "url": "https://github.com/dannyvfilms/Floppy/issues"
     },
@@ -65,13 +65,37 @@
     "seerrGlobalWebhook": {
       "address": "/webhook/seerr/global/",
       "title": "seerrGlobalWebhook",
-      "summary": "Overseerr or Jellyseerr global webhook. Floppy resolves the owning user from the payload instead of a token in the path.",
+      "summary": "Overseerr or Jellyseerr global webhook. Watchmask resolves the owning user from the payload instead of a token in the path.",
       "messages": {
         "request": {
           "$ref": "#/components/messages/seerrGlobalWebhookRequest"
         }
       },
       "x-floppy-provider": "seerr",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "bingebanditWebhook": {
+      "address": "/webhook/bingebandit/{token}",
+      "title": "bingebanditWebhook",
+      "summary": "BingeBandit JSON webhook: playback.start and playback.finished track progress, player.* events drive Now Playing, and playback.stop saves a resume point.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/bingebanditWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "bingebandit",
+      "x-floppy-dispatches-to-queue": "celery"
+    },
+    "cinemaskWebhook": {
+      "address": "/webhook/cinemask/{token}",
+      "title": "cinemaskWebhook",
+      "summary": "Cinemask request.created and request.available events, which refresh request status and add requests as Planning.",
+      "messages": {
+        "request": {
+          "$ref": "#/components/messages/cinemaskWebhookRequest"
+        }
+      },
+      "x-floppy-provider": "cinemask",
       "x-floppy-dispatches-to-queue": "celery"
     },
     "kodiWebhook": {
@@ -89,7 +113,7 @@
     "stremioAddonSubtitles": {
       "address": "/stremio-addon/{token}/subtitles/{media_type}/{media_id}.json",
       "title": "stremioAddonSubtitles",
-      "summary": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Floppy throttles to one scrobble per item per window.",
+      "summary": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Watchmask throttles to one scrobble per item per window.",
       "messages": {
         "request": {
           "$ref": "#/components/messages/stremioAddonSubtitlesRequest"
@@ -168,7 +192,21 @@
       "channel": {
         "$ref": "#/channels/seerrGlobalWebhook"
       },
-      "summary": "Overseerr or Jellyseerr global webhook. Floppy resolves the owning user from the payload instead of a token in the path."
+      "summary": "Overseerr or Jellyseerr global webhook. Watchmask resolves the owning user from the payload instead of a token in the path."
+    },
+    "receiveBingebanditWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/bingebanditWebhook"
+      },
+      "summary": "BingeBandit JSON webhook: playback.start and playback.finished track progress, player.* events drive Now Playing, and playback.stop saves a resume point."
+    },
+    "receiveCinemaskWebhook": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/cinemaskWebhook"
+      },
+      "summary": "Cinemask request.created and request.available events, which refresh request status and add requests as Planning."
     },
     "receiveKodiWebhook": {
       "action": "receive",
@@ -182,7 +220,7 @@
       "channel": {
         "$ref": "#/channels/stremioAddonSubtitles"
       },
-      "summary": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Floppy throttles to one scrobble per item per window."
+      "summary": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Watchmask throttles to one scrobble per item per window."
     },
     "receiveStremioAddonPlayer": {
       "action": "receive",
@@ -246,7 +284,25 @@
       },
       "seerrGlobalWebhookRequest": {
         "name": "seerrGlobalWebhookRequest",
-        "title": "Overseerr or Jellyseerr global webhook. Floppy resolves the owning user from the payload instead of a token in the path.",
+        "title": "Overseerr or Jellyseerr global webhook. Watchmask resolves the owning user from the payload instead of a token in the path.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "bingebanditWebhookRequest": {
+        "name": "bingebanditWebhookRequest",
+        "title": "BingeBandit JSON webhook: playback.start and playback.finished track progress, player.* events drive Now Playing, and playback.stop saves a resume point.",
+        "contentType": "application/json",
+        "payload": {
+          "type": "object"
+        },
+        "x-floppy-payload-owner": "third-party"
+      },
+      "cinemaskWebhookRequest": {
+        "name": "cinemaskWebhookRequest",
+        "title": "Cinemask request.created and request.available events, which refresh request status and add requests as Planning.",
         "contentType": "application/json",
         "payload": {
           "type": "object"
@@ -264,7 +320,7 @@
       },
       "stremioAddonSubtitlesRequest": {
         "name": "stremioAddonSubtitlesRequest",
-        "title": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Floppy throttles to one scrobble per item per window.",
+        "title": "Stremio subtitles request used as a playback-start signal. Stremio re-requests on seek and quality change, so Watchmask throttles to one scrobble per item per window.",
         "contentType": "application/json",
         "payload": {
           "type": "object"

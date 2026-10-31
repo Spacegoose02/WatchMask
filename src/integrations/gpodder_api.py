@@ -16,7 +16,7 @@ from integrations.safe_fetch import send_to_self_hosted
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "Floppy/1.0 (https://github.com/dannyvfilms/Floppy)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 DEFAULT_SERVER_URL = "https://gpodder.net"
 
 
@@ -171,7 +171,7 @@ def verify_login(credentials: GPodderCredentials) -> None:
 
 def register_device(credentials: GPodderCredentials, device_id: str) -> None:
     """Best-effort registration of the Floppy device."""
-    payload = {"caption": "Floppy", "type": "server"}
+    payload = {"caption": "Watchmask", "type": "server"}
     _request(
         "POST",
         credentials.server_url,

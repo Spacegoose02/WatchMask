@@ -334,7 +334,7 @@ class OnboardingMetadataStepTests(TestCase):
         response = self.client.get(self.url)
 
         self.assertEqual(self.offered(response), ["tmdb"])
-        self.assertContains(response, "shared by every Floppy install")
+        self.assertContains(response, "shared by every Watchmask install")
 
     def test_a_provider_is_only_offered_for_media_types_that_use_it(self):
         self.enable("game", "movie")

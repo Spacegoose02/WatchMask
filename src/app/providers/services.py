@@ -314,7 +314,7 @@ def build_limiter_session():
         logger.warning(
             "Redis rate-limit bucket unavailable (%s); falling back to a "
             "per-process limiter. Provider budgets are shared across processes "
-            "again once Redis recovers and Floppy restarts.",
+            "again once Redis recovers and Watchmask restarts.",
             error,
         )
         return LimiterSession(per_second=_GLOBAL_PER_SECOND)
@@ -349,7 +349,7 @@ def _build_host_limiter_adapter(**limits):
         logger.warning(
             "Redis rate-limit bucket unavailable (%s); falling back to a "
             "per-process limiter for this host. Its provider budget is only "
-            "enforced per-process until Redis recovers and Floppy restarts.",
+            "enforced per-process until Redis recovers and Watchmask restarts.",
             error,
         )
         return LimiterAdapter(**limits)
@@ -420,7 +420,7 @@ except Exception as _host_pool_error:
     logger.warning(
         "Redis rate-limit pool unavailable (%s); per-host provider budgets "
         "will fall back to a per-process limiter until Redis recovers and "
-        "Floppy restarts.",
+        "Watchmask restarts.",
         _host_pool_error,
     )
     _host_limiter_redis_pool = None

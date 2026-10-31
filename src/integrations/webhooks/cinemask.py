@@ -25,6 +25,7 @@ class CinemaskWebhookProcessor:
     }
 
     def process_payload(self, payload, user):
+        """Refresh the request named in a Cinemask event and track it."""
         try:
             account = user.cinemask_account
         except CinemaskAccount.DoesNotExist:

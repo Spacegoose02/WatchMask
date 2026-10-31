@@ -1285,7 +1285,7 @@ class SqliteIntegrityTests(SimpleTestCase):
             check_database_integrity(self.unused_path())
 
         self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("Stop other Floppy processes", stderr.getvalue())
+        self.assertIn("Stop other Watchmask processes", stderr.getvalue())
         self.assertNotIn("corrupt", stderr.getvalue())
 
     def test_healthy_database_passes(self):

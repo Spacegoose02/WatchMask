@@ -1,10 +1,10 @@
 {% load i18n %}
 {# Body of the TMDb modal; the shell is outbound_service_modal.html. #}
 <p class="text-sm text-[var(--color-text-muted)]">
-  {% translate "Send your movie, show and episode ratings to your TMDb account. Season ratings stay in Floppy." %}
+  {% translate "Send your movie, show and episode ratings to your TMDb account. Season ratings stay in Watchmask." %}
 </p>
 <p class="text-xs text-[var(--color-text-muted)]">
-  {% translate "Scores are rounded to the nearest half-point (minimum 0.5). Your Floppy score is unchanged. Clearing a rating removes it from TMDb. TMDb may remove rated titles from its watchlist, depending on your TMDb account settings." %}
+  {% translate "Scores are rounded to the nearest half-point (minimum 0.5). Your Watchmask score is unchanged. Clearing a rating removes it from TMDb. TMDb may remove rated titles from its watchlist, depending on your TMDb account settings." %}
 </p>
 {% if tmdb_rating_sync.account %}
   <p class="text-sm text-[var(--color-text)]">{% translate "Connected as" %} {{ tmdb_rating_sync.account.username }}</p>
@@ -18,9 +18,9 @@
     {% csrf_token %}
     <label class="flex items-center gap-2 text-sm text-[var(--color-text)]">
       <input type="checkbox" name="enabled" {% if tmdb_rating_sync.enabled %}checked{% endif %}>
-      {% translate "Automatically send my rating edits from Floppy" %}
+      {% translate "Automatically send my rating edits from Watchmask" %}
     </label>
-    <p class="text-xs text-[var(--color-text-muted)]">{% translate "Floppy replaces existing TMDb ratings. Imported ratings are only sent when you export them." %}</p>
+    <p class="text-xs text-[var(--color-text-muted)]">{% translate "Watchmask replaces existing TMDb ratings. Imported ratings are only sent when you export them." %}</p>
     <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm cursor-pointer">{% translate "Save" %}</button>
   </form>
   {% if tmdb_rating_sync.enabled %}

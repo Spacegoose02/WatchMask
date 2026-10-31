@@ -250,7 +250,7 @@ class ListItemsOrderView(drf_views.APIView):
         request=ListItemsOrderRequestSerializer,
         responses={204: None, 400: DetailErrorSerializer, **_ORDER_ERRORS},
         description=(
-            "Set the order of a list's items. `item_ids` are Floppy's numeric "
+            "Set the order of a list's items. `item_ids` are Watchmask's numeric "
             "Item ids, the `id` field of each entry in "
             "GET /api/v1/lists/{list_id}/items/, which returns items in this "
             "order unless `sort` is given. Send every item of the list, or "

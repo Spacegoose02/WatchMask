@@ -57,7 +57,7 @@
           {% elif server_port_config_error_source == "environment" %}
             {% translate "Correct the environment value before evaluating fallbacks." %}
           {% elif server_port_status and server_port_status.saved_port %}
-            {% translate "Stored under the Floppy data directory." %}
+            {% translate "Stored under the Watchmask data directory." %}
           {% else %}
             {% blocktranslate %}No saved override. The default is {{ default_port }}.{% endblocktranslate %}
           {% endif %}
@@ -73,7 +73,7 @@
           <div>
             <h4 class="font-medium text-[var(--color-warning-text)]">{% translate "Environment override is active" %}</h4>
             <p class="mt-1 text-sm text-[var(--color-text-muted)]">
-              <code>{{ environment_name }}</code> {% translate "controls this instance. This form cannot replace it. Change or remove the environment variable, then restart Floppy." %}
+              <code>{{ environment_name }}</code> {% translate "controls this instance. This form cannot replace it. Change or remove the environment variable, then restart Watchmask." %}
             </p>
           </div>
         </div>
@@ -96,9 +96,9 @@
             <p class="mt-1 text-sm text-[var(--color-text-muted)]">{{ server_port_config_error }}</p>
             <p class="mt-2 text-sm text-[var(--color-text-muted)]">
               {% if server_port_config_error_source == "environment" %}
-                {% translate "Correct" %} <code>{{ environment_name }}</code> {% translate "before you restart Floppy." %}
+                {% translate "Correct" %} <code>{{ environment_name }}</code> {% translate "before you restart Watchmask." %}
               {% else %}
-                {% translate "Reset the saved value below, or correct the file before you restart Floppy." %}
+                {% translate "Reset the saved value below, or correct the file before you restart Watchmask." %}
               {% endif %}
             </p>
             {% else %}
@@ -116,7 +116,7 @@
     <div class="bg-[var(--color-surface-strong)] rounded-lg p-5">
       <h4 class="text-base font-medium mb-1">{% translate "Internal listener" %}</h4>
       <p id="server-port-help" class="text-sm text-[var(--color-text-muted)] mb-4">
-        {% translate "Use an integer from 1 through 65535. Saving changes the next listener value. It does not restart Floppy." %}
+        {% translate "Use an integer from 1 through 65535. Saving changes the next listener value. It does not restart Watchmask." %}
       </p>
 
       <form method="post" action="{% url 'update_server_port' %}" class="space-y-4 max-w-xl">
@@ -173,9 +173,9 @@
     <div class="mt-5 text-sm text-[var(--color-text-muted)] max-w-4xl">
       <h4 class="font-medium text-[var(--color-text)]">{% translate "Deployment notes" %}</h4>
       <ul class="mt-2 list-disc list-inside space-y-2">
-        <li>{% translate "For a normal host-port change, keep Floppy on 8000 and map another host port, for example" %} <code>9000:8000</code>.</li>
+        <li>{% translate "For a normal host-port change, keep Watchmask on 8000 and map another host port, for example" %} <code>9000:8000</code>.</li>
         <li>{% translate "If the internal listener must move, use the same target in the container mapping, for example" %} <code>9000:9000</code>.</li>
-        <li>{% translate "If Floppy shares another container's network namespace, publish the selected port on the container that owns that namespace." %}</li>
+        <li>{% translate "If Watchmask shares another container's network namespace, publish the selected port on the container that owns that namespace." %}</li>
         <li>{% translate "The private application hop remains internal and is not changed by this setting." %}</li>
       </ul>
     </div>

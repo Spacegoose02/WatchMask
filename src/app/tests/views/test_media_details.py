@@ -1435,7 +1435,7 @@ class MediaDetailsViewTests(TestCase):
         # The page render arms an early poll; the swapped-in fragment must
         # not, or every swap re-fires `load` and polls once per second.
         self.assertContains(
-            detail_response, 'hx-trigger="load delay:500ms, every 5s"'
+            detail_response, "hx-trigger=\"load delay:500ms, every 5s [document.visibilityState === 'visible']\""
         )
         self.assertContains(
             detail_response,
@@ -1459,7 +1459,7 @@ class MediaDetailsViewTests(TestCase):
         )
         self.assertContains(refresh_response, "hx-preserve", html=False)
         self.assertContains(refresh_response, "Refreshing cover art")
-        self.assertContains(refresh_response, 'hx-trigger="every 5s"')
+        self.assertContains(refresh_response, "hx-trigger=\"every 5s [document.visibilityState === 'visible']\"")
         self.assertNotContains(refresh_response, "load delay")
 
     @patch("app.services.music.needs_discography_sync", return_value=False)

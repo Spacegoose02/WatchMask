@@ -144,7 +144,7 @@ class RecoveryPageTests(SimpleTestCase):
 
             with self.post(f"{base}/retry") as response:
                 body = response.read().decode()
-            self.assertIn("Floppy is retrying", body)
+            self.assertIn("Watchmask is retrying", body)
 
             decision = json.loads(
                 Path(f"{db_path}.integrity.decision").read_text(),
@@ -255,7 +255,7 @@ class RecoveryPageTests(SimpleTestCase):
             )
             self.assertEqual(response.status, 200)
             body = response.read().decode()
-            self.assertIn("Floppy has your choice.", body)
+            self.assertIn("Watchmask has your choice.", body)
             # The app needs minutes to migrate and start. A timed reload would
             # land on a connection error and read as a failed repair.
             self.assertNotIn("http-equiv='refresh'", body)
@@ -419,7 +419,7 @@ class RecoveryPageTests(SimpleTestCase):
             report = self.block_startup(db_path)
             status = {"database": db_path, "status": "ok"}
             page = recovery.render_page(report, interactive=True, status=status)
-            self.assertIn("Your data is safe. Floppy paused before migrations.", page)
+            self.assertIn("Your data is safe. Watchmask paused before migrations.", page)
             self.assertNotIn("stopped making progress", page)
 
     def test_offline_and_live_pages_render_the_same_timeout_diagnosis(self):
@@ -637,7 +637,7 @@ class RecoveryPageTests(SimpleTestCase):
             "can_quarantine": False,
         }
         page = recovery.render_page(report, interactive=True)
-        self.assertIn("Floppy's database file is damaged.", page)
+        self.assertIn("Watchmask's database file is damaged.", page)
         self.assertIn("Physical corruption detected", page)
         self.assertIn("sqlite-recovery", page)
         # #1053: a CSV export cannot replace this file, and sqlite-recovery/
@@ -851,7 +851,7 @@ class RestoreSnapshotTests(SimpleTestCase):
         self.assertIn("The repair did not work.", body)
         self.assertIn("None of the 1 saved copies", body)
         # The page carries a report that names the step, error and files.
-        self.assertIn("Floppy restore failure report", body)
+        self.assertIn("Watchmask restore failure report", body)
         self.assertIn("failed step: check the saved copy", body)
         self.assertIn("db-bad.sqlite3", body)
         self.assertIn("free space beside database", body)

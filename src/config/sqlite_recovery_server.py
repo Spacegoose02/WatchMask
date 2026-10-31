@@ -64,7 +64,7 @@ _SECRET_REPORT_KEYS = frozenset({"actions", "incident_token"})
 # files (LOG_DIR), and users have reported checking those instead (#960). Name
 # the actual command and disclaim the app logs explicitly wherever this comes up.
 _CONTAINER_LOG_HINT = (
-    "the container's own log output, not Floppy's log files. Run "
+    "the container's own log output, not Watchmask's log files. Run "
     "<code>docker compose logs floppy</code> (or <code>docker logs "
     "&lt;container&gt;</code>) and search for &quot;approval code&quot;"
 )
@@ -174,7 +174,7 @@ def _masthead() -> str:
     """Show the Floppy mark, so the page reads as part of the app."""
     icon = _asset_data_uri("android-chrome-192x192.png")
     mark = f"<img src='{icon}' alt='' width='36' height='36'>" if icon else ""
-    return f"<header class='masthead'>{mark}<span>Floppy</span></header>"
+    return f"<header class='masthead'>{mark}<span>Watchmask</span></header>"
 
 
 def _download_enabled() -> bool:
@@ -254,16 +254,16 @@ def _restore_card(snapshots: list[dict]) -> str:
     )
     return (
         "<div class='card'><h2>Saved copies</h2>"
-        "<p>Floppy keeps these checked copies of your database. Anything you "
+        "<p>Watchmask keeps these checked copies of your database. Anything you "
         "added after the newest one is not in it.</p>"
         f"<ul>{rows}</ul></div>"
         "<div class='card'><h2>Repair it</h2>"
-        "<p>Floppy starts with the newest copy. If a copy fails its check, it "
+        "<p>Watchmask starts with the newest copy. If a copy fails its check, it "
         "tries the next one. Your damaged file is moved to the "
         f"<code>{_DAMAGED_FOLDER}</code> folder next to your database, "
         "not deleted.</p>"
         "<form method='POST' action='/restore'>"
-        "<button>Restore and start Floppy</button></form>"
+        "<button>Restore and start Watchmask</button></form>"
         "<p class='note'>This can take a few minutes for a large library. "
         "Leave this page open.</p></div>"
     )
@@ -274,7 +274,7 @@ def _verify_snapshot_file(path: Path) -> None:
     try:
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
     except sqlite3.Error as error:
-        msg = "Floppy could not open the saved copy."
+        msg = "Watchmask could not open the saved copy."
         raise RestoreError(msg, "open the saved copy") from error
     try:
         result = connection.execute("PRAGMA quick_check").fetchall()
@@ -380,7 +380,7 @@ def _failure_report(attempts: list[dict], db_path: str, folder: Path) -> str:
         free = "unknown"
     incident = _read_incident_report(db_path) or {}
     lines = [
-        "Floppy restore failure report",
+        "Watchmask restore failure report",
         f"time: {datetime.now(UTC).isoformat()}",
         f"floppy: {os.environ.get('VERSION', 'unknown')} "
         f"({os.environ.get('COMMIT_SHA', 'unknown')})",
@@ -461,7 +461,7 @@ def restore_snapshot(db_path: str, name: str, snapshot_dir: Path | None = None) 
         error.report = _failure_report([error.attempt], db_path, directory)
         raise
     except (OSError, sqlite3.Error) as error:
-        msg = "Floppy could not restore the saved copy."
+        msg = "Watchmask could not restore the saved copy."
         failure = RestoreError(msg, step)
         failure.attempt = {
             "snapshot": name,
@@ -495,10 +495,10 @@ def restore_latest(db_path: str, snapshot_dir: Path | None = None) -> tuple[str,
     if attempts:
         msg = (
             f"None of the {len(attempts)} saved copies could be restored. "
-            "Floppy changed nothing."
+            "Watchmask changed nothing."
         )
     else:
-        msg = "Floppy found no saved copies to restore."
+        msg = "Watchmask found no saved copies to restore."
     failure = RestoreError(msg, "restore latest")
     failure.report = _failure_report(attempts, db_path, directory)
     raise failure
@@ -537,7 +537,7 @@ def _restore_verified(db_path: str, source: Path) -> Path:
                 target.replace(original)
         with suppress(OSError):
             staged.unlink()
-        msg = "Floppy could not swap in the saved copy. Nothing was changed."
+        msg = "Watchmask could not swap in the saved copy. Nothing was changed."
         raise RestoreError(msg, "swap in the saved copy") from error
     # The incident belongs to the file that was moved. Clearing it lets the
     # normal startup check judge the restored file from scratch.
@@ -565,22 +565,22 @@ def _backup_card(*, for_corruption: bool = False) -> str:
             "<div class='card'><h2>Keep the damaged file</h2>"
             "<p class='note'>Repairing moves the damaged file to the "
             "<code>sqlite-recovery</code> folder beside <code>db.sqlite3</code>. "
-            "A repair tool can still read data from it. Floppy keeps nightly "
+            "A repair tool can still read data from it. Watchmask keeps nightly "
             "database snapshots in the <code>database</code> folder of "
             "<code>BACKUP_DIR</code>; a CSV export is not a database snapshot "
             "and cannot replace this file.</p>"
             f"<p class='note'>To download the damaged file from this page, set "
-            f"<code>{_DOWNLOAD_ENV}=true</code> and start Floppy again. Keep it "
+            f"<code>{_DOWNLOAD_ENV}=true</code> and start Watchmask again. Keep it "
             "off at other times, because this page has no sign-in.</p></div>"
         )
     else:
         action = (
-            "<p class='note'>Floppy writes a verified copy of the database to the "
+            "<p class='note'>Watchmask writes a verified copy of the database to the "
             "<code>sqlite-recovery</code> folder beside <code>db.sqlite3</code> "
             "before it changes a broken relationship or removes a row. Copy the "
             "file from there.</p>"
             f"<p class='note'>To download the file from this page instead, set "
-            f"<code>{_DOWNLOAD_ENV}=true</code> and start Floppy again. Keep it "
+            f"<code>{_DOWNLOAD_ENV}=true</code> and start Watchmask again. Keep it "
             "off at other times, because this page has no sign-in.</p>"
         )
     return action
@@ -641,7 +641,7 @@ def _repair_plan_card(report: dict) -> str:
     derived = _count(safe_repair.get("relationship_rows_removed"))
     if cleared or derived:
         parts.append(
-            "<p>Floppy already preserved the affected tracking rows where it could: "
+            "<p>Watchmask already preserved the affected tracking rows where it could: "
             f"it cleared {cleared} broken optional reference(s) and removed "
             f"{derived} derived relationship row(s). A verified backup was created "
             "before those changes.</p>"
@@ -671,7 +671,7 @@ def _repair_plan_card(report: dict) -> str:
 def _timeout_body() -> str:
     return (
         "<h1>The SQLite startup check stopped making progress.</h1>"
-        "<p>Floppy paused before migrations and services. The check read "
+        "<p>Watchmask paused before migrations and services. The check read "
         "nothing and used no CPU for several minutes, so it was stopped; a "
         "check that is merely slow is left to finish. This usually means the "
         "storage under the database stopped responding (a network share or "
@@ -746,7 +746,7 @@ def _timeout_retry_card(*, interactive: bool) -> str:
         return (
             "<div class='card'><h2>Retry the startup check</h2>"
             "<p>After checking the database, retry the startup integrity gate. "
-            "Floppy will not bypass the gate; if it finds relationship damage, "
+            "Watchmask will not bypass the gate; if it finds relationship damage, "
             "the normal recovery policy still applies.</p>"
             "<form method='POST' action='/retry'>"
             "<button>Retry startup check</button></form></div>"
@@ -775,7 +775,7 @@ def render_page(
             f"<p>{html.escape(str(status.get('error_message', 'Inspect the container logs.')))}</p>"
             "<p>Stop all application containers and database writers before preparing "
             "migrations or recovery. Run maintenance with the same image and database "
-            "mounts, then restart Floppy. No database rows were changed by admission.</p>"
+            "mounts, then restart Watchmask. No database rows were changed by admission.</p>"
             + _help_card()
         )
     if status and status.get("status") == "timeout":
@@ -790,7 +790,7 @@ def render_page(
     if not report:
         body = (
             "<h1>Your data is safe. Nothing was deleted.</h1>"
-            "<p>Floppy paused before it started. It cannot read the report that "
+            "<p>Watchmask paused before it started. It cannot read the report that "
             f"explains why. Look at {_CONTAINER_LOG_HINT}.</p>"
             + _help_card()
         )
@@ -803,10 +803,10 @@ def render_page(
         )
         snapshots = list_snapshots()
         parts = [
-            "<h1>Floppy's database file is damaged.</h1>",
-            "<p>Your data is probably fine. Floppy stopped on purpose, because "
+            "<h1>Watchmask's database file is damaged.</h1>",
+            "<p>Your data is probably fine. Watchmask stopped on purpose, because "
             "writing to a damaged file can make it worse. Nothing was changed.</p>",
-            "<p>Floppy saves a checked copy of your database every night, so "
+            "<p>Watchmask saves a checked copy of your database every night, so "
             "it can usually put things back.</p>",
         ]
         if snapshots:
@@ -814,17 +814,17 @@ def render_page(
         else:
             parts.append(
                 "<div class='card'><h2>No saved copies were found</h2>"
-                "<p>Floppy looks for nightly copies in the <code>database</code> "
+                "<p>Watchmask looks for nightly copies in the <code>database</code> "
                 "folder inside your backups folder (<code>BACKUP_DIR</code>) and "
                 "found none. If you have your own copy of <code>db.sqlite3</code>, "
-                "stop Floppy, replace the file with it, and start Floppy again.</p>"
+                "stop Watchmask, replace the file with it, and start Watchmask again.</p>"
                 "<p class='note'>A CSV export cannot replace this file. It only "
                 "recreates media, ratings and lists, not accounts or "
                 "integration settings.</p></div>"
             )
         parts.append(
             "<details><summary>Technical details and more options</summary>"
-            "<div class='card'><h2>What Floppy found</h2>"
+            "<div class='card'><h2>What Watchmask found</h2>"
             f"<ul>{corruption_reasons}</ul></div>"
             + _backup_card(for_corruption=True)
             + "</details>"
@@ -836,10 +836,10 @@ def render_page(
     can_accept = "accept" in actions
     can_repair = bool("quarantine" in actions and report.get("can_quarantine"))
     parts = [
-        "<h1>Your data is safe. Floppy paused before migrations.</h1>",
-        f"<p>Floppy found {total} broken relationship(s). One row can have more "
+        "<h1>Your data is safe. Watchmask paused before migrations.</h1>",
+        f"<p>Watchmask found {total} broken relationship(s). One row can have more "
         "than one broken relationship, so this number is not a count of rows to "
-        "remove. Floppy paused before migrations so recovery cannot silently "
+        "remove. Watchmask paused before migrations so recovery cannot silently "
         "discard user data.</p>",
         _repair_plan_card(report),
         _affected_list(report),
@@ -852,13 +852,13 @@ def render_page(
                 "<p>This legacy choice keeps every invalid relationship. Use it "
                 "only when the current recovery policy explicitly allows it.</p>"
                 "<form method='POST' action='/accept'>"
-                "<button>Keep everything and start Floppy</button></form></div>",
+                "<button>Keep everything and start Watchmask</button></form></div>",
             )
         if can_repair:
             required = _count((report.get("repair_plan") or {}).get("required_relationships"))
             if required:
                 explanation = (
-                    "Floppy creates and verifies a backup first. It preserves "
+                    "Watchmask creates and verifies a backup first. It preserves "
                     "nullable tracking rows by clearing only their broken references. "
                     "Rows whose required parent is still missing must be removed from "
                     "the live database so SQLite can validate migrations; their original "
@@ -866,7 +866,7 @@ def render_page(
                 )
             else:
                 explanation = (
-                    "Floppy creates and verifies a backup first, then repairs the "
+                    "Watchmask creates and verifies a backup first, then repairs the "
                     "broken relationships without removing user-owned rows when the "
                     "schema permits that."
                 )
@@ -875,34 +875,34 @@ def render_page(
                 f"<p>{explanation}</p>"
                 f"<p class='note'>Enter the current approval code, found in "
                 f"{_CONTAINER_LOG_HINT}. The code is tied to this exact database "
-                "state and changes if Floppy safely repairs part of the incident "
+                "state and changes if Watchmask safely repairs part of the incident "
                 "first.</p>"
                 "<form method='POST' action='/quarantine'>"
                 "<p><label for='recovery-token'>Approval code</label><br>"
                 "<input id='recovery-token' name='token' required autocomplete='off' "
                 "spellcheck='false' inputmode='text'></p>"
-                "<button>Repair relationships and start Floppy</button>"
+                "<button>Repair relationships and start Watchmask</button>"
                 "</form></div>",
             )
         elif not can_accept:
             parts.append(
                 "<div class='card'><h2>Repair these entries yourself</h2>"
-                "<p>Floppy cannot prove that an automatic write is safe for this "
+                "<p>Watchmask cannot prove that an automatic write is safe for this "
                 "schema. Restore a backup or inspect the technical details before "
                 "you change the database.</p></div>",
             )
     else:
         parts.append(
             "<div class='card'><h2>How to choose</h2>"
-            "<p>This is a copy on disk. To choose an available action, open Floppy "
+            "<p>This is a copy on disk. To choose an available action, open Watchmask "
             f"at port {port} while the container runs.</p></div>",
         )
 
     parts.append(
         "<div class='card'><h2>Use a backup instead</h2><ol>"
-        "<li>Stop Floppy.</li>"
+        "<li>Stop Watchmask.</li>"
         "<li>Replace <code>db.sqlite3</code> with your backup.</li>"
-        "<li>Start Floppy.</li></ol>"
+        "<li>Start Watchmask.</li></ol>"
         + _backup_card()
         + "</div>",
     )
@@ -927,7 +927,7 @@ def _restore_failure_page(error: RestoreError) -> str:
         f"<p>{html.escape(str(error))} Your damaged database is exactly where it "
         "was, so nothing is lost.</p>"
         "<p>Copy the report below into a new issue so it can be traced. It "
-        "lists every saved copy Floppy tried and why each one failed.</p>"
+        "lists every saved copy Watchmask tried and why each one failed.</p>"
         "<div class='card'><h2>Report</h2>"
         "<p><button data-copy='details'>Copy details</button></p>"
         f"<pre id='details'>{html.escape(error.report)}</pre></div>"
@@ -945,12 +945,12 @@ def _waiting_page() -> str:
     """
     body = (
         "<div class='card'>"
-        "<h1>Floppy has your choice.</h1>"
-        "<p role='status'>Floppy is applying it, then starting. This can take "
+        "<h1>Watchmask has your choice.</h1>"
+        "<p role='status'>Watchmask is applying it, then starting. This can take "
         "several minutes on a large database. You can leave this page open.</p>"
-        "<p class='note'>This page opens Floppy when Floppy is ready. If it "
+        "<p class='note'>This page opens Watchmask when Watchmask is ready. If it "
         f"stays on this message, look at {_CONTAINER_LOG_HINT}.</p>"
-        "<p><a class='button' href='/'>Open Floppy</a></p>"
+        "<p><a class='button' href='/'>Open Watchmask</a></p>"
         "</div>"
     )
     return _document(body, script=_POLL_SCRIPT)
@@ -959,8 +959,8 @@ def _waiting_page() -> str:
 def _retry_waiting_page() -> str:
     body = (
         "<div class='card'>"
-        "<h1>Floppy is retrying the startup check.</h1>"
-        "<p role='status'>The database was not changed. Floppy will start the "
+        "<h1>Watchmask is retrying the startup check.</h1>"
+        "<p role='status'>The database was not changed. Watchmask will start the "
         "application if the check completes successfully.</p>"
         "<p class='note'>If the check times out again, this page will be available "
         "after the recovery server starts again.</p>"
@@ -989,7 +989,7 @@ def _document(body: str, script: str = _COPY_SCRIPT) -> str:
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Floppy needs a decision</title>"
+        "<title>Watchmask needs a decision</title>"
         f"{link}<style>{_STYLE}</style></head><body>"
         f"<main>{_masthead()}{body}</main>"
         f"<script>{script}</script></body></html>"
@@ -1201,7 +1201,7 @@ class _Handler(BaseHTTPRequestHandler):
                 403,
                 _document(
                     "<h1>That recovery choice is not available.</h1>"
-                    "<p>Floppy changed nothing. Reload the recovery page and use "
+                    "<p>Watchmask changed nothing. Reload the recovery page and use "
                     "one of the choices shown for the current database state.</p>"
                 ),
                 "text/html; charset=utf-8",
@@ -1278,7 +1278,7 @@ def serve(db_path: str, port: object | None = None) -> None:
         )
         return
     _log(
-        f"[entrypoint] Open http://localhost:{server_port}/ to choose what Floppy does "
+        f"[entrypoint] Open http://localhost:{server_port}/ to choose what Watchmask does "
         "next.",
     )
     try:

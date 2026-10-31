@@ -254,7 +254,7 @@ def retry_startup_check(request: HttpRequest) -> HttpResponse:
     """
     messages.info(
         request,
-        "Floppy has already resumed; the startup check no longer needs a retry.",
+        "Watchmask has already resumed; the startup check no longer needs a retry.",
     )
     return redirect(_safe_return_url(request))
 
@@ -299,7 +299,7 @@ def csrf_failure(
         error_message=(
             "CSRF verification failed for this request. This usually means the CSRF "
             "cookie was missing, expired, or didn't match the form token. If "
-            "Floppy is behind an HTTPS reverse proxy, set the CSRF (or URLS) "
+            "Watchmask is behind an HTTPS reverse proxy, set the CSRF (or URLS) "
             "environment variable to the address you use to reach it, and set "
             "USE_X_FORWARDED=true."
         ),

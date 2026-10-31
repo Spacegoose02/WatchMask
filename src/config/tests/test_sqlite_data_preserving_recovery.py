@@ -162,7 +162,7 @@ class SqliteDataPreservingRecoveryTests(SimpleTestCase):
             self.assertNotIn("action='/accept'", page)
             self.assertIn("broken relationship", page)
             self.assertIn("One row can have more than one broken relationship", page)
-            self.assertIn("Repair relationships and start Floppy", page)
+            self.assertIn("Repair relationships and start Watchmask", page)
 
             Path(f"{db_path}.integrity.decision").write_text(
                 json.dumps(

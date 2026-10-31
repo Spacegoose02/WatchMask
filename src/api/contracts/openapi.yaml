@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: Floppy verified MCP and grounding API
+  title: Watchmask verified MCP and grounding API
   version: 1.0.0
   description: Verified consumer subset covering MCP HTTP operations, public grounding
     information, and ListenBrainz-compatible authentication. The full diagnostic API
@@ -3402,7 +3402,7 @@ paths:
       operationId: getListenBrainzUserArtists
       description: Ranks the token owner's artists by recorded plays, in ListenBrainz's
         response shape, so clients that build recommendations from ListenBrainz statistics
-        can read them from Floppy. A range without plays returns an empty ranking.
+        can read them from Watchmask. A range without plays returns an empty ranking.
       summary: Get top artists for a user (ListenBrainz-compatible)
       parameters:
       - in: query
@@ -3434,7 +3434,7 @@ paths:
         name: username
         schema:
           type: string
-        description: The token owner's Floppy username.
+        description: The token owner's Watchmask username.
         required: true
       tags:
       - apis
@@ -3492,7 +3492,7 @@ paths:
         name: username
         schema:
           type: string
-        description: The token owner's Floppy username.
+        description: The token owner's Watchmask username.
         required: true
       tags:
       - apis
@@ -3529,7 +3529,7 @@ paths:
       operationId: getListenBrainzUserRecordings
       description: Ranks the token owner's recordings by recorded plays, in ListenBrainz's
         response shape, so clients that build recommendations from ListenBrainz statistics
-        can read them from Floppy. A range without plays returns an empty ranking.
+        can read them from Watchmask. A range without plays returns an empty ranking.
       summary: Get top recordings for a user (ListenBrainz-compatible)
       parameters:
       - in: query
@@ -3561,7 +3561,7 @@ paths:
         name: username
         schema:
           type: string
-        description: The token owner's Floppy username.
+        description: The token owner's Watchmask username.
         required: true
       tags:
       - apis
@@ -3598,7 +3598,7 @@ paths:
       operationId: getListenBrainzUserReleaseGroups
       description: Ranks the token owner's release groups by recorded plays, in ListenBrainz's
         response shape, so clients that build recommendations from ListenBrainz statistics
-        can read them from Floppy. A range without plays returns an empty ranking.
+        can read them from Watchmask. A range without plays returns an empty ranking.
       summary: Get top release groups for a user (ListenBrainz-compatible)
       parameters:
       - in: query
@@ -3630,7 +3630,7 @@ paths:
         name: username
         schema:
           type: string
-        description: The token owner's Floppy username.
+        description: The token owner's Watchmask username.
         required: true
       tags:
       - apis
@@ -3722,7 +3722,7 @@ paths:
     get:
       operationId: getListenBrainzUserListens
       description: Returns recorded plays newest first, so ListenBrainz clients such
-        as Multi-Scrobbler can check what has already reached Floppy before submitting
+        as Multi-Scrobbler can check what has already reached Watchmask before submitting
         a play. Only the token owner's listens are available.
       summary: Get listens for a user (ListenBrainz-compatible)
       parameters:
@@ -3745,7 +3745,7 @@ paths:
         name: username
         schema:
           type: string
-        description: The token owner's Floppy username.
+        description: The token owner's Watchmask username.
         required: true
       tags:
       - apis

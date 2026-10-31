@@ -418,7 +418,7 @@ def download_history_calendar(request, token: str):
         "BEGIN:VCALENDAR",
         "PRODID:-//Floppy//EN",
         "VERSION:2.0",
-        "X-WR-CALNAME:Floppy history",
+        "X-WR-CALNAME:Watchmask history",
     ]
     for play in get_history_plays(user, media_types, now):
         if play.is_date_only:

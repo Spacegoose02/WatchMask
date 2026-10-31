@@ -580,7 +580,7 @@ def podcast_save(request):
             end_date = helpers.parse_completion_datetime(end_date_str)
         except (TypeError, ValueError):
             message = gettext(
-                'Floppy cannot read the date "%(value_1)s". Enter the date as YYYY-MM-DD. To record this play at the current time, keep the date empty.'
+                'Watchmask cannot read the date "%(value_1)s". Enter the date as YYYY-MM-DD. To record this play at the current time, keep the date empty.'
             ) % {"value_1": end_date_str}
             if request.headers.get("HX-Request"):
                 # Do not swap and do not close the modal. The date the user
@@ -619,7 +619,7 @@ def podcast_save(request):
         messages.info(
             request,
             gettext(
-                "Floppy recorded a play for %(value_1)s less than five minutes ago. Floppy did not add a second play."
+                "Watchmask recorded a play for %(value_1)s less than five minutes ago. Watchmask did not add a second play."
             )
             % {"value_1": episode_title},
         )

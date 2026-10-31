@@ -12,7 +12,7 @@ from app.providers import services
 logger = logging.getLogger(__name__)
 
 SEARCH_URL = "https://gpodder.net/search.json"
-USER_AGENT = "Floppy/1.0 (https://github.com/dannyvfilms/Floppy)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 
 
 def _search_results(query):

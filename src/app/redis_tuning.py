@@ -289,6 +289,6 @@ def _tune_persistence(client: redis.Redis, summary: dict) -> None:
         return
     summary["applied"]["appendfsync"] = "everysec"
     logger.info(
-        "Relaxed Redis appendfsync from always to everysec; Floppy's cache is "
+        "Relaxed Redis appendfsync from always to everysec; Watchmask's cache is "
         "regenerable and does not need a disk sync per write",
     )

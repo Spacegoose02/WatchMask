@@ -201,7 +201,7 @@ class RestartDescriptionTests(SimpleTestCase):
         self.assertIn("same container (d57ad038526c)", text)
         self.assertIn("version unchanged (v1)", text)
         self.assertIn("container process started 2026-10-14T18:45:56+00:00", text)
-        self.assertIn("Floppy 14s later", text)
+        self.assertIn("Watchmask 14s later", text)
 
     def test_requested_stop_names_the_signal(self):
         """The restart line says which signal asked for the stop."""

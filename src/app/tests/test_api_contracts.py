@@ -293,7 +293,7 @@ class OpenAPIArtifactTests(SimpleTestCase):
         self.assertEqual(
             settings.SPECTACULAR_SETTINGS,
             {
-                "TITLE": "Floppy",
+                "TITLE": "Watchmask",
                 "DESCRIPTION": "A self-hosted media tracker.",
                 "VERSION": "1.0.0",
                 "CONTACT": {

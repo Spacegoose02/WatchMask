@@ -85,7 +85,7 @@ def update_server_port(request):
             if removed:
                 messages.success(
                     request,
-                    "Saved server port removed. Restart Floppy to apply the current "
+                    "Saved server port removed. Restart Watchmask to apply the current "
                     "environment or default value.",
                 )
             else:
@@ -97,7 +97,7 @@ def update_server_port(request):
             messages.error(
                 request,
                 f"{SERVER_PORT_ENV} controls the server port for this instance. "
-                "Change or remove that environment variable, then restart Floppy.",
+                "Change or remove that environment variable, then restart Watchmask.",
             )
             return redirect("advanced")
 
@@ -117,8 +117,8 @@ def update_server_port(request):
                 messages.success(
                     request,
                     f"Server port {saved_port} saved. If your container publishes "
-                    f"Floppy's port, update its target to {saved_port} before you "
-                    "restart Floppy.",
+                    f"Watchmask's port, update its target to {saved_port} before you "
+                    "restart Watchmask.",
                 )
         return redirect("advanced")
 

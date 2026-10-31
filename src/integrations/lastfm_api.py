@@ -13,7 +13,7 @@ from app.providers import credentials
 logger = logging.getLogger(__name__)
 
 LASTFM_API_BASE = "https://ws.audioscrobbler.com/2.0/"
-USER_AGENT = "Floppy/1.0 (https://github.com/dannyvfilms/Floppy)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 
 # Last.fm API error codes: https://www.last.fm/api/errorcodes
 LASTFM_ERROR_RATE_LIMIT_EXCEEDED = 29

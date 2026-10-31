@@ -361,7 +361,7 @@ class ListItemsReorderRequestSerializer(serializers.Serializer):
     item_id = serializers.IntegerField(
         min_value=1,
         help_text=(
-            "Floppy's numeric Item id, the `id` field of an entry in "
+            "Watchmask's numeric Item id, the `id` field of an entry in "
             "GET /api/v1/lists/{list_id}/items/ (not the `item_id` string)."
         ),
     )
@@ -382,7 +382,7 @@ class ListItemsOrderRequestSerializer(serializers.Serializer):
         allow_empty=False,
         min_length=1,
         help_text=(
-            "Floppy's numeric Item ids in the new order, the `id` field of an "
+            "Watchmask's numeric Item ids in the new order, the `id` field of an "
             "entry in GET /api/v1/lists/{list_id}/items/ (not the `item_id` "
             "string). Send every item of the list, or only a subset: the "
             "listed items take the positions they already occupy, in the "
@@ -399,7 +399,7 @@ class ListItemRankSerializer(serializers.Serializer):
     item_id = serializers.IntegerField(
         min_value=1,
         help_text=(
-            "Floppy's numeric Item id, the `id` field of an entry in "
+            "Watchmask's numeric Item id, the `id` field of an entry in "
             "GET /api/v1/lists/{list_id}/items/ (not the `item_id` string)."
         ),
     )
@@ -608,7 +608,7 @@ class RecommendationSerializer(serializers.Serializer):
         child=serializers.CharField(),
         help_text=(
             "Provider ids as strings, using the keys `tmdb`, `imdb` and `tvdb`. "
-            "A key is absent when Floppy could not resolve that id."
+            "A key is absent when Watchmask could not resolve that id."
         ),
     )
 

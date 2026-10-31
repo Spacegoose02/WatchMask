@@ -145,8 +145,8 @@ class PathsCheckTests(SimpleTestCase):
         three, so the wording follows the environment.
         """
         for containerised, expected, forbidden in (
-            (True, "PUID", "the user that runs Floppy"),
-            (False, "the user that runs Floppy", "PUID"),
+            (True, "PUID", "the user that runs Watchmask"),
+            (False, "the user that runs Watchmask", "PUID"),
         ):
             with self.subTest(container=containerised):
                 with _TempDatabase() as temp, temp.settings():

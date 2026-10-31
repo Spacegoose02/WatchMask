@@ -32,7 +32,7 @@ except ModuleNotFoundError:
     # would otherwise fail to boot over a speed-up. Same answers, slower inserts.
     logger.warning(
         "sortedcontainers is not installed; using a slower fallback. "
-        "Run `uv sync --locked --no-default-groups` in the environment Floppy runs from.",
+        "Run `uv sync --locked --no-default-groups` in the environment Watchmask runs from.",
     )
     SortedList = _PlainSortedList
 

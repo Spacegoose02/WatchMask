@@ -9,7 +9,7 @@
 {% block title %}
   {{ media|display_title:user }}
   {% if media.media_type == MediaTypes.SEASON.value %}{% blocktranslate trimmed with value_1=media.season_number %}S{{ value_1 }}{% endblocktranslate %}{% endif %}
-  - Floppy
+  - Watchmask
 {% endblock title %}
 
 {% block content %}

@@ -84,7 +84,7 @@ class OAuthClient(models.Model):
     ) -> OAuthClient:
         """Register a public OAuth client with explicit scope/grant restrictions."""
         if client_type != "public":
-            msg = "Floppy currently supports public OAuth clients only."
+            msg = "Watchmask currently supports public OAuth clients only."
             raise ValueError(msg)
 
         clean_name = name.strip()

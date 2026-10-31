@@ -30,7 +30,7 @@ OTHER = "other"
 # server that answered and said no.
 UNREACHABLE = frozenset({DNS, REFUSED, TIMEOUT})
 
-GUIDE_SECTION = "Floppy can't reach Redis"
+GUIDE_SECTION = "Watchmask can't reach Redis"
 GUIDE_URL = (
     "https://github.com/dannyvfilms/Floppy/blob/latest/docs/deployment.md"
     "#floppy-cant-reach-redis"
@@ -144,7 +144,7 @@ def explain_redis_error(error: BaseException, url: str | None) -> tuple[str, str
         cause = f'the hostname "{host}" does not resolve'
         if container:
             fix = (
-                "put Floppy and Redis on the same user-defined Docker network (a "
+                "put Watchmask and Redis on the same user-defined Docker network (a "
                 "networks: entry on every service, and no network_mode: bridge), "
                 "or set REDIS_URL to an address this container can reach. See "
                 f'"{GUIDE_SECTION}" in the deployment guide: {GUIDE_URL}'
@@ -180,7 +180,7 @@ def unreachable_detail(error: BaseException, url: str | None) -> str | None:
     cause, _fix = explain_redis_error(error, url)
     endpoint, _host = _endpoint(url)
     return (
-        f"Floppy cannot reach Redis at {endpoint}: {cause}. "
+        f"Watchmask cannot reach Redis at {endpoint}: {cause}. "
         f'See "{GUIDE_SECTION}" in the deployment guide.'
     )
 

@@ -12,7 +12,7 @@
 {% endblock extra_head %}
 
 {% block title %}
-  {% translate "Lists - Floppy" %}
+  {% translate "Lists - Watchmask" %}
 {% endblock title %}
 
 {% block content %}
@@ -289,7 +289,7 @@
             <div class="bg-blue-900/20 border border-blue-700/50 rounded-lg p-4 space-y-2">
               {% if trakt_device_flow %}
                 <p class="text-sm text-blue-200">
-                  <strong>{% translate "Note:" %}</strong> {% translate "This instance is not served over HTTPS, and Trakt only accepts HTTPS redirects, so Floppy will show you a code to enter at trakt.tv/activate instead." %}
+                  <strong>{% translate "Note:" %}</strong> {% translate "This instance is not served over HTTPS, and Trakt only accepts HTTPS redirects, so Watchmask will show you a code to enter at trakt.tv/activate instead." %}
                 </p>
               {% else %}
                 <p class="text-sm text-blue-200">
@@ -380,7 +380,7 @@
 
           <div class="space-y-4" x-show="traktStep === 3" x-cloak>
             <p class="text-[var(--color-text-secondary)]">
-              {% translate "Trakt credentials are saved. Authorize Floppy to import your lists." %}
+              {% translate "Trakt credentials are saved. Authorize Watchmask to import your lists." %}
             </p>
 
             <form method="post"
@@ -484,7 +484,7 @@
             </div>
           {% else %}
             <p class="text-[var(--color-text-secondary)]">
-              {% translate "Import your MDBList lists as Floppy lists and keep them in sync. Get your API key from" %}
+              {% translate "Import your MDBList lists as Watchmask lists and keep them in sync. Get your API key from" %}
               <a href="https://mdblist.com/preferences/"
                  target="_blank"
                  rel="noopener noreferrer"

@@ -245,7 +245,7 @@ class ScrobbleView(drf_views.APIView):
                         "minimum": 0,
                         "maximum": 100,
                         "description": "For a player that knows how far "
-                        "through a title it is but not in seconds. Floppy "
+                        "through a title it is but not in seconds. Watchmask "
                         "turns it into a position with duration_seconds, or "
                         "else the title's runtime. Ignored when "
                         "position_seconds is sent.",

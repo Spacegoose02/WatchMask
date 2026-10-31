@@ -37,7 +37,7 @@ def developer_credentials():
     return {
         "devid": dev_id,
         "devpassword": dev_password,
-        "softname": (settings.SCREENSCRAPER_SOFTNAME or "Floppy").strip(),
+        "softname": (settings.SCREENSCRAPER_SOFTNAME or "Watchmask").strip(),
     }
 
 

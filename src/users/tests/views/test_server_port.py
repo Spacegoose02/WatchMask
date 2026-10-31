@@ -125,7 +125,7 @@ class AdvancedServerPortTests(TestCase):
         self.assertRedirects(response, reverse("advanced"))
         self.assertContains(response, "Server port 9123 saved")
         self.assertContains(response, "target to 9123")
-        self.assertContains(response, "restart Floppy")
+        self.assertContains(response, "restart Watchmask")
 
     def test_invalid_port_is_rejected_without_changing_saved_value(self):
         self.client.force_login(self.superuser)

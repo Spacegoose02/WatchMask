@@ -217,7 +217,7 @@ def get_username_from_oauth(access_token, client_id=None):
 
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": f"Floppy/{settings.VERSION}",
+        "User-Agent": f"Watchmask/{settings.VERSION}",
         "trakt-api-version": "2",
         "trakt-api-key": client_id,
         "Authorization": f"Bearer {access_token}",
@@ -409,7 +409,7 @@ def _refresh_rejected_message(error):
     detail = f" ({reason})" if reason else ""
     return (
         f"Trakt rejected the token refresh{detail}. Check that the Redirect URI "
-        "on your Trakt app matches the one Floppy shows, then reconnect Trakt."
+        "on your Trakt app matches the one Watchmask shows, then reconnect Trakt."
     )
 
 
@@ -1055,7 +1055,7 @@ class TraktImporter(TraktMetadataResolverMixin):
         """Make a request to the Trakt API with proper headers."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": f"Floppy/{settings.VERSION}",
+            "User-Agent": f"Watchmask/{settings.VERSION}",
             "trakt-api-version": "2",
             "trakt-api-key": credentials.get("trakt", "client_id"),
         }

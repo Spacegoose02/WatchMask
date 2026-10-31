@@ -32,7 +32,7 @@ if _sqlite_policy is not None:
     if _fallback_applied:
         logging.getLogger(__name__).warning(
             "SQLite %s is affected by the WAL-reset corruption bug. "
-            "Floppy requested %s but will use %s journal mode with "
+            "Watchmask requested %s but will use %s journal mode with "
             "synchronous=%s for data safety. Upgrade SQLite to 3.51.3 or "
             "later, or a fixed 3.44.6/3.50.7 backport, to restore WAL mode.",
             sqlite3.sqlite_version,

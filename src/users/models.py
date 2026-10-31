@@ -275,7 +275,7 @@ class LogoStyleChoices(models.TextChoices):
 class LogoTextFontChoices(models.TextChoices):
     """Safe local font stacks available to text wordmarks."""
 
-    DISPLAY = "display", _("Floppy display")
+    DISPLAY = "display", _("Watchmask display")
     SANS = "sans", _("Clean sans")
     SERIF = "serif", _("Editorial serif")
     MONO = "mono", _("Technical mono")
@@ -561,7 +561,7 @@ class User(AbstractUser):
     )
 
     # Media type preferences: TV Seasons
-    season_enabled = models.BooleanField(default=True)
+    season_enabled = models.BooleanField(default=False)
     season_layout = models.CharField(
         max_length=20,
         default=LayoutChoices.GRID,
@@ -692,7 +692,7 @@ class User(AbstractUser):
     )
 
     # Media type preferences: Board Games
-    boardgame_enabled = models.BooleanField(default=True)
+    boardgame_enabled = models.BooleanField(default=False)
     boardgame_layout = models.CharField(
         max_length=20,
         default=LayoutChoices.GRID,
@@ -1160,7 +1160,7 @@ class User(AbstractUser):
     )
     seerr_url = models.URLField(
         blank=True,
-        help_text="Seerr server URL, used to request movies and shows from Floppy",
+        help_text="Seerr server URL, used to request movies and shows from Watchmask",
     )
     seerr_api_key = models.TextField(
         blank=True,
@@ -1226,12 +1226,12 @@ class User(AbstractUser):
         max_length=12,
         default=LogoStyleChoices.COLORFUL,
         choices=LogoStyleChoices.choices,
-        help_text="Preferred Floppy logo style",
+        help_text="Preferred Watchmask logo style",
     )
 
     logo_text = models.CharField(
         max_length=32,
-        default="Floppy",
+        default="Watchmask",
         help_text="Short navigation wordmark",
     )
 
@@ -2399,7 +2399,7 @@ class User(AbstractUser):
 
         import pyotp
 
-        issuer = "Floppy"
+        issuer = "Watchmask"
         return pyotp.TOTP(self.authenticator_secret).provisioning_uri(
             name=self.username,
             issuer_name=issuer,

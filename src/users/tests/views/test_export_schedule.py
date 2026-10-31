@@ -255,7 +255,7 @@ class DatabaseSnapshotStatusTests(SimpleTestCase):
             "users/export_data.html",
             {"db_snapshot_status": status, "media_type": "movie"},
         )
-        self.assertIn("PostgreSQL database backups are not managed by Floppy", rendered)
+        self.assertIn("PostgreSQL database backups are not managed by Watchmask", rendered)
         self.assertNotIn(
-            "Floppy separately writes a verified database snapshot", rendered
+            "Watchmask separately writes a verified database snapshot", rendered
         )

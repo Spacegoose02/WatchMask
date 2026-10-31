@@ -559,7 +559,7 @@ def _log_blocked_recovery_options(report: dict, plan: dict) -> None:
     _log(f"[entrypoint] SQLite recovery approval code: {token}")
     _log(
         "[entrypoint] To approve relationship repair, set "
-        f"{_ACTION_ENV}=quarantine:{token} and restart Floppy.",
+        f"{_ACTION_ENV}=quarantine:{token} and restart Watchmask.",
     )
 
 
@@ -622,7 +622,7 @@ def check_database_for_startup(db_path: str) -> None:
     if reopened:
         _log(
             "[entrypoint] The old keep-rows choice cannot make schema migrations "
-            "safe. Floppy reopened recovery without changing the database.",
+            "safe. Watchmask reopened recovery without changing the database.",
         )
 
     report = _read_incident_report(db_path)

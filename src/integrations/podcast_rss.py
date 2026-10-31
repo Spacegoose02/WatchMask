@@ -20,7 +20,7 @@ from integrations.safe_fetch import UnsafeUrlError, safe_fetch
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "Floppy/1.0 (https://github.com/dannyvfilms/Floppy)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 MAX_FEED_BYTES = 10 * 1024 * 1024
 
 # Component counts for duration strings formatted as "MM:SS" or "HH:MM:SS".

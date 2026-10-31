@@ -545,7 +545,7 @@ class PinnedTransportTests(TestCase):
                     requests.Request(
                         "GET",
                         wire_url,
-                        headers={"Host": "example.com", "User-Agent": "Floppy"},
+                        headers={"Host": "example.com", "User-Agent": "Watchmask"},
                     )
                 )
                 response = session.send(prepared, timeout=(5, 10), stream=True)

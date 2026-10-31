@@ -5,7 +5,7 @@
 {% load static %}
 
 {% block title %}
-  {% translate "About - Floppy" %}
+  {% translate "About - Watchmask" %}
 {% endblock title %}
 
 {% block settings_content %}
@@ -51,7 +51,7 @@
   }"
   @keydown.escape.window="schemaModalOpen = false"
   class="bg-[var(--color-surface)] rounded-lg p-6 relative">
-    <h2 class="text-2xl font-bold mb-6 text-[var(--color-text)]">{% translate "About Floppy" %}</h2>
+    <h2 class="text-2xl font-bold mb-6 text-[var(--color-text)]">{% translate "About Watchmask" %}</h2>
 
     <div class="space-y-8">
       {# Description #}
@@ -62,10 +62,10 @@
         </div>
         <div class="space-y-3 pl-7">
           <p class="text-[var(--color-text-secondary)] leading-relaxed">
-            {% translate "Floppy is an open-source, self-hosted media tracker and personal diary. Track, rate, and organize movies, shows, video games, books, music, podcasts, anime, comics, and more in one unified library." %}
+            {% translate "Watchmask is an open-source, self-hosted media tracker and personal diary. Track, rate, and organize movies, shows, video games, books, music, podcasts, anime, comics, and more in one unified library." %}
           </p>
           <p class="text-[var(--color-text-muted)] text-sm leading-relaxed">
-            {% translate "Floppy is free and supported by" %}
+            {% translate "Watchmask is free and supported by" %}
             <a href="https://github.com/sponsors/dannyvfilms?metadata_source=app-about-description"
                target="_blank"
                rel="noopener noreferrer"
@@ -129,8 +129,8 @@
                      await prompt.prompt();
                      const choice = await prompt.userChoice;
                      this.status = choice.outcome === 'accepted'
-                       ? gettext('Installing Floppy. Look for it alongside your other apps.')
-                       : gettext('Installation dismissed. You can still add Floppy using the steps below.');
+                       ? gettext('Installing Watchmask. Look for it alongside your other apps.')
+                       : gettext('Installation dismissed. You can still add Watchmask using the steps below.');
                    } catch (error) {
                      this.status = gettext('Your browser could not open the install prompt. Use the steps below instead.');
                    }
@@ -140,11 +140,11 @@
                @floppy:install-availability.window="sync()">
         <div class="flex items-center gap-2 text-lg font-medium text-[var(--color-text-secondary)]">
           {% include "app/icons/download.svg" with classes="w-5 h-5 text-[var(--color-link)]" %}
-          <h3 id="about-install-heading">{% translate "Install Floppy" %}</h3>
+          <h3 id="about-install-heading">{% translate "Install Watchmask" %}</h3>
         </div>
         <div class="space-y-4 pl-7">
           <p class="text-[var(--color-text-secondary)] leading-relaxed">
-            {% translate "Floppy is an installable PWA. Add it to your Home Screen to launch it like an app directly from your browser." %}
+            {% translate "Watchmask is an installable PWA. Add it to your Home Screen to launch it like an app directly from your browser." %}
           </p>
 
           <div x-show="canInstall" style="display: none;" class="space-y-2">
@@ -152,7 +152,7 @@
                     @click="install()"
                     class="inline-flex items-center gap-2 px-3 py-2 rounded-md font-medium text-white bg-indigo-600 hover:bg-indigo-500 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400">
               {% include "app/icons/download.svg" with classes="w-4 h-4" %}
-              <span>{% translate "Install Floppy" %}</span>
+              <span>{% translate "Install Watchmask" %}</span>
             </button>
           </div>
           <p x-show="status"
@@ -203,7 +203,7 @@
           </p>
 
           <p class="text-[var(--color-text-muted)] text-sm leading-relaxed">
-            {% translate "No install control anywhere? Serve the instance over HTTPS and open it in a full browser rather than an in-app one. Tracking still needs a connection to your Floppy server." %}
+            {% translate "No install control anywhere? Serve the instance over HTTPS and open it in a full browser rather than an in-app one. Tracking still needs a connection to your Watchmask server." %}
             <a href="https://github.com/dannyvfilms/Floppy/wiki/2.-User-Guide#installing-floppy-on-your-phone"
                target="_blank"
                rel="noopener noreferrer"
@@ -311,7 +311,7 @@
                     {% include "app/icons/persons.svg" with classes="w-4 h-4 text-[var(--color-link)] shrink-0" %}
                     <span>{% translate "Community Discord" %}</span>
                   </td>
-                  <td class="px-4 py-3 text-[var(--color-text-muted)] text-xs">{% translate "Connect with other Floppy users, share setups, and help each other out" %}</td>
+                  <td class="px-4 py-3 text-[var(--color-text-muted)] text-xs">{% translate "Connect with other Watchmask users, share setups, and help each other out" %}</td>
                   <td class="px-4 py-3 text-right">
                     <a href="https://discord.gg/uFgha7Kb6n"
                        target="_blank"
@@ -328,9 +328,9 @@
                 <tr class="hover:bg-[var(--color-surface-hover)] transition-colors">
                   <td class="px-4 py-3 font-medium text-[var(--color-text)] flex items-center gap-2">
                     {% include "app/icons/heart.svg" with classes="w-4 h-4 text-[var(--color-link)] shrink-0" %}
-                    <span>{% translate "Support Floppy" %}</span>
+                    <span>{% translate "Support Watchmask" %}</span>
                   </td>
-                  <td class="px-4 py-3 text-[var(--color-text-muted)] text-xs">{% translate "Floppy is free and open source, with no paid features. If it has earned a place in your routine, sponsoring helps it keep improving for everyone." %}</td>
+                  <td class="px-4 py-3 text-[var(--color-text-muted)] text-xs">{% translate "Watchmask is free and open source, with no paid features. If it has earned a place in your routine, sponsoring helps it keep improving for everyone." %}</td>
                   <td class="px-4 py-3 text-right">
                     <a href="https://github.com/sponsors/dannyvfilms?metadata_source=app-about"
                        target="_blank"
@@ -423,7 +423,7 @@
                       {% include "app/icons/page.svg" with classes="w-4 h-4 text-[var(--color-link)]" %}
                       <span>{% translate "Domain Context (JSON-LD)" %}</span>
                     </a>
-                    <p class="text-xs text-[var(--color-text-muted)] mt-0.5">{% translate "Semantic RDF / schema.org vocabulary mapping for Floppy entities" %}</p>
+                    <p class="text-xs text-[var(--color-text-muted)] mt-0.5">{% translate "Semantic RDF / schema.org vocabulary mapping for Watchmask entities" %}</p>
                   </td>
                   <td class="px-4 py-3">
                     <span class="text-xs font-mono px-2 py-0.5 rounded bg-[var(--color-surface-muted)] text-[var(--color-text-muted)] border border-[var(--color-border)]">{% translate "JSON-LD 1.1" %}</span>
@@ -623,7 +623,7 @@
               </thead>
               <tbody class="divide-y divide-[var(--color-border)] bg-[var(--color-surface)]">
                 <tr class="hover:bg-[var(--color-surface-hover)] transition-colors">
-                  <td class="px-4 py-3 font-medium text-[var(--color-text)]">{% translate "Floppy Application" %}</td>
+                  <td class="px-4 py-3 font-medium text-[var(--color-text)]">{% translate "Watchmask Application" %}</td>
                   <td class="px-4 py-3 text-xs text-[var(--color-text-muted)]">{% translate "GNU Affero General Public License v3.0 (AGPL-3.0)" %}</td>
                   <td class="px-4 py-3 text-right">
                     <a href="https://github.com/dannyvfilms/Floppy/blob/release/LICENSE"

@@ -11,11 +11,11 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="keywords" content="Floppy, Media Tracker">
-    <meta name="description" content="Search and track media on Floppy.">
+    <meta name="keywords" content="Watchmask, Media Tracker">
+    <meta name="description" content="Search and track media on Watchmask.">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="mobile-web-app-title" content="Floppy">
+    <meta name="mobile-web-app-title" content="Watchmask">
     {% comment %}
       Lets base.html's htmx guard recognize an entrance page that arrived as a
       fragment response and navigate instead of swapping it in (#386).
@@ -24,7 +24,7 @@
 
     <title>
       {% block title %}
-        Floppy
+        Watchmask
       {% endblock title %}
     </title>
 
@@ -69,14 +69,14 @@
               <h1 class="flex items-center">
                 {% if user.is_authenticated and user.logo_style == 'monochrome' %}
                   <img src="{% static 'img/floppy-logo-white.png' %}"
-                       alt="Floppy"
+                       alt="Watchmask"
                        width="158"
                        height="48"
                        class="h-9 w-[158px] object-cover object-center">
                 {% else %}
                 <img src="{% static 'img/floppy-logo.png' %}"
                      srcset="{% static 'img/floppy-logo.png' %} 1x, {% static 'img/floppy-logo@2x.png' %} 2x"
-                     alt="Floppy"
+                     alt="Watchmask"
                      width="158"
                      height="48"
                      class="h-9 w-auto">
@@ -101,7 +101,7 @@
         <footer class="border-t border-[var(--color-border)] bg-[var(--color-sidebar)]">
           <div class="container mx-auto px-4 py-6 space-y-2">
             <p class="text-sm text-[var(--color-text-muted)]">
-              {% translate "Floppy is a self-hosted media tracker for books, games, movies, music, podcasts, tv shows, and more." %}
+              {% translate "Watchmask is a self-hosted media tracker for books, games, movies, music, podcasts, tv shows, and more." %}
             </p>
             <p class="text-sm text-[var(--color-text-muted)]">
               {% translate "This fork is maintained by" %}

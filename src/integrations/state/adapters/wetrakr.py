@@ -375,7 +375,7 @@ class WeTrakrAdapter:
     def _read_reply(self, path, reply, items, indexes, results):
         """Turn one reply into per-item results for the items it covered."""
         if not any(key in reply for key in RESPONSE_KEYS):
-            message = "WeTrakr sent a reply this version of Floppy does not understand."
+            message = "WeTrakr sent a reply this version of Watchmask does not understand."
             for index in indexes:
                 results[index] = BatchResult(BATCH_RETRY, error=message)
             return

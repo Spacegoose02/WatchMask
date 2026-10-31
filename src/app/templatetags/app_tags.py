@@ -2342,7 +2342,7 @@ def month_abbreviation(value):
 @register.filter
 def in_bingebandit_library(item, user):
     """Whether a TMDB movie or show is in the user's BingeBandit library."""
-    from integrations import bingebandit  # noqa: PLC0415
+    from integrations import bingebandit
 
     if (
         getattr(item, "source", None) != Sources.TMDB.value
@@ -2351,9 +2351,10 @@ def in_bingebandit_library(item, user):
     ):
         return False
     # Cached on the user for the rest of the request: a page renders many cards.
+    # library_item_ids is cached (empty for users without BingeBandit), so a
+    # warm list page adds no queries.
     item_ids = getattr(user, "_bingebandit_library_item_ids", None)
     if item_ids is None:
-        has_account = hasattr(user, "bingebandit_account")
-        item_ids = bingebandit.library_item_ids(user) if has_account else {}
-        user._bingebandit_library_item_ids = item_ids  # noqa: SLF001
+        item_ids = bingebandit.library_item_ids(user)
+        user._bingebandit_library_item_ids = item_ids
     return (item.media_type, str(item.media_id)) in item_ids

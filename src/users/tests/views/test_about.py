@@ -63,10 +63,10 @@ class AboutViewTests(TestCase):
         section = soup.find("section", attrs={"aria-labelledby": "about-install-heading"})
 
         self.assertIsNotNone(section, "About page is missing the install section")
-        self.assertEqual(section.find(id="about-install-heading").get_text(strip=True), "Install Floppy")
+        self.assertEqual(section.find(id="about-install-heading").get_text(strip=True), "Install Watchmask")
 
         text = section.get_text(" ", strip=True)
-        self.assertIn("Floppy is an installable PWA.", text)
+        self.assertIn("Watchmask is an installable PWA.", text)
         self.assertIn("Add it to your Home Screen", text)
 
         # Both platform walkthroughs must render server-side so they survive
@@ -97,7 +97,7 @@ class AboutViewTests(TestCase):
         button = section.find("button")
 
         self.assertIsNotNone(button, "Install section must offer an install button")
-        self.assertEqual(button.get_text(" ", strip=True), "Install Floppy")
+        self.assertEqual(button.get_text(" ", strip=True), "Install Watchmask")
         # Hidden in the served HTML: only an actionable beforeinstallprompt
         # event reveals it, so a browser without one never shows a dead button.
         wrapper = button.parent
@@ -157,7 +157,7 @@ class AboutViewTests(TestCase):
         )
         self.assertEqual(link.get("rel"), ["noopener", "noreferrer"])
         self.assertIn(
-            "Floppy is free and supported by users like you",
+            "Watchmask is free and supported by users like you",
             link.parent.get_text(" ", strip=True),
         )
         self.assertNotIn("began as a fork", response.content.decode())

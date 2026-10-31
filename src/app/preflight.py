@@ -240,7 +240,7 @@ def check_paths() -> CheckResult:
                 fix=_where(
                     f"{HOST} give the file to the container's user (PUID and "
                     "PGID, 1000 by default), including its -wal and -shm files",
-                    f"{HOST} give the file to the user that runs Floppy, "
+                    f"{HOST} give the file to the user that runs Watchmask, "
                     "including its -wal and -shm files",
                 ),
                 facts=facts,
@@ -269,7 +269,7 @@ def check_paths() -> CheckResult:
                 fix=_where(
                     f"{HOST} give the mapped directory to the container's user "
                     "(PUID and PGID, 1000 by default)",
-                    f"{HOST} give this directory to the user that runs Floppy",
+                    f"{HOST} give this directory to the user that runs Watchmask",
                 ),
                 facts=facts,
             )
@@ -514,7 +514,7 @@ def check_database(
                 status=FAIL,
                 summary="the database is locked by another process",
                 cause=clean(error),
-                fix=f"{FLOPPY} stop the other Floppy processes, then try again",
+                fix=f"{FLOPPY} stop the other Watchmask processes, then try again",
                 facts=facts,
             )
         return CheckResult(
@@ -554,7 +554,7 @@ def check_database(
             summary=f"{total} relationship conflict(s) in {', '.join(tables)}",
             cause="rows point at parent rows that no longer exist",
             fix=(
-                f"{FLOPPY} restart Floppy; startup repairs what it safely can "
+                f"{FLOPPY} restart Watchmask; startup repairs what it safely can "
                 "and writes a report beside the database for the rest"
             ),
             facts=facts,
@@ -603,7 +603,7 @@ def check_migrations(*, database_ok: bool) -> CheckResult:
             status=FAIL,
             summary="the migration state cannot be read",
             cause=clean(error),
-            fix=f"{FLOPPY} run with --auto-migrate, or restart Floppy",
+            fix=f"{FLOPPY} run with --auto-migrate, or restart Watchmask",
         )
 
     if plan:
@@ -613,7 +613,7 @@ def check_migrations(*, database_ok: bool) -> CheckResult:
             status=FAIL,
             summary=f"{len(plan)} migration(s) pending",
             cause=f"first pending: {names[0]}",
-            fix=f"{FLOPPY} run with --auto-migrate, or restart Floppy",
+            fix=f"{FLOPPY} run with --auto-migrate, or restart Watchmask",
             facts={"pending": names},
         )
 

@@ -134,7 +134,7 @@ def _error_panel(app, instance, error):
     if isinstance(error, ConnectionAuthError):
         message = f"{app} rejected the API key."
     elif isinstance(error, SelfHostedUrlError):
-        message = f"Floppy is not allowed to call this {app} address."
+        message = f"Watchmask is not allowed to call this {app} address."
     else:
         message = f"Can't reach {app}."
     return _panel(app, instance, error=message, found=False)

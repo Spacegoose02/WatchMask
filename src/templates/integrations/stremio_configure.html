@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Configure Floppy for Stremio</title>
+  <title>Configure Watchmask for Stremio</title>
   <link rel="icon" href="{% static 'favicon/favicon-32x32.png' %}">
   <link rel="stylesheet" href="{% static 'css/main.css' %}">
   <style>
@@ -75,16 +75,16 @@
 <main>
   <div class="brand">
     {% if user.is_authenticated and user.logo_style == 'monochrome' %}
-      <img src="{% static 'img/floppy-logo-white.png' %}" alt="Floppy"
+      <img src="{% static 'img/floppy-logo-white.png' %}" alt="Watchmask"
            width="158" height="48" class="mono">
     {% else %}
       <img src="{% static 'img/floppy-logo.png' %}"
            srcset="{% static 'img/floppy-logo.png' %} 1x,
                    {% static 'img/floppy-logo@2x.png' %} 2x"
-           alt="Floppy">
+           alt="Watchmask">
     {% endif %}
   </div>
-  <h1>Configure Floppy for Stremio</h1>
+  <h1>Configure Watchmask for Stremio</h1>
   <p class="lede">Choose which catalogs this addon publishes and the order they appear in. Reinstall the addon in Stremio for changes to take effect.</p>
 
   <fieldset>
@@ -159,7 +159,7 @@
 
       var name = document.createElement("span");
       name.className = "name";
-      name.textContent = "Floppy: " + option.label;
+      name.textContent = "Watchmask: " + option.label;
 
       var type = document.createElement("span");
       type.className = "type";

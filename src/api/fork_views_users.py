@@ -451,9 +451,9 @@ class UserNotificationTestView(drf_views.APIView):
             apobj.add(url)
         try:
             result = apobj.notify(
-                title="Floppy Test Notification",
+                title="Watchmask Test Notification",
                 body=(
-                    "<p>This is a test notification from Floppy.</p>"
+                    "<p>This is a test notification from Watchmask.</p>"
                     "<p>If you're seeing this, "
                     "your notifications are working correctly!</p>"
                 ),

@@ -47,7 +47,7 @@ def format_jellyfin_push_message(push_counts: dict, warning_text: str = "") -> s
         parts.append(f"{skipped_unsupported} use an unsupported metadata source")
 
     if not parts:
-        message = "Nothing to sync — Jellyfin already matched Floppy's watched state."
+        message = "Nothing to sync — Jellyfin already matched Watchmask's watched state."
     else:
         message = "Jellyfin sync: " + ", ".join(parts) + "."
 

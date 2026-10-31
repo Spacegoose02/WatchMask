@@ -1,6 +1,6 @@
 {% load i18n %}
 {% comment %}
-One-time "Floppy was updated" banner for administrators. The release tag the
+One-time "Watchmask was updated" banner for administrators. The release tag the
 admin last saw lives in this browser's localStorage: a browser with nothing
 stored is treated as new (no banner), and a different tag shows the banner
 until it is dismissed or followed. Storage can be unavailable (private
@@ -11,7 +11,7 @@ windows), so every access is guarded and the banner simply stays hidden.
      x-cloak
      role="status"
      class="mb-4 flex items-center gap-3 px-3 py-2 rounded-md text-sm bg-indigo-500/10 border border-indigo-500/30 text-[var(--color-text-secondary)]">
-  <span class="flex-1">{% blocktranslate %}Floppy was updated to {{ RELEASE_TAG }}.{% endblocktranslate %}</span>
+  <span class="flex-1">{% blocktranslate %}Watchmask was updated to {{ RELEASE_TAG }}.{% endblocktranslate %}</span>
   <a href="{% url 'about' %}#whats-new"
      @click="dismiss()"
      class="underline text-[var(--color-link)] hover:text-[var(--color-link-hover)]">{% translate "See what's new" %}</a>

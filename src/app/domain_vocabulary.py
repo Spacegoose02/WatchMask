@@ -26,7 +26,7 @@ DOMAIN_TERMS: tuple[DomainTerm, ...] = (
         key="item",
         term="Item",
         definition=(
-            "An Item is the shared work that Floppy identifies from a media provider. "
+            "An Item is the shared work that Watchmask identifies from a media provider. "
             "Users can track the same Item with separate Consumption records."
         ),
         bounded_context="app",
@@ -64,7 +64,7 @@ DOMAIN_TERMS: tuple[DomainTerm, ...] = (
         key="celery_queue",
         term="Celery queue",
         definition=(
-            "A Celery queue sends a task to a worker. Floppy uses the `celery`, "
+            "A Celery queue sends a task to a worker. Watchmask uses the `celery`, "
             "`interactive`, and `discover` queue names. `celery` handles background "
             "work. `interactive` handles user-triggered work. `discover` handles "
             "Discover cache rebuilds. The Reload calendar task has no queue override, "
@@ -155,9 +155,9 @@ def render_agent_guide() -> str:
     lines = [
         GENERATED_WARNING,
         "",
-        "# Floppy domain model",
+        "# Watchmask domain model",
         "",
-        "Use these terms when you change Floppy or its API.",
+        "Use these terms when you change Watchmask or its API.",
     ]
     for term in DOMAIN_TERMS:
         lines.extend(

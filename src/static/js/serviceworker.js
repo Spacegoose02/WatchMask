@@ -1,4 +1,4 @@
-const CACHE_NAME = "floppy-v2";
+const CACHE_NAME = "floppy-v3";
 const urlsToCache = [
   "/static/css/main.css",
   "/static/favicon/android-chrome-192x192.png",

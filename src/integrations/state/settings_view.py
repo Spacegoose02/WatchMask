@@ -27,8 +27,8 @@ DIRECTION_BOTH = "both"
 
 DIRECTION_CHOICES = (
     (DIRECTION_OFF, "Off"),
-    (DIRECTION_INBOUND, "Provider to Floppy"),
-    (DIRECTION_OUTBOUND, "Floppy to provider"),
+    (DIRECTION_INBOUND, "Provider to Watchmask"),
+    (DIRECTION_OUTBOUND, "Watchmask to provider"),
     (DIRECTION_BOTH, "Both"),
 )
 DIRECTION_LABELS = dict(DIRECTION_CHOICES)

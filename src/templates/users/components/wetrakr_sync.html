@@ -19,7 +19,7 @@
            }
          }"
          x-init="setTimeout(() => tick(), interval * 1000)">
-      <p class="text-sm text-[var(--color-text)] font-medium">{% translate "Open WeTrakr and enter this code to approve Floppy:" %}</p>
+      <p class="text-sm text-[var(--color-text)] font-medium">{% translate "Open WeTrakr and enter this code to approve Watchmask:" %}</p>
       <p class="text-2xl font-mono tracking-widest text-[var(--color-text)]">{{ account.user_code }}</p>
       <p class="text-sm"><a href="{{ account.verification_url }}" target="_blank" rel="noopener noreferrer" class="text-[var(--color-link)] hover:underline">{{ account.verification_url }}</a></p>
       <p class="text-xs text-[var(--color-text-muted)]">{% translate "This page connects on its own once you approve." %}</p>

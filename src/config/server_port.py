@@ -329,7 +329,7 @@ def prepare_runtime(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Read or change Floppy's public HTTP port. "
+            "Read or change Watchmask's public HTTP port. "
             f"Precedence is {SERVER_PORT_ENV}, saved value, then {DEFAULT_SERVER_PORT}."
         )
     )
@@ -380,7 +380,7 @@ def _execute(args: argparse.Namespace) -> int:
                     "The saved value will take effect only after FLOPPY_PORT is removed.",
                 )
             else:
-                _write_line(sys.stdout, "Restart Floppy to use the saved port.")
+                _write_line(sys.stdout, "Restart Watchmask to use the saved port.")
         return 0
 
     if args.reset:
@@ -394,7 +394,7 @@ def _execute(args: argparse.Namespace) -> int:
             message = "Saved server port removed." if removed else "No saved server port."
             _write_line(sys.stdout, message)
             _print_status(status, stream=sys.stdout)
-            _write_line(sys.stdout, "Restart Floppy if the effective port changed.")
+            _write_line(sys.stdout, "Restart Watchmask if the effective port changed.")
         return 0
 
     if args.prepare_runtime:

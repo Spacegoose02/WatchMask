@@ -229,7 +229,7 @@ def describe_unclean_exit(previous):
     else:
         parts.append(
             "If a stop was requested from outside (docker stop, a restart, a "
-            f"NAS task) and cut short, the stop signal never reached Floppy. {STOP_GRACE_HINT}"
+            f"NAS task) and cut short, the stop signal never reached Watchmask. {STOP_GRACE_HINT}"
         )
     return " ".join(parts)
 
@@ -284,7 +284,7 @@ def describe_restart(previous, current):
     if booted and started and started >= booted:
         parts.append(
             f"container process started {booted.isoformat()}, "
-            f"Floppy {_duration((started - booted).total_seconds())} later"
+            f"Watchmask {_duration((started - booted).total_seconds())} later"
         )
     return "Restart: " + "; ".join(parts) + "."
 
@@ -308,7 +308,7 @@ def describe_requested_stop(previous):
     return (
         f"Previous run was stopped by {previous['stop_signal']} at "
         f"{previous.get('stop_requested_at')} and shut down cleanly. "
-        "That signal comes from outside Floppy (docker stop, docker restart, "
+        "That signal comes from outside Watchmask (docker stop, docker restart, "
         "docker compose, a NAS scheduled task or updater), so this was not a "
         "crash."
     )

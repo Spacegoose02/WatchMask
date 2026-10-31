@@ -55,7 +55,6 @@ from app.providers import credentials, services
 from app.redis_diagnosis import queue_failure_message
 from app.services import metadata_resolution
 from app.templatetags.app_tags import media_url
-from integrations import bingebandit as bingebandit_api
 from integrations import (
     arr_library,
     cinemask,
@@ -76,6 +75,7 @@ from integrations import (
 from integrations import (
     audiobookshelf_cover as abs_cover_proxy,
 )
+from integrations import bingebandit as bingebandit_api
 from integrations import plex as plex_api
 from integrations import plex_cover as plex_cover_proxy
 from integrations.gpodder_api import GPodderAuthError, GPodderClientError
@@ -2405,7 +2405,7 @@ def import_yamtrack(request):
         messages.error(request, "A CSV file is required.")
         return _integration_redirect(request)
 
-    staged_file = _stage_upload_or_message(request, file, "Floppy CSV")
+    staged_file = _stage_upload_or_message(request, file, "Watchmask CSV")
     if staged_file is None:
         return _integration_redirect(request)
 
@@ -6354,9 +6354,9 @@ STREMIO_ADDON_MANIFEST = {
     # Keep the existing addon id so installed clients remain compatible.
     "id": "org.yamtrack.scrobbler",
     "version": "1.3.0",
-    "name": "Floppy",
+    "name": "Watchmask",
     "description": (
-        "Floppy Watchlist catalogs and playback scrobbling for Stremio."
+        "Watchmask Watchlist catalogs and playback scrobbling for Stremio."
     ),
     # `player` and `library` are additive: a client that predates them parses
     # the manifest, never matches the resource, and never calls the route.

@@ -202,7 +202,7 @@ class TheGamesDbTests(TestCase):
 DEV = {
     "SCREENSCRAPER_DEV_ID": "dev",
     "SCREENSCRAPER_DEV_PASSWORD": "devpass",
-    "SCREENSCRAPER_SOFTNAME": "Floppy",
+    "SCREENSCRAPER_SOFTNAME": "Watchmask",
     "SCREENSCRAPER_SSID": "",
     "SCREENSCRAPER_SSPASSWORD": "",
 }

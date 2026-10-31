@@ -1330,7 +1330,7 @@ def preview_full_sync(user, mal_account, mapping_issues=None, progress_callback=
             changes.append(
                 {
                     "target": "floppy",
-                    "target_label": "Floppy",
+                    "target_label": "Watchmask",
                     "field": (
                         field_labels[PROGRESS_RESPONSE_FIELDS[media_type][0]]
                         if field == "progress" else field_labels[field]

@@ -29,6 +29,8 @@ This document specifies Floppy's asynchronous message channels, inbound webhook 
 | `webhook/emby/{token}` | `receiveEmbyWebhook` | Emby | `celery` | Playback state and library synchronization payloads from Emby Server. |
 | `webhook/jellyseerr/{token}` | `receiveJellyseerrWebhook` | Jellyseerr | `celery` | Media request approval, availability, and user issue notifications from Jellyseerr. |
 | `webhook/seerr/global/` | `receiveSeerrGlobalWebhook` | Overseerr / Jellyseerr | `celery` | Global non-tokenized webhook notifications from Overseerr instances. |
+| `webhook/bingebandit/{token}` | `receiveBingebanditWebhook` | BingeBandit | `celery` | BingeBandit JSON webhooks: playback start/finished tracking, player events for Now Playing, and resume points on stop. |
+| `webhook/cinemask/{token}` | `receiveCinemaskWebhook` | Cinemask | `celery` | Request created and available events that refresh request status and add requests as Planning. |
 | `webhook/kodi/{token}` | `receiveKodiWebhook` | Kodi | `celery` | Playback state updates from the Floppy Kodi sync add-on. |
 | `stremio-addon/{token}/subtitles/{media_type}/{media_id}.json` | `receiveStremioSubtitlesSignal` | Stremio | `celery` | Lightweight playback start beacon emitted when subtitles are loaded. |
 | `stremio-addon/{token}/player/{media_type}/{media_id}/position=0&duration=0.json` | `receiveStremioAddonPlayer` | Stremio | `celery` | Playback position and duration on play, pause, and stop. The only resume-position source for a client that cannot emit a stop. |

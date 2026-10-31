@@ -36,7 +36,7 @@ class TraktSeriesGraphFragmentTests(TestCase):
 
         content = response.content.decode()
         self.assertEqual(response.status_code, 200)
-        self.assertNotIn('hx-trigger="every 5s"', content)
+        self.assertNotIn("hx-trigger=\"every 5s [document.visibilityState === 'visible']\"", content)
         self.assertNotIn("Fetching remaining episodes", content)
 
     def _unrated_episode(self, media_id, release_datetime=None):
@@ -64,7 +64,7 @@ class TraktSeriesGraphFragmentTests(TestCase):
 
         content = self._poll("show-2").content.decode()
 
-        self.assertNotIn('hx-trigger="every 5s"', content)
+        self.assertNotIn("hx-trigger=\"every 5s [document.visibilityState === 'visible']\"", content)
 
     def test_polling_stops_after_the_attempt_cap(self):
         """An aired episode Trakt never rates must not poll for as long as the page is open."""
@@ -75,6 +75,6 @@ class TraktSeriesGraphFragmentTests(TestCase):
             "show-3", f"?attempt={TRAKT_SERIES_GRAPH_MAX_POLLS}"
         ).content.decode()
 
-        self.assertIn('hx-trigger="every 5s"', first)
+        self.assertIn("hx-trigger=\"every 5s [document.visibilityState === 'visible']\"", first)
         self.assertIn("?attempt=1", first)
-        self.assertNotIn('hx-trigger="every 5s"', last)
+        self.assertNotIn("hx-trigger=\"every 5s [document.visibilityState === 'visible']\"", last)

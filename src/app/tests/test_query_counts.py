@@ -332,6 +332,11 @@ class QueryCountTests(TestCase):
         credentials.is_configured("tmdb")
         credentials.is_configured("tmdb", user)
         services._get_tmdb_proxy_url()  # no public warm entry point
+        # Watchmask: the per-user BingeBandit library map behind the card badge
+        # is cached like the lookups above.
+        from integrations import bingebandit
+
+        bingebandit.library_item_ids(user)
 
     def _assert_query_budget(self, url, budget, label):
         with CaptureQueriesContext(connection) as context:

@@ -135,37 +135,37 @@ class StremioAddonViewTests(TestCase):
                 {
                     "type": "movie",
                     "id": "floppy-watchlist-movies",
-                    "name": "Floppy: Movies",
+                    "name": "Watchmask: Movies",
                     "extra": [{"name": "skip", "isRequired": False}],
                 },
                 {
                     "type": "series",
                     "id": "floppy-watchlist-series",
-                    "name": "Floppy: Series",
+                    "name": "Watchmask: Series",
                     "extra": [{"name": "skip", "isRequired": False}],
                 },
                 {
                     "type": "movie",
                     "id": "floppy-history-movies",
-                    "name": "Floppy: History",
+                    "name": "Watchmask: History",
                     "extra": [{"name": "skip", "isRequired": False}],
                 },
                 {
                     "type": "series",
                     "id": "floppy-history-series",
-                    "name": "Floppy: History",
+                    "name": "Watchmask: History",
                     "extra": [{"name": "skip", "isRequired": False}],
                 },
                 {
                     "type": "movie",
                     "id": "floppy-in-progress-movies",
-                    "name": "Floppy: In Progress",
+                    "name": "Watchmask: In Progress",
                     "extra": [{"name": "skip", "isRequired": False}],
                 },
                 {
                     "type": "series",
                     "id": "floppy-in-progress-series",
-                    "name": "Floppy: In Progress",
+                    "name": "Watchmask: In Progress",
                     "extra": [{"name": "skip", "isRequired": False}],
                 },
             ],
@@ -184,12 +184,12 @@ class StremioAddonViewTests(TestCase):
         self.assertEqual(
             names,
             [
-                "Floppy: Watchlist",
-                "Floppy: Watchlist",
-                "Floppy: History",
-                "Floppy: History",
-                "Floppy: In Progress",
-                "Floppy: In Progress",
+                "Watchmask: Watchlist",
+                "Watchmask: Watchlist",
+                "Watchmask: History",
+                "Watchmask: History",
+                "Watchmask: In Progress",
+                "Watchmask: In Progress",
             ],
         )
 

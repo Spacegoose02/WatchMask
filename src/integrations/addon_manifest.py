@@ -73,7 +73,7 @@ def parse_manifest(body):
     """
     if isinstance(body, (bytes, bytearray)):
         if len(body) > MAX_MANIFEST_BYTES:
-            msg = "This manifest is larger than Floppy will accept."
+            msg = "This manifest is larger than Watchmask will accept."
             raise InvalidManifestError(REASON_TOO_LARGE, msg)
         try:
             body = body.decode("utf-8")
@@ -82,7 +82,7 @@ def parse_manifest(body):
             raise InvalidManifestError(REASON_NOT_JSON, msg) from error
 
     if isinstance(body, str) and len(body.encode("utf-8")) > MAX_MANIFEST_BYTES:
-        msg = "This manifest is larger than Floppy will accept."
+        msg = "This manifest is larger than Watchmask will accept."
         raise InvalidManifestError(REASON_TOO_LARGE, msg)
 
     if isinstance(body, str):
@@ -109,7 +109,7 @@ def parse_manifest(body):
         allowed=SUPPORTED_RESOURCES,
     )
     if not resources:
-        msg = "This add-on offers nothing Floppy can use."
+        msg = "This add-on offers nothing Watchmask can use."
         raise InvalidManifestError(REASON_NO_USABLE_RESOURCE, msg)
 
     catalogs = []

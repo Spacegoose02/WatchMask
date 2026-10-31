@@ -3,7 +3,7 @@ services:
     container_name: floppy
     # Image defaults to :latest tag (latest commit on the latest branch)
     # You can also explicitly use :latest, :release, or a version tag
-    image: ghcr.io/dannyvfilms/floppy
+    image: ghcr.io/spacegoose02/watchmask
     restart: unless-stopped
     # A running celery task gets up to 60 s to finish and the web server 30 s.
     # Docker's default 10 s stop timeout kills the container mid-shutdown.

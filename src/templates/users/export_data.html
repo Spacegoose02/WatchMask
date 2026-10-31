@@ -5,7 +5,7 @@
 {% load app_tags %}
 
 {% block title %}
-  {% translate "Export - Floppy" %}
+  {% translate "Export - Watchmask" %}
 {% endblock title %}
 
 {% block settings_content %}
@@ -33,7 +33,7 @@
       </p>
       <p class="mb-5 text-sm">
         {% if db_snapshot_status.supported %}
-          {% translate "For disaster recovery, Floppy separately writes a verified database snapshot to:" %} <code class="text-[var(--color-text-secondary)] bg-[var(--color-surface-strong)] px-1.5 py-0.5 rounded text-xs">{{ db_snapshot_status.path }}</code>
+          {% translate "For disaster recovery, Watchmask separately writes a verified database snapshot to:" %} <code class="text-[var(--color-text-secondary)] bg-[var(--color-surface-strong)] px-1.5 py-0.5 rounded text-xs">{{ db_snapshot_status.path }}</code>
           {% if db_snapshot_status.enabled %}
             {% if db_snapshot_status.host_reachable %}
               <br>
@@ -47,7 +47,7 @@
             <span class="text-xs text-[var(--color-warning-text)]">{% translate "Disabled — set" %} <code class="text-[var(--color-warning-text)] bg-[var(--color-surface-strong)] px-1.5 py-0.5 rounded text-xs">DB_SNAPSHOT_ENABLED=true</code> {% translate "to turn it back on." %}</span>
           {% endif %}
         {% else %}
-          {% translate "PostgreSQL database backups are not managed by Floppy. Configure and test pg_dump/pg_restore separately." %}
+          {% translate "PostgreSQL database backups are not managed by Watchmask. Configure and test pg_dump/pg_restore separately." %}
         {% endif %}
       </p>
 

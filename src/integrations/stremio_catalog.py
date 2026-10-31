@@ -301,7 +301,7 @@ def manifest_catalogs(user, selected=None):
             {
                 "type": spec.stremio_type,
                 "id": spec.catalog_id,
-                "name": f"Floppy: {catalog_display_name(user, spec)}",
+                "name": f"Watchmask: {catalog_display_name(user, spec)}",
                 "extra": [{"name": "skip", "isRequired": False}],
             }
         )

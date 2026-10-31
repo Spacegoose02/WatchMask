@@ -51,13 +51,20 @@ WEBHOOK_WRITE_POLICIES = {
         "Stremio only sends a start ping; completion comes from the delayed "
         "verifier, so the start is the only In Progress signal there is.",
     ),
+    "bingebandit": (
+        WritePolicy.START_ONLY,
+        "BingeBandit sends playback.start after 30 seconds of play, which "
+        "records In Progress, and playback.finished when it marks an item "
+        "watched. Pause, resume and stop only drive Now Playing and resume "
+        "points.",
+    ),
     "scrobble": (
         WritePolicy.FINAL_ONLY,
         "The scrobble API only accepts stop/completion events.",
     ),
     "check-in": (
         WritePolicy.FINAL_ONLY,
-        "Floppy's own Check-in button; every call is a deliberate user action.",
+        "Watchmask's own Check-in button; every call is a deliberate user action.",
     ),
 }
 

@@ -75,13 +75,13 @@ class AboutInstallSectionTests(SerialStaticLiveServerTestCase):
         return page
 
     def install_button(self, page):
-        return page.get_by_role("button", name="Install Floppy")
+        return page.get_by_role("button", name="Install Watchmask")
 
     def test_instructions_render_without_an_install_event(self):
         page = self.open_about()
 
-        expect(page.get_by_role("heading", name="Install Floppy")).to_be_visible()
-        expect(page.get_by_text("Floppy is an installable PWA.")).to_be_visible()
+        expect(page.get_by_role("heading", name="Install Watchmask")).to_be_visible()
+        expect(page.get_by_text("Watchmask is an installable PWA.")).to_be_visible()
         # Desktop keeps a route to the phone steps without printing both.
         expect(page.get_by_text("Installing on a phone instead?")).to_be_visible()
         # No event means no button, and no claim that install is impossible.
@@ -97,7 +97,7 @@ class AboutInstallSectionTests(SerialStaticLiveServerTestCase):
         no_js_page = page.new_page()
         no_js_page.goto(f"{self.live_server_url}/settings/about")
 
-        expect(no_js_page.get_by_role("heading", name="Install Floppy")).to_be_visible()
+        expect(no_js_page.get_by_role("heading", name="Install Watchmask")).to_be_visible()
         expect(no_js_page.get_by_role("heading", name="iOS and iPadOS")).to_be_visible()
         expect(no_js_page.get_by_role("heading", name="Android")).to_be_visible()
         expect(self.install_button(no_js_page)).to_be_hidden()
@@ -115,7 +115,7 @@ class AboutInstallSectionTests(SerialStaticLiveServerTestCase):
 
         self.install_button(page).click()
 
-        expect(page.get_by_text("Installing Floppy.")).to_be_visible()
+        expect(page.get_by_text("Installing Watchmask.")).to_be_visible()
         expect(self.install_button(page)).to_be_hidden()
         self.assertIsNone(page.evaluate("() => window.floppyPwa.deferredPrompt"))
 

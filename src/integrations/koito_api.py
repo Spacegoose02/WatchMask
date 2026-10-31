@@ -19,7 +19,7 @@ from integrations.safe_fetch import send_to_self_hosted
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "Floppy/1.0 (https://github.com/dannyvfilms/Floppy)"
+USER_AGENT = "Watchmask/1.0 (https://github.com/Spacegoose02/Yamtrack)"
 
 # Koito caps `limit` at 500 and silently falls back to its 100 default above it.
 MAX_LISTENS_PER_PAGE = 500

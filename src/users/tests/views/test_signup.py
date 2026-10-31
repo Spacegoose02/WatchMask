@@ -59,7 +59,7 @@ class SignupViewTests(TestCase):
         """Test the signup page greets a fresh install differently."""
         response = self.client.get(reverse("account_signup"))
 
-        self.assertContains(response, "Welcome to Floppy")
+        self.assertContains(response, "Welcome to Watchmask")
 
     def test_not_first_run_after_a_real_account_exists(self):
         """Test the welcome copy disappears once a real account exists."""
@@ -68,7 +68,7 @@ class SignupViewTests(TestCase):
 
         response = self.client.get(reverse("account_signup"))
 
-        self.assertNotContains(response, "Welcome to Floppy")
+        self.assertNotContains(response, "Welcome to Watchmask")
 
     @override_settings(
         ACCOUNT_ADAPTER="users.account_adapter.NoNewUsersAccountAdapter",

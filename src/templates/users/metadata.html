@@ -4,7 +4,7 @@
 {% load app_tags %}
 {% load user_tags %}
 
-{% block title %}{% translate "Metadata - Floppy" %}{% endblock title %}
+{% block title %}{% translate "Metadata - Watchmask" %}{% endblock title %}
 
 {% block settings_content %}
   {# Modal state shared by every provider row, same shape as the Import Data page. #}
@@ -36,8 +36,8 @@
             {% endif %}
           </p>
           <p>
-            {% translate "Floppy does not make anyone a superuser during setup, so a fresh install has none. Run this" %}
-            {% if in_container %}{% translate "on the host running the container" %}{% else %}{% translate "where Floppy is installed" %}{% endif %}:
+            {% translate "Watchmask does not make anyone a superuser during setup, so a fresh install has none. Run this" %}
+            {% if in_container %}{% translate "on the host running the container" %}{% else %}{% translate "where Watchmask is installed" %}{% endif %}:
           </p>
           <pre class="overflow-x-auto rounded bg-[var(--color-surface)] p-2 text-indigo-200"><code>{{ promote_command }}</code></pre>
           <p>

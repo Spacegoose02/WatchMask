@@ -29,7 +29,7 @@ _RELATIONSHIP_HINT = (
     "errors before you restart"
 )
 _BUSY_HINT = (
-    "[entrypoint] The SQLite database is busy. Stop other Floppy processes, "
+    "[entrypoint] The SQLite database is busy. Stop other Watchmask processes, "
     "then restart"
 )
 _ALBUM_ARTIST_TABLE = "app_albumartist"

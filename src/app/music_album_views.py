@@ -291,7 +291,7 @@ def song_save(request):
             end_date = helpers.parse_completion_datetime(end_date_str)
         except (TypeError, ValueError):
             message = gettext(
-                'Floppy cannot read the date "%(value_1)s". Enter the date as YYYY-MM-DD. To record this listen at the current time, keep the date empty.'
+                'Watchmask cannot read the date "%(value_1)s". Enter the date as YYYY-MM-DD. To record this listen at the current time, keep the date empty.'
             ) % {"value_1": end_date_str}
             if request.headers.get("HX-Request"):
                 # Do not swap and do not close the modal. The date the user

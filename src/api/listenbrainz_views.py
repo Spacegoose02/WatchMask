@@ -139,7 +139,7 @@ def _listen_metadata(music, origin_url):
         summary="Get listens for a user (ListenBrainz-compatible)",
         description=(
             "Returns recorded plays newest first, so ListenBrainz clients such as "
-            "Multi-Scrobbler can check what has already reached Floppy before "
+            "Multi-Scrobbler can check what has already reached Watchmask before "
             "submitting a play. Only the token owner's listens are available."
         ),
         parameters=[
@@ -147,7 +147,7 @@ def _listen_metadata(music, origin_url):
                 name="username",
                 type=str,
                 location=OpenApiParameter.PATH,
-                description="The token owner's Floppy username.",
+                description="The token owner's Watchmask username.",
             ),
             OpenApiParameter(
                 name="count",
@@ -428,7 +428,7 @@ def _stats_parameters(entity):
             name="username",
             type=str,
             location=OpenApiParameter.PATH,
-            description="The token owner's Floppy username.",
+            description="The token owner's Watchmask username.",
         ),
         OpenApiParameter(
             name="range",
@@ -468,7 +468,7 @@ def _stats_schema(operation_id, entity, serializer):
                 f"Ranks the token owner's {entity} by recorded plays, in "
                 "ListenBrainz's response shape, so clients that build "
                 "recommendations from ListenBrainz statistics can read them from "
-                "Floppy. A range without plays returns an empty ranking."
+                "Watchmask. A range without plays returns an empty ranking."
             ),
             parameters=_stats_parameters(entity),
             responses={

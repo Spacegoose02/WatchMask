@@ -318,7 +318,7 @@ class WindowsInstallerTests(SimpleTestCase):
 class RenderTemplateTests(SimpleTestCase):
     def test_placeholders_are_replaced_including_paths_with_spaces(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             template = root / "t.tmpl"
             template.write_text("dir=@@DIR@@\nport=@@PORT@@\n", encoding="utf-8")
@@ -417,7 +417,7 @@ class DockerStateTests(SimpleTestCase):
 class InstallStateTests(SimpleTestCase):
     def test_values_survive_a_round_trip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             output = run_helper(
                 "state_set METHOD docker\n"
@@ -576,7 +576,7 @@ class GeneratedComposeTests(SimpleTestCase):
 
     def test_generated_stack_is_valid_yaml_with_the_expected_wiring(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             compose = self.render(root)
 
@@ -604,7 +604,7 @@ class GeneratedComposeTests(SimpleTestCase):
 
     def test_installation_owns_its_own_project_and_no_fixed_container_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             compose = self.render(root)
         # A fixed container_name would collide with, or take over, an existing
@@ -639,7 +639,7 @@ class GeneratedSupervisorTests(SimpleTestCase):
 
     def test_every_process_is_defined_and_runs_from_the_installation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             parser = self.render(root)
 
@@ -703,7 +703,7 @@ class GeneratedNginxTests(SimpleTestCase):
 
     def test_listener_and_static_root_follow_the_answers(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             conf = self.render(root, bind="127.0.0.1", port="9001")
         self.assertIn("listen 127.0.0.1:9001;", conf)
@@ -734,7 +734,7 @@ class GeneratedNginxTests(SimpleTestCase):
 class GeneratedServiceUnitTests(SimpleTestCase):
     def test_systemd_unit_runs_the_wrapper_as_the_installing_user(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             output = root / "floppy.service"
             run_helper(
@@ -751,7 +751,7 @@ class GeneratedServiceUnitTests(SimpleTestCase):
 
     def test_launch_daemon_runs_the_wrapper_as_the_installing_user(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             output = root / "com.floppy.app.plist"
             run_helper(
@@ -780,7 +780,7 @@ class GeneratedServiceUnitTests(SimpleTestCase):
 class GeneratedWrapperTests(SimpleTestCase):
     def test_wrapper_loads_configuration_and_probes_the_resource_profile(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "My Floppy"
+            root = Path(temp_dir) / "My Watchmask"
             root.mkdir()
             output = root / "floppy-supervisord"
             run_helper(

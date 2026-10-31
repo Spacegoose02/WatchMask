@@ -44,7 +44,7 @@ _TOKEN_IMPORTS = {
 # File-driven imports: service -> (task export, file label).
 _FILE_IMPORTS = {
     # Service key stays "yamtrack": it is a public API parameter value.
-    "yamtrack": ("import_yamtrack", "Floppy backup or Yamtrack CSV"),
+    "yamtrack": ("import_yamtrack", "Watchmask backup or Yamtrack CSV"),
     "trakt-collection": ("import_trakt_collection_csv", "Trakt collection CSV"),
     "trakt-export": ("import_trakt_export", "Trakt data export zip"),
     "hltb": ("import_hltb", "HowLongToBeat CSV"),

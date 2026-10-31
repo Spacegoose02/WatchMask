@@ -97,7 +97,7 @@ class DiscoverRowFeed(Feed):
 
     def title(self, obj):
         """Return the feed title."""
-        return f"{obj['row_definition'].title} - Floppy"
+        return f"{obj['row_definition'].title} - Watchmask"
 
     def link(self, obj):
         """Return the Discover page URL."""

@@ -33,7 +33,7 @@ VERIFIED_OPERATIONS = frozenset(
 )
 
 STATIC_SPECTACULAR_SETTINGS = {
-    "TITLE": "Floppy verified MCP and grounding API",
+    "TITLE": "Watchmask verified MCP and grounding API",
     "DESCRIPTION": (
         "Verified consumer subset covering MCP HTTP operations, public grounding "
         "information, and ListenBrainz-compatible authentication. The full "

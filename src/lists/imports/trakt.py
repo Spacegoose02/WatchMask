@@ -269,7 +269,7 @@ def _make_trakt_request(access_token, url, client_id=None):
         client_id = credentials.get("trakt", "client_id")
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": f"Floppy/{settings.VERSION}",
+        "User-Agent": f"Watchmask/{settings.VERSION}",
         "trakt-api-version": "2",
         "trakt-api-key": client_id,
         "Authorization": f"Bearer {access_token}",

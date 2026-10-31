@@ -62,8 +62,8 @@ class WebManifestTests(SimpleTestCase):
             )
 
     def test_manifest_declares_a_standalone_root_scoped_identity(self):
-        self.assertEqual(self.manifest["name"], "Floppy - Media Tracker")
-        self.assertEqual(self.manifest["short_name"], "Floppy")
+        self.assertEqual(self.manifest["name"], "Watchmask - Media Tracker")
+        self.assertEqual(self.manifest["short_name"], "Watchmask")
         self.assertEqual(self.manifest["id"], "/")
         self.assertEqual(self.manifest["start_url"], "/")
         self.assertEqual(self.manifest["scope"], "/")

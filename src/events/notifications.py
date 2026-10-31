@@ -66,7 +66,7 @@ def send_releases():
     result = send_notifications(
         events=events,
         users=users,
-        title="🔔 Floppy: New Releases Available! 🔔",
+        title="🔔 Watchmask: New Releases Available! 🔔",
     )
 
     # Mark events as notified
@@ -126,7 +126,7 @@ def send_daily_digest():
     if not events.exists():
         return "No releases scheduled for today"
 
-    title = "📆 Floppy: Today's Releases 📆"
+    title = "📆 Watchmask: Today's Releases 📆"
 
     result = send_notifications(
         events=events,
@@ -203,7 +203,7 @@ def send_premiere_digest():
     result = send_notifications(
         events=events,
         users=users,
-        title="🎬 Floppy: Premieres This Week 🎬",
+        title="🎬 Watchmask: Premieres This Week 🎬",
         formatter=format_premiere_notification_html,
     )
 

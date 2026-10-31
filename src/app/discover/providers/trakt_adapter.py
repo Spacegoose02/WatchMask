@@ -37,7 +37,7 @@ class TraktDiscoverAdapter:
 
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": f"Floppy/{settings.VERSION}",
+            "User-Agent": f"Watchmask/{settings.VERSION}",
             "trakt-api-version": "2",
             "trakt-api-key": credentials.get("trakt", "client_id"),
         }

@@ -2,12 +2,6 @@ name: Docker Image
 
 on:
   workflow_dispatch:
-    inputs:
-      bootstrap_ghcr:
-        description: "Use GHCR_TOKEN once to create the renamed floppy package"
-        required: false
-        default: false
-        type: boolean
   push:
     branches:
       - "release"
@@ -32,8 +26,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: dannyvfilms/floppy
-  LEGACY_IMAGE_NAME: dannyvfilms/yamtrack
+  IMAGE_NAME: spacegoose02/watchmask
 
 jobs:
   quality:
@@ -248,12 +241,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          # Dual-publish during the rename grace period: the legacy path keeps
-          # receiving identical tags so pre-rename deployments still get
-          # updates. Drop the second line once traffic to it has died off.
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.REGISTRY }}/${{ env.LEGACY_IMAGE_NAME }}
           tags: |
             type=ref,event=pr
             type=semver,pattern={{version}}
@@ -272,11 +261,8 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
-          # The one-time bootstrap is needed because floppy was created by a
-          # PAT-based push, while the existing yamtrack package is already
-          # associated with this repository. Normal builds stay on GITHUB_TOKEN.
-          username: ${{ inputs.bootstrap_ghcr == true && 'dannyvfilms' || github.actor }}
-          password: ${{ inputs.bootstrap_ghcr == true && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
         id: build-and-push

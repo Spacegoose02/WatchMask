@@ -297,7 +297,7 @@ class WeTrakrExport:
         if skipped_episodes:
             self.warnings.append(
                 f"Skipped {skipped_episodes} note(s) on episodes or seasons: "
-                "Floppy imports notes for movies and shows only.",
+                "Watchmask imports notes for movies and shows only.",
             )
         return entries
 

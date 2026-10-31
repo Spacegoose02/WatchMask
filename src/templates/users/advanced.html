@@ -7,7 +7,7 @@
 {% load server_port_tags %}
 
 {% block title %}
-  {% translate "Advanced - Floppy" %}
+  {% translate "Advanced - Watchmask" %}
 {% endblock title %}
 
 {% block settings_content %}
@@ -55,7 +55,7 @@
           <h3 class="text-base font-medium">{% translate "External Image Caching" %}</h3>
         </div>
         <p class="text-[var(--color-text-muted)] mb-4 text-sm">
-          {% translate "Proxy artwork from approved metadata providers through Floppy so browsers and API clients do not need direct access to those providers. Cached images use disk space and are removed automatically after 30 days without access." %}
+          {% translate "Proxy artwork from approved metadata providers through Watchmask so browsers and API clients do not need direct access to those providers. Cached images use disk space and are removed automatically after 30 days without access." %}
         </p>
         <div class="grid gap-3 sm:grid-cols-2 mb-4 text-sm">
           <div class="rounded-md bg-[var(--color-surface)] px-4 py-3">
@@ -110,7 +110,7 @@
           <h3 class="text-base font-medium">{% translate "Cache Management" %}</h3>
         </div>
         <p class="text-[var(--color-text-muted)] mb-4 text-sm">
-          {% translate "Floppy caches computed pages (History, Statistics, Discover) and provider search results so they load fast. If one looks stale or wrong, clearing it forces a rebuild from your actual data — nothing about your library, watch history, ratings, or lists is touched by any of these." %}
+          {% translate "Watchmask caches computed pages (History, Statistics, Discover) and provider search results so they load fast. If one looks stale or wrong, clearing it forces a rebuild from your actual data — nothing about your library, watch history, ratings, or lists is touched by any of these." %}
         </p>
 
         <div class="grid gap-3 sm:grid-cols-2">
@@ -210,7 +210,7 @@
                   </div>
                   <p class="text-sm text-[var(--color-text-secondary)] mb-3">
                     {% translate "This is the one shared cache here — clearing it affects" %}
-                    <strong>{% translate "every user" %}</strong> {% translate "on this Floppy instance, not just you." %}
+                    <strong>{% translate "every user" %}</strong> {% translate "on this Watchmask instance, not just you." %}
                   </p>
                   <ul class="text-sm text-[var(--color-text-muted)] list-disc list-inside space-y-1 mb-5">
                     <li>{% translate "No data is lost — this only affects search/lookup results, not your library." %}</li>

@@ -367,7 +367,7 @@ REGISTRY: dict[str, ProviderCredentialSpec] = {
             docs_url="https://dev.twitch.tv/console/apps/create",
             setup_hint=(
                 "Register an application with the Twitch Developer Console. "
-                "Set OAuth Redirect URL to https://localhost (Floppy only uses "
+                "Set OAuth Redirect URL to https://localhost (Watchmask only uses "
                 "client credentials, so it is never called), Category to "
                 "Application Integration, and Client Type to Confidential. "
                 "Then click Manage and New Secret."

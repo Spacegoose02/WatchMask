@@ -186,7 +186,7 @@ METADATA_SUGGESTIONS = (
         "media_types": (MediaTypes.MOVIE.value, MediaTypes.TV.value),
         "badge": "Your own key",
         "why": (
-            "The built-in key is shared by every Floppy install and can hit its limit "
+            "The built-in key is shared by every Watchmask install and can hit its limit "
             "during big imports. A free key of your own avoids that."
         ),
     },

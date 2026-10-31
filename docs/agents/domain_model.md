@@ -1,12 +1,12 @@
 <!-- GENERATED FILE. DO NOT EDIT. Run `PYTHONPATH=src uv run --no-sync python -m app.domain_vocabulary` to regenerate. -->
 
-# Floppy domain model
+# Watchmask domain model
 
-Use these terms when you change Floppy or its API.
+Use these terms when you change Watchmask or its API.
 
 ## Item
 
-An Item is the shared work that Floppy identifies from a media provider. Users can track the same Item with separate Consumption records.
+An Item is the shared work that Watchmask identifies from a media provider. Users can track the same Item with separate Consumption records.
 
 Bounded context: `app`.
 
@@ -42,7 +42,7 @@ Relationships:
 
 ## Celery queue
 
-A Celery queue sends a task to a worker. Floppy uses the `celery`, `interactive`, and `discover` queue names. `celery` handles background work. `interactive` handles user-triggered work. `discover` handles Discover cache rebuilds. The Reload calendar task has no queue override, so it uses `celery` with background priority `9`.
+A Celery queue sends a task to a worker. Watchmask uses the `celery`, `interactive`, and `discover` queue names. `celery` handles background work. `interactive` handles user-triggered work. `discover` handles Discover cache rebuilds. The Reload calendar task has no queue override, so it uses `celery` with background priority `9`.
 
 Bounded context: `config`.
 

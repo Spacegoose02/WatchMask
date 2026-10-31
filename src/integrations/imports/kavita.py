@@ -36,7 +36,7 @@ from integrations.models import KavitaAccount, KavitaLink
 logger = logging.getLogger(__name__)
 
 ENTRY_SOURCE = "kavita"
-PLUGIN_NAME = "Floppy"
+PLUGIN_NAME = "Watchmask"
 PAGE_SIZE = 100
 COMICVINE_PAGE_SIZE = 100
 COMICVINE_MAX_VOLUME_PAGES = 50
