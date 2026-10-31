@@ -8,7 +8,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("app", "0216_reliable_sync_contract"),
+        ("app", "0199_episode_rating_only"),
         ("integrations", "0066_bingebandit_collection_watched_signature"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
