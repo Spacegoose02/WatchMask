@@ -164,7 +164,7 @@ class BranchAndImageDefaultsTests(SimpleTestCase):
             r"FLOPPY_REPO_BRANCH=\$\{FLOPPY_REPO_BRANCH:-(\w+)\}", text
         ).group(1)
         image_tag = re.search(
-            r"FLOPPY_IMAGE=\$\{FLOPPY_IMAGE:-ghcr\.io/dannyvfilms/floppy:(\w+)\}",
+            r"FLOPPY_IMAGE=\$\{FLOPPY_IMAGE:-ghcr\.io/spacegoose02/watchmask:(\w+)\}",
             text,
         ).group(1)
         self.assertEqual(
@@ -514,21 +514,21 @@ class ExistingComposeImageUpdateTests(SimpleTestCase):
             root = Path(temp_dir)
             compose = self._compose_file(root, "ghcr.io/dannyvfilms/floppy:release")
             run_docker_helper(
-                'FLOPPY_IMAGE="ghcr.io/dannyvfilms/floppy:latest"\n'
+                'FLOPPY_IMAGE="ghcr.io/spacegoose02/watchmask:latest"\n'
                 "_docker_update_image_tag\n",
                 root,
             )
             text = compose.read_text(encoding="utf-8")
-        self.assertIn("image: ghcr.io/dannyvfilms/floppy:latest", text)
+        self.assertIn("image: ghcr.io/spacegoose02/watchmask:latest", text)
         self.assertIn("image: redis:8-alpine", text)
 
     def test_an_already_current_tag_is_left_alone(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            compose = self._compose_file(root, "ghcr.io/dannyvfilms/floppy:latest")
+            compose = self._compose_file(root, "ghcr.io/spacegoose02/watchmask:latest")
             before = compose.read_text(encoding="utf-8")
             run_docker_helper(
-                'FLOPPY_IMAGE="ghcr.io/dannyvfilms/floppy:latest"\n'
+                'FLOPPY_IMAGE="ghcr.io/spacegoose02/watchmask:latest"\n'
                 "_docker_update_image_tag\n",
                 root,
             )
@@ -551,13 +551,13 @@ class ExistingComposeImageUpdateTests(SimpleTestCase):
                 encoding="utf-8",
             )
             run_docker_helper(
-                'FLOPPY_IMAGE="ghcr.io/dannyvfilms/floppy:latest"\n'
+                'FLOPPY_IMAGE="ghcr.io/spacegoose02/watchmask:latest"\n'
                 "_docker_update_image_tag\n",
                 root,
             )
             text = compose.read_text(encoding="utf-8")
         self.assertIn("./hand-added-extra:/custom", text)
-        self.assertIn("image: ghcr.io/dannyvfilms/floppy:latest", text)
+        self.assertIn("image: ghcr.io/spacegoose02/watchmask:latest", text)
 
 
 class GeneratedComposeTests(SimpleTestCase):

@@ -6,13 +6,13 @@
 # The bootstrap (scripts/install.sh) deliberately does NOT source this: it runs
 # before the repository exists and carries its own minimal prompt helper.
 
-FLOPPY_REPO_URL=${FLOPPY_REPO_URL:-https://github.com/dannyvfilms/Floppy.git}
+FLOPPY_REPO_URL=${FLOPPY_REPO_URL:-https://github.com/Spacegoose02/WatchMask.git}
 # TODO: point both back at "release" once a release cuts these forward onto
 # that branch. Today only "latest" (and its :latest image) carries the
 # installer and the commands it runs, e.g. promote_superuser - the :release
 # image predates it and fails with "Unknown command".
 FLOPPY_REPO_BRANCH=${FLOPPY_REPO_BRANCH:-latest}
-FLOPPY_IMAGE=${FLOPPY_IMAGE:-ghcr.io/dannyvfilms/floppy:latest}
+FLOPPY_IMAGE=${FLOPPY_IMAGE:-ghcr.io/spacegoose02/watchmask:latest}
 
 # Readiness bound shared by every method (five minutes, per the install spec).
 FLOPPY_READY_TIMEOUT=${FLOPPY_READY_TIMEOUT:-300}

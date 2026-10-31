@@ -73,12 +73,12 @@ _docker_install_engine_apt() {
 # leaving the rest of a possibly-customized file untouched.
 _docker_update_image_tag() {
     local current wanted tmp
-    current=$(grep -m1 '^    image: ghcr\.io/dannyvfilms/floppy:' "$COMPOSE_FILE" || true)
+    current=$(grep -m1 -E '^    image: ghcr\.io/(spacegoose02/watchmask|dannyvfilms/floppy):' "$COMPOSE_FILE" || true)
     [ -n "$current" ] || return 0
     wanted="    image: $FLOPPY_IMAGE"
     [ "$current" = "$wanted" ] && return 0
     tmp="${COMPOSE_FILE}.tmp.$$"
-    sed "s|^    image: ghcr\.io/dannyvfilms/floppy:.*\$|$wanted|" "$COMPOSE_FILE" >"$tmp" \
+    sed -E "s#^    image: ghcr\.io/(spacegoose02/watchmask|dannyvfilms/floppy):.*\$#$wanted#" "$COMPOSE_FILE" >"$tmp" \
         && mv "$tmp" "$COMPOSE_FILE"
     say "  Updated the image tag: ${current#*image: } -> $FLOPPY_IMAGE"
 }
