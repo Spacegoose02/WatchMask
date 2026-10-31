@@ -269,9 +269,10 @@ class MediaEpisodeScoreView(drf_views.APIView):
                 episode_number,
                 language=metadata_resolution.metadata_language_default(request.user),
             )
-        except Exception as error:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": "Could not resolve episode.", "errors": str(error)},
+                {"detail": "Could not resolve episode.", "errors": "An internal error occurred; see the server logs."},
                 status=HTTP.NOT_FOUND,
             )
         if coordinate_error:

@@ -73,6 +73,16 @@ function initStatisticsCharts() {
     };
     return labels[value] || value;
   }
+  // Colors come from JSON embedded in the page; only let plain CSS color
+  // values through before they are written into inline styles.
+  function chartSafeColor(value) {
+    const text = String(value == null ? "" : value).trim();
+    if (/^(#[0-9a-fA-F]{3,8}|(rgb|rgba|hsl|hsla)\([0-9.,%\s/-]+\)|[a-zA-Z]+)$/.test(text)) {
+      return text;
+    }
+    return "transparent";
+  }
+
   function chartEscapeHtml(value) {
     return String(value).replace(/[&<>"']/g, function (ch) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
@@ -1264,7 +1274,7 @@ function initStatisticsCharts() {
         tooltipEl.innerHTML =
           '<div style="font-weight:600;margin-bottom:4px;color:' + CHART_TOOLTIP_TEXT + '">' + chartEscapeHtml(label) + "</div>" +
           '<div style="display:flex;align-items:center;gap:6px">' +
-            '<span style="width:10px;height:10px;border-radius:2px;background:' + color + ';flex-shrink:0"></span>' +
+            '<span style="width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + ';flex-shrink:0"></span>' +
             '<span>' + fmtHours(hrs, Infinity) + " (" + pct + "%)</span>" +
           "</div>";
       }
@@ -1325,11 +1335,11 @@ function initStatisticsCharts() {
         row.style.cssText = "display:flex;align-items:center;gap:14px;font-size:11px;line-height:1.3;";
         row.innerHTML =
           '<div style="flex-shrink:0;display:flex;align-items:center;gap:6px;width:74px">' +
-            '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + color + '"></span>' +
+            '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + '"></span>' +
             '<span style="flex:1;color:#d1d5db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + chartEscapeHtml(label) + "</span>" +
           '</div>' +
           '<div style="flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,0.07);overflow:hidden;min-width:40px">' +
-            '<div style="height:100%;border-radius:3px;background:' + color + ';width:' + pct + '%"></div>' +
+            '<div style="height:100%;border-radius:3px;background:' + chartSafeColor(color) + ';width:' + pct + '%"></div>' +
           '</div>' +
           '<span style="flex-shrink:0;width:34px;text-align:center;color:#d1d5db;font-weight:600">' + pct + "%</span>" +
           '<span style="flex-shrink:0;min-width:80px;text-align:center;color:#6b7280;font-variant-numeric:tabular-nums;white-space:nowrap">' + fmtHours(hrs) + "</span>";
@@ -1467,7 +1477,7 @@ function initStatisticsCharts() {
         tooltipEl.innerHTML =
           '<div style="font-weight:600;margin-bottom:4px;color:' + CHART_TOOLTIP_TEXT + '">' + chartEscapeHtml(label) + "</div>" +
           '<div style="display:flex;align-items:center;gap:6px">' +
-            '<span style="width:10px;height:10px;border-radius:2px;background:' + color + ';flex-shrink:0"></span>' +
+            '<span style="width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + ';flex-shrink:0"></span>' +
             "<span>" + count.toLocaleString(document.documentElement.lang || undefined) + " (" + pct + "%)</span>" +
           "</div>";
       }
@@ -1532,11 +1542,11 @@ function initStatisticsCharts() {
           row.style.cssText = "display:flex;align-items:center;gap:10px;font-size:11px;min-width:250px;";
           row.innerHTML =
             '<div style="flex-shrink:0;display:flex;align-items:center;gap:6px;min-width:0;width:84px">' +
-              '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + color + '"></span>' +
+              '<span style="flex-shrink:0;width:10px;height:10px;border-radius:2px;background:' + chartSafeColor(color) + '"></span>' +
               '<span style="min-width:0;color:#d1d5db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + chartEscapeHtml(label) + "</span>" +
             "</div>" +
             '<div style="flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,0.07);overflow:hidden;min-width:40px">' +
-              '<div style="height:100%;border-radius:3px;background:' + color + ';width:' + pct + '%"></div>' +
+              '<div style="height:100%;border-radius:3px;background:' + chartSafeColor(color) + ';width:' + pct + '%"></div>' +
             "</div>" +
             '<span style="flex-shrink:0;width:34px;text-align:center;color:' + CHART_TOOLTIP_TEXT + ';font-weight:700">' + pct + "%</span>" +
             '<span style="flex-shrink:0;min-width:60px;text-align:center;color:#6b7280;font-variant-numeric:tabular-nums">' + count.toLocaleString(document.documentElement.lang || undefined) + "</span>";
@@ -1858,7 +1868,7 @@ function initStatisticsCharts() {
       html += '<div class="shrink-0 text-right text-xs font-medium text-gray-400" style="width:56px">' + chartEscapeHtml(gettext("Total")) + '</div>';
       statusColumns.forEach(function (ds) {
         html +=
-          '<div class="shrink-0 text-right text-xs font-medium" style="width:' + colWidth(ds) + 'px;color:' + ds.background_color + '">' +
+          '<div class="shrink-0 text-right text-xs font-medium" style="width:' + colWidth(ds) + 'px;color:' + chartSafeColor(ds.background_color) + '">' +
           escapeHtml(chartDisplayLabel(ds.label)) + "</div>";
       });
       html += "</div>";
@@ -1875,7 +1885,7 @@ function initStatisticsCharts() {
           '<div class="flex items-center gap-2 flex-1 min-w-0" style="min-width:110px">' +
           '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" ' +
           'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ' +
-          'class="w-4 h-4 shrink-0" style="color:' + (visuals.color || "#9ca3af") + '">' + (visuals.icon || "") + "</svg>" +
+          'class="w-4 h-4 shrink-0" style="color:' + chartSafeColor(visuals.color || "#9ca3af") + '">' + (visuals.icon || "") + "</svg>" +
           '<span class="text-sm text-gray-300 truncate">' + escapeHtml(chartDisplayLabel(typeLabel)) + "</span>" +
           "</div>";
         html +=
@@ -1889,13 +1899,13 @@ function initStatisticsCharts() {
             html +=
               '<div class="shrink-0 flex items-center gap-2" style="width:' + colWidth(ds) + 'px">' +
               '<div class="rounded-full overflow-hidden shrink-0" style="width:34px;height:4px;background:rgba(255,255,255,0.1)">' +
-              '<div style="height:100%;width:' + pct + '%;background:' + ds.background_color + '"></div>' +
+              '<div style="height:100%;width:' + pct + '%;background:' + chartSafeColor(ds.background_color) + '"></div>' +
               "</div>" +
-              '<span class="text-sm text-right flex-1" style="color:' + ds.background_color + '">' + value.toLocaleString(document.documentElement.lang || undefined) + "</span>" +
+              '<span class="text-sm text-right flex-1" style="color:' + chartSafeColor(ds.background_color) + '">' + value.toLocaleString(document.documentElement.lang || undefined) + "</span>" +
               "</div>";
           } else {
             html +=
-              '<div class="shrink-0 text-sm text-right" style="width:' + colWidth(ds) + 'px;color:' + ds.background_color + '">' +
+              '<div class="shrink-0 text-sm text-right" style="width:' + colWidth(ds) + 'px;color:' + chartSafeColor(ds.background_color) + '">' +
               value.toLocaleString(document.documentElement.lang || undefined) + "</div>";
           }
         });

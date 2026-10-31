@@ -2287,11 +2287,12 @@ def import_data_plex_status(request):
                 "error": "Plex token expired or revoked. Please reconnect.",
             },
         )
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Request failed")
         return JsonResponse(
             {
                 "state": "error",
-                "error": str(exc),
+                "error": "An internal error occurred; see the server logs.",
             },
         )
 

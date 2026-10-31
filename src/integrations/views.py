@@ -4190,8 +4190,9 @@ def storyteller_poll(request):
     client = StorytellerClient(pending["server_url"])
     try:
         data, status_code = client.poll_device_token(pending["device_code"])
-    except Exception as exc:
-        return JsonResponse({"status": "pending", "detail": str(exc)})
+    except Exception:
+        logger.exception("Request failed")
+        return JsonResponse({"status": "pending", "detail": "An internal error occurred; see the server logs."})
 
     access_token = data.get("access_token") if isinstance(data, dict) else None
     if access_token:

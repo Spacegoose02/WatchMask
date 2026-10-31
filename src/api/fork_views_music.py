@@ -147,9 +147,10 @@ class MusicArtistsView(drf_views.APIView):
                 artist = fork_services_music.get_or_create_artist_from_musicbrainz(
                     musicbrainz_id,
                 )
-            except Exception as e:
+            except Exception:
+                logger.exception("Request failed")
                 return Response(
-                    {"detail": "Could not fetch artist.", "errors": str(e)},
+                    {"detail": "Could not fetch artist.", "errors": "An internal error occurred; see the server logs."},
                     status=HTTP.BAD_GATEWAY,
                 )
         else:
@@ -267,9 +268,10 @@ class MusicArtistSyncView(drf_views.APIView):
             return Response({"detail": "Artist not found."}, status=HTTP.NOT_FOUND)
         try:
             count = sync_artist_discography(artist, force=True)
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": "Discography sync failed.", "errors": str(e)},
+                {"detail": "Discography sync failed.", "errors": "An internal error occurred; see the server logs."},
                 status=HTTP.BAD_GATEWAY,
             )
         if count:

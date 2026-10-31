@@ -33,6 +33,7 @@ from django.templatetags.static import static
 from django.urls import NoReverseMatch, reverse
 from django.utils import formats, timezone
 from django.utils.dateparse import parse_date
+from django.utils.html import escape
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.text import slugify
 from django.utils.timezone import datetime
@@ -1806,7 +1807,7 @@ def delete_history_record(request, media_type, history_id):
                     response = HttpResponse()
                     # Update the count on the album detail page
                     response.write(
-                        f'<p id="track-history-{music_id}" hx-swap-oob="true" class="text-xs text-gray-400 mt-2 px-4">{history_text}</p>'
+                        f'<p id="track-history-{music.id}" hx-swap-oob="true" class="text-xs text-gray-400 mt-2 px-4">{escape(history_text)}</p>'
                     )
                     # Update the count in the modal
                     modal_text = (
@@ -1815,16 +1816,16 @@ def delete_history_record(request, media_type, history_id):
                         else f"Listened {remaining_count} times"
                     )
                     response.write(
-                        f'<p id="modal-listen-count-{music_id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">{modal_text}</p>'
+                        f'<p id="modal-listen-count-{music.id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">{modal_text}</p>'
                     )
                     return response
                 # No history left, hide the album page element and update modal
                 response = HttpResponse()
                 response.write(
-                    f'<p id="track-history-{music_id}" hx-swap-oob="true" class="text-xs text-gray-400 mt-2 px-4" style="display: none;"></p>'
+                    f'<p id="track-history-{music.id}" hx-swap-oob="true" class="text-xs text-gray-400 mt-2 px-4" style="display: none;"></p>'
                 )
                 response.write(
-                    f'<p id="modal-listen-count-{music_id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">Not listened yet</p>'
+                    f'<p id="modal-listen-count-{music.id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">Not listened yet</p>'
                 )
             except Music.DoesNotExist:
                 pass
@@ -1876,14 +1877,14 @@ def delete_history_record(request, media_type, history_id):
                         else f"Played {remaining_count} times"
                     )
                     response.write(
-                        f'<p id="modal-listen-count-{podcast_id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">{modal_text}</p>'
+                        f'<p id="modal-listen-count-{podcast.id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">{modal_text}</p>'
                     )
                     response["HX-Trigger"] = "history-refresh-start"
                     return response
                 # No history left, update modal
                 response = HttpResponse()
                 response.write(
-                    f'<p id="modal-listen-count-{podcast_id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">Not played yet</p>'
+                    f'<p id="modal-listen-count-{podcast.id}" hx-swap-oob="true" class="text-sm text-gray-400 mt-1">Not played yet</p>'
                 )
                 response["HX-Trigger"] = "history-refresh-start"
             except Podcast.DoesNotExist:

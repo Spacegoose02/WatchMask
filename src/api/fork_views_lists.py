@@ -439,9 +439,10 @@ class ListRecommendationsView(drf_views.APIView):
                     request.user
                 ),
             )
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": "Could not resolve item.", "errors": str(e)},
+                {"detail": "Could not resolve item.", "errors": "An internal error occurred; see the server logs."},
                 status=HTTP.BAD_GATEWAY,
             )
 

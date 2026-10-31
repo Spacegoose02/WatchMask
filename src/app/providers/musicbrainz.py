@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from http import HTTPStatus
 from typing import NoReturn
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from django.conf import settings
@@ -1096,7 +1096,7 @@ def get_artist(artist_id):
             if "wikipedia.org/wiki/" in url:
                 wikipedia_title = url.split("/wiki/")[-1]
                 # Prefer English Wikipedia
-                if "en.wikipedia.org" in url:
+                if urlparse(url).hostname == "en.wikipedia.org":
                     break
 
     if not artist_bio and wikipedia_title:

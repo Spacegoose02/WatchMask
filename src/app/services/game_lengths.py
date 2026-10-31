@@ -45,7 +45,7 @@ HLTB_TITLE_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 HLTB_GAME_URL_RE = re.compile(r"/game/(\d+)")
 HLTB_NEXT_DATA_RE = re.compile(
     r'<script(?=[^>]*id=["\']__NEXT_DATA__["\'])(?=[^>]*type=["\']application/json["\'])[^>]*>(.*?)</script>',
-    re.DOTALL,
+    re.DOTALL | re.IGNORECASE,
 )
 HLTB_MATCH_AMBIGUOUS = "ambiguous"
 HLTB_MATCH_DIRECT = "direct_url"

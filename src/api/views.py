@@ -4253,9 +4253,10 @@ class MediaEpisodeConsumptionEntryDetailView(drf_views.APIView):
                 episode_number=episode_number,
                 library_media_type=request.query_params.get("library_media_type"),
             )
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": f"{e!s}"},
+                {"detail": "An internal error occurred; see the server logs."},
                 status=HTTP.INTERNAL_SERVER_ERROR,
             )
 
@@ -4328,9 +4329,10 @@ class MediaEpisodeConsumptionEntryDetailView(drf_views.APIView):
                 episode_number=episode_number,
                 library_media_type=request.query_params.get("library_media_type"),
             )
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": f"{e!s}"},
+                {"detail": "An internal error occurred; see the server logs."},
                 status=HTTP.INTERNAL_SERVER_ERROR,
             )
 
@@ -4406,9 +4408,10 @@ class MediaEpisodeConsumptionEntryDetailView(drf_views.APIView):
                 episode_number=episode_number,
                 library_media_type=request.query_params.get("library_media_type"),
             )
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": f"{e!s}"},
+                {"detail": "An internal error occurred; see the server logs."},
                 status=HTTP.INTERNAL_SERVER_ERROR,
             )
 

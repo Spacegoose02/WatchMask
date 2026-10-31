@@ -67,7 +67,9 @@ class PagePipelineCostTests(TestCase):
         page = self.client.get(reverse("home")).content.decode()
         source = next(
             script
-            for script in re.findall(r"<script>(.*?)</script>", page, re.DOTALL)
+            for script in re.findall(
+                r"<script>(.*?)</script>", page, re.DOTALL | re.IGNORECASE
+            )
             if "function initHtmxCacheBusting()" in script
         )
         source = (

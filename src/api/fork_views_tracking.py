@@ -274,9 +274,10 @@ class MediaMovieWatchView(drf_views.APIView):
 
         try:
             movie = resolve_or_create_movie(request.user, media_id, source)
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": "Could not resolve movie.", "errors": str(e)},
+                {"detail": "Could not resolve movie.", "errors": "An internal error occurred; see the server logs."},
                 status=HTTP.NOT_FOUND,
             )
 

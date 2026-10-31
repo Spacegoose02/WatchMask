@@ -459,9 +459,10 @@ class UserNotificationTestView(drf_views.APIView):
                 ),
                 body_format=apprise.NotifyFormat.HTML,
             )
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": "Failed to send test notification.", "errors": str(e)},
+                {"detail": "Failed to send test notification.", "errors": "An internal error occurred; see the server logs."},
                 status=HTTP.BAD_GATEWAY,
             )
         if not result:

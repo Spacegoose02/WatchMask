@@ -665,9 +665,10 @@ class PlaybackProgressView(drf_views.APIView):
                 data.get("episode_number"),
                 create=True,
             )
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": "Could not resolve media.", "errors": str(e)},
+                {"detail": "Could not resolve media.", "errors": "An internal error occurred; see the server logs."},
                 status=HTTP.NOT_FOUND,
             )
         if item is None:
@@ -770,9 +771,10 @@ class PlaybackProgressView(drf_views.APIView):
                 data.get("episode_number"),
                 create=False,
             )
-        except Exception as e:
+        except Exception:
+            logger.exception("Request failed")
             return Response(
-                {"detail": "Could not resolve media.", "errors": str(e)},
+                {"detail": "Could not resolve media.", "errors": "An internal error occurred; see the server logs."},
                 status=HTTP.NOT_FOUND,
             )
         if item is None:
