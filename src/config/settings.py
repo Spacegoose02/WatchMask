@@ -1645,6 +1645,7 @@ if os.environ.get("FLOPPY_PROCESS_ROLE") == "interactive":
 else:
     CELERY_IMPORTS = (
         "app.tasks_game_groups",
+        "integrations.tasks._bingebandit",
         "integrations.tasks._change_log",
         "integrations.tasks._cinemask",
         "integrations.tasks._jellyfin_pull",
@@ -2185,6 +2186,11 @@ CELERY_BEAT_SCHEDULE = {
     "sync_cinemask_requests": {
         "task": "Sync Cinemask requests for all users",
         "schedule": 60 * 30,  # every 30 minutes
+        "options": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
+    },
+    "sync_bingebandit_libraries": {
+        "task": "Sync BingeBandit libraries for all users",
+        "schedule": 60 * 60 * 6,  # every 6 hours
         "options": {"priority": CELERY_TASK_PRIORITY_BACKGROUND},
     },
     "refresh_discover_profiles": {

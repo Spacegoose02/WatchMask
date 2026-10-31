@@ -238,6 +238,15 @@
               </div>
             {% endif %}
 
+            {% if request.user.bingebandit_account and media.source == Sources.TMDB.value %}
+              {% if media_type == MediaTypes.MOVIE.value or media_type == MediaTypes.TV.value %}
+                <div class="flex-1 md:flex-none"
+                     hx-get="{% url 'bingebandit_play_button' %}?media_type={{ media_type }}&tmdb_id={{ media.media_id|urlencode }}"
+                     hx-trigger="load"
+                     hx-swap="outerHTML"></div>
+              {% endif %}
+            {% endif %}
+
             {% if request.user.cinemask_account and media.source == Sources.TMDB.value %}
               {% if media_type == MediaTypes.MOVIE.value or media_type == MediaTypes.TV.value %}
                 <div class="flex-1 md:flex-none"

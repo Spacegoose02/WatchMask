@@ -85,6 +85,9 @@
         {% include "app/components/active_playback_card.html" %}
       {% endif %}
     </div>
+    {% if continue_watching %}
+      {% include "app/components/continue_watching_row.html" %}
+    {% endif %}
     {% include "app/components/home_groups.html" %}
     {% if deferred_groups %}
       {% comment %}

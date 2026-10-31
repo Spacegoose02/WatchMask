@@ -2337,3 +2337,23 @@ def month_abbreviation(value):
     except ValueError:
         return value
     return formats.date_format(date(2000, number, 1), "M") if number else ""
+
+
+@register.filter
+def in_bingebandit_library(item, user):
+    """Whether a TMDB movie or show is in the user's BingeBandit library."""
+    from integrations import bingebandit  # noqa: PLC0415
+
+    if (
+        getattr(item, "source", None) != Sources.TMDB.value
+        or getattr(item, "media_type", None) not in bingebandit.MEDIA_TYPE_BY_KIND.values()
+        or not getattr(user, "is_authenticated", False)
+    ):
+        return False
+    # Cached on the user for the rest of the request: a page renders many cards.
+    item_ids = getattr(user, "_bingebandit_library_item_ids", None)
+    if item_ids is None:
+        has_account = hasattr(user, "bingebandit_account")
+        item_ids = bingebandit.library_item_ids(user) if has_account else {}
+        user._bingebandit_library_item_ids = item_ids  # noqa: SLF001
+    return (item.media_type, str(item.media_id)) in item_ids

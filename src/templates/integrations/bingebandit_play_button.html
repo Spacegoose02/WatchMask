@@ -1,0 +1,13 @@
+<a href="{{ url }}"
+   target="_blank"
+   rel="noopener"
+   title="{% if resume_point %}Resume {% if resume_point.episode_code %}{{ resume_point.episode_code }} {% endif %}at {{ resume_point.position_display }} on BingeBandit{% else %}Play on BingeBandit{% endif %}"
+   class="relative inline-flex h-11 w-full flex-1 items-center justify-center gap-2 overflow-hidden rounded-xl border border-indigo-500/60 bg-indigo-600 px-4 text-sm font-medium text-white shadow-sm transition-colors duration-200 hover:bg-indigo-500 sm:w-auto sm:flex-none">
+  {% include "app/icons/play.svg" with classes="w-4 h-4" %}
+  {% if resume_point %}
+    Resume{% if resume_point.episode_code %} {{ resume_point.episode_code }}{% endif %} · {{ resume_point.position_display }}
+    <span class="absolute bottom-0 left-0 h-0.5 bg-white/70" style="width: {{ resume_point.progress_percent }}%"></span>
+  {% else %}
+    Play
+  {% endif %}
+</a>

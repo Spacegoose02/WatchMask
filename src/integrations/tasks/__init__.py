@@ -5,6 +5,10 @@ from django.contrib.auth import get_user_model
 
 _EXPORT_MODULES = {
     **dict.fromkeys(
+        ("sync_all_bingebandit_libraries", "sync_bingebandit_library"),
+        "integrations.tasks._bingebandit",
+    ),
+    **dict.fromkeys(
         ("sync_all_cinemask_requests", "sync_cinemask_requests"),
         "integrations.tasks._cinemask",
     ),
@@ -77,6 +81,7 @@ _EXPORT_MODULES = {
             "import_anilist",
             "import_audiobookshelf",
             "import_audiobookshelf_recurring",
+            "import_bingebandit",
             "import_clz",
             "import_goodreads",
             "import_goodreads_dotted",
@@ -248,10 +253,13 @@ __all__ = [
     "format_media_type_display",
     "format_watchlist_sync_message",
     "import_anilist",
+    "sync_all_bingebandit_libraries",
     "sync_all_cinemask_requests",
+    "sync_bingebandit_library",
     "sync_cinemask_requests",
     "import_audiobookshelf",
     "import_audiobookshelf_recurring",
+    "import_bingebandit",
     "import_clz",
     "import_goodreads",
     "import_goodreads_dotted",

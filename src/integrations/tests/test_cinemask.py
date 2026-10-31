@@ -193,7 +193,8 @@ class CinemaskWebhookTests(CinemaskTestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
-        mock_delay.assert_called_once_with("cinemask", payload, self.user.id)
+        mock_delay.assert_called_once()
+        self.assertEqual(mock_delay.call_args.args, ("cinemask", payload, self.user.id))
 
     @patch("app.providers.services.get_media_metadata", return_value=METADATA)
     def test_available_updates_own_request_and_adds_to_tracking(self, _meta):

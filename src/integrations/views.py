@@ -55,6 +55,7 @@ from app.providers import credentials, services
 from app.redis_diagnosis import queue_failure_message
 from app.services import metadata_resolution
 from app.templatetags.app_tags import media_url
+from integrations import bingebandit as bingebandit_api
 from integrations import (
     arr_library,
     cinemask,
@@ -125,6 +126,9 @@ from integrations.match_corrections import (
 )
 from integrations.models import (
     AudiobookshelfAccount,
+    BingeBanditAccount,
+    BingeBanditLibraryItem,
+    BingeBanditResumePoint,
     CinemaskAccount,
     CinemaskRequest,
     CollectionSourceState,
@@ -775,6 +779,154 @@ def _save_lastfm_history_reset(account, cutoff_uts: int):
             "history_import_last_error_message",
         ],
     )
+
+
+BINGEBANDIT_IMPORT_TASK_NAME = "Import from BingeBandit"
+
+
+def _clean_usernames(raw_usernames):
+    """De-duplicate a comma-separated username list, keeping the first spelling."""
+    seen = set()
+    names = [name.strip() for name in raw_usernames.split(",") if name.strip()]
+    return ", ".join(
+        name for name in names if not (name.lower() in seen or seen.add(name.lower()))
+    )
+
+
+@require_POST
+def bingebandit_connect(request):
+    """Connect a BingeBandit server with an API key."""
+    base_url = request.POST.get("base_url", "").strip()
+    api_key = request.POST.get("api_key", "").strip()
+    if not base_url or not api_key:
+        messages.error(request, "BingeBandit server URL and API key are required.")
+        return redirect("import_data")
+
+    try:
+        me = bingebandit_api.BingeBanditClient(base_url, api_key).get_me()
+    except bingebandit_api.BingeBanditError as exc:
+        messages.error(request, str(exc))
+        return redirect("import_data")
+
+    username = str(me.get("username") or "")
+    account, created = BingeBanditAccount.objects.update_or_create(
+        user=request.user,
+        defaults={
+            "base_url": base_url.rstrip("/"),
+            "api_key": helpers.encrypt(api_key),
+            "username": username,
+        },
+    )
+    # Start the webhook filter on the connected user so other members'
+    # plays on the same server aren't tracked.
+    if created and username:
+        account.webhook_usernames = username
+        account.save(update_fields=["webhook_usernames"])
+    tasks.sync_bingebandit_library.delay(user_id=request.user.id)
+
+    messages.success(request, f"Connected BingeBandit as {username or 'your account'}.")
+    return redirect("import_data")
+
+
+@require_POST
+def bingebandit_disconnect(request):
+    """Disconnect BingeBandit and remove its scheduled imports."""
+    from django_celery_beat.models import PeriodicTask
+
+    PeriodicTask.objects.filter(
+        _periodic_task_filter_for_user(request.user.id),
+        task=BINGEBANDIT_IMPORT_TASK_NAME,
+    ).delete()
+    BingeBanditAccount.objects.filter(user=request.user).delete()
+    BingeBanditLibraryItem.objects.filter(user=request.user).delete()
+    BingeBanditResumePoint.objects.filter(user=request.user).delete()
+    cache.delete(bingebandit_api.LIBRARY_CACHE_KEY.format(user_id=request.user.id))
+    messages.info(request, "Disconnected BingeBandit.")
+    return redirect("import_data")
+
+
+@require_GET
+def bingebandit_status(request):
+    """Check the stored BingeBandit key and list its libraries."""
+    account = getattr(request.user, "bingebandit_account", None)
+    if not account:
+        return JsonResponse({"state": "disconnected", "libraries": [], "error": ""})
+    try:
+        # Rendered live on the Import page, so fail fast instead of holding a
+        # web thread for the full default timeout when BingeBandit is down.
+        libraries = bingebandit_api.client_for(account).get_libraries(timeout=5)
+    except bingebandit_api.BingeBanditError as exc:
+        return JsonResponse({"state": "error", "libraries": [], "error": str(exc)})
+    return JsonResponse({"state": "connected", "libraries": libraries, "error": ""})
+
+
+@require_GET
+def bingebandit_play_button(request):
+    """Render a Resume or Play on BingeBandit button for a detail page."""
+    account = getattr(request.user, "bingebandit_account", None)
+    media_type = request.GET.get("media_type", "")
+    tmdb_id = request.GET.get("tmdb_id", "")
+    if not account or media_type not in bingebandit_api.MEDIA_TYPE_BY_KIND.values():
+        return HttpResponse("")
+
+    resume_point = BingeBanditResumePoint.objects.filter(
+        user=request.user,
+        media_type=media_type,
+        tmdb_id=tmdb_id,
+    ).first()
+    if resume_point:
+        context = {
+            "resume_point": resume_point,
+            "url": account.play_url(
+                resume_point.item_id,
+                resume_point.position_seconds,
+            ),
+        }
+    else:
+        item_id = bingebandit_api.library_item_ids(request.user).get(
+            (media_type, tmdb_id),
+        )
+        if not item_id:
+            return HttpResponse("")
+        context = {"url": account.item_url(item_id)}
+    return render(request, "integrations/bingebandit_play_button.html", context)
+
+
+@require_POST
+def import_bingebandit(request):
+    """Save the webhook username filter and queue a BingeBandit history import."""
+    account = getattr(request.user, "bingebandit_account", None)
+    if not account:
+        messages.error(request, "Connect BingeBandit before importing.")
+        return redirect("import_data")
+
+    usernames = _clean_usernames(request.POST.get("bingebandit_usernames", ""))
+    if usernames != account.webhook_usernames:
+        account.webhook_usernames = usernames
+        account.save(update_fields=["webhook_usernames"])
+
+    library = request.POST.get("library") or "all"
+    mode = request.POST.get("mode", "new")
+    frequency = request.POST.get("frequency", "once")
+    if mode not in ("new", "overwrite"):
+        messages.error(request, "BingeBandit only supports the new and overwrite import modes.")
+        return redirect("import_data")
+
+    if frequency != "once":
+        helpers.create_import_schedule(
+            username=account.username or request.user.username,
+            request=request,
+            mode=mode,
+            frequency=frequency,
+            import_time=request.POST.get("time", "00:00"),
+            source="BingeBandit",
+            extra_kwargs={"library": library},
+        )
+        return redirect("import_data")
+
+    tasks.import_bingebandit.delay(library=library, user_id=request.user.id, mode=mode)
+    messages.info(request, "The task to import watch history from BingeBandit has been queued.")
+    return redirect("import_data")
 
 
 @require_POST
@@ -5979,6 +6131,69 @@ def emby_webhook(request, token):
 @login_not_required
 @csrf_exempt
 @require_POST
+def bingebandit_webhook(request, token):
+    """Handle BingeBandit webhook notifications for media playback."""
+    try:
+        user = users.models.User.objects.get(token=token)
+    except ObjectDoesNotExist:
+        logger.warning(
+            "Could not process BingeBandit webhook: Invalid token: %s",
+            token,
+        )
+        return HttpResponse(status=401)
+
+    # BingeBandit's "Plex-style" format posts a multipart form, which this
+    # endpoint can't read. Say so, since BingeBandit shows the reply.
+    if request.content_type == "multipart/form-data":
+        logger.warning("BingeBandit webhook sent in Plex-style format")
+        return HttpResponse(
+            "Plex-style format: set this webhook's Format to BingeBandit JSON",
+            status=400,
+        )
+
+    data = request.body
+    if not data:
+        logger.warning("Missing payload in BingeBandit webhook request")
+        return HttpResponse("Missing payload", status=400)
+
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON payload in BingeBandit webhook request")
+        return HttpResponse("Invalid JSON", status=400)
+    if not isinstance(payload, dict):
+        return HttpResponse("Invalid payload", status=400)
+
+    # One BingeBandit server sends every member's plays to each webhook, so
+    # ?users=alice,bob on the URL limits tracking to those BingeBandit users.
+    # The usernames saved on the Import page's BingeBandit card do the same.
+    allowed_users = {
+        name.strip().lower()
+        for name in request.GET.get("users", "").split(",")
+        if name.strip()
+    }
+    account = BingeBanditAccount.objects.filter(user=user).first()
+    if account:
+        allowed_users |= account.webhook_username_set
+    event_user = str((payload.get("data") or {}).get("user") or "").strip().lower()
+    if allowed_users and event_user not in allowed_users:
+        logger.debug("Ignoring BingeBandit webhook for an unlisted user")
+        return HttpResponse(status=200)
+
+    if not _queue_task_quietly(
+        tasks.process_webhook,
+        "bingebandit",
+        payload,
+        user.id,
+        **_webhook_request_fields(payload, "bingebandit", user.id),
+    ):
+        return HttpResponse(status=503)
+    return HttpResponse(status=200)
+
+
+@login_not_required
+@csrf_exempt
+@require_POST
 def cinemask_webhook(request, token):
     """Handle Cinemask webhook events for requests."""
     try:
@@ -5995,7 +6210,14 @@ def cinemask_webhook(request, token):
     if not isinstance(payload, dict):
         return HttpResponse("Invalid payload", status=400)
 
-    tasks.process_webhook.delay("cinemask", payload, user.id)
+    if not _queue_task_quietly(
+        tasks.process_webhook,
+        "cinemask",
+        payload,
+        user.id,
+        **_webhook_request_fields(payload, "cinemask", user.id),
+    ):
+        return HttpResponse(status=503)
     return HttpResponse(status=200)
 
 

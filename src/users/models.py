@@ -2041,6 +2041,7 @@ class User(AbstractUser):
             "jellyfin_playback_reporting": [
                 "Import from Jellyfin Playback Reporting",
             ],
+            "bingebandit": ["Import from BingeBandit"],
             "radarr": ["Import from Radarr", "Import from Radarr (Recurring)"],
             "sonarr": ["Import from Sonarr", "Import from Sonarr (Recurring)"],
             "mylar": ["Import from Mylar3", "Import from Mylar3 (Recurring)"],

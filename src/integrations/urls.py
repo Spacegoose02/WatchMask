@@ -70,6 +70,19 @@ urlpatterns = [
         name="plex_disable_watchlist",
     ),
     path("import/plex", views.import_plex, name="import_plex"),
+    path("import/bingebandit/connect", views.bingebandit_connect, name="bingebandit_connect"),
+    path(
+        "import/bingebandit/disconnect",
+        views.bingebandit_disconnect,
+        name="bingebandit_disconnect",
+    ),
+    path("import/bingebandit/status", views.bingebandit_status, name="bingebandit_status"),
+    path(
+        "bingebandit/play-button",
+        views.bingebandit_play_button,
+        name="bingebandit_play_button",
+    ),
+    path("import/bingebandit", views.import_bingebandit, name="import_bingebandit"),
     path(
         "import/plex/cover/<str:token>",
         views.plex_cover,
@@ -404,6 +417,11 @@ urlpatterns = [
         "webhook/seerr/global/",
         views.seerr_global_webhook,
         name="seerr_global_webhook",
+    ),
+    path(
+        "webhook/bingebandit/<str:token>",
+        views.bingebandit_webhook,
+        name="bingebandit_webhook",
     ),
     path(
         "webhook/cinemask/<str:token>",

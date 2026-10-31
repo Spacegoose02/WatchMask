@@ -14,6 +14,7 @@ from integrations import connection_health, import_progress
 from integrations.imports import (
     anilist,
     audiobookshelf,
+    bingebandit,
     clz,
     goodreads,
     gpodder,
@@ -584,6 +585,12 @@ def import_tvtime_movies(file, user_id, mode):
 def import_plex(library, user_id, mode, username=None):
     """Celery task for importing media data from Plex."""
     return import_media(plex.importer, library, user_id, mode)
+
+
+@shared_task(name="Import from BingeBandit")
+def import_bingebandit(library, user_id, mode, username=None):  # noqa: ARG001
+    """Celery task for importing watch history from BingeBandit."""
+    return import_media(bingebandit.importer, library, user_id, mode)
 
 
 @shared_task(name=plex.MARK_WATCHED_TASK_NAME)
