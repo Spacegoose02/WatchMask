@@ -20,7 +20,7 @@
 # call below checks its exit code instead.
 $ErrorActionPreference = 'Continue'
 
-$FloppyImage = if ($env:FLOPPY_IMAGE) { $env:FLOPPY_IMAGE } else { 'ghcr.io/dannyvfilms/floppy:latest' }
+$FloppyImage = if ($env:FLOPPY_IMAGE) { $env:FLOPPY_IMAGE } else { 'ghcr.io/spacegoose02/watchmask:latest' }
 $Project = 'floppy'
 $ReadyTimeoutSeconds = 300
 

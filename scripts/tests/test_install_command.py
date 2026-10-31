@@ -93,7 +93,7 @@ class InstallCommandTests(unittest.TestCase):
                 harness = (
                     "$ErrorActionPreference = 'Stop'\n"
                     "function Invoke-RestMethod { [CmdletBinding()] param([string]$Uri)\n"
-                    "if ($Uri -ne 'https://raw.githubusercontent.com/dannyvfilms/Floppy/latest/scripts/install.ps1') "
+                    "if ($Uri -ne 'https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/scripts/install.ps1') "
                     "{ throw 'Wrong installer endpoint' }\n" + download + "\n}\n"
                     "function bash { throw 'Unix branch ran in PowerShell' }\n"
                     + COMMAND

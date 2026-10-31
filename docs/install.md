@@ -7,7 +7,7 @@ Open **PowerShell** on Windows 10/11 or **Terminal** on macOS/Linux and paste
 the same complete line:
 
 ```text
-echo "\" | Out-Null; irm 'https://raw.githubusercontent.com/dannyvfilms/Floppy/latest/scripts/install.ps1' -ErrorAction Stop | iex; #" >/dev/null; bash -c 'p=$(mktemp) || exit; cleanup() { rm -f "$p"; }; trap cleanup EXIT; curl -fsSL https://raw.githubusercontent.com/dannyvfilms/Floppy/latest/scripts/install.sh -o "$p" && bash "$p"'
+echo "\" | Out-Null; irm 'https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/scripts/install.ps1' -ErrorAction Stop | iex; #" >/dev/null; bash -c 'p=$(mktemp) || exit; cleanup() { rm -f "$p"; }; trap cleanup EXIT; curl -fsSL https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/scripts/install.sh -o "$p" && bash "$p"'
 ```
 
 No Python, Node, or preinstalled Docker is needed to launch it. On Windows,

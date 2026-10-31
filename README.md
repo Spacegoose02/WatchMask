@@ -100,7 +100,14 @@ you add is visible to everyone else trying it.
 
 ## Install
 
-Watchmask runs in Docker. Use the [Docker Compose example](docs/deployment.md#docker-compose-recommended)
+Watchmask runs in Docker. On a machine with Docker installed, paste this into a terminal
+(PowerShell on Windows) and follow the prompts:
+
+```text
+echo "\" | Out-Null; irm 'https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/scripts/install.ps1' -ErrorAction Stop | iex; #" >/dev/null; bash -c 'p=$(mktemp) || exit; cleanup() { rm -f "$p"; }; trap cleanup EXIT; curl -fsSL https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/scripts/install.sh -o "$p" && bash "$p"'
+```
+
+Or use the [Docker Compose example](docs/deployment.md#docker-compose-recommended)
 with the `ghcr.io/spacegoose02/watchmask` image; `SECRET` is the only setting you must fill in.
 [Docker Run](docs/deployment.md#docker-run) and the [deployment reference](docs/deployment.md)
 cover PostgreSQL, reverse proxies, environment variables and upgrades.

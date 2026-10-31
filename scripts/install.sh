@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-REPO_URL=${FLOPPY_REPO_URL:-https://github.com/dannyvfilms/Floppy.git}
+REPO_URL=${FLOPPY_REPO_URL:-https://github.com/Spacegoose02/WatchMask.git}
 REPO_BRANCH=${FLOPPY_REPO_BRANCH:-latest}
 INSTALL_ROOT=${FLOPPY_ROOT:-}
 ASSUME_YES=0
