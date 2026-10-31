@@ -8,6 +8,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.test import TestCase, override_settings
 
+from app.apps import IMDB_PROFILE_BACKFILL_STARTUP_DELAY_SECONDS
 from app.apps import AppConfig as YamtrackAppConfig
 from app.tasks import GENRE_BACKFILL_VERSION
 
@@ -35,6 +36,31 @@ class AppStartupTests(TestCase):
             config.ready()
 
         mock_schedule.assert_called_once_with()
+
+    @override_settings(
+        TESTING=False,
+        DISCOVER_WARMUP_ON_STARTUP=False,
+        RUNTIME_POPULATION_ON_STARTUP=False,
+    )
+    @patch("app.apps._is_celery_worker_process", return_value=False)
+    def test_app_ready_schedules_imdb_backfill_once_per_day(
+        self,
+        _mock_is_celery_worker,
+    ):
+        cache.delete("imdb_profile_backfill_startup_scheduled")
+        config = YamtrackAppConfig("app", import_module("app"))
+
+        with (
+            patch.object(config, "_repair_celery_redis_bindings"),
+            patch.object(config, "_schedule_history_day_coverage_warmup"),
+            patch.object(config, "_schedule_imdb_game_person_profile_backfill") as mock_imdb,
+            patch.object(config, "_schedule_genre_backfill_reconcile"),
+            patch.object(config, "_schedule_trakt_popularity_reconcile"),
+        ):
+            config.ready()
+            config.ready()
+
+        mock_imdb.assert_called_once_with()
 
     @override_settings(
         TESTING=False,
@@ -76,7 +102,7 @@ class AppStartupTests(TestCase):
         config._schedule_imdb_game_person_profile_backfill()
 
         mock_apply_async.assert_called_once_with(
-            countdown=0,
+            countdown=IMDB_PROFILE_BACKFILL_STARTUP_DELAY_SECONDS,
             priority=settings.CELERY_TASK_PRIORITY_BACKGROUND,
         )
 
