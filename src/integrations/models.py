@@ -563,6 +563,7 @@ class BingeBanditAccount(models.Model):
         default="",
         help_text="Comma-separated BingeBandit usernames whose webhook events are tracked",
     )
+    library_synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -584,6 +585,109 @@ class BingeBanditAccount(models.Model):
             for name in self.webhook_usernames.split(",")
             if name.strip()
         }
+
+    def item_url(self, item_id):
+        """Link to an item's page in the BingeBandit web app."""
+        return f"{self.base_url}/item/{item_id}"
+
+    def play_url(self, item_id, position=0):
+        """Link that starts playing an item, optionally from a position."""
+        url = f"{self.base_url}/play/{item_id}"
+        return f"{url}?t={int(position)}" if position else url
+
+
+class BingeBanditLibraryItem(models.Model):
+    """A movie or show the user can play on their BingeBandit server."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="bingebandit_library_items",
+    )
+    media_type = models.CharField(max_length=10)
+    tmdb_id = models.CharField(max_length=32)
+    item_id = models.PositiveIntegerField()
+
+    class Meta:
+        """Model options."""
+
+        verbose_name = "BingeBandit library item"
+        verbose_name_plural = "BingeBandit library items"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "media_type", "tmdb_id"],
+                name="integrations_bblibraryitem_unique_user_media",
+            ),
+        ]
+
+    def __str__(self):
+        """Readable representation."""
+        return f"BingeBanditLibraryItem({self.media_type} {self.tmdb_id})"
+
+
+class BingeBanditResumePoint(models.Model):
+    """Where the user stopped a movie or show part way on BingeBandit.
+
+    One row per movie or show: stopping another episode of a show moves its
+    resume point to that episode.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="bingebandit_resume_points",
+    )
+    media_type = models.CharField(max_length=10)
+    # The show's TMDB ID for episodes.
+    tmdb_id = models.CharField(max_length=32)
+    item_id = models.PositiveIntegerField()
+    title = models.CharField(max_length=255, blank=True, default="")
+    episode_title = models.CharField(max_length=255, blank=True, default="")
+    season_number = models.PositiveIntegerField(null=True, blank=True)
+    episode_number = models.PositiveIntegerField(null=True, blank=True)
+    position_seconds = models.PositiveIntegerField()
+    duration_seconds = models.PositiveIntegerField()
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Model options."""
+
+        verbose_name = "BingeBandit resume point"
+        verbose_name_plural = "BingeBandit resume points"
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "media_type", "tmdb_id"],
+                name="integrations_bbresumepoint_unique_user_media",
+            ),
+        ]
+
+    def __str__(self):
+        """Readable representation."""
+        return f"BingeBanditResumePoint({self.title} @ {self.position_seconds}s)"
+
+    @property
+    def episode_code(self):
+        """S01E02 for episodes, empty for movies."""
+        if self.season_number is None or self.episode_number is None:
+            return ""
+        return f"S{self.season_number:02d}E{self.episode_number:02d}"
+
+    @property
+    def progress_percent(self):
+        """How far in, 0 to 100."""
+        if not self.duration_seconds:
+            return 0
+        return min(100, round(self.position_seconds * 100 / self.duration_seconds))
+
+    @property
+    def position_display(self):
+        """Position as H:MM:SS or M:SS."""
+        hours, rest = divmod(self.position_seconds, 3600)
+        minutes, seconds = divmod(rest, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes}:{seconds:02d}"
 
 
 class TraktAccount(models.Model):

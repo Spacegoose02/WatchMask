@@ -1,4 +1,4 @@
-"""Thin client for the BingeBandit HTTP API.
+"""BingeBandit HTTP API client and library sync.
 
 https://github.com/Spacegoose02/BingeBandit/blob/main/docs/API.md
 """
@@ -7,8 +7,25 @@ import csv
 import io
 
 import requests
+from django.core.cache import cache
+from django.db import transaction
+from django.utils import timezone
+
+from app.models import Item, MediaTypes, Sources
+from integrations.imports import helpers
+from integrations.models import BingeBanditLibraryItem, BingeBanditResumePoint
 
 LIBRARY_PAGE_SIZE = 500
+
+MEDIA_TYPE_BY_KIND = {
+    "movie": MediaTypes.MOVIE.value,
+    "show": MediaTypes.TV.value,
+}
+
+LIBRARY_CACHE_KEY = "bingebandit_library:{user_id}"
+LIBRARY_CACHE_SECONDS = 60 * 60 * 24
+
+CONTINUE_WATCHING_LIMIT = 14
 
 
 class BingeBanditError(Exception):
@@ -57,9 +74,9 @@ class BingeBanditClient:
             for lib in self._get("/libraries", timeout=timeout).json()
         ]
 
-    def get_library_tmdb_ids(self, library_id):
-        """Return the TMDB IDs of the movies and shows in a library."""
-        tmdb_ids = set()
+    def get_library_items(self, library_id):
+        """Return the TMDB-matched movies and shows in a library."""
+        matched = []
         offset = 0
         while True:
             page = self._get(
@@ -67,14 +84,20 @@ class BingeBanditClient:
                 {"offset": offset, "limit": LIBRARY_PAGE_SIZE},
             ).json()
             items = page.get("items") or []
-            tmdb_ids.update(
-                str(item["tmdbId"])
+            matched.extend(
+                item
                 for item in items
-                if item.get("kind") in ("movie", "show") and item.get("tmdbId")
+                if item.get("kind") in MEDIA_TYPE_BY_KIND
+                and item.get("tmdbId")
+                and item.get("id")
             )
             offset += len(items)
             if not items or offset >= page.get("total", 0):
-                return tmdb_ids
+                return matched
+
+    def get_library_tmdb_ids(self, library_id):
+        """Return the TMDB IDs of the movies and shows in a library."""
+        return {str(item["tmdbId"]) for item in self.get_library_items(library_id)}
 
     def get_history(self):
         """Return the user's plays from the history CSV export, newest first.
@@ -85,3 +108,78 @@ class BingeBanditClient:
         response = self._get("/me/export/history.csv")
         response.encoding = "utf-8"
         return list(csv.DictReader(io.StringIO(response.text)))
+
+
+def client_for(account):
+    """Build a client from a stored account."""
+    return BingeBanditClient(account.base_url, helpers.decrypt(account.api_key))
+
+
+def sync_library(account):
+    """Refresh which movies and shows the user can play. Returns the count."""
+    client = client_for(account)
+    item_ids = {}
+    for library in client.get_libraries():
+        for item in client.get_library_items(library["id"]):
+            key = (MEDIA_TYPE_BY_KIND[item["kind"]], str(item["tmdbId"]))
+            item_ids.setdefault(key, int(item["id"]))
+
+    with transaction.atomic():
+        BingeBanditLibraryItem.objects.filter(user=account.user).delete()
+        BingeBanditLibraryItem.objects.bulk_create(
+            BingeBanditLibraryItem(
+                user=account.user,
+                media_type=media_type,
+                tmdb_id=tmdb_id,
+                item_id=item_id,
+            )
+            for (media_type, tmdb_id), item_id in item_ids.items()
+        )
+    cache.delete(LIBRARY_CACHE_KEY.format(user_id=account.user_id))
+
+    account.library_synced_at = timezone.now()
+    account.save(update_fields=["library_synced_at"])
+    return len(item_ids)
+
+
+def library_item_ids(user):
+    """Map (media_type, tmdb_id) to BingeBandit item IDs for a user, cached."""
+    key = LIBRARY_CACHE_KEY.format(user_id=user.id)
+    item_ids = cache.get(key)
+    if item_ids is None:
+        item_ids = {
+            (media_type, tmdb_id): item_id
+            for media_type, tmdb_id, item_id in BingeBanditLibraryItem.objects.filter(
+                user=user,
+            ).values_list("media_type", "tmdb_id", "item_id")
+        }
+        cache.set(key, item_ids, LIBRARY_CACHE_SECONDS)
+    return item_ids
+
+
+def continue_watching(user):
+    """Resume points for the Home page, newest first, with posters and links."""
+    account = getattr(user, "bingebandit_account", None)
+    if not account:
+        return []
+    points = list(
+        BingeBanditResumePoint.objects.filter(user=user)[:CONTINUE_WATCHING_LIMIT],
+    )
+    if not points:
+        return []
+    items = {
+        (item.media_type, item.media_id): item
+        for item in Item.objects.filter(
+            source=Sources.TMDB.value,
+            media_type__in=MEDIA_TYPE_BY_KIND.values(),
+            media_id__in={point.tmdb_id for point in points},
+        )
+    }
+    return [
+        {
+            "point": point,
+            "item": items.get((point.media_type, point.tmdb_id)),
+            "resume_url": account.play_url(point.item_id, point.position_seconds),
+        }
+        for point in points
+    ]

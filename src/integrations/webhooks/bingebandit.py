@@ -2,6 +2,7 @@ import logging
 
 from app import live_playback
 from app.models import MediaTypes, Sources
+from integrations.models import BingeBanditResumePoint
 
 from .base import BaseWebhookProcessor
 
@@ -21,6 +22,13 @@ BINGEBANDIT_LIVE_EVENT_MAP = {
 # already marked the item in progress and playback.finished marks it watched,
 # so tracking a stop would only open a new in-progress entry after a finish.
 BINGEBANDIT_TRACKING_EVENTS = ("playback.start", "playback.finished")
+
+# Events that save or clear the resume point shown under Continue Watching.
+BINGEBANDIT_RESUME_EVENTS = ("playback.stop", "playback.finished")
+
+# A stop this early, or with this little left, isn't worth resuming.
+RESUME_MIN_POSITION_SECONDS = 60
+RESUME_MAX_PERCENT = 95
 
 
 def _seconds(value) -> int | None:
@@ -57,6 +65,8 @@ class BingeBanditWebhookProcessor(BaseWebhookProcessor):
 
         ids = self._extract_external_ids(payload)
         self._update_live_playback_state(payload, user, ids)
+        if event_type in BINGEBANDIT_RESUME_EVENTS and ids["tmdb_id"]:
+            self._update_resume_point(payload, user, ids)
 
         if event_type not in BINGEBANDIT_TRACKING_EVENTS:
             return
@@ -73,6 +83,7 @@ class BingeBanditWebhookProcessor(BaseWebhookProcessor):
         return (
             event_type in BINGEBANDIT_LIVE_EVENT_MAP
             or event_type in BINGEBANDIT_TRACKING_EVENTS
+            or event_type in BINGEBANDIT_RESUME_EVENTS
         )
 
     def _is_played(self, payload):
@@ -115,6 +126,48 @@ class BingeBanditWebhookProcessor(BaseWebhookProcessor):
         if self._get_media_type(payload) == MediaTypes.TV.value:
             return (payload.get("data") or {}).get("title")
         return None
+
+    # -- Resume points ----------------------------------------------------
+
+    def _update_resume_point(self, payload, user, ids):
+        """Save where a play stopped part way, or clear it once finished."""
+        media_type = self._get_media_type(payload)
+        if not media_type:
+            return
+        data = payload.get("data") or {}
+        key = {"user": user, "media_type": media_type, "tmdb_id": ids["tmdb_id"]}
+        position = _seconds(data.get("position")) or 0
+        duration = _seconds(data.get("duration")) or 0
+        item_id = _positive_id(data.get("itemId"))
+
+        if payload.get("event") == "playback.finished":
+            BingeBanditResumePoint.objects.filter(**key).delete()
+            return
+        if not item_id:
+            return
+        if (
+            not duration
+            or position < RESUME_MIN_POSITION_SECONDS
+            or position * 100 >= duration * RESUME_MAX_PERCENT
+        ):
+            # Only clear the point if it's for this item, so a short look at
+            # another episode keeps the show's resume point.
+            BingeBanditResumePoint.objects.filter(**key, item_id=item_id).delete()
+            return
+
+        season, episode = self._extract_season_episode_from_payload(payload)
+        BingeBanditResumePoint.objects.update_or_create(
+            **key,
+            defaults={
+                "item_id": int(item_id),
+                "title": (data.get("title") or "")[:255],
+                "episode_title": (data.get("episodeTitle") or "")[:255],
+                "season_number": season,
+                "episode_number": episode,
+                "position_seconds": position,
+                "duration_seconds": duration,
+            },
+        )
 
     # -- Live playback --------------------------------------------------
 

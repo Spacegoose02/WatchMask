@@ -1494,3 +1494,23 @@ def show_media_score(rating, user):
 
     hide_zero = getattr(user, "hide_zero_rating", False)
     return not hide_zero or rating_value > 0
+
+
+@register.filter
+def in_bingebandit_library(item, user):
+    """Whether a TMDB movie or show is in the user's BingeBandit library."""
+    from integrations import bingebandit  # noqa: PLC0415
+
+    if (
+        getattr(item, "source", None) != Sources.TMDB.value
+        or getattr(item, "media_type", None) not in bingebandit.MEDIA_TYPE_BY_KIND.values()
+        or not getattr(user, "is_authenticated", False)
+    ):
+        return False
+    # Cached on the user for the rest of the request: a page renders many cards.
+    item_ids = getattr(user, "_bingebandit_library_item_ids", None)
+    if item_ids is None:
+        has_account = hasattr(user, "bingebandit_account")
+        item_ids = bingebandit.library_item_ids(user) if has_account else {}
+        user._bingebandit_library_item_ids = item_ids  # noqa: SLF001
+    return (item.media_type, str(item.media_id)) in item_ids

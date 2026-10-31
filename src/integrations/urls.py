@@ -31,6 +31,11 @@ urlpatterns = [
         name="bingebandit_disconnect",
     ),
     path("import/bingebandit/status", views.bingebandit_status, name="bingebandit_status"),
+    path(
+        "bingebandit/play-button",
+        views.bingebandit_play_button,
+        name="bingebandit_play_button",
+    ),
     path("import/bingebandit", views.import_bingebandit, name="import_bingebandit"),
     path("import/simkl-oauth", views.simkl_oauth, name="simkl_oauth"),
     path(

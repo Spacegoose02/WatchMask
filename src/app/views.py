@@ -361,7 +361,7 @@ from app.view_constants import (
     DETAIL_SECONDARY_FRAGMENT,
     LOCAL_ONLY_MISSING_SEASON_BANNER,
 )
-from integrations import anime_mapping
+from integrations import anime_mapping, bingebandit
 from integrations.models import CollectionSourceState
 from lists.models import CustomList
 from users.home_screen import build_home_page_groups
@@ -432,6 +432,7 @@ def home(request):
             "home_groups": home_groups,
             "items_limit": items_limit,
             "active_playback_card": live_playback.build_home_playback_card(request.user),
+            "continue_watching": bingebandit.continue_watching(request.user),
             "MediaTypes": MediaTypes,
             "IMG_NONE": settings.IMG_NONE,
             "defer_remaining_groups": defer_remaining_groups and bool(home_groups),

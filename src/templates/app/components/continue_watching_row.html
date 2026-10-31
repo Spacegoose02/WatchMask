@@ -1,0 +1,40 @@
+{% load app_tags %}
+
+<section>
+  <div class="mb-2 flex items-start justify-between gap-3">
+    <h3 class="text-lg font-semibold leading-none text-gray-100">Continue Watching</h3>
+  </div>
+  <div class="flex gap-4 overflow-x-auto pb-2">
+    {% for entry in continue_watching %}
+      <div class="w-44 shrink-0">
+        <div class="media-card bg-[#2a2f35] rounded-lg overflow-hidden shadow-lg relative group">
+          <a href="{{ entry.resume_url }}"
+             target="_blank"
+             rel="noopener"
+             title="Resume on BingeBandit"
+             class="relative block">
+            <img alt="{{ entry.point.title }}"
+                 class="media-card-poster w-full aspect-[2/3] bg-[#3e454d]{% if entry.item.image %} object-cover{% endif %}"
+                 src="{{ entry.item.image|default:IMG_NONE }}"
+                 loading="lazy">
+            <span class="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+              <span class="flex size-12 items-center justify-center rounded-full bg-indigo-600 text-white shadow-lg">
+                {% include "app/icons/play.svg" with classes="w-5 h-5" %}
+              </span>
+            </span>
+            <span class="absolute bottom-0 left-0 right-0 h-1 bg-gray-900/60">
+              <span class="block h-full bg-indigo-500" style="width: {{ entry.point.progress_percent }}%"></span>
+            </span>
+          </a>
+          <div class="p-3">
+            <a href="{% if entry.item %}{{ entry.item|media_url }}{% else %}{{ entry.resume_url }}{% endif %}"
+               class="text-sm font-semibold text-white hover:text-indigo-400 transition duration-300 line-clamp-1">{{ entry.point.title }}</a>
+            <p class="text-xs text-gray-400 mt-1 line-clamp-1">
+              {% if entry.point.episode_code %}<span class="text-indigo-400 font-medium">{{ entry.point.episode_code }}</span> · {% endif %}{{ entry.point.position_display }}
+            </p>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+</section>

@@ -10,6 +10,7 @@ import requests
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
+from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import Q
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
@@ -52,6 +53,8 @@ from integrations.lastfm_api import (
 from integrations.models import (
     AudiobookshelfAccount,
     BingeBanditAccount,
+    BingeBanditLibraryItem,
+    BingeBanditResumePoint,
     CinemaskAccount,
     CinemaskRequest,
     GPodderAccount,
@@ -616,13 +619,6 @@ def _clean_usernames(raw_usernames):
     )
 
 
-def _bingebandit_client(account):
-    return bingebandit_api.BingeBanditClient(
-        account.base_url,
-        helpers.decrypt(account.api_key),
-    )
-
-
 @require_POST
 def bingebandit_connect(request):
     """Connect a BingeBandit server with an API key."""
@@ -652,6 +648,7 @@ def bingebandit_connect(request):
     if created and username:
         account.webhook_usernames = username
         account.save(update_fields=["webhook_usernames"])
+    tasks.sync_bingebandit_library.delay(user_id=request.user.id)
 
     messages.success(request, f"Connected BingeBandit as {username or 'your account'}.")
     return redirect("import_data")
@@ -667,6 +664,9 @@ def bingebandit_disconnect(request):
         task=BINGEBANDIT_IMPORT_TASK_NAME,
     ).delete()
     BingeBanditAccount.objects.filter(user=request.user).delete()
+    BingeBanditLibraryItem.objects.filter(user=request.user).delete()
+    BingeBanditResumePoint.objects.filter(user=request.user).delete()
+    cache.delete(bingebandit_api.LIBRARY_CACHE_KEY.format(user_id=request.user.id))
     messages.info(request, "Disconnected BingeBandit.")
     return redirect("import_data")
 
@@ -680,10 +680,42 @@ def bingebandit_status(request):
     try:
         # Rendered live on the Import page, so fail fast instead of holding a
         # web thread for the full default timeout when BingeBandit is down.
-        libraries = _bingebandit_client(account).get_libraries(timeout=5)
+        libraries = bingebandit_api.client_for(account).get_libraries(timeout=5)
     except bingebandit_api.BingeBanditError as exc:
         return JsonResponse({"state": "error", "libraries": [], "error": str(exc)})
     return JsonResponse({"state": "connected", "libraries": libraries, "error": ""})
+
+
+@require_GET
+def bingebandit_play_button(request):
+    """Render a Resume or Play on BingeBandit button for a detail page."""
+    account = getattr(request.user, "bingebandit_account", None)
+    media_type = request.GET.get("media_type", "")
+    tmdb_id = request.GET.get("tmdb_id", "")
+    if not account or media_type not in bingebandit_api.MEDIA_TYPE_BY_KIND.values():
+        return HttpResponse("")
+
+    resume_point = BingeBanditResumePoint.objects.filter(
+        user=request.user,
+        media_type=media_type,
+        tmdb_id=tmdb_id,
+    ).first()
+    if resume_point:
+        context = {
+            "resume_point": resume_point,
+            "url": account.play_url(
+                resume_point.item_id,
+                resume_point.position_seconds,
+            ),
+        }
+    else:
+        item_id = bingebandit_api.library_item_ids(request.user).get(
+            (media_type, tmdb_id),
+        )
+        if not item_id:
+            return HttpResponse("")
+        context = {"url": account.item_url(item_id)}
+    return render(request, "integrations/bingebandit_play_button.html", context)
 
 
 @require_POST
