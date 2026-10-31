@@ -110,7 +110,7 @@ jobs:
           assert_runtime() {
             curl -fsS --max-time 10 http://127.0.0.1:8000/health/ >/dev/null
             login_html=$(curl -fsS --max-time 10 http://127.0.0.1:8000/accounts/login/)
-            grep -Fq 'alt="Floppy"' <<<"$login_html"
+            grep -Fq 'alt="Watchmask"' <<<"$login_html"
             curl -fsS --max-time 10 http://127.0.0.1:8000/static/css/main.css >/dev/null
             curl -fsS --max-time 10 http://127.0.0.1:8000/api/v1/info/ |
               python3 -c 'import json, sys; assert json.load(sys.stdin)["version"] == "ci-smoke"'

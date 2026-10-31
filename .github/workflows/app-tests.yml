@@ -65,6 +65,9 @@ jobs:
       - name: Fetch migration baseline
         run: git fetch --no-tags https://github.com/FuzzyGrim/Yamtrack.git dev:refs/remotes/upstream/dev
 
+      - name: Fetch Floppy upstream history
+        run: git fetch --no-tags https://github.com/dannyvfilms/Floppy.git latest:refs/remotes/floppy/latest '+refs/tags/v*:refs/tags/v*'
+
       - name: Migration hygiene
         if: matrix.suite == 'app'
         run: uv run --no-sync python src/manage.py check_migration_hygiene --strict
@@ -219,6 +222,8 @@ jobs:
           version: "0.12.3"
       - name: Install dependencies
         run: uv sync --locked --no-default-groups --group test
+      - name: Fetch Floppy release tags
+        run: git fetch --no-tags https://github.com/dannyvfilms/Floppy.git '+refs/tags/v*:refs/tags/v*'
       - name: Replay representative release with retained user data
         # A pinned release is intentional: the tag being published must not
         # accidentally become its own upgrade baseline. Advance deliberately.

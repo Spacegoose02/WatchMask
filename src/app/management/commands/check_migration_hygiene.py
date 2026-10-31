@@ -14,6 +14,7 @@ from django.db.migrations.loader import MigrationLoader
 
 DEFAULT_APPS = ("app", "users", "lists", "integrations", "events")
 DEFAULT_BASE_REF = "upstream/dev"
+UPSTREAM_LATEST_REFS = ("floppy/latest",)
 MIGRATION_FILE_RE = re.compile(r"^\d{4}_.+\.py$")
 RISKY_OP_RE = re.compile(
     r"\bmigrations\.(AddConstraint|RemoveConstraint|AddIndex|RemoveIndex|AddField)\s*\("
@@ -154,6 +155,12 @@ def _immutable_migration_paths(
         warnings.append(
             "Could not find origin/latest or local latest for immutable checks."
         )
+
+    # Watchmask tracks Floppy: migrations already shipped on Floppy's latest
+    # branch are upstream history, not new fork-only work.
+    for upstream_ref in UPSTREAM_LATEST_REFS:
+        if _git_ref_exists(repo_root, upstream_ref):
+            immutable_paths.update(_ref_migration_paths(repo_root, upstream_ref, apps))
 
     for tag_ref in _release_tag_refs(repo_root):
         immutable_paths.update(_ref_migration_paths(repo_root, tag_ref, apps))
