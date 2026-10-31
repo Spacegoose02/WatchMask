@@ -52,6 +52,7 @@ def build_time_left_cache_key(
     completed_date_from: str = "",
     completed_date_to: str = "",
     range_filters: str = "",
+    library_filter: str = "",
 ) -> str:
     """Create the cache key used for time-left sorted TV lists."""
     normalized_status = status_filter or ""
@@ -86,6 +87,7 @@ def build_time_left_cache_key(
         f"{normalized_media_status}_{normalized_pinned_providers}_"
         f"{normalized_completed_date_from}_{normalized_completed_date_to}"
         f"_{range_filters or ''}"
+        + (f"_lib:{library_filter}" if library_filter else "")
     )
 
 

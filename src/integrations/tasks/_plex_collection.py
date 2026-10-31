@@ -5,6 +5,7 @@ import requests
 from celery import shared_task
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.utils import timezone
 
 from app.collection_helpers import extract_collection_metadata_from_plex
@@ -1013,6 +1014,10 @@ def _aggregate_tv_show_collection_metadata(
     return result, episode_list
 
 
+PLEX_COLLECTION_LOCK_KEY = "plex_collection_update:{user_id}"
+PLEX_COLLECTION_LOCK_SECONDS = 60 * 60 * 6
+
+
 @shared_task(name="Update collection metadata from Plex")
 def update_collection_metadata_from_plex(library, user_id):
     """Update collection metadata for existing Floppy items from Plex server.
@@ -1020,12 +1025,47 @@ def update_collection_metadata_from_plex(library, user_id):
     This task queries the Plex server for items that match existing Floppy items
     and updates their collection metadata without performing a full import.
 
+    Runs at most once at a time per user. Per-row smart-list and cache signals
+    are suppressed during the run and replayed once at the end, so a big
+    library doesn't trigger thousands of cache wipes and smart-list syncs.
+
     Args:
         library: Plex library identifier(s) - "all", "machine_id::section_id",
             or a list of either (accepts a bare string for backward
             compatibility with already-scheduled PeriodicTask rows)
         user_id: User ID
     """
+    from app.signals import suppress_media_change_side_effects  # noqa: PLC0415
+
+    lock_key = PLEX_COLLECTION_LOCK_KEY.format(user_id=user_id)
+    if not cache.add(lock_key, True, timeout=PLEX_COLLECTION_LOCK_SECONDS):
+        logger.info("Plex collection update already running for user %s", user_id)
+        return {"skipped": "already running"}
+    try:
+        with suppress_media_change_side_effects():
+            result = _update_collection_metadata_from_plex(library, user_id)
+        _replay_collection_side_effects(user_id)
+        return result
+    finally:
+        cache.delete(lock_key)
+
+
+def _replay_collection_side_effects(user_id):
+    """Run the cache and smart-list work the suppressed per-row signals skipped."""
+    from app.cache_utils import (  # noqa: PLC0415
+        clear_home_row_cache_for_user,
+        clear_media_list_cache_for_user,
+    )
+    from lists.models import CustomList  # noqa: PLC0415
+    from lists.tasks import schedule_smart_list_sync  # noqa: PLC0415
+
+    clear_media_list_cache_for_user(user_id)
+    clear_home_row_cache_for_user(user_id)
+    for custom_list in CustomList.objects.filter(owner_id=user_id, is_smart=True):
+        schedule_smart_list_sync(custom_list)
+
+
+def _update_collection_metadata_from_plex(library, user_id):
     library = [library] if isinstance(library, str) else library
     user_model = get_user_model()
     try:
@@ -1248,14 +1288,15 @@ def update_collection_metadata_from_plex(library, user_id):
                 )
 
             # Step 2: Get items that need library scanning
-            items_needing_scan = [
-                item
-                for item in section_items
-                if not CollectionEntry.objects.filter(
+            keyed_item_ids = set(
+                CollectionEntry.objects.filter(
                     user=user,
-                    item=item,
+                    item_id__in=item_ids,
                     plex_rating_key__isnull=False,
-                ).exists()
+                ).values_list("item_id", flat=True),
+            )
+            items_needing_scan = [
+                item for item in section_items if item.id not in keyed_item_ids
             ]
 
             if not items_needing_scan:

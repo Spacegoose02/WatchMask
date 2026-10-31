@@ -119,27 +119,54 @@ def sync_library(account):
     """Refresh which movies and shows the user can play. Returns the count."""
     client = client_for(account)
     item_ids = {}
+    library_rows = {}
     for library in client.get_libraries():
+        library_name = library["name"] or str(library["id"])
         for item in client.get_library_items(library["id"]):
             key = (MEDIA_TYPE_BY_KIND[item["kind"]], str(item["tmdbId"]))
             item_ids.setdefault(key, int(item["id"]))
+            library_rows.setdefault((*key, library_name), int(item["id"]))
 
     with transaction.atomic():
         BingeBanditLibraryItem.objects.filter(user=account.user).delete()
         BingeBanditLibraryItem.objects.bulk_create(
-            BingeBanditLibraryItem(
-                user=account.user,
-                media_type=media_type,
-                tmdb_id=tmdb_id,
-                item_id=item_id,
-            )
-            for (media_type, tmdb_id), item_id in item_ids.items()
+            (
+                BingeBanditLibraryItem(
+                    user=account.user,
+                    media_type=media_type,
+                    tmdb_id=tmdb_id,
+                    library_name=library_name,
+                    item_id=item_id,
+                )
+                for (media_type, tmdb_id, library_name), item_id in library_rows.items()
+            ),
+            batch_size=1000,
         )
     cache.delete(LIBRARY_CACHE_KEY.format(user_id=account.user_id))
 
     account.library_synced_at = timezone.now()
     account.save(update_fields=["library_synced_at"])
     return len(item_ids)
+
+
+def library_names(user, media_type):
+    """Return the BingeBandit library names holding titles of a media type."""
+    return list(
+        BingeBanditLibraryItem.objects.filter(user=user, media_type=media_type)
+        .exclude(library_name="")
+        .values_list("library_name", flat=True)
+        .distinct()
+        .order_by("library_name"),
+    )
+
+
+def library_tmdb_ids(user, media_type, library_name):
+    """Return a subquery of the TMDB IDs in one of the user's BingeBandit libraries."""
+    return BingeBanditLibraryItem.objects.filter(
+        user=user,
+        media_type=media_type,
+        library_name=library_name,
+    ).values("tmdb_id")
 
 
 def library_item_ids(user):

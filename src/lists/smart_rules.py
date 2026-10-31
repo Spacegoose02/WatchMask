@@ -357,8 +357,10 @@ def _valid_linked_list_ids(owner, raw_values: list[str]) -> list[int]:
 
 def get_available_media_types(owner) -> list[str]:
     """Return enabled media types that can participate in smart rules."""
-    if owner and hasattr(owner, "get_enabled_media_types"):
-        enabled = list(owner.get_enabled_media_types())
+    if owner and hasattr(owner, "get_active_media_types"):
+        # Active types keep seasons while TV is on, so season rules and Home
+        # season rows still work without a Seasons section.
+        enabled = list(owner.get_active_media_types())
     else:
         enabled = list(MediaTypes.values)
 

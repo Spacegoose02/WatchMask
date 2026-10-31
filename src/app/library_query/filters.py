@@ -36,7 +36,7 @@ from django.db.models.lookups import (
 )
 
 from app.library_query.spec import STATUS_MATCH_ANY, STATUS_MATCH_LATEST, FilterValues
-from app.models.choices import MediaTypes, Status
+from app.models.choices import MediaTypes, Sources, Status
 from app.models.discovery import CollectionEntry, ItemTag
 from app.models.item import Item
 from app.models.manager import item_ids_with_json_array_value_ci
@@ -548,6 +548,19 @@ def _text(key: str):
     return lambda values: bool(_norm(getattr(values, key)))
 
 
+def _library_sql(values: FilterValues, ctx: TypeContext) -> Q:
+    """Titles in one of the user's BingeBandit libraries (matched by TMDB id)."""
+    from integrations import bingebandit  # noqa: PLC0415
+
+    media_type = (
+        MediaTypes.TV.value if ctx.media_type == MediaTypes.SEASON.value else ctx.media_type
+    )
+    return Q(
+        source=Sources.TMDB.value,
+        media_id__in=bingebandit.library_tmdb_ids(ctx.user, media_type, values.library.strip()),
+    )
+
+
 FILTERS: tuple[FilterDef, ...] = (
     FilterDef("status", _status_active, row=_status_row, sql=_status_sql),
     FilterDef(
@@ -595,6 +608,7 @@ FILTERS: tuple[FilterDef, ...] = (
         sql=_release_window_sql,
     ),
     FilterDef("source", _text("source"), sql=lambda v, ctx: Q(source__iexact=v.source.strip())),
+    FilterDef("library", _text("library"), sql=_library_sql),
     FilterDef(
         "media_status",
         _text("media_status"),

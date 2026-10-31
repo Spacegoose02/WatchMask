@@ -1978,16 +1978,16 @@ class User(AbstractUser):
         ]
 
     def get_active_media_types(self):
-        """Return a list of active media type values based on user preferences."""
-        enabled_types = self.get_enabled_media_types()
+        """Return a list of active media type values based on user preferences.
 
-        # Legacy fallback: if a historical user record predates `season_enabled`
-        # but has TV enabled, include seasons as active.
-        season_pref = getattr(self, "season_enabled", None)
+        Seasons are not a library section of their own, but they hold TV
+        progress, so they stay active (release alerts, history, stats data)
+        whenever TV is enabled.
+        """
+        enabled_types = self.get_enabled_media_types()
         if (
             MediaTypes.TV.value in enabled_types
             and MediaTypes.SEASON.value not in enabled_types
-            and season_pref is None
         ):
             enabled_types.insert(0, MediaTypes.SEASON.value)
 

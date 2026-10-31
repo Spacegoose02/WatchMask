@@ -2960,6 +2960,9 @@ class BingeBanditLibraryItem(models.Model):
     media_type = models.CharField(max_length=10)
     tmdb_id = models.CharField(max_length=32)
     item_id = models.PositiveIntegerField()
+    # BingeBandit library the title is in, e.g. "Kids Movies". A title in
+    # several libraries gets one row per library.
+    library_name = models.CharField(max_length=255, blank=True, default="")
 
     class Meta:
         """Model options."""
@@ -2968,8 +2971,8 @@ class BingeBanditLibraryItem(models.Model):
         verbose_name_plural = "BingeBandit library items"
         constraints = [
             models.UniqueConstraint(
-                fields=["user", "media_type", "tmdb_id"],
-                name="integrations_bblibraryitem_unique_user_media",
+                fields=["user", "media_type", "tmdb_id", "library_name"],
+                name="integrations_bblibraryitem_unique_user_media_library",
             ),
         ]
 

@@ -16,7 +16,7 @@ from django.core.exceptions import FieldError
 from django.core.paginator import Paginator
 from django.db.models import Count, F, Min, Q
 from django.http import HttpResponse, HttpResponseBadRequest
-from django.shortcuts import render
+from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
@@ -30,6 +30,7 @@ from app.columns import (
     sanitize_column_prefs,
 )
 from app.library_query import FilterValues, LibraryQuery, LibraryQueryExecutor
+from integrations import bingebandit
 from app.library_query.adapters import (
     from_media_list_filters,
     last_watched_sort_key,
@@ -1563,8 +1564,15 @@ def _build_artist_list_context(
     }
 
 
+# Media types that BingeBandit libraries hold.
+BINGEBANDIT_LIBRARY_MEDIA_TYPES = {MediaTypes.MOVIE.value, MediaTypes.TV.value}
+
+
 def media_list(request, media_type):
     """Return the media list page."""
+    if media_type == MediaTypes.SEASON.value and not request.user.season_enabled:
+        # With the Seasons section hidden, seasons live inside their TV shows.
+        return redirect("medialist", media_type=MediaTypes.TV.value)
     route_media_type = media_type
     comic_subview = None
     if route_media_type == MediaTypes.COMIC.value:
@@ -1638,6 +1646,14 @@ def media_list(request, media_type):
     completed_date_within_unit = parsed_filters.completed_date_within_unit
     release_filter = parsed_filters.release
     source_filter = parsed_filters.source
+    library_options = (
+        bingebandit.library_names(request.user, media_type)
+        if media_type in BINGEBANDIT_LIBRARY_MEDIA_TYPES
+        else []
+    )
+    library_filter = parsed_filters.library if parsed_filters.library in library_options else ""
+    if library_filter != parsed_filters.library:
+        parsed_filters = replace(parsed_filters, library=library_filter)
     media_status_filter = parsed_filters.media_status
     language_filter = parsed_filters.language
     country_filter = parsed_filters.country
@@ -1840,6 +1856,7 @@ def media_list(request, media_type):
         "completed_date_to": completed_date_to,
         "release": release_filter,
         "source": source_filter,
+        "library": library_filter,
         "media_status": media_status_filter,
         "language": language_filter,
         "country": country_filter,
@@ -1891,6 +1908,8 @@ def media_list(request, media_type):
         if media_type in {MediaTypes.ANIME.value, MediaTypes.TV.value}
         else ""
     )
+    if library_filter:
+        cache_variant = f"{cache_variant}|lib:{library_filter}"
 
     tracked_status_filter = tuple(
         value for value in status_filter if value != MEDIA_LIST_NO_STATUS
@@ -2030,9 +2049,17 @@ def media_list(request, media_type):
 
         today = timezone.localdate()
         filtered_items = []
-        candidate_items = list(
-            Item.objects.filter(id__in=candidate_item_ids).order_by("title", "id"),
-        )
+        candidate_queryset = Item.objects.filter(id__in=candidate_item_ids)
+        if library_filter:
+            candidate_queryset = candidate_queryset.filter(
+                source=Sources.TMDB.value,
+                media_id__in=bingebandit.library_tmdb_ids(
+                    request.user,
+                    media_type,
+                    library_filter,
+                ),
+            )
+        candidate_items = list(candidate_queryset.order_by("title", "id"))
         for item in candidate_items:
             if not _item_matches_requested_media_type(item):
                 continue
@@ -2293,6 +2320,7 @@ def media_list(request, media_type):
             completed_date_from=completed_date_from,
             completed_date_to=completed_date_to,
             range_filters=range_cache_key,
+            library_filter=library_filter,
         )
         _time_left_cached_order = cache.get(_time_left_cache_key)
         if _time_left_cached_order is not None and filter_data is not None:
@@ -3248,6 +3276,8 @@ def media_list(request, media_type):
         "current_completed_date_within_unit": completed_date_within_unit,
         "current_release": release_filter,
         "current_source": source_filter,
+        "current_library": library_filter,
+        "library_options": library_options,
         "current_media_status": media_status_filter,
         "current_language": language_filter,
         "current_country": country_filter,

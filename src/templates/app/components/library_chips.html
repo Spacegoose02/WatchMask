@@ -1,0 +1,21 @@
+<div class="flex gap-2 flex-wrap mb-6" aria-label="BingeBandit libraries">
+  <button hx-get="{{ filter_hx_endpoint }}"
+          hx-target="{{ filter_hx_target }}"
+          hx-include="#filter-form"
+          hx-indicator="#loading-indicator"
+          class="px-3 py-1.5 rounded-full text-sm transition-colors cursor-pointer"
+          :class="library === '' ? 'bg-indigo-600 text-white' : 'bg-[#2a2f35] text-gray-300 hover:bg-[#454d5a] hover:text-white'"
+          @click="library = ''"
+          type="button">All libraries</button>
+  {% for library_name in library_options %}
+    <button hx-get="{{ filter_hx_endpoint }}"
+            hx-target="{{ filter_hx_target }}"
+            hx-include="#filter-form"
+            hx-indicator="#loading-indicator"
+            class="px-3 py-1.5 rounded-full text-sm transition-colors cursor-pointer"
+            :class="library === $el.dataset.library ? 'bg-indigo-600 text-white' : 'bg-[#2a2f35] text-gray-300 hover:bg-[#454d5a] hover:text-white'"
+            data-library="{{ library_name }}"
+            @click="library = $el.dataset.library"
+            type="button">{{ library_name }}</button>
+  {% endfor %}
+</div>

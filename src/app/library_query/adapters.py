@@ -92,6 +92,7 @@ def filter_values_from_media_list_filters(filters: MediaListFilters) -> FilterVa
         release_date_from=filters.release_date_from,
         release_date_to=filters.release_date_to,
         source=filters.source,
+        library=filters.library,
         media_status=filters.media_status,
         language=filters.language,
         country=filters.country,

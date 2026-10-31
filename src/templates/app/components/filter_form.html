@@ -69,6 +69,9 @@
   {% endif %}
   <input type="hidden" name="release" x-model="release">
   <input type="hidden" name="source" x-model="source">
+  {% if library_options %}
+    <input type="hidden" name="library" x-model="library">
+  {% endif %}
   {% if filter_data.media_statuses %}
     <input type="hidden" name="media_status" x-model="media_status">
   {% endif %}
