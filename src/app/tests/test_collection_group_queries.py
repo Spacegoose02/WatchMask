@@ -51,6 +51,11 @@ class CollectionGroupByTypeQueriesTest(TestCase):
 
     def test_grouped_query_count_does_not_scale_per_type(self):
         """Six media types render in 29 queries (44 before decorating once)."""
+        # Watchmask: the cached per-user BingeBandit library map behind the
+        # card badge is warm on a running instance.
+        from integrations import bingebandit
+
+        bingebandit.library_item_ids(self.user)
         with CaptureQueriesContext(connection) as ctx:
             response = self.client.get(reverse("collection_list"), {"group": "type"})
         self.assertEqual(response.status_code, 200)

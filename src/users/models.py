@@ -61,6 +61,20 @@ FIVE_POINT_RATING_SCALE = 5
 MAX_INTERNAL_RATING_SCORE = 10
 
 
+def season_enabled_default():
+    """Watchmask hides the standalone TV seasons section for new users."""
+    from django.conf import settings
+
+    return MediaTypes.SEASON.value not in settings.WATCHMASK_HIDDEN_MEDIA_TYPES
+
+
+def boardgame_enabled_default():
+    """Watchmask hides board games for new users."""
+    from django.conf import settings
+
+    return MediaTypes.BOARDGAME.value not in settings.WATCHMASK_HIDDEN_MEDIA_TYPES
+
+
 def generate_token():
     """Generate a user token."""
     return secrets.token_urlsafe(24)
@@ -561,7 +575,7 @@ class User(AbstractUser):
     )
 
     # Media type preferences: TV Seasons
-    season_enabled = models.BooleanField(default=False)
+    season_enabled = models.BooleanField(default=season_enabled_default)
     season_layout = models.CharField(
         max_length=20,
         default=LayoutChoices.GRID,
@@ -692,7 +706,7 @@ class User(AbstractUser):
     )
 
     # Media type preferences: Board Games
-    boardgame_enabled = models.BooleanField(default=False)
+    boardgame_enabled = models.BooleanField(default=boardgame_enabled_default)
     boardgame_layout = models.CharField(
         max_length=20,
         default=LayoutChoices.GRID,

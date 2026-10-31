@@ -119,3 +119,6 @@ TRAKT_API = "test_trakt_api_key"
 
 # Hardcover token for testing (production default is empty; see #1025)
 HARDCOVER_API = "Bearer test_hardcover_token"
+
+# Floppy's tests assume every media type starts enabled.
+WATCHMASK_HIDDEN_MEDIA_TYPES = ()

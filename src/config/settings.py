@@ -1382,6 +1382,17 @@ STEAM_API_KEY = config(
 # shared by every Floppy install on the internet and is permanently exhausted
 # (#1025). Operators supply their own token, or users set a personal one in
 # Preferences; without either, Hardcover is simply not an available source.
+# Watchmask: media types switched off for new users (each user can turn them
+# back on under Settings). Comma-separated MediaTypes values.
+WATCHMASK_HIDDEN_MEDIA_TYPES = tuple(
+    value.strip()
+    for value in config(
+        "WATCHMASK_HIDDEN_MEDIA_TYPES",
+        default="boardgame,season",
+    ).split(",")
+    if value.strip()
+)
+
 HARDCOVER_API = config(
     "HARDCOVER_API",
     default=secret("HARDCOVER_API_FILE", ""),

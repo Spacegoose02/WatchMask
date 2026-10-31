@@ -2,6 +2,8 @@
 
 from django.db import migrations, models
 
+import users.models
+
 
 def watchmask_defaults(apps, schema_editor):
     """Hide board games and standalone seasons, and use the Watchmask wordmark.
@@ -23,7 +25,7 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name="user",
             name="boardgame_enabled",
-            field=models.BooleanField(default=False),
+            field=models.BooleanField(default=users.models.boardgame_enabled_default),
         ),
         migrations.AlterField(
             model_name="user",
@@ -68,7 +70,7 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name="user",
             name="season_enabled",
-            field=models.BooleanField(default=False),
+            field=models.BooleanField(default=users.models.season_enabled_default),
         ),
         migrations.AlterField(
             model_name="user",
