@@ -4,6 +4,40 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
+## v26.11.2
+
+### New
+
+- **BingeBandit library chips**: library sync keeps each server library
+  separately, so the Movies and TV lists get a chip per library (for example
+  Movies, Kids Movies, TV Shows, Kids TV Shows).
+- **Smart list `library` rule**: pick BingeBandit libraries with chips in the
+  list editor. A library list shows everything in that library, watched or not.
+- **BingeBandit collection**: titles on the server are marked collected and
+  un-collected when they're removed. New titles are matched on TMDB, 500 per
+  sync.
+- **Request on BingeBandit**: a button on movie and show pages that aren't on
+  the server.
+- Optional push of completions back to BingeBandit, and an optional webhook
+  secret that checks `X-BingeBandit-Signature`.
+- **LootDen**: connect with a personal API token from the Import page (Games).
+  Games sync every hour with play time summed across devices; hours only go
+  up, and statuses you set by hand are kept. Matched game pages get a
+  "Play on LootDen" button.
+
+### Performance
+
+- List pages compute the breakdown and completion only on a full page load,
+  using a subquery for completion.
+- Smart-list sync is chunked, and bulk collection syncs skip per-item signal
+  work. The Plex collection sync is locked and rebuilds caches once.
+
+### Upgrade notes
+
+- Runs three new database migrations (`integrations.0065` to `0067`). They are
+  safe to re-run.
+- Library chips appear after the next BingeBandit library sync.
+
 ## v26.11.1 — Rebased on Floppy
 
 Watchmask now sits on top of current [Floppy](https://github.com/dannyvfilms/Floppy)
