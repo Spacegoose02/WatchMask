@@ -4,7 +4,7 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
-## Unreleased: rebased on Floppy v26.10.29+
+## v26.11.1 — Rebased on Floppy
 
 Watchmask now sits on top of current [Floppy](https://github.com/dannyvfilms/Floppy)
 (`latest` at 928bc40, 31 Oct 2026) instead of the 10 July snapshot it was
