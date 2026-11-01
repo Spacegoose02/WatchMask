@@ -1,6 +1,7 @@
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
@@ -199,6 +200,37 @@ class DiscoverRowFeedViewTests(TestCase):
         self.assertEqual(item.findtext("title"), "Some Movie")
         self.assertEqual(item.findtext("category"), "movie")
         self.assertEqual(item.findtext("guid"), "tmdb://42")
+        thumb = item.find("{http://search.yahoo.com/mrss/}thumbnail")
+        self.assertIsNotNone(thumb)
+        self.assertEqual(thumb.get("url"), "http://example.com/42.jpg")
+
+    @patch("app.discover.service.get_or_compute_taste_profile", return_value={})
+    @patch("app.discover.service._build_row_candidates")
+    def test_feed_omits_thumbnail_for_placeholder_image(self, mock_build, _mock_profile):
+        mock_build.return_value = [
+            CandidateItem(
+                media_type=MediaTypes.MOVIE.value,
+                source=Sources.TMDB.value,
+                media_id="43",
+                title="No Art Movie",
+                image=settings.IMG_NONE,
+            ),
+        ]
+
+        url = reverse(
+            "discover_row_feed",
+            kwargs={
+                "token": self.user.token,
+                "media_type": MediaTypes.MOVIE.value,
+                "row_key": "trending_right_now",
+            },
+        )
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        item = ET.fromstring(response.content).find("./channel/item")
+        self.assertIsNotNone(item)
+        self.assertIsNone(item.find("{http://search.yahoo.com/mrss/}thumbnail"))
 
     def test_invalid_token_returns_404(self):
         url = reverse(
