@@ -17,4 +17,5 @@ class IntegrationsConfig(AppConfig):
     def ready(self):
         """Import integration state signals when the app is ready."""
         import_module("integrations.signals_state")
+        import_module("integrations.bingebandit_signals")
         import_module("integrations.state.ratings")

@@ -233,16 +233,23 @@ def list_detail(request, list_reference):
     items = custom_list.items.all()
     # Count memberships directly; counting ``items`` joins app_item for nothing.
     total_items_count = CustomListItem.objects.filter(custom_list=custom_list).count()
-    media_type_breakdown = _build_media_type_breakdown(custom_list)
 
-    # Compute completion percentage (titles completed / total titles)
+    is_partial = helpers.is_htmx_fragment(request)
+
+    # The header (breakdown + completion) only renders on the full page, so
+    # skip these whole-list queries on infinite-scroll and filter requests.
+    media_type_breakdown = []
     completion_percent = None
     completed_count = 0
-    if total_items_count > 0 and not is_public_view:
-        all_item_ids = set(custom_list.items.values_list("id", flat=True))
-        completed_ids = _get_completed_item_ids(request.user, all_item_ids)
-        completed_count = len(completed_ids)
-        completion_percent = round(completed_count / total_items_count * 100)
+    if not is_partial:
+        media_type_breakdown = _build_media_type_breakdown(custom_list)
+        if total_items_count > 0 and not is_public_view:
+            completed_ids = _get_completed_item_ids(
+                request.user,
+                CustomListItem.objects.filter(custom_list=custom_list).values("item_id"),
+            )
+            completed_count = len(completed_ids)
+            completion_percent = round(completed_count / total_items_count * 100)
 
     if params["media_types"]:
         items = items.filter(media_type__in=params["media_types"])
@@ -300,7 +307,6 @@ def list_detail(request, list_reference):
 
     # Base context for both full and partial responses
     chip_sort = "score" if params["sort_by"] == "rating" else params["sort_by"]
-    is_partial = helpers.is_htmx_fragment(request)
     is_pagination = is_partial and params["page"] > 1
     current_media_type = _resolve_list_table_media_type(
         params["media_types"],

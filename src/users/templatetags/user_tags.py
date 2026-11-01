@@ -199,6 +199,10 @@ SOURCES_CONFIG = {
         "name": "Plex",
         "logo": static("img/plex-logo.svg"),
     },
+    "lootden": {
+        "name": "LootDen",
+        "logo": static("img/lootden-logo.png"),
+    },
     "bingebandit": {
         "name": "BingeBandit",
         "logo": static("img/bingebandit-logo.png"),

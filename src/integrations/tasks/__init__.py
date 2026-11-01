@@ -5,8 +5,16 @@ from django.contrib.auth import get_user_model
 
 _EXPORT_MODULES = {
     **dict.fromkeys(
-        ("sync_all_bingebandit_libraries", "sync_bingebandit_library"),
+        (
+            "push_bingebandit_watched",
+            "sync_all_bingebandit_libraries",
+            "sync_bingebandit_library",
+        ),
         "integrations.tasks._bingebandit",
+    ),
+    **dict.fromkeys(
+        ("sync_all_lootden", "sync_lootden"),
+        "integrations.tasks._lootden",
     ),
     **dict.fromkeys(
         ("sync_all_cinemask_requests", "sync_cinemask_requests"),
@@ -318,6 +326,7 @@ __all__ = [
     "process_stremio_webhook",
     "process_webhook",
     "pull_jellyfin_history",
+    "push_bingebandit_watched",
     "push_jellyfin_watched",
     "reconcile_watched_state",
     "refresh_plex_sections",
@@ -325,8 +334,10 @@ __all__ = [
     "sweep_watched_state_deliveries",
     "sync_all_bingebandit_libraries",
     "sync_all_cinemask_requests",
+    "sync_all_lootden",
     "sync_bingebandit_library",
     "sync_cinemask_requests",
+    "sync_lootden",
     "sync_mal_status",
     "sync_plex_mark_watched",
     "sync_plex_watchlist",

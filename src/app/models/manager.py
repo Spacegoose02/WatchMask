@@ -511,6 +511,19 @@ class MediaManager(models.Manager.from_queryset(ImportScopedQuerySet)):
         if source:
             queryset = queryset.filter(item__source=source)
 
+        library = str(filters.get("library") or "").strip()
+        if library:
+            from integrations import bingebandit
+
+            queryset = queryset.filter(
+                item__source=Sources.TMDB.value,
+                item__media_id__in=bingebandit.library_tmdb_ids(
+                    user,
+                    MediaTypes.TV.value if media_type == MediaTypes.SEASON.value else media_type,
+                    library,
+                ),
+            )
+
         media_status = str(filters.get("media_status") or "").strip()
         if media_status:
             queryset = queryset.filter(item__status=media_status)

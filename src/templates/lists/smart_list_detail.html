@@ -35,6 +35,7 @@
         granular: ['season', 'episode'],
       },
     ),
+    library: '{{ current_library|default:''|escapejs }}',
     showModal: false,
     isOrderEditing: false,
     canEdit: {% if can_edit %}true{% else %}false{% endif %},
@@ -545,7 +546,7 @@
       'release_date_within', 'release_date_within_unit',
       'date_added_within', 'date_added_within_unit',
       'source', 'language', 'country',
-      'platform', 'origin', 'format', 'provider', 'author',
+      'platform', 'origin', 'format', 'provider', 'author', 'library',
     ];
 
 

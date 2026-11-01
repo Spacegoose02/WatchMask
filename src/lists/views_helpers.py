@@ -10,7 +10,7 @@ import logging
 from django.apps import apps
 from django.conf import settings
 from django.core.paginator import Paginator
-from django.db.models import Count, F, Max, Q
+from django.db.models import Count, F, Max, Q, QuerySet
 from django.urls import reverse
 from django.utils.text import slugify
 from django.utils.translation import ngettext
@@ -119,11 +119,24 @@ def get_public_list_for_item(list_reference, item):
 
 
 def _get_completed_item_ids(user, item_ids):
-    """Return the subset of item_ids that the user has marked Completed in any media type."""
-    if not item_ids:
-        return set()
+    """Return the subset of item_ids that the user has marked Completed in any media type.
+
+    ``item_ids`` may be a set of ids or a ``values("item_id")`` queryset. Pass a
+    queryset for big lists: it runs as a SQL subquery, so the database never
+    receives thousands of bound parameters (SQLite caps them).
+    """
+    if isinstance(item_ids, QuerySet):
+        media_types = set(
+            Item.objects.filter(id__in=item_ids)
+            .values_list("media_type", flat=True)
+            .distinct(),
+        )
+    else:
+        if not item_ids:
+            return set()
+        media_types = set(MediaTypes.values)
     completed = set()
-    for media_type in MediaTypes.values:
+    for media_type in media_types:
         if media_type == MediaTypes.EPISODE.value:
             continue  # Episode has no status/user field
         try:

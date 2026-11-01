@@ -76,6 +76,7 @@ from integrations import (
     audiobookshelf_cover as abs_cover_proxy,
 )
 from integrations import bingebandit as bingebandit_api
+from integrations import lootden as lootden_api
 from integrations import plex as plex_api
 from integrations import plex_cover as plex_cover_proxy
 from integrations.gpodder_api import GPodderAuthError, GPodderClientError
@@ -143,6 +144,8 @@ from integrations.models import (
     KoreaderAccount,
     KoreaderDocumentLink,
     LastFMAccount,
+    LootDenAccount,
+    LootDenGame,
     MDBListAccount,
     MylarInstance,
     PlaytimeSnapshot,
@@ -840,9 +843,156 @@ def bingebandit_disconnect(request):
     BingeBanditAccount.objects.filter(user=request.user).delete()
     BingeBanditLibraryItem.objects.filter(user=request.user).delete()
     BingeBanditResumePoint.objects.filter(user=request.user).delete()
-    cache.delete(bingebandit_api.LIBRARY_CACHE_KEY.format(user_id=request.user.id))
+    bingebandit_api.sync_collection(request.user, set())
+    cache.delete_many(
+        [
+            bingebandit_api.LIBRARY_CACHE_KEY.format(user_id=request.user.id),
+            bingebandit_api.LIBRARY_NAMES_CACHE_KEY.format(user_id=request.user.id),
+        ],
+    )
     messages.info(request, "Disconnected BingeBandit.")
     return redirect("import_data")
+
+
+@require_POST
+def bingebandit_settings(request):
+    """Save the BingeBandit collection, watched-push and webhook-secret options."""
+    account = getattr(request.user, "bingebandit_account", None)
+    if not account:
+        messages.error(request, "Connect BingeBandit first.")
+        return redirect("import_data")
+
+    turned_on_collection = (
+        "sync_collection" in request.POST and not account.sync_collection
+    )
+    account.sync_collection = "sync_collection" in request.POST
+    account.push_watched = "push_watched" in request.POST
+    update_fields = ["sync_collection", "push_watched"]
+    secret = request.POST.get("webhook_secret", "")
+    if secret:
+        # A lone space clears the secret, since the field never shows it.
+        account.webhook_secret = helpers.encrypt(secret.strip()) if secret.strip() else ""
+        update_fields.append("webhook_secret")
+    account.save(update_fields=update_fields)
+    if not account.sync_collection:
+        # An empty server list un-collects everything BingeBandit collected,
+        # and leaves copies added by hand or by other sources alone.
+        bingebandit_api.sync_collection(request.user, set())
+    elif turned_on_collection:
+        tasks.sync_bingebandit_library.delay(user_id=request.user.id)
+    messages.success(request, "Saved BingeBandit settings.")
+    return redirect("import_data")
+
+
+@require_POST
+def bingebandit_request(request, media_type, tmdb_id):
+    """Ask the BingeBandit server to add a movie or show that isn't on it."""
+    account = getattr(request.user, "bingebandit_account", None)
+    kind = bingebandit_api.KIND_BY_MEDIA_TYPE.get(media_type)
+    if not account or not kind or not tmdb_id.isdigit():
+        return HttpResponse("", status=404)
+    item = Item.objects.filter(
+        source=Sources.TMDB.value,
+        media_type=media_type,
+        media_id=tmdb_id,
+    ).first()
+    title = request.POST.get("title") or (item.title if item else "")
+    year = request.POST.get("year") or ""
+    if not year and item and item.release_datetime:
+        year = item.release_datetime.year
+    try:
+        bingebandit_api.client_for(account).request_title(
+            kind,
+            tmdb_id,
+            title,
+            year=int(year) if str(year).isdigit() else 0,
+            poster=item.image if item else "",
+        )
+    except bingebandit_api.BingeBanditError as exc:
+        return render(
+            request,
+            "integrations/bingebandit_request_button.html",
+            {"error": str(exc)},
+        )
+    return render(
+        request,
+        "integrations/bingebandit_request_button.html",
+        {"requested": True},
+    )
+
+
+@require_POST
+def lootden_connect(request):
+    """Connect a LootDen server with a personal API token."""
+    base_url = request.POST.get("base_url", "").strip()
+    api_token = request.POST.get("api_token", "").strip()
+    if not base_url or not api_token:
+        messages.error(request, "LootDen server URL and API token are required.")
+        return redirect("import_data")
+
+    try:
+        me = lootden_api.LootDenClient(base_url, api_token).get_me()
+    except lootden_api.LootDenError as exc:
+        messages.error(request, str(exc))
+        return redirect("import_data")
+    if not me:
+        messages.error(
+            request,
+            "That's the server's service token. Use a personal API token so "
+            "Watchmask reads your own games and play time.",
+        )
+        return redirect("import_data")
+
+    username = str(me.get("username") or "")
+    LootDenAccount.objects.update_or_create(
+        user=request.user,
+        defaults={
+            "base_url": base_url.rstrip("/"),
+            "api_token": helpers.encrypt(api_token),
+            "username": username,
+            "last_error": "",
+        },
+    )
+    tasks.sync_lootden.delay(user_id=request.user.id)
+    messages.success(
+        request,
+        f"Connected LootDen as {username or 'your account'}. Your games are syncing now.",
+    )
+    return redirect("import_data")
+
+
+@require_POST
+def lootden_disconnect(request):
+    """Disconnect LootDen. Games already synced stay in the library."""
+    LootDenAccount.objects.filter(user=request.user).delete()
+    LootDenGame.objects.filter(user=request.user).delete()
+    messages.info(request, "Disconnected LootDen.")
+    return redirect("import_data")
+
+
+@require_POST
+def lootden_sync_now(request):
+    """Queue a LootDen sync for the current user."""
+    if not getattr(request.user, "lootden_account", None):
+        messages.error(request, "Connect LootDen first.")
+        return redirect("import_data")
+    tasks.sync_lootden.delay(user_id=request.user.id)
+    messages.info(request, "Syncing your LootDen games.")
+    return redirect("import_data")
+
+
+@require_GET
+def lootden_play_button(request):
+    """Render a Play on LootDen button for a game's detail page."""
+    item = Item.objects.filter(
+        source=Sources.IGDB.value,
+        media_type=MediaTypes.GAME.value,
+        media_id=request.GET.get("igdb_id", ""),
+    ).first()
+    found = lootden_api.game_link(request.user, item) if item else None
+    if not found:
+        return HttpResponse("")
+    return render(request, "integrations/lootden_play_button.html", found)
 
 
 @require_GET
@@ -887,7 +1037,14 @@ def bingebandit_play_button(request):
             (media_type, tmdb_id),
         )
         if not item_id:
-            return HttpResponse("")
+            if not tmdb_id.isdigit():
+                return HttpResponse("")
+            # Not on the server: offer to request it instead.
+            return render(
+                request,
+                "integrations/bingebandit_request_button.html",
+                {"media_type": media_type, "tmdb_id": tmdb_id},
+            )
         context = {"url": account.item_url(item_id)}
     return render(request, "integrations/bingebandit_play_button.html", context)
 
@@ -6157,6 +6314,15 @@ def bingebandit_webhook(request, token):
         logger.warning("Missing payload in BingeBandit webhook request")
         return HttpResponse("Missing payload", status=400)
 
+    account = BingeBanditAccount.objects.filter(user=user).first()
+    if account and account.webhook_secret and not bingebandit_api.verify_signature(
+        helpers.decrypt(account.webhook_secret),
+        data,
+        request.headers.get("X-BingeBandit-Signature", ""),
+    ):
+        logger.warning("BingeBandit webhook signature did not match")
+        return HttpResponse("Bad signature", status=401)
+
     try:
         payload = json.loads(data)
     except json.JSONDecodeError:
@@ -6173,7 +6339,6 @@ def bingebandit_webhook(request, token):
         for name in request.GET.get("users", "").split(",")
         if name.strip()
     }
-    account = BingeBanditAccount.objects.filter(user=user).first()
     if account:
         allowed_users |= account.webhook_username_set
     event_user = str((payload.get("data") or {}).get("user") or "").strip().lower()

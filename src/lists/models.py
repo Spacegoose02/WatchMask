@@ -112,6 +112,9 @@ class CustomListManager(models.Manager):
         return queryset.filter(public_slug=reference).first()
 
 
+SMART_SYNC_BATCH_SIZE = 500
+
+
 class CustomList(models.Model):
     """Model for custom lists."""
 
@@ -304,8 +307,11 @@ class CustomList(models.Model):
         if not self.is_smart:
             return
 
+        # Use the matched ids directly: round-tripping them through an
+        # ``id__in`` query is slow and can exceed SQLite's parameter limit.
+        normalized_rules = smart_rules.normalize_list_rules(self)
         target_item_ids = set(
-            self.get_smart_items_queryset().values_list("id", flat=True)
+            smart_rules.collect_matching_item_ids(self.owner, normalized_rules),
         )
         existing_item_ids = set(
             CustomListItem.objects.filter(custom_list=self).values_list(
@@ -316,11 +322,15 @@ class CustomList(models.Model):
         to_remove = existing_item_ids - target_item_ids
         to_add = target_item_ids - existing_item_ids
 
-        if to_remove:
+        to_remove = sorted(to_remove)
+        for start in range(0, len(to_remove), SMART_SYNC_BATCH_SIZE):
             CustomListItem.objects.filter(
-                custom_list=self, item_id__in=to_remove
+                custom_list=self,
+                item_id__in=to_remove[start : start + SMART_SYNC_BATCH_SIZE],
             ).delete()
         if to_add:
+            # ignore_conflicts: an incremental per-item sync may add the same
+            # row while this full sync runs.
             CustomListItem.objects.bulk_create(
                 [
                     CustomListItem(
@@ -328,6 +338,8 @@ class CustomList(models.Model):
                     )
                     for item_id in to_add
                 ],
+                batch_size=SMART_SYNC_BATCH_SIZE,
+                ignore_conflicts=True,
             )
 
     @property

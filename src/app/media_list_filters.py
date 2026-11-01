@@ -123,6 +123,8 @@ class MediaListFilters:
     date_added_within: str = ""
     date_added_within_unit: str = "days"
     source: str = ""
+    # BingeBandit library name, e.g. "Kids Movies".
+    library: str = ""
     media_status: str = ""
     language: str = ""
     country: str = ""
@@ -448,6 +450,7 @@ def parse_media_list_filters(request, *, strict: bool = True) -> MediaListFilter
         date_added_within=ranges["date_added_within"],
         date_added_within_unit=ranges["date_added_within_unit"],
         source=params.text("source"),
+        library=params.text("library"),
         media_status=params.text("media_status"),
         language=params.text("language"),
         country=params.text("country"),

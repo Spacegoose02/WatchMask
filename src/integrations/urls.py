@@ -77,6 +77,28 @@ urlpatterns = [
         name="bingebandit_disconnect",
     ),
     path("import/bingebandit/status", views.bingebandit_status, name="bingebandit_status"),
+    path("import/lootden/connect", views.lootden_connect, name="lootden_connect"),
+    path(
+        "import/lootden/disconnect",
+        views.lootden_disconnect,
+        name="lootden_disconnect",
+    ),
+    path("import/lootden/sync", views.lootden_sync_now, name="lootden_sync_now"),
+    path(
+        "lootden/play-button",
+        views.lootden_play_button,
+        name="lootden_play_button",
+    ),
+    path(
+        "import/bingebandit/settings",
+        views.bingebandit_settings,
+        name="bingebandit_settings",
+    ),
+    path(
+        "bingebandit/request/<str:media_type>/<str:tmdb_id>",
+        views.bingebandit_request,
+        name="bingebandit_request",
+    ),
     path(
         "bingebandit/play-button",
         views.bingebandit_play_button,

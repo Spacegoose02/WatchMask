@@ -55,6 +55,8 @@ class BingeBanditLibraryTests(TestCase):
             base_url="http://bb.local",
             api_key=helpers.encrypt("bb_key"),
             username="alice",
+            # Collection sync looks titles up on TMDB; it has its own tests.
+            sync_collection=False,
         )
 
     @patch("integrations.bingebandit.BingeBanditClient._get", _library_page)
@@ -118,8 +120,10 @@ class BingeBanditLibraryTests(TestCase):
         self.assertIn('href="http://bb.local/play/77?t=630"', html)
         self.assertIn("Resume S01E02 · 10:30", html)
 
-    def test_play_button_empty_when_not_in_library(self):
-        self.assertEqual(self._button(MediaTypes.MOVIE.value, "603"), "")
+    def test_play_button_offers_request_when_not_in_library(self):
+        html = self._button(MediaTypes.MOVIE.value, "603")
+        self.assertIn("Request on BingeBandit", html)
+        self.assertIn(reverse("bingebandit_request", args=[MediaTypes.MOVIE.value, "603"]), html)
 
     def test_card_badge_filter(self):
         BingeBanditLibraryItem.objects.create(

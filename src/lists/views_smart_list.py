@@ -44,6 +44,18 @@ from users.models import ListDetailSortChoices, MediaStatusChoices
 logger = logging.getLogger(__name__)
 
 
+def _library_options(owner, can_edit):
+    """BingeBandit library names the list's owner can build a list from."""
+    if not can_edit:
+        return []
+    from integrations import bingebandit
+
+    return sorted(
+        set(bingebandit.library_names(owner, MediaTypes.MOVIE.value))
+        | set(bingebandit.library_names(owner, MediaTypes.TV.value)),
+    )
+
+
 def _smart_list_detail_response(
     request,
     custom_list,
@@ -171,6 +183,7 @@ def _smart_list_detail_response(
                 "origin": request.GET.get("origin", saved_rules["origin"]),
                 "format": request.GET.get("format", saved_rules["format"]),
                 "author": request.GET.get("author", saved_rules["author"]),
+                "library": request.GET.get("library", saved_rules["library"]),
                 "tag": request.GET.getlist("tag")
                 if "tag" in request.GET
                 else saved_rules["tag"],
@@ -349,6 +362,8 @@ def _smart_list_detail_response(
         "saved_smart_rules": saved_rules,
         "active_smart_rules": active_rules,
         "smart_filter_data": filter_data,
+        "library_options": _library_options(custom_list.owner, can_edit),
+        "current_library": active_rules.get("library", ""),
         "available_media_types": available_media_types,
         "available_media_type_labels": available_media_type_labels,
         "current_media_types": active_rules["media_types"],

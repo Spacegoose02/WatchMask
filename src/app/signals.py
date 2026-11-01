@@ -343,7 +343,7 @@ def sync_smart_lists_on_media_change(sender, instance, **kwargs):
 @receiver([post_save, post_delete], sender=CollectionEntry)
 def sync_smart_lists_on_collection_change(sender, instance, **kwargs):
     """Incrementally update smart lists when collection ownership changes."""
-    if kwargs.get("raw"):
+    if kwargs.get("raw") or media_change_side_effects_suppressed():
         return
     owner = getattr(instance, "user", None)
     item = getattr(instance, "item", None)
@@ -417,7 +417,7 @@ def clear_home_row_cache_on_music_podcast_tracker_change(sender, instance, **kwa
 @receiver([post_save, post_delete], sender=ItemTag)
 def sync_smart_lists_on_item_tag_change(sender, instance, **kwargs):
     """Incrementally update smart lists when a tag is applied to or removed from an item."""
-    if kwargs.get("raw"):
+    if kwargs.get("raw") or media_change_side_effects_suppressed():
         return
     owner = getattr(getattr(instance, "tag", None), "user", None)
     item = getattr(instance, "item", None)
@@ -1526,9 +1526,12 @@ def schedule_runtime_backfill_on_item_save(
         return
 
     # Check if runtime_minutes was actually updated (not just saving the same value)
+    # Bulk syncs suppress this and clear caches once when they finish.
     runtime_updated = (
-        update_fields is None or "runtime_minutes" in update_fields
-    ) and instance.media_type == MediaTypes.EPISODE.value
+        (update_fields is None or "runtime_minutes" in update_fields)
+        and instance.media_type == MediaTypes.EPISODE.value
+        and not media_change_side_effects_suppressed()
+    )
 
     # Invalidate time_left cache for all users tracking this show/season when runtime changes
     if runtime_updated:

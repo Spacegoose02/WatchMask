@@ -63,6 +63,7 @@ class FilterValues:
     release_date_from: str = ""
     release_date_to: str = ""
     source: str = ""
+    library: str = ""
     media_status: str = ""
     language: str = ""
     country: str = ""
