@@ -4,7 +4,7 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
-## Unreleased
+## v26.11.3
 
 ### Fixed
 
