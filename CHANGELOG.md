@@ -4,6 +4,14 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
+## Unreleased
+
+### Fixed
+
+- **Discover RSS feeds carry cover art**: each item has a `<media:thumbnail>`
+  with its poster, so feed readers such as LootDen's wishlist show covers
+  instead of letter placeholders. Radarr and Sonarr ignore the extra element.
+
 ## v26.11.2
 
 ### New

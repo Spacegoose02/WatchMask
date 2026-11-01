@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from django.conf import settings
 from django.contrib.auth.decorators import login_not_required
 from django.contrib.syndication.views import Feed
 from django.core.exceptions import ObjectDoesNotExist
@@ -52,15 +53,31 @@ def _parse_bool_param(request, name: str, *, default: bool = True) -> bool:
     return raw not in {"0", "false", "False"}
 
 
+MEDIA_RSS_NS = "http://search.yahoo.com/mrss/"
+
+
 class DiscoverRssFeed(Rss201rev2Feed):
-    """RSS feed generator emitting the arr-compatible <category> element."""
+    """RSS feed generator emitting the arr-compatible <category> and a cover image.
+
+    The cover is a Media RSS ``<media:thumbnail>`` so readers such as LootDen's
+    wishlist can show poster art; Radarr/Sonarr ignore elements they don't know.
+    """
+
+    def rss_attributes(self):
+        """Declare the Media RSS namespace alongside the standard attributes."""
+        attrs = super().rss_attributes()
+        attrs["xmlns:media"] = MEDIA_RSS_NS
+        return attrs
 
     def add_item_elements(self, handler, item):
-        """Add standard RSS elements plus the Radarr/Sonarr category."""
+        """Add standard RSS elements plus the Radarr/Sonarr category and cover."""
         super().add_item_elements(handler, item)
         category = item.get("arr_category")
         if category:
             handler.addQuickElement("category", category)
+        image = item.get("image_url")
+        if image:
+            handler.addQuickElement("media:thumbnail", "", {"url": image})
 
 
 class DiscoverRowFeed(Feed):
@@ -136,9 +153,23 @@ class DiscoverRowFeed(Feed):
         """Guids are identifiers, not permalinks."""
         return False
 
+    def item_image_url(self, item):
+        """Return the item's absolute cover URL, or None for the placeholder."""
+        image = item.image
+        if not image or image == settings.IMG_NONE:
+            return None
+        if image.startswith("//"):
+            return f"https:{image}"
+        if image.startswith("/"):
+            return self.request.build_absolute_uri(image)
+        return image
+
     def item_extra_kwargs(self, item):
-        """Expose the arr category for DiscoverRssFeed to render."""
-        return {"arr_category": ARR_CATEGORY_BY_MEDIA_TYPE.get(item.media_type, "")}
+        """Expose the arr category and cover for DiscoverRssFeed to render."""
+        return {
+            "arr_category": ARR_CATEGORY_BY_MEDIA_TYPE.get(item.media_type, ""),
+            "image_url": self.item_image_url(item),
+        }
 
 
 @login_not_required
