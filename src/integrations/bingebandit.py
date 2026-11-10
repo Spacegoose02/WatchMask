@@ -46,6 +46,16 @@ COLLECTION_SOURCE = "bingebandit"
 # next sync, so a first sync of a very large server can't run for hours.
 COLLECTION_NEW_ITEMS_PER_SYNC = 500
 
+# Watchmask lists mirrored from BingeBandit carry this source; the watchlist's
+# source_id is WATCHLIST_SOURCE_ID and each playlist's is its BingeBandit id.
+LIST_SOURCE = "bingebandit"
+WATCHLIST_SOURCE_ID = "watchlist"
+WATCHLIST_NAME = "BingeBandit Watchlist"
+LIST_DESCRIPTION = "Synced from BingeBandit. Changes made on BingeBandit show up here."
+
+# New titles looked up on TMDB per list sync, like COLLECTION_NEW_ITEMS_PER_SYNC.
+LIST_NEW_ITEMS_PER_SYNC = 200
+
 
 class BingeBanditError(Exception):
     """BingeBandit request failed."""
@@ -125,6 +135,18 @@ class BingeBanditClient:
     def get_library_tmdb_ids(self, library_id):
         """Return the TMDB IDs of the movies and shows in a library."""
         return {str(item["tmdbId"]) for item in self.get_library_items(library_id)}
+
+    def get_watchlist(self):
+        """Return the movies and shows on the user's watchlist, newest first."""
+        return self._get("/watchlist").json() or []
+
+    def get_playlists(self):
+        """Return the user's own playlists as [{id, name, ...}]."""
+        return self._get("/playlists").json() or []
+
+    def get_playlist_items(self, playlist_id):
+        """Return a playlist's movies and episodes, in playlist order."""
+        return self._get(f"/playlists/{int(playlist_id)}").json().get("items") or []
 
     def mark_watched(self, item_id, watched=True):
         """Mark a movie, or every episode of a show, watched on the server."""
@@ -302,6 +324,114 @@ def sync_collection(user, keys, new_items_limit=COLLECTION_NEW_ITEMS_PER_SYNC):
         )
     if added or removed:
         _replay_collection_side_effects(user.id)
+    return added, removed
+
+
+def _list_keys(entries, show_tmdb_ids):
+    """Map BingeBandit list entries to unique (media_type, tmdb_id) keys, in order.
+
+    Playlists hold episodes rather than shows, so an episode stands for its
+    show, found through the library index by the show's BingeBandit id.
+    """
+    keys = []
+    for entry in entries:
+        kind = entry.get("kind")
+        if kind in MEDIA_TYPE_BY_KIND:
+            key = (MEDIA_TYPE_BY_KIND[kind], str(entry.get("tmdbId") or ""))
+        elif kind == "episode":
+            key = (MediaTypes.TV.value, show_tmdb_ids.get(entry.get("showId"), ""))
+        else:
+            continue
+        if key[1] and key[1] != "0" and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def sync_lists(account):
+    """Mirror the user's BingeBandit watchlist and playlists into Watchmask lists.
+
+    Each one gets its own private list (source "bingebandit"). Titles added on
+    BingeBandit are added, titles taken off are removed, and lists for deleted
+    playlists are deleted. Returns (added, removed).
+    """
+    from lists.models import CustomList, CustomListItem
+
+    user = account.user
+    client = client_for(account)
+    # Newest first from the API; add oldest first so the list's order matches.
+    remote = [
+        (WATCHLIST_SOURCE_ID, WATCHLIST_NAME, list(reversed(client.get_watchlist()))),
+    ]
+    remote.extend(
+        (
+            str(playlist["id"]),
+            (playlist.get("name") or f"Playlist {playlist['id']}")[:255],
+            client.get_playlist_items(playlist["id"]),
+        )
+        for playlist in client.get_playlists()
+        if playlist.get("id")
+    )
+
+    show_tmdb_ids = dict(
+        BingeBanditLibraryItem.objects.filter(
+            user=user,
+            media_type=MediaTypes.TV.value,
+        ).values_list("item_id", "tmdb_id"),
+    )
+    wanted = [
+        (source_id, name, _list_keys(entries, show_tmdb_ids))
+        for source_id, name, entries in remote
+    ]
+    items = _resolve_items(
+        {key for _, _, keys in wanted for key in keys},
+        LIST_NEW_ITEMS_PER_SYNC,
+    )
+
+    existing = {
+        custom_list.source_id: custom_list
+        for custom_list in CustomList.objects.filter(owner=user, source=LIST_SOURCE)
+    }
+    added = removed = 0
+    for source_id, name, keys in wanted:
+        custom_list = existing.pop(source_id, None)
+        if custom_list is None:
+            custom_list = CustomList.objects.create(
+                name=name,
+                description=LIST_DESCRIPTION,
+                owner=user,
+                visibility="private",
+                source=LIST_SOURCE,
+                source_id=source_id,
+            )
+        elif custom_list.name != name and source_id != WATCHLIST_SOURCE_ID:
+            custom_list.name = name
+            custom_list.save(update_fields=["name"])
+
+        item_ids = [items[key].id for key in keys if key in items]
+        have = set(
+            CustomListItem.objects.filter(custom_list=custom_list).values_list(
+                "item_id",
+                flat=True,
+            ),
+        )
+        for item_id in item_ids:
+            if item_id not in have:
+                CustomListItem.objects.create(
+                    custom_list=custom_list,
+                    item_id=item_id,
+                    added_by=user,
+                )
+                added += 1
+        # One at a time: CustomListItem.delete keeps the list's numbering whole.
+        for list_item in CustomListItem.objects.filter(
+            custom_list=custom_list,
+        ).exclude(item_id__in=item_ids):
+            list_item.delete()
+            removed += 1
+
+    for custom_list in existing.values():
+        custom_list.delete()
+
     return added, removed
 
 

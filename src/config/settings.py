@@ -2206,6 +2206,11 @@ CELERY_BEAT_SCHEDULE = {
         "task": "Sync BingeBandit libraries for all users",
         "schedule": 60 * 60 * 6,  # every 6 hours
     },
+    # BingeBandit sends no webhook when a list changes, so lists are polled.
+    "sync_bingebandit_lists": {
+        "task": "Sync BingeBandit lists for all users",
+        "schedule": 60 * 15,  # every 15 minutes
+    },
     "sync_lootden_games": {
         "task": "Sync LootDen games for all users",
         "schedule": 60 * 60,  # every hour

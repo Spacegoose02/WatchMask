@@ -4,6 +4,17 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
+## Unreleased
+
+### New
+
+- **BingeBandit lists**: turn on *Copy my BingeBandit watchlist and playlists
+  into lists here* in the BingeBandit settings and the watchlist and each
+  playlist get a private Watchmask list, checked every 15 minutes. Titles added
+  or removed on BingeBandit are added or removed here, renamed playlists keep
+  their list, and deleted playlists take their list with them. Episodes in a
+  playlist add their show.
+
 ## v26.11.3
 
 ### Fixed

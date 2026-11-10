@@ -856,7 +856,7 @@ def bingebandit_disconnect(request):
 
 @require_POST
 def bingebandit_settings(request):
-    """Save the BingeBandit collection, watched-push and webhook-secret options."""
+    """Save the BingeBandit collection, watched-push, list and webhook-secret options."""
     account = getattr(request.user, "bingebandit_account", None)
     if not account:
         messages.error(request, "Connect BingeBandit first.")
@@ -867,7 +867,9 @@ def bingebandit_settings(request):
     )
     account.sync_collection = "sync_collection" in request.POST
     account.push_watched = "push_watched" in request.POST
-    update_fields = ["sync_collection", "push_watched"]
+    turned_on_lists = "sync_lists" in request.POST and not account.sync_lists
+    account.sync_lists = "sync_lists" in request.POST
+    update_fields = ["sync_collection", "push_watched", "sync_lists"]
     secret = request.POST.get("webhook_secret", "")
     if secret:
         # A lone space clears the secret, since the field never shows it.
@@ -880,6 +882,8 @@ def bingebandit_settings(request):
         bingebandit_api.sync_collection(request.user, set())
     elif turned_on_collection:
         tasks.sync_bingebandit_library.delay(user_id=request.user.id)
+    if turned_on_lists:
+        tasks.sync_bingebandit_lists.delay(user_id=request.user.id)
     messages.success(request, "Saved BingeBandit settings.")
     return redirect("import_data")
 

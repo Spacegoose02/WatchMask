@@ -1170,6 +1170,13 @@
                        class="rounded border-gray-600 bg-[var(--color-surface)] text-indigo-600">
                 Mark titles watched on BingeBandit when I complete them here
               </label>
+              <label class="flex items-start gap-2 text-sm text-[var(--color-text-secondary)]">
+                <input type="checkbox" name="sync_lists" {% if bingebandit_account.sync_lists %}checked{% endif %}
+                       class="mt-0.5 rounded border-gray-600 bg-[var(--color-surface)] text-indigo-600">
+                <span>Copy my BingeBandit watchlist and playlists into lists here
+                  <span class="block text-xs text-[var(--color-text-muted)]">Checked every 15 minutes. BingeBandit owns these lists, so titles added to them here are removed at the next sync.</span>
+                </span>
+              </label>
               <input type="password" name="webhook_secret" autocomplete="off"
                      class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
                      placeholder="{% if bingebandit_account.webhook_secret %}Webhook secret is set (type a new one to change, or a space to clear){% else %}Webhook secret (optional, from the webhook in BingeBandit){% endif %}">
