@@ -48,7 +48,7 @@ One stack, app plus Redis. Save it as `docker-compose.yml` and run `docker compo
 ```yaml
 services:
   floppy:
-    image: ghcr.io/dannyvfilms/floppy:latest
+    image: ghcr.io/spacegoose02/watchmask:latest
     container_name: floppy
     restart: unless-stopped
     stop_grace_period: 150s
@@ -153,7 +153,7 @@ whenever the container is recreated:
 ```yaml
 services:
   floppy:
-    image: ghcr.io/dannyvfilms/floppy:latest
+    image: ghcr.io/spacegoose02/watchmask:latest
     volumes:
       - ./backups:/floppy/backups
 ```
@@ -202,7 +202,7 @@ directory:
 ```yaml
 services:
   floppy:
-    image: ghcr.io/dannyvfilms/floppy:latest
+    image: ghcr.io/spacegoose02/watchmask:latest
     environment:
       FLOPPY_DATA_DIR: /data/floppy
     volumes:
@@ -216,7 +216,7 @@ This example stores the SQLite file in a separate mounted directory:
 ```yaml
 services:
   floppy:
-    image: ghcr.io/dannyvfilms/floppy:latest
+    image: ghcr.io/spacegoose02/watchmask:latest
     environment:
       FLOPPY_DATA_DIR: /data/floppy
       FLOPPY_DB_PATH: /database/floppy/db.sqlite3
@@ -264,7 +264,7 @@ Floppy uses PostgreSQL only when `DB_HOST` is set. Without it, it uses
 ```yaml
 services:
   floppy:
-    image: ghcr.io/dannyvfilms/floppy:latest
+    image: ghcr.io/spacegoose02/watchmask:latest
     container_name: floppy
     restart: unless-stopped
     stop_grace_period: 150s
@@ -370,7 +370,7 @@ docker run -d \
   -v floppy-db:/floppy/db \
   -v floppy-backups:/floppy/backups \
   -p 8000:8000 \
-  ghcr.io/dannyvfilms/floppy:latest
+  ghcr.io/spacegoose02/watchmask:latest
 ```
 
 Leave `REGISTRATION=True` for your first run, then recreate the container with `False` once your account exists.
@@ -875,14 +875,14 @@ contains it before relying on it in production:
 
 ```bash
 # Pull the exact digest you intend to run, not just a moving tag.
-docker pull ghcr.io/dannyvfilms/floppy@sha256:<digest>
+docker pull ghcr.io/spacegoose02/watchmask@sha256:<digest>
 
 # Confirm the baked-in build identity.
-docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ghcr.io/dannyvfilms/floppy@sha256:<digest> | grep -E '^(VERSION|COMMIT_SHA)='
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ghcr.io/spacegoose02/watchmask@sha256:<digest> | grep -E '^(VERSION|COMMIT_SHA)='
 
 # Run it once, disposably, and check the startup identity line and, if you
 # can trigger one, the heartbeat/timeout behavior described above.
-docker run --rm ghcr.io/dannyvfilms/floppy@sha256:<digest> 2>&1 | grep 'Floppy runtime:'
+docker run --rm ghcr.io/spacegoose02/watchmask@sha256:<digest> 2>&1 | grep 'Floppy runtime:'
 ```
 
 If a moving tag such as `latest` still reports an older `COMMIT_SHA` after a
@@ -974,7 +974,7 @@ environment:
 
 ## Docker image tags
 
-The image lives at `ghcr.io/dannyvfilms/floppy`:
+The image lives at `ghcr.io/spacegoose02/watchmask`:
 
 - `:latest` - the latest commit on the `latest` branch
 - `:release` - the latest commit on the `release` branch, or the stable alias for a GitHub release tag

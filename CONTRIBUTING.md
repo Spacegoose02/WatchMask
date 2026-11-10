@@ -1,6 +1,6 @@
-# Contributing to Floppy
+# Contributing to Watchmask
 
-Floppy is a self-hosted media tracking platform forked from [FuzzyGrim/Yamtrack](https://github.com/FuzzyGrim/Yamtrack). We welcome contributions from developers and AI-assisted workflows alike.
+Watchmask is a self-hosted media tracking platform built on [Floppy](https://github.com/dannyvfilms/Floppy), itself a fork of [FuzzyGrim/Yamtrack](https://github.com/FuzzyGrim/Yamtrack). We welcome contributions from developers and AI-assisted workflows alike.
 
 Our bar is practical: **make changes clean, minimal, safe, and well-understood.** This guide provides clear instructions to help contributors build, test, and ship high-leverage pull requests that land quickly.
 
@@ -20,11 +20,11 @@ Our bar is practical: **make changes clean, minimal, safe, and well-understood.*
 
 ## Local development
 
-Running Floppy from source for development:
+Running Watchmask from source for development:
 
 ```bash
-git clone https://github.com/dannyvfilms/Floppy.git
-cd Floppy
+git clone https://github.com/Spacegoose02/WatchMask.git
+cd WatchMask
 docker run -d --name redis -p 127.0.0.1:6379:6379 --restart unless-stopped redis:8-alpine
 uv sync --locked
 ```
@@ -69,7 +69,7 @@ Every contribution should maintain and elevate our codebase baseline.
 - **Reference**: For foundational principles, see [Don't Repeat Yourself (DRY)](https://en.wikipedia.org/wiki/Don%27t_repeat_yourself).
 
 ### Explicit Domain Boundaries & Consistent Vocabulary
-- **Separation by bounded context**: Floppy organizes code into distinct domain areas:
+- **Separation by bounded context**: Watchmask organizes code into distinct domain areas:
   - `app`: Core media entities, metadata providers, and detail views.
   - `users`: User authentication, account management, and profile preferences.
   - `lists`: Collections, custom watchlists, and smart filters.
@@ -87,7 +87,7 @@ Security is critical. Every change touching authentication, user data, or networ
 - **XSS & CSRF Prevention**: Rely on Django template auto-escaping. Never mark user-supplied data as `|safe`. Include `{% csrf_token %}` on all state-modifying POST/PUT forms.
 
 ### Human-Centered UI/UX & Cognitive Accessibility
-User interfaces in Floppy should be intuitive, accessible, and fatigue-free:
+User interfaces in Watchmask should be intuitive, accessible, and fatigue-free:
 - **Gestalt Principles**: Group related elements logically using consistent proximity, visual similarity, and clear alignment.
 - **Nielsen Usability Heuristics**:
   - Keep system status visible (loading states, success banners, clear progress feedback).
@@ -123,10 +123,10 @@ When you discover a non-obvious database nuance, integration quirk, or operation
 
 ## 3. Living Documentation & API Contract Hygiene
 
-Documentation in Floppy is a **first-class product surface**, not an afterthought. When changing functionality, actively consider and update all affected documentation surfaces in the same PR.
+Documentation in Watchmask is a **first-class product surface**, not an afterthought. When changing functionality, actively consider and update all affected documentation surfaces in the same PR.
 
 ### OpenAPI Specification & API Contracts
-Floppy maintains an OpenAPI schema contract verified by automated test suites.
+Watchmask maintains an OpenAPI schema contract verified by automated test suites.
 - When you add, modify, or deprecate API endpoints or serializers, regenerate and validate the OpenAPI schema:
   ```bash
   SECRET=test-only uv run --no-sync python src/manage.py spectacular --custom-settings api.schema_contract.STATIC_SPECTACULAR_SETTINGS --fail-on-warn --validate --file src/api/contracts/openapi.yaml
@@ -182,7 +182,7 @@ Match validation depth to risk. Always run targeted tests before opening a PR:
 | **Upstream outcome port** | Classify in the local `UPSTREAM_PORTS.md` ledger, adapt against the current graph, and run the migration sync gate + `scripts/replay_upgrade_matrix.sh` |
 
 `upstream` is an exact upstream mirror. Do not merge or rebase it into `latest`;
-port the accepted behavior through Floppy's existing boundaries. Keep targeted
+port the accepted behavior through Watchmask's existing boundaries. Keep targeted
 regressions and fix confirmed baseline failures. Record a large or risky repair
 that cannot safely be completed instead of silently treating it as green.
 

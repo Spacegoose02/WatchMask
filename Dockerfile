@@ -59,6 +59,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM ${PYTHON_IMAGE}
 
+# Image identity shown by GHCR, Docker Desktop, Portainer and Unraid. CI's
+# metadata-action sets the same keys (plus version/revision/created); these
+# keep a local `docker build` branded too.
+LABEL org.opencontainers.image.title="Watchmask" \
+      org.opencontainers.image.description="Self-hosted tracker for movies, TV, anime, books, comics, manga and games, with BingeBandit built in." \
+      org.opencontainers.image.url="https://github.com/Spacegoose02/WatchMask" \
+      org.opencontainers.image.source="https://github.com/Spacegoose02/WatchMask" \
+      org.opencontainers.image.documentation="https://github.com/Spacegoose02/WatchMask#readme" \
+      org.opencontainers.image.vendor="Spacegoose02" \
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      net.unraid.docker.icon="https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/src/static/favicon/android-chrome-512x512.png" \
+      net.unraid.docker.webui="http://[IP]:[PORT:8000]/"
+
 # https://stackoverflow.com/questions/58701233/docker-logs-erroneously-appears-empty-until-container-stops
 ENV PYTHONUNBUFFERED=1
 ENV VIRTUAL_ENV=/opt/venv
