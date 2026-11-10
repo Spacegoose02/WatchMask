@@ -2930,6 +2930,10 @@ class BingeBanditAccount(models.Model):
         default=False,
         help_text="Mark titles watched on BingeBandit when they are completed here",
     )
+    sync_lists = models.BooleanField(
+        default=False,
+        help_text="Mirror the BingeBandit watchlist and playlists into Watchmask lists",
+    )
     library_synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

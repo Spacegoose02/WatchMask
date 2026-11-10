@@ -12,7 +12,9 @@ def sync_bingebandit_library(user_id):
     from integrations.models import BingeBanditAccount
 
     account = (
-        BingeBanditAccount.objects.select_related("user").filter(user_id=user_id).first()
+        BingeBanditAccount.objects.select_related("user")
+        .filter(user_id=user_id)
+        .first()
     )
     if not account:
         return "No BingeBandit account"
@@ -41,6 +43,46 @@ def sync_all_bingebandit_libraries():
     return {"synced": synced, "errors": errors}
 
 
+@shared_task(name="Sync BingeBandit lists")
+def sync_bingebandit_lists(user_id):
+    """Mirror one user's BingeBandit watchlist and playlists into Watchmask lists."""
+    from integrations import bingebandit
+    from integrations.models import BingeBanditAccount
+
+    account = (
+        BingeBanditAccount.objects.select_related("user")
+        .filter(user_id=user_id, sync_lists=True)
+        .first()
+    )
+    if not account:
+        return "BingeBandit list sync is off"
+    added, removed = bingebandit.sync_lists(account)
+    return f"Added {added} and removed {removed} BingeBandit list items"
+
+
+@shared_task(name="Sync BingeBandit lists for all users")
+def sync_all_bingebandit_lists():
+    """Mirror BingeBandit lists for every account that has list sync on."""
+    from integrations import bingebandit
+    from integrations.models import BingeBanditAccount
+
+    synced = errors = 0
+    for account in BingeBanditAccount.objects.select_related("user").filter(
+        sync_lists=True,
+    ):
+        try:
+            bingebandit.sync_lists(account)
+            synced += 1
+        except bingebandit.BingeBanditError as exc:
+            errors += 1
+            logger.warning(
+                "BingeBandit list sync failed for %s: %s",
+                account.user.username,
+                exc,
+            )
+    return {"synced": synced, "errors": errors}
+
+
 @shared_task(name="Push watched to BingeBandit")
 def push_bingebandit_watched(user_id, media_type, tmdb_id):
     """Mark a title completed in Watchmask as watched on BingeBandit."""
@@ -54,6 +96,8 @@ def push_bingebandit_watched(user_id, media_type, tmdb_id):
     try:
         pushed = bingebandit.push_watched(user, media_type, tmdb_id)
     except bingebandit.BingeBanditError as exc:
-        logger.warning("Could not mark %s %s watched on BingeBandit: %s", media_type, tmdb_id, exc)
+        logger.warning(
+            "Could not mark %s %s watched on BingeBandit: %s", media_type, tmdb_id, exc
+        )
         return "Failed"
     return "Pushed" if pushed else "Not on the server"
