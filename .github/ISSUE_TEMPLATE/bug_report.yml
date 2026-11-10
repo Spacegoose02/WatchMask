@@ -9,7 +9,7 @@ body:
         Include relevant diagnostics when you can. Logs can help diagnose webhook or
         integration bugs, but may contain private activity or secrets. Review and trim
         them before posting. Report sensitive security issues privately using
-        [SECURITY.md](https://github.com/dannyvfilms/Floppy/blob/latest/SECURITY.md).
+        [SECURITY.md](https://github.com/Spacegoose02/WatchMask/blob/latest/SECURITY.md).
   - type: checkboxes
     id: logs-attached
     attributes:
@@ -18,7 +18,7 @@ body:
         Instance administrators can use **Settings > Advanced > Download Sanitized Logs**.
         Known credential patterns are redacted; private titles, account details, URLs, or
         unrecognized secrets can remain. Share only a reviewed, relevant excerpt. If you
-        cannot access logs, describe the problem without them. If Floppy will not start,
+        cannot access logs, describe the problem without them. If Watchmask will not start,
         you can run the startup check and review its output before sharing:
 
         ```bash
@@ -65,7 +65,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: Floppy version
+      label: Watchmask version
     validations:
       required: true
   - type: dropdown

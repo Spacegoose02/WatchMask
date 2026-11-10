@@ -240,9 +240,28 @@ jobs:
       - name: Extract Docker metadata tags
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        env:
+          # GHCR reads a multi-arch package's description from the index
+          # annotations, not the per-platform image labels.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Without these, the repository name and description become the
+          # image title and description.
+          labels: |
+            org.opencontainers.image.title=Watchmask
+            org.opencontainers.image.description=Self-hosted tracker for movies, TV, anime, books, comics, manga and games, with BingeBandit built in.
+            org.opencontainers.image.vendor=Spacegoose02
+            org.opencontainers.image.documentation=https://github.com/Spacegoose02/WatchMask#readme
+            org.opencontainers.image.licenses=AGPL-3.0
+            net.unraid.docker.icon=https://raw.githubusercontent.com/Spacegoose02/WatchMask/latest/src/static/favicon/android-chrome-512x512.png
+          annotations: |
+            org.opencontainers.image.title=Watchmask
+            org.opencontainers.image.description=Self-hosted tracker for movies, TV, anime, books, comics, manga and games, with BingeBandit built in.
+            org.opencontainers.image.vendor=Spacegoose02
+            org.opencontainers.image.documentation=https://github.com/Spacegoose02/WatchMask#readme
+            org.opencontainers.image.licenses=AGPL-3.0
           tags: |
             type=ref,event=pr
             type=semver,pattern={{version}}
@@ -272,6 +291,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || 'false' }}

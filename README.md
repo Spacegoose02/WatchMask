@@ -10,7 +10,7 @@
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="https://github.com/dannyvfilms/Floppy/wiki">Docs (Floppy wiki)</a> ·
-  <a href="https://github.com/Spacegoose02/Yamtrack/releases">Releases</a> ·
+  <a href="https://github.com/Spacegoose02/WatchMask/releases">Releases</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -92,12 +92,6 @@ The [full feature tour](https://github.com/dannyvfilms/Floppy/wiki/Features) on
 the wiki lists everything, including multi-user accounts, OIDC sign-in, a REST
 API, and an MCP server.
 
-## Try it
-
-The [live demo](https://yamtrack.dannyvfilms.com) is open — sign in with
-username `demo` and password `demodemo`. It's one shared account, so what
-you add is visible to everyone else trying it.
-
 ## Install
 
 Watchmask runs in Docker. On a machine with Docker installed, paste this into a terminal
@@ -124,13 +118,13 @@ after creating your account. Details:
 [security notes](docs/security-hardening.md) ·
 [reporting a vulnerability](SECURITY.md).
 
-## Watchmask, Watchmask and Yamtrack
+## Watchmask, Floppy and Yamtrack
 
 Watchmask is built on [Floppy](https://github.com/dannyvfilms/Floppy), which
 started as a fork of [Yamtrack](https://github.com/FuzzyGrim/Yamtrack). It
-follows Watchmask closely and adds a native [BingeBandit](https://github.com/Spacegoose02/BingeBandit)
+follows Floppy closely and adds a native [BingeBandit](https://github.com/Spacegoose02/BingeBandit)
 integration (webhook tracking, history import, Play/Resume and Continue
-Watching) and Cinemask requests. Existing Watchmask and Yamtrack data keep
+Watching) and Cinemask requests. Existing Floppy and Yamtrack data keep
 working; Yamtrack CSV exports import under **Settings → Import**.
 
 ## Building on Watchmask
@@ -143,7 +137,7 @@ can read lists and report owned media ([FlexGet guide](docs/integrations/flexget
 
 ## Support
 
-Report Watchmask bugs on [this repository's issues](https://github.com/Spacegoose02/Yamtrack/issues).
+Report Watchmask bugs on [this repository's issues](https://github.com/Spacegoose02/WatchMask/issues).
 Thank you to everyone who has contributed to Watchmask, and to Yamtrack before it.
 
 ## Configuration and deployment

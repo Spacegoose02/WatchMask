@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1
         with:
-          package: floppy
+          package: watchmask
           dry-run: true
           keep-n-untagged: 15
           delete-ghost-images: true
@@ -24,7 +24,7 @@ jobs:
       # the log before running the real one.
       - uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1
         with:
-          packages: floppy,yamtrack
+          packages: watchmask
           dry-run: true
           delete-tags: pr-*
           validate: true

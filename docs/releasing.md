@@ -81,8 +81,7 @@ Carry these points into the actual release notes before publication:
    Observe all quality, upgrade and smoke prerequisites on that actual event.
    A green PR does not replace a failed release-event gate.
 4. Record the new immutable multi-architecture index and each platform digest.
-   Check both `ghcr.io/dannyvfilms/floppy` and the legacy
-   `ghcr.io/dannyvfilms/yamtrack` while dual publication remains supported.
+   Check `ghcr.io/spacegoose02/watchmask`.
 5. Retrieve the real SBOM and maximum-mode provenance for the distributed
    platform subjects. Check their digests, source revision and build materials;
    empty or missing objects are a verification failure, not proof of generation.
