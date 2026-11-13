@@ -37,7 +37,7 @@ from app.media_list_filters import (
     get_next_episode_map,
     parse_media_list_filters,
 )
-from app.models import BasicMedia, Episode, Item, MediaTypes, Sources
+from app.models import BasicMedia, Episode, Item, MediaTypes, MoviePlay, Sources
 from app.providers import services, tmdb
 from app.services import metadata_resolution
 from app.services.metadata_sync import enrich_synced_item, sync_podcast_show_from_rss
@@ -97,6 +97,7 @@ from .helpers import (
     resolve_episode_coordinate_for_request,
     resolve_item_queryset,  # FORK: bucket-aware Item resolution
     try_parse_date,
+    unsupported_fields,
     validate_body,
 )
 from .schema import (
@@ -1739,7 +1740,10 @@ class MediaConsumptionEntryDetailView(drf_views.APIView):
                 status=HTTP.NOT_FOUND,
             )
 
-        consumption.delete()
+        if isinstance(consumption, MoviePlay):
+            consumption.movie.remove_play(consumption)
+        else:
+            consumption.delete()
 
         return Response(status=HTTP.NO_CONTENT)
 
@@ -1867,6 +1871,18 @@ class MediaConsumptionEntryDetailView(drf_views.APIView):
                 status=HTTP.BAD_REQUEST,
             )
 
+        unsupported = unsupported_fields(consumption, validated_body)
+        if unsupported:
+            return Response(
+                {
+                    "detail": HTTP.BAD_REQUEST.phrase,
+                    "errors": "Fields not stored on this entry: "
+                    + ", ".join(unsupported),
+                    "code": "UNSUPPORTED_FIELDS",
+                },
+                status=HTTP.BAD_REQUEST,
+            )
+
         for field, value in validated_body.items():
             if hasattr(consumption, field):
                 setattr(consumption, field, value)
@@ -1933,6 +1949,7 @@ class MediaListDetailView(drf_views.APIView):
     """Media list detail view."""
 
     @extend_schema(parameters=[MEDIA_TYPE_PARAM])
+    @extend_schema(parameters=[MEDIA_TYPE_PARAM, LIBRARY_MEDIA_TYPE_PARAM])
     def delete(self, request, media_type, source, media_id, list_id):
         """Remove a specific media from a specific list."""
         user = request.user
@@ -1974,11 +1991,21 @@ class MediaListDetailView(drf_views.APIView):
                 media_id,
                 source,
                 media_type,
+                library_media_type=request.query_params.get("library_media_type"),
             )
         except CustomListItem.DoesNotExist:
             return Response(
                 {"detail": "Media not found in the list."},
                 status=HTTP.NOT_FOUND,
+            )
+        except CustomListItem.MultipleObjectsReturned:
+            return Response(
+                {
+                    "detail": "The list holds this media in several library "
+                    "buckets; pass library_media_type to choose one.",
+                    "code": "AMBIGUOUS_LIBRARY_BUCKET",
+                },
+                status=HTTP.CONFLICT,
             )
 
         list_item.delete()
@@ -3218,6 +3245,18 @@ class MediaSeasonConsumptionEntryDetailView(drf_views.APIView):
                 status=HTTP.BAD_REQUEST,
             )
 
+        unsupported = unsupported_fields(consumption, validated_body)
+        if unsupported:
+            return Response(
+                {
+                    "detail": HTTP.BAD_REQUEST.phrase,
+                    "errors": "Fields not stored on this entry: "
+                    + ", ".join(unsupported),
+                    "code": "UNSUPPORTED_FIELDS",
+                },
+                status=HTTP.BAD_REQUEST,
+            )
+
         for field, value in validated_body.items():
             if hasattr(consumption, field):
                 setattr(consumption, field, value)
@@ -4429,6 +4468,18 @@ class MediaEpisodeConsumptionEntryDetailView(drf_views.APIView):
         if error:
             return Response(
                 {"detail": f"{error}"},
+                status=HTTP.BAD_REQUEST,
+            )
+
+        unsupported = unsupported_fields(consumption, validated_body)
+        if unsupported:
+            return Response(
+                {
+                    "detail": HTTP.BAD_REQUEST.phrase,
+                    "errors": "Fields not stored on this entry: "
+                    + ", ".join(unsupported),
+                    "code": "UNSUPPORTED_FIELDS",
+                },
                 status=HTTP.BAD_REQUEST,
             )
 
