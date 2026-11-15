@@ -4,6 +4,64 @@ Releases are tagged with date-based versions (`vYY.M.D`). Each tag builds and
 publishes `ghcr.io/spacegoose02/watchmask` with the matching version tags plus
 `:release`.
 
+## v26.11.15
+
+### New
+
+- **Sign-in providers in Settings**: superusers can add an OpenID Connect
+  provider (Tinyauth, Authelia, Pocket ID, Authentik and others) under
+  Settings > Advanced, with switches for creating accounts on first sign-in
+  and showing the provider on the sign-in page. Client secrets are stored
+  encrypted. Providers set through `SOCIAL_PROVIDERS` and
+  `SOCIALACCOUNT_PROVIDERS` keep working.
+- **Link sign-ins to existing accounts**: with account creation off (the
+  default), sign in with your password once, then link a provider under
+  Settings > Account > Link or Unlink Sign-ins.
+- **Sign in with BingeBandit**: Watchmask shows a BingeBandit link code; approve
+  it on BingeBandit and you're signed in. If you already connected that
+  BingeBandit server under Integrations with the same username, the first
+  sign-in links your account automatically.
+
+### Fixes (ported from upstream Floppy)
+
+- The calendar uses only your own TV rows, so another account's paused or
+  dropped show no longer hides it.
+- Deleting or editing a single play is safe, and grouped movie history rows are
+  marked as tracker rows.
+- History caches can't republish stale days, and type-filtered history pages
+  load about 6x faster on a cold scan.
+- Trakt and MDBList list imports handle the same title in several library
+  buckets; episode scores and list removal respect the library bucket.
+- History API items include `library_media_type`, and the collection endpoint
+  gains an opt-in `strict_library` flag.
+- Trakt export refuses modes that would run the full import, padded provider
+  names match after trimming, clearing a resume position clears it on every
+  copy of the title, and the anime duplicate check only looks at your own
+  items.
+
+### Security
+
+- Jellyfin, Seerr, gPodder and Koito now connect through a pinned transport
+  that resolves the server once and sticks to that address, closing a
+  DNS-rebinding gap, with a request deadline and response size limit.
+- `soupsieve` updated to 4.1.1 for four advisories.
+
+### Other
+
+- The container image is labelled as Watchmask (title, description, Unraid
+  icon), and docs, issue templates and cleanup workflows point at
+  `ghcr.io/spacegoose02/watchmask` instead of the upstream image.
+
+### Upgrade notes
+
+- No database migrations.
+- BingeBandit allows about 10 link codes per 15 minutes per IP, and all
+  BingeBandit sign-ins come from the Watchmask server's address. A BingeBandit
+  admin can approve a code as any BingeBandit user, so they can sign in to any
+  Watchmask account linked to BingeBandit.
+- If Watchmask sits behind a forward-auth gate such as Tinyauth, see
+  `docs/deployment.md` for the sign-in paths to let through.
+
 ## v26.11.10
 
 ### New
