@@ -2292,6 +2292,16 @@ SOCIALACCOUNT_LOGIN_ON_GET = True
 
 SOCIAL_PROVIDERS = config("SOCIAL_PROVIDERS", default="", cast=Csv())
 INSTALLED_APPS += SOCIAL_PROVIDERS
+# Sign-in providers added under Settings > Advanced: OpenID Connect apps and
+# "Sign in with BingeBandit".
+if "allauth.socialaccount" in INSTALLED_APPS:
+    for _signin_app in (
+        "allauth.socialaccount.providers.openid_connect",
+        "integrations.bingebandit_signin",
+    ):
+        if _signin_app not in INSTALLED_APPS:
+            INSTALLED_APPS.append(_signin_app)
+SOCIALACCOUNT_ADAPTER = "users.sso.SocialAccountAdapter"
 
 SOCIALACCOUNT_PROVIDERS = config(
     "SOCIALACCOUNT_PROVIDERS",

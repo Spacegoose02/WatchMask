@@ -72,7 +72,7 @@ from integrations.models import (
 )
 from integrations.plex_watchlist import WATCHLIST_TASK_NAME
 from users import appearance as appearance_config
-from users import cache_management, helpers, release_notes
+from users import cache_management, helpers, release_notes, sso_views
 from users.forms import (
     AuthenticatorSetupForm,
     NotificationSettingsForm,
@@ -2502,6 +2502,12 @@ def advanced(request):
             (run_state.read_state() or {}).get("last_unclean_at") or "",
         ),
     }
+    if request.user.is_superuser:
+        context["sso_providers"] = sso_views.provider_rows(request)
+        context["sso_has_bingebandit"] = any(
+            row["app"].provider == "bingebandit" for row in context["sso_providers"]
+        )
+        context["bingebandit_default_url"] = sso_views.bingebandit_default_url(request)
     return render(request, "users/advanced.html", context)
 
 

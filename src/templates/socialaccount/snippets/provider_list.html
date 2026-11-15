@@ -3,6 +3,8 @@
 {% if socialaccount_providers %}
   {% element provider_list %}
     {% for provider in socialaccount_providers %}
+      {# Providers added in Settings can stay off the sign-in page and still be linked. #}
+      {% if process != "login" or not provider.app.settings.managed or provider.app.settings.show_on_login %}
       {% if provider.id == "openid" %}
         {% for brand in provider.get_brands %}
           {% provider_login_url provider openid=brand.openid_url process=process as href %}
@@ -20,6 +22,7 @@
         {% element provider name=provider.name provider_id=provider.id href=href %}
         {% endelement %}
       </form>
+      {% endif %}
     {% endfor %}
   {% endelement %}
 {% endif %}

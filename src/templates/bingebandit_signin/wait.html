@@ -1,0 +1,61 @@
+{% extends "socialaccount/base_entrance.html" %}
+{% load i18n %}
+
+{% block head_title %}
+  {% translate "Sign in with BingeBandit" %}
+{% endblock head_title %}
+
+{% block content_title %}
+  {% translate "Sign in with BingeBandit" %}
+{% endblock content_title %}
+
+{% block content %}
+  <div class="text-center space-y-4" id="bingebandit-wait" data-poll-url="{{ poll_url }}">
+    <p class="text-[var(--color-text-muted)] text-sm">
+      {% translate "Approve this code on BingeBandit. Pick the account or profile to sign in as, then come back here." %}
+    </p>
+    <p class="font-mono text-3xl tracking-widest font-semibold">{{ code }}</p>
+    <a href="{{ link_url }}" target="_blank" rel="noopener"
+       class="inline-flex items-center justify-center w-full px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm">
+      {% translate "Approve on BingeBandit" %}
+    </a>
+    <p class="text-xs text-[var(--color-text-muted)]" data-status>
+      {% translate "Waiting for approval…" %}
+    </p>
+    <p class="text-sm hidden" data-expired>
+      {% translate "This code expired." %}
+      <a class="text-[var(--color-link)] hover:text-[var(--color-link-hover)]" href="{{ new_code_url }}">{% translate "Get a new code" %}</a>
+    </p>
+    <a class="block text-sm text-[var(--color-link)] hover:text-[var(--color-link-hover)]" href="{% url 'account_login' %}">
+      {% translate "Back to sign-in" %}
+    </a>
+  </div>
+{% endblock content %}
+
+{% block extra_body %}
+  {{ block.super }}
+  <script>
+    (function () {
+      const box = document.getElementById("bingebandit-wait");
+      const check = async () => {
+        try {
+          const response = await fetch(box.dataset.pollUrl, { credentials: "same-origin" });
+          const data = await response.json();
+          if (data.status === "approved") {
+            window.location.assign(data.next);
+            return;
+          }
+          if (data.status === "expired") {
+            box.querySelector("[data-status]").classList.add("hidden");
+            box.querySelector("[data-expired]").classList.remove("hidden");
+            return;
+          }
+        } catch (error) {
+          // Keep waiting through a dropped request.
+        }
+        window.setTimeout(check, 2000);
+      };
+      window.setTimeout(check, 2000);
+    })();
+  </script>
+{% endblock extra_body %}

@@ -344,12 +344,12 @@
           <h2 class="text-xl font-semibold">{% translate "Third-Party Connections" %}</h2>
         </div>
         <p class="text-[var(--color-text-muted)] mb-5 text-sm">
-          {% translate "Manage your connected third-party accounts for easier sign-in." %}
+          {% translate "Link a sign-in provider to this account so you can use it instead of your password. You can link more than one." %}
         </p>
         <a href="{% url 'socialaccount_connections' %}"
            class="inline-flex items-center px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm">
           {% include "app/icons/link.svg" with classes="w-4 h-4 mr-2" %}
-          {% translate "Manage Account Connections" %}
+          {% translate "Link or Unlink Sign-ins" %}
         </a>
       </div>
     {% endif %}

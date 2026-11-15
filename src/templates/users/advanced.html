@@ -49,6 +49,59 @@
         </div>
       </div>
 
+      {% if user.is_superuser %}
+        <div id="sign-in-providers"
+             class="bg-[var(--color-surface-strong)] p-5 rounded-lg mb-6"
+             x-data="{ activeModal: null, closeModal() { this.activeModal = null; } }">
+          <div class="flex items-center mb-3">
+            {% include "app/icons/shield.svg" with classes="w-5 h-5 text-[var(--color-link)] mr-2" %}
+            <h3 class="text-base font-medium">{% translate "Sign-in Providers" %}</h3>
+          </div>
+          <p class="text-[var(--color-text-muted)] mb-4 text-sm">
+            {% translate "Let people sign in with BingeBandit or an OpenID Connect provider such as Tinyauth, Authelia, Pocket ID or Authentik. People with an account here link a provider under Settings > Account." %}
+          </p>
+          {% if sso_providers %}
+            <ul class="space-y-2 mb-4">
+              {% for row in sso_providers %}
+                <li class="flex items-center justify-between gap-3 rounded-md bg-[var(--color-surface)] px-4 py-3 text-sm">
+                  <div class="min-w-0">
+                    <span class="block font-medium">{{ row.app.name }}</span>
+                    <span class="block text-xs text-[var(--color-text-muted)] truncate">
+                      {{ row.app.settings.server_url }}
+                      {% if row.app.settings.auto_create %} · {% translate "creates accounts" %}{% endif %}
+                      {% if not row.app.settings.show_on_login %} · {% translate "hidden on sign-in page" %}{% endif %}
+                    </span>
+                  </div>
+                  <button type="button" @click="activeModal = 'sso-{{ row.app.pk }}'"
+                          class="shrink-0 px-3 py-1.5 bg-[var(--color-surface-strong)] border border-gray-600 rounded-md hover:border-indigo-500 text-sm cursor-pointer">
+                    {% translate "Edit" %}
+                  </button>
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          <div class="flex flex-wrap gap-3">
+            <button type="button" @click="activeModal = 'sso-new-openid_connect'"
+                    class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
+              {% translate "Add Provider" %}
+            </button>
+            {% if not sso_has_bingebandit %}
+              <button type="button" @click="activeModal = 'sso-new-bingebandit'"
+                      class="px-4 py-2 bg-[var(--color-surface)] border border-gray-600 rounded-md hover:border-indigo-500 transition-colors text-sm cursor-pointer">
+                {% translate "Add Sign in with BingeBandit" %}
+              </button>
+            {% endif %}
+          </div>
+          {% include "users/_sso_provider_modal.html" with app=None kind="openid_connect" callback_url="" default_url="" %}
+          {% if not sso_has_bingebandit %}
+            {% include "users/_sso_provider_modal.html" with app=None kind="bingebandit" callback_url="" default_url=bingebandit_default_url %}
+          {% endif %}
+          {% for row in sso_providers %}
+            {% include "users/_sso_provider_modal.html" with app=row.app kind="" callback_url=row.callback_url default_url="" %}
+          {% endfor %}
+        </div>
+      {% endif %}
+
       <div class="bg-[var(--color-surface-strong)] p-5 rounded-lg mb-6">
         <div class="flex items-center mb-3">
           {% include "app/icons/image.svg" with classes="w-5 h-5 text-[var(--color-link)] mr-2" %}
