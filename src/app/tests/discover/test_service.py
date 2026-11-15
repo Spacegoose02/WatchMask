@@ -5271,7 +5271,9 @@ class DiscoverServiceTests(TestCase):
             .startswith("keywords:"),
         )
 
-    def test_behavior_first_confidence_keeps_anime_on_generic_path(self):
+    @patch("app.discover.comfort_scoring._is_holiday_window", return_value=False)
+    @patch("app.discover.movie_comfort._is_holiday_window", return_value=False)
+    def test_behavior_first_confidence_keeps_anime_on_generic_path(self, *_mock_windows):
         base_profile = {
             "phase_keyword_affinity": {"holiday": 1.0, "whodunit": 0.9},
             "recent_keyword_affinity": {"holiday": 0.9, "whodunit": 0.8},
@@ -5781,9 +5783,8 @@ class DiscoverServiceTests(TestCase):
         self.assertNotIn("title-days", content)
 
     @patch("app.discover.comfort_scoring._is_holiday_window", return_value=False)
-    def test_movie_behavior_first_applies_keyword_holiday_penalty_out_of_season(
-        self, _mock_window
-    ):
+    @patch("app.discover.movie_comfort._is_holiday_window", return_value=False)
+    def test_movie_behavior_first_applies_keyword_holiday_penalty_out_of_season(self, *_mock_windows):
         candidates = [
             CandidateItem(
                 media_type=MediaTypes.MOVIE.value,
@@ -5872,9 +5873,8 @@ class DiscoverServiceTests(TestCase):
         )
 
     @patch("app.discover.comfort_scoring._is_holiday_window", return_value=False)
-    def test_movie_behavior_first_debug_payload_exposes_holiday_penalty(
-        self, _mock_window
-    ):
+    @patch("app.discover.movie_comfort._is_holiday_window", return_value=False)
+    def test_movie_behavior_first_debug_payload_exposes_holiday_penalty(self, *_mock_windows):
         candidates = [
             CandidateItem(
                 media_type=MediaTypes.MOVIE.value,
