@@ -1,0 +1,110 @@
+{% load i18n %}
+{# Sign-in provider dialog. Params: app (None to add), kind (when adding), callback_url, default_url. #}
+{% with kind=app.provider|default:kind %}
+<div x-show="activeModal === '{% if app %}sso-{{ app.pk }}{% else %}sso-new-{{ kind }}{% endif %}'"
+     x-cloak
+     @keydown.escape.window="closeModal()"
+     x-transition.opacity.duration.150ms
+     class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+     @mousedown.self="closeModal()">
+  <div class="modal-max-height overflow-y-auto w-full bg-[var(--color-surface-strong)] p-5 rounded-lg"
+       style="width: min(96vw, 32rem);">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-base font-semibold">
+        {% if app %}{% blocktranslate with name=app.name %}Edit {{ name }}{% endblocktranslate %}{% elif kind == "bingebandit" %}{% translate "Sign in with BingeBandit" %}{% else %}{% translate "Add a sign-in provider" %}{% endif %}
+      </h3>
+      <button type="button"
+              @click="closeModal()"
+              class="text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer p-1 rounded-md hover:bg-[var(--color-surface-hover)]">
+        {% include "app/icons/x.svg" with classes="w-4 h-4" %}
+      </button>
+    </div>
+    <form method="post"
+          action="{% if app %}{% url 'edit_sso_provider' app.pk %}{% else %}{% url 'add_sso_provider' %}{% endif %}"
+          class="space-y-3">
+      {% csrf_token %}
+      <input type="hidden" name="kind" value="{{ kind }}">
+      {% if kind == "bingebandit" %}
+        <p class="text-xs text-[var(--color-text-muted)]">
+          {% translate "People sign in by approving a code on BingeBandit, like signing in a TV. Anyone who already connected this BingeBandit server under Integrations is linked automatically the first time." %}
+        </p>
+      {% endif %}
+      <div>
+        <label class="block text-sm text-[var(--color-text-muted)] mb-2">{% translate "Name on the sign-in button" %}</label>
+        <input type="text" name="name" required maxlength="40" value="{% if app %}{{ app.name }}{% elif kind == 'bingebandit' %}BingeBandit{% endif %}"
+               class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none"
+               placeholder="Tinyauth">
+      </div>
+      <div>
+        <label class="block text-sm text-[var(--color-text-muted)] mb-2">{% if kind == "bingebandit" %}{% translate "BingeBandit server URL" %}{% else %}{% translate "Issuer URL" %}{% endif %}</label>
+        <input type="url" name="issuer" required value="{% if app %}{{ app.settings.server_url }}{% else %}{{ default_url|default:'' }}{% endif %}"
+               class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none font-mono"
+               placeholder="{% if kind == 'bingebandit' %}https://bingebandit.example.com{% else %}https://auth.example.com{% endif %}">
+      </div>
+      {% if kind != "bingebandit" %}
+      <div>
+        <label class="block text-sm text-[var(--color-text-muted)] mb-2">{% translate "Client ID" %}</label>
+        <input type="text" name="client_id" required value="{{ app.client_id|default:'' }}" autocomplete="off"
+               class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none font-mono">
+      </div>
+      <div>
+        <label class="block text-sm text-[var(--color-text-muted)] mb-2">{% translate "Client secret" %}</label>
+        <input type="password" name="secret" {% if not app %}required{% endif %} autocomplete="new-password"
+               class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none font-mono"
+               {% if app %}placeholder="{% translate 'Saved; leave empty to keep it' %}"{% endif %}>
+      </div>
+      <div>
+        <label class="block text-sm text-[var(--color-text-muted)] mb-2">{% translate "Extra scopes (optional)" %}</label>
+        <input type="text" name="scopes" value="{% for s in app.settings.scope %}{% if s != 'openid' and s != 'profile' and s != 'email' %}{{ s }} {% endif %}{% endfor %}"
+               class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text)] text-sm border border-gray-600 focus:border-indigo-500 focus:outline-none font-mono"
+               placeholder="{% translate 'openid, profile and email are always asked for' %}">
+      </div>
+      {% if callback_url %}
+        <div>
+          <label class="block text-sm text-[var(--color-text-muted)] mb-2">{% translate "Redirect URL to give the provider" %}</label>
+          <input type="text" readonly value="{{ callback_url }}" onclick="this.select()"
+                 class="w-full py-2 px-3 bg-[var(--color-surface)] rounded-md text-[var(--color-text-muted)] text-xs border border-gray-700 font-mono">
+        </div>
+      {% else %}
+        <p class="text-xs text-[var(--color-text-muted)]">
+          {% translate "After saving, edit the provider to copy the redirect URL into your provider's client settings." %}
+        </p>
+      {% endif %}
+      {% endif %}
+      <label class="flex items-start gap-2 text-sm cursor-pointer">
+        <input type="checkbox" name="auto_create" value="1" {% if app.settings.auto_create %}checked{% endif %}
+               class="rounded border-gray-600 bg-[var(--color-surface)] text-indigo-600 focus:ring-indigo-500">
+        <span>{% translate "Create an account for anyone who signs in with it" %}</span>
+      </label>
+      <p class="text-xs text-[var(--color-text-muted)] ml-6">
+        {% if kind == "bingebandit" %}{% translate "Everyone with a BingeBandit account on that server gets a Watchmask account. Left off, only people with a linked Watchmask account can sign in." %}{% else %}{% translate "Only turn this on for a provider that just lets in people you trust (your own Tinyauth, Authelia or Pocket ID). Left off, people sign in with their password once and link the provider under Settings > Account." %}{% endif %}
+      </p>
+      <label class="flex items-start gap-2 text-sm cursor-pointer">
+        <input type="checkbox" name="show_on_login" value="1" {% if not app or app.settings.show_on_login %}checked{% endif %}
+               class="rounded border-gray-600 bg-[var(--color-surface)] text-indigo-600 focus:ring-indigo-500">
+        <span>{% translate "Show on the sign-in page" %}</span>
+      </label>
+      <div class="flex flex-wrap justify-end gap-2 pt-2">
+        <button type="button" @click="closeModal()"
+                class="px-4 py-2 text-sm rounded-md bg-[var(--color-surface)] border border-gray-600 hover:border-indigo-500 cursor-pointer">
+          {% translate "Cancel" %}
+        </button>
+        <button type="submit"
+                class="px-4 py-2 text-sm rounded-md bg-indigo-600 text-white hover:bg-indigo-700 cursor-pointer">
+          {% translate "Save" %}
+        </button>
+      </div>
+    </form>
+    {% if app %}
+      <form method="post" action="{% url 'delete_sso_provider' app.pk %}" class="mt-4 pt-4 border-t border-gray-700"
+            onsubmit="return window.confirm(gettext('Remove this sign-in provider? Everyone linked to it will need their password to sign in.'));">
+        {% csrf_token %}
+        <button type="submit"
+                class="px-3 py-2 bg-red-600/10 border border-red-600/40 text-[var(--color-error-text)] rounded-md hover:bg-red-600/20 transition-colors text-sm cursor-pointer">
+          {% blocktranslate with name=app.name %}Remove {{ name }}{% endblocktranslate %}
+        </button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+{% endwith %}

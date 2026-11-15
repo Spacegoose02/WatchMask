@@ -965,6 +965,24 @@ environment:
 
 > **Note:** With a Cloudflare Tunnel or any HTTPS-terminating proxy, also set `USE_X_FORWARDED_PROTO=True` — otherwise Django cannot detect the correct scheme and CSRF checks will fail.
 
+## Single sign-on and Sign in with BingeBandit
+
+An administrator adds sign-in providers under **Settings > Advanced > Sign-in Providers**:
+
+- **OpenID Connect** (Tinyauth, Authelia, Pocket ID, Authentik, and so on): enter the issuer URL, client ID and secret, then edit the provider to copy its redirect URL (`https://your_domain.com/accounts/oidc/<id>/login/callback/`) into the provider's client settings.
+- **Sign in with BingeBandit**: enter the BingeBandit server URL. People sign in by approving a code on BingeBandit, the same way a TV is signed in. Anyone who already connected that server under Integrations is linked automatically on their first BingeBandit sign-in.
+
+Each provider has two switches. **Create an account for anyone who signs in with it** is off by default: someone without a linked account is sent back to the sign-in page and told to sign in with their password, then link the provider under **Settings > Account > Link or Unlink Sign-ins**. **Show on the sign-in page** hides the button without stopping people from linking it.
+
+Providers set through `SOCIAL_PROVIDERS` / `SOCIALACCOUNT_PROVIDERS` keep working as before.
+
+BingeBandit allows about ten new sign-in codes per 15 minutes from one address, and Watchmask's server is that address for every person signing in. A BingeBandit administrator can approve a code as any BingeBandit user, so they can sign in to any Watchmask account linked to BingeBandit.
+
+### Behind a forward-auth proxy (Tinyauth, Authelia)
+
+Watchmask does not read `Remote-User` headers, so a forward-auth gate means signing in twice unless you also add the gate as an OpenID Connect provider above. Let machine-to-machine paths through the gate, since they check their own tokens:
+`^/(api/|apis/listenbrainz/|webhook/|stremio-addon/|calendar/download/|rss/|image-cache/|import/(plex|audiobookshelf)/cover/|health/|ping/|serviceworker\.js)`
+
 ## Troubleshooting: I updated and my login is gone
 
 1. If you intended to use PostgreSQL, confirm `DB_HOST` is set. `DATABASE_URL` alone will not enable Postgres.

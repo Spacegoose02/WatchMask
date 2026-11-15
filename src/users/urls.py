@@ -1,6 +1,6 @@
 from django.urls import path
 
-from users import metadata_views, onboarding_views, server_port_views, views
+from users import metadata_views, onboarding_views, server_port_views, sso_views, views
 
 urlpatterns = [
     path("setup/", onboarding_views.onboarding_media_types, name="onboarding_media_types"),
@@ -172,6 +172,21 @@ urlpatterns = [
         "settings/advanced/image-cache/clear",
         views.clear_image_cache,
         name="clear_image_cache",
+    ),
+    path(
+        "settings/advanced/sign-in-providers",
+        sso_views.save_sso_provider,
+        name="add_sso_provider",
+    ),
+    path(
+        "settings/advanced/sign-in-providers/<int:pk>",
+        sso_views.save_sso_provider,
+        name="edit_sso_provider",
+    ),
+    path(
+        "settings/advanced/sign-in-providers/<int:pk>/delete",
+        sso_views.delete_sso_provider,
+        name="delete_sso_provider",
     ),
     path("settings/advanced/logs", views.export_logs, name="export_logs"),
     path(
